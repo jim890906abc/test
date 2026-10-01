@@ -1,7 +1,7 @@
 {
   "name": "agent-hub",
-  "version": "0.2.0",
-  "description": "A Claude-Code-web-style control center for driving coding agents from many vendors (Claude, OpenAI, Gemini, Codex, Claude Code CLI, Aider, ...) from one browser UI.",
+  "version": "0.3.0",
+  "description": "A Claude-Code-web-style control center for Kimi Code on all your computers: follow and drive Kimi (terminal or kimi web) from one browser UI.",
   "type": "module",
   "main": "server/index.js",
   "scripts": {

@@ -5,7 +5,6 @@ import path from 'node:path';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import os from 'node:os';
-import { spawn } from 'node:child_process';
 import express from 'express';
 import { WebSocketServer } from 'ws';
 import * as store from './store.js';
@@ -13,7 +12,7 @@ import * as runner from './runner.js';
 import * as workspace from './workspace.js';
 import { ADAPTERS, TYPE_LABELS } from './adapters/index.js';
 import { TEMPLATES } from './adapters/presets.js';
-import { splitArgs, loginHint, disposeAll } from './adapters/acp.js';
+import { disposeAll } from './adapters/acp.js';
 import * as machines from './machines.js';
 
 const PORT = Number(process.env.PORT || 8787);
@@ -91,7 +90,7 @@ const EDITABLE = ['name', 'enabled', 'color', 'command', 'args', 'env', 'login',
 // ------------------------------------------------------------------ meta
 
 app.get('/api/config', wrap(() => ({
-  version: '0.2.0',
+  version: '0.3.0',
   workspacesDir: store.WORKSPACES_DIR,
   home: os.homedir(),
   host: HOST,
@@ -165,58 +164,32 @@ app.post('/api/agents/:id/test', wrap(async (req) => {
   }
 }));
 
-// Runs an agent's own login command (e.g. `kimi login`, a device-code flow)
-// and streams its output to the browser, so a subscription account can be
-// connected without opening a terminal.
-const logins = new Map();
-app.post('/api/agents/:id/login', wrap((req) => {
-  const agent = store.getAgent(req.params.id);
-  if (!agent) throw Object.assign(new Error('找不到 agent'), { status: 404 });
-  logins.get(agent.id)?.kill('SIGTERM');
-  const [cmd, ...args] = splitArgs(agent.login || loginHint(agent));
-  const child = spawn(cmd, args, { env: { ...process.env, ...(agent.env || {}) }, stdio: ['pipe', 'pipe', 'pipe'] });
-  logins.set(agent.id, child);
-  const send = (text) => broadcast({ t: 'login', agentId: agent.id, text });
-  send(`$ ${[cmd, ...args].join(' ')}\n`);
-  child.stdout.on('data', (d) => send(d.toString('utf8')));
-  child.stderr.on('data', (d) => send(d.toString('utf8')));
-  child.stdin.on('error', () => {});
-  child.on('error', (err) => {
-    send(`\n${err.code === 'ENOENT' ? `找不到指令 ${cmd}` : err.message}\n`);
-    broadcast({ t: 'login_end', agentId: agent.id, code: -1 });
-  });
-  child.on('close', (code) => {
-    if (logins.get(agent.id) === child) logins.delete(agent.id);
-    broadcast({ t: 'login_end', agentId: agent.id, code });
-  });
-  return { ok: true };
-}));
-app.post('/api/agents/:id/login/input', wrap((req) => {
-  const child = logins.get(req.params.id);
-  if (!child) throw Object.assign(new Error('登入程序未在執行'), { status: 409 });
-  child.stdin.write(`${req.body?.text ?? ''}\n`);
-}));
-app.post('/api/agents/:id/login/cancel', wrap((req) => {
-  logins.get(req.params.id)?.kill('SIGTERM');
-}));
-
 // -------------------------------------------------------------- sessions
 
 app.get('/api/sessions', wrap(() =>
   store.listSessions().map(runner.summarize).sort((a, b) => b.updatedAt - a.updatedAt),
 ));
 
+// New conversation. On a connected machine ({ machineId, cwd }) the folder is
+// a path on that machine; otherwise a local agent ({ agentId }) is used.
 app.post('/api/sessions', wrap(async (req) => {
-  const { agentId, prompt, cwd, permissionMode, images } = req.body || {};
-  const dir = cwd ? workspace.validateDir(cwd) : undefined;
-  const s = await runner.newSession({ agentId, cwd: dir, permissionMode, nameHint: prompt });
+  const { agentId, machineId, prompt, cwd, permissionMode, images, model, effort, permission, planMode } = req.body || {};
+  const remote = machineId || String(agentId || '').startsWith('kimi@');
+  const dir = cwd ? (remote ? String(cwd) : workspace.validateDir(cwd)) : undefined;
+  const s = await runner.newSession({
+    agentId: machineId ? `kimi@${machineId}` : agentId,
+    cwd: dir,
+    permissionMode,
+    nameHint: prompt,
+    config: remote ? { model, effort, permission, planMode } : undefined,
+  });
   if (prompt?.trim() || images?.length) runner.startTurn(s, prompt || '', { images });
   return runner.summarize(s);
 }));
 
 app.get('/api/sessions/:id', wrap((req) => {
   const s = mustSession(req.params.id);
-  return { ...runner.summarize(s), seq: s.seq || 0, events: s.events, allowedTools: s.allowedTools, handoffFrom: s.handoffFrom };
+  return { ...runner.summarize(s), seq: s.seq || 0, events: s.events, allowedTools: s.allowedTools };
 }));
 
 app.patch('/api/sessions/:id', wrap((req) => {
@@ -247,9 +220,33 @@ app.delete('/api/sessions/:id', wrap((req) => {
 app.post('/api/sessions/:id/messages', wrap((req) => {
   const s = mustSession(req.params.id);
   const text = String(req.body?.text ?? '');
-  const images = req.body?.images || [];
+  const images = (req.body?.images || []).slice(0, 10);
   if (!text.trim() && !images.length) throw Object.assign(new Error('訊息是空的'), { status: 400 });
-  runner.startTurn(s, text, { images });
+  const note = req.body?.from === 'artifact' ? '從 Artifact 送出' : undefined;
+  runner.startTurn(s, text, { images, note });
+}));
+
+app.post('/api/sessions/:id/command', wrap(async (req) => {
+  const name = String(req.body?.name || '').replace(/^\//, '');
+  if (!name) throw Object.assign(new Error('缺少指令名稱'), { status: 400 });
+  const s = mustSession(req.params.id);
+  const r = await runner.command(s, name, String(req.body?.args ?? '').trim());
+  if (name === 'archive') {
+    runner.disposeSession(s);
+    store.deleteSession(s.id);
+    broadcast({ t: 'deleted', sid: s.id });
+  }
+  return r;
+}));
+
+app.post('/api/sessions/:id/earlier', wrap(async (req) => {
+  const s = mustSession(req.params.id);
+  if (!s.kimiSessionId) return {};
+  await ADAPTERS['kimi-remote'].loadEarlier(s);
+}));
+
+app.delete('/api/sessions/:id/queue/:promptId', wrap(async (req) => {
+  await runner.cancelQueued(mustSession(req.params.id), req.params.promptId);
 }));
 
 app.post('/api/sessions/:id/interrupt', wrap(async (req) => {
@@ -257,17 +254,13 @@ app.post('/api/sessions/:id/interrupt', wrap(async (req) => {
 }));
 
 app.post('/api/sessions/:id/permissions/:eventId', wrap(async (req) => {
-  const ok = await runner.resolvePermission(req.params.id, req.params.eventId, req.body?.optionId);
-  if (!ok) throw Object.assign(new Error('這個權限請求已經失效'), { status: 409 });
+  const { optionId, answers, feedback } = req.body || {};
+  const ok = await runner.resolvePermission(req.params.id, req.params.eventId, optionId, { answers, feedback });
+  if (!ok) throw Object.assign(new Error('這個請求已經處理過了'), { status: 409 });
 }));
 
 app.post('/api/sessions/:id/config', wrap(async (req) => {
   await runner.configure(mustSession(req.params.id), req.body || {});
-}));
-
-app.post('/api/sessions/:id/handoff', wrap(async (req) => {
-  const s = mustSession(req.params.id);
-  return runner.summarize(await runner.handoff(s, req.body || {}));
 }));
 
 const kimiRemote = ADAPTERS['kimi-remote'];
@@ -293,27 +286,46 @@ app.get('/api/machines', wrap(() => machines.listMachines()));
 app.delete('/api/machines/:id', wrap((req) => machines.removeMachine(req.params.id)));
 app.post('/api/machines/:id/refresh', wrap((req) => machines.rpc(req.params.id, 'kimi.status')));
 app.post('/api/machines/:id/kimi/start', wrap((req) => machines.rpc(req.params.id, 'kimi.start', {}, 40_000)));
-app.post('/api/machines/:mid/kimi/:kid/attach', wrap(async (req) => runner.summarize(await runner.attachKimi(req.params.mid, req.params.kid))));
-
-// ----------------------------------------------------------- compare mode
-
-app.post('/api/compare', wrap(async (req) => {
-  const { agentIds, prompt, cwd, permissionMode } = req.body || {};
-  if (!prompt?.trim()) throw Object.assign(new Error('請輸入提示詞'), { status: 400 });
-  return runner.newCompareGroup({ agentIds, prompt, cwd: cwd ? workspace.validateDir(cwd) : undefined, permissionMode });
+// Models the machine's Kimi offers, for the new-conversation screen.
+app.get('/api/machines/:id/models', wrap(async (req) => {
+  if (!machines.getMachine(req.params.id)?.kimi?.server) return { defaultModel: '', models: [] };
+  return kimiRemote.modelsFor(req.params.id);
 }));
-
-app.post('/api/groups/:gid/messages', wrap((req) => {
-  const text = String(req.body?.text ?? '');
-  if (!text.trim()) throw Object.assign(new Error('訊息是空的'), { status: 400 });
-  const sessions = store.listSessions().filter((s) => s.groupId === req.params.gid);
-  let sent = 0;
-  for (const s of sessions) {
-    if (runner.isRunning(s.id)) continue;
-    runner.startTurn(s, text);
-    sent++;
+app.post('/api/machines/:mid/kimi/:kid/attach', wrap(async (req) => runner.summarize(await runner.attachKimi(req.params.mid, req.params.kid))));
+// Rename or archive a Kimi conversation straight from the sidebar, followed
+// by the hub or not. Kimi has no delete; archiving removes it from its lists.
+app.post('/api/machines/:mid/kimi/:kid/:action', wrap(async (req) => {
+  const { mid, kid, action } = req.params;
+  if (!['title', 'archive'].includes(action)) throw Object.assign(new Error('不支援的操作'), { status: 404 });
+  const hubId = kimiRemote.findByKimi(mid, kid);
+  const s = hubId ? store.getSession(hubId) : null;
+  const entry = machines.getMachine(mid)?.sessions?.find((x) => x.id === kid);
+  const terminal = entry?.owner === 'tui';
+  if (terminal && action === 'archive') throw Object.assign(new Error('這個對話正在終端機的 Kimi 裡執行。先關掉那個 Kimi，再從這裡刪除'), { status: 409 });
+  if (action === 'title') {
+    const title = String(req.body?.title || '').trim().slice(0, 120);
+    if (!title) throw Object.assign(new Error('標題是空的'), { status: 400 });
+    if (terminal) await machines.rpc(mid, 'kimi.tui.input', { sessionId: kid, action: 'command', text: `/title ${title}` });
+    else {
+      await kimiRemote.ensureServer(mid);
+      await machines.kimiApi(mid, 'POST', `/api/v1/sessions/${kid}/profile`, { title });
+    }
+    if (s) {
+      s.title = title;
+      s.titled = true;
+      store.saveSession(s);
+      broadcast({ t: 'session', session: runner.summarize(s) });
+    }
+    return {};
   }
-  return { sent };
+  await kimiRemote.ensureServer(mid);
+  await machines.kimiApi(mid, 'POST', `/api/v1/sessions/${kid}:archive`, {});
+  if (s) {
+    runner.disposeSession(s);
+    store.deleteSession(s.id);
+    broadcast({ t: 'deleted', sid: s.id });
+  }
+  return {};
 }));
 
 // ---------------------------------------------------------------- static
@@ -376,13 +388,12 @@ server.listen(PORT, HOST, () => {
   const url = `http://${HOST.includes(':') ? `[${HOST}]` : HOST}:${PORT}/${TOKEN ? `#token=${TOKEN}` : ''}`;
   console.log(`\n  Agent Hub 已啟動 → ${url}`);
   if (TOKEN) console.log(`  登入密碼（token）：${TOKEN}`);
-  console.log('  連接其他機器：在網頁上點側欄的「連接機器」取得指令\n');
+  console.log('  連接其他電腦：在網頁左下角點「連接電腦…」取得指令\n');
 });
 
 function shutdown() {
   store.flushAll();
   disposeAll();
-  for (const child of logins.values()) child.kill('SIGTERM');
   process.exit(0);
 }
 process.on('SIGINT', shutdown);

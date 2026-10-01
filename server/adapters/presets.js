@@ -78,4 +78,7 @@ export const TEMPLATES = [
   },
 ];
 
-export const DEFAULT_AGENTS = TEMPLATES.filter((t) => !t.id.startsWith('custom-')).map((t) => ({ ...t, builtin: true }));
+// The hub currently shows only Kimi on connected machines, so no local agents
+// of other vendors are created by default. The templates stay available for
+// POST /api/agents.
+export const DEFAULT_AGENTS = [];

@@ -1,216 +1,175 @@
-// Agent Hub UI: sidebar of sessions, conversation view, compare grid,
-// workspace panel and agent settings — all driven by one WebSocket stream.
-import { h, fill, icon, initials, relTime, dayGroup, shortPath, linkify, fmtTokens } from './dom.js';
-import { get, post, put, patch, del, connect, setToken } from './api.js';
-import { Conversation, renderUnifiedDiff } from './render.js';
-
-const PERM_LABELS = { ask: '每次詢問', auto_edits: '自動接受編輯', bypass: '全部自動允許' };
-// Kimi's own modes: manual / yolo (asks only for risky actions) / auto (never asks).
-const KIMI_PERM_LABELS = { ask: '每次詢問', auto_edits: '只問高風險操作', bypass: '全部自動' };
-const TYPE_ORDER = ['kimi-remote', 'acp', 'cli', 'openai', 'demo'];
-const TYPE_TITLES = { 'kimi-remote': '我的機器上的 Kimi', acp: 'ACP agents（本機）', cli: 'CLI agents（本機）', openai: 'API（API key）', demo: '示範' };
+// Agent Hub — Kimi Code on all your machines, in one window.
+import { h, fill, icon, relTime, dayGroup, shortPath, baseName, copyText } from './dom.js';
+import { get, post, del, connect, setToken } from './api.js';
+import { renderHunks, parseUnifiedDiff } from './markdown.js';
+import { openMenu, closeMenu, menuOpen, pointAnchor } from './menu.js';
+import { Transcript } from './transcript.js';
+import { Composer, PERMISSION_LABELS } from './composer.js';
+import { ArtifactView, downloadHtml, htmlTitle } from './artifacts.js';
 
 const S = {
   config: null,
-  agents: [],
   machines: [],
-  openMachines: new Set(),
-  closedMachines: new Set(),
-  machinesShowAll: new Set(),
-  sessions: new Map(),
-  connected: false,
-  search: '',
-  drafts: new Map(),
-  home: { mode: 'single', agentId: null, agentIds: new Set(), cwd: '', cwdMachine: null, perm: 'ask' },
-  panel: { open: false, tab: 'changes' },
-  settings: null,
-  view: null,
+  sessions: new Map(), // hub sessions (Kimi conversations taken over by the hub)
+  cur: null, // { id, summary, seq, transcript }
+  route: null,
+  panel: null, // { tab: 'artifact' | 'changes', path, version, wide }
+  artifacts: [],
+  home: loadHome(),
+  query: '',
+  seen: new Map(), // row key -> status, for "needs you" notifications
+  online: true,
+  pins: loadPins(),
 };
-try {
-  S.panel.open = localStorage.getItem('hubPanel') === '1';
-  S.home.agentId = localStorage.getItem('hubAgent');
-  S.home.perm = localStorage.getItem('hubPerm') || 'ask';
-} catch {}
+
+const INIT_PROMPT =
+  '請分析這個專案：找出主要的設定檔、技術架構、建置與測試方式、程式碼的組織方式與開發慣例，然後把整理好的內容寫進專案根目錄的 AGENTS.md。已經有這個檔案的話，先讀它，保留仍然正確的部分，整理成一份完整的新版本。AGENTS.md 是給 AI coding agent 看的說明，讀者完全不了解這個專案。請使用這個專案的註解與文件主要使用的語言。';
+
+// ------------------------------------------------------------- helpers
+
+function loadHome() {
+  try {
+    return JSON.parse(localStorage.getItem('hubHome') || '{}');
+  } catch {
+    return {};
+  }
+}
+function loadPins() {
+  try {
+    return new Set(JSON.parse(localStorage.getItem('hubPins') || '[]'));
+  } catch {
+    return new Set();
+  }
+}
+function togglePin(key) {
+  if (S.pins.has(key)) S.pins.delete(key);
+  else S.pins.add(key);
+  try {
+    localStorage.setItem('hubPins', JSON.stringify([...S.pins]));
+  } catch {}
+  renderSidebar();
+}
+
+function saveHome() {
+  try {
+    localStorage.setItem('hubHome', JSON.stringify(S.home));
+  } catch {}
+}
+
+const machineById = (id) => S.machines.find((m) => m.id === id);
+const busy = (status) => status === 'running' || status === 'awaiting_permission';
+
+function toast(text, { action, onAction, kind = '' } = {}) {
+  const el = h('div', { class: `toast ${kind}`, role: 'status' }, h('span', null, text), action ? h('button', { class: 'om-btn om-btn--plain om-btn--sm', type: 'button', onclick: () => (onAction(), el.remove()) }, action) : null);
+  $toasts.append(el);
+  setTimeout(() => el.classList.add('out'), 4200);
+  setTimeout(() => el.remove(), 4600);
+}
+const fail = (err) => toast(err?.message || String(err), { kind: 'error' });
+
+function notify(title, body, onClick) {
+  try {
+    if (document.hasFocus() || Notification.permission !== 'granted') return;
+    const n = new Notification(title, { body, tag: title });
+    n.onclick = () => (window.focus(), onClick?.(), n.close());
+  } catch {}
+}
+
+// --------------------------------------------------------------- shell
 
 const $app = document.getElementById('app');
-const agentById = (id) => S.agents.find((a) => a.id === id);
-const agentColor = (id) => agentById(id)?.color || '#8b887e';
-const agentName = (id) => agentById(id)?.name || id;
+const $toasts = h('div', { class: 'toasts', 'aria-live': 'polite' });
+document.body.append($toasts);
 
-// ------------------------------------------------------------- toasts
-
-function toast(text, { error = false, action, timeout = 4200 } = {}) {
-  const t = h('div', { class: `toast ${error ? 'err' : ''}` }, h('span', null, text));
-  if (action) t.append(h('button', { onclick: () => (action.run(), t.remove()) }, action.label));
-  document.getElementById('toasts').append(t);
-  setTimeout(() => t.remove(), timeout);
+const traffic = h(
+  'div',
+  { class: 'om-traffic' },
+  h('button', { class: 'om-traffic__btn om-traffic__btn--close', type: 'button', 'aria-label': '關閉對話', title: '關閉對話', onclick: () => go('#/') }, svgGlyph('M2 2l4 4M6 2 2 6')),
+  h('button', { class: 'om-traffic__btn om-traffic__btn--minimize', type: 'button', 'aria-label': '收合側欄', title: '收合側欄', onclick: () => toggleSidebar(false) }, svgGlyph('M1.5 4h5')),
+  h('button', { class: 'om-traffic__btn om-traffic__btn--zoom', type: 'button', 'aria-label': '全螢幕', title: '全螢幕', onclick: toggleFullscreen }, svgGlyph('M4 1.5v5M1.5 4h5')),
+);
+function svgGlyph(d) {
+  const s = h('span');
+  s.innerHTML = `<svg viewBox="0 0 8 8" aria-hidden="true"><path d="${d}"/></svg>`;
+  return s.firstChild;
 }
-const fail = (err) => toast(err.message || String(err), { error: true });
-
-// -------------------------------------------------------------- menus
-
-let openMenuEl = null;
-function closeMenu() {
-  openMenuEl?.remove();
-  openMenuEl = null;
-}
-function openMenu(anchor, items, { align = 'left', above = false } = {}) {
-  closeMenu();
-  const menu = h('div', { class: 'menu' });
-  for (const it of items) {
-    if (it === 'sep') menu.append(h('div', { class: 'sep' }));
-    else if (it.header) menu.append(h('div', { class: 'mh' }, it.header));
-    else {
-      const row = h(
-        'button',
-        { class: `mi ${it.disabled ? 'disabled' : ''}`, title: it.title || '' },
-        it.color ? h('span', { class: 'status-dot', style: { '--c': it.color, marginTop: 0 } }) : it.icon ? icon(it.icon) : null,
-        h('span', { class: 'grow' }, it.label, it.sub ? h('span', { class: 'sub' }, it.sub) : null),
-        it.checked ? icon('check', 'check') : null,
-      );
-      row.onclick = (e) => {
-        e.stopPropagation();
-        if (it.disabled && !it.allowDisabled) return;
-        if (!it.keepOpen) closeMenu();
-        it.run?.();
-      };
-      menu.append(row);
-    }
-  }
-  document.body.append(menu);
-  const r = anchor.getBoundingClientRect();
-  const mw = menu.offsetWidth;
-  const mh = menu.offsetHeight;
-  let left = align === 'right' ? r.right - mw : r.left;
-  left = Math.max(8, Math.min(left, innerWidth - mw - 8));
-  let top = above || r.bottom + mh + 8 > innerHeight ? r.top - mh - 6 : r.bottom + 6;
-  menu.style.left = `${left}px`;
-  menu.style.top = `${Math.max(8, top)}px`;
-  openMenuEl = menu;
-  setTimeout(() => document.addEventListener('click', closeMenu, { once: true }), 0);
-  const onKey = (e) => {
-    if (e.key !== 'Escape') return;
-    if (openMenuEl === menu) e.stopPropagation();
-    closeMenu();
-    document.removeEventListener('keydown', onKey, true);
-  };
-  document.addEventListener('keydown', onKey, true);
+function toggleFullscreen() {
+  if (document.fullscreenElement) document.exitFullscreen?.();
+  else document.documentElement.requestFullscreen?.().catch(() => {});
 }
 
-// -------------------------------------------------------------- modal
+const $search = h('input', { class: 'om-input', type: 'search', placeholder: '搜尋對話', 'aria-label': '搜尋對話', oninput: () => ((S.query = $search.value.trim().toLowerCase()), renderSidebar()) });
+const $list = h('div', { class: 'side-list', role: 'list' });
+const $foot = h('div', { class: 'side-foot' });
+const $sidebar = h(
+  'nav',
+  { class: 'sidebar om-sidebar', 'aria-label': '對話' },
+  h('div', { class: 'om-sidebar__top' }, traffic, h('span', { class: 'brand' }, 'Agent Hub'), h('span', { class: 'om-toolbar__spacer' }), h('button', { class: 'om-btn om-btn--toolbar', type: 'button', title: '新對話', 'aria-label': '新對話', onclick: () => go('#/') }, icon('plus'))),
+  h('a', { class: 'om-sidebar__item new-item', href: '#/' }, icon('plus'), '新對話'),
+  h('label', { class: 'om-search side-search' }, icon('search'), $search),
+  $list,
+  $foot,
+);
+const $toolbar = h('header', { class: 'om-toolbar toolbar' });
+const $view = h('div', { class: 'view' });
+const $main = h('main', { class: 'main om-window__main' }, $toolbar, $view);
+const $panel = h('aside', { class: 'panel', hidden: true, 'aria-label': '側邊面板' });
+const $scrim = h('div', { class: 'scrim', onclick: () => closeDrawer() });
+fill($app, $sidebar, $main, $panel, $scrim);
+$app.className = 'app om';
 
-function modal(content, { small = false, onClose } = {}) {
-  const box = h('div', { class: `modal ${small ? 'small' : ''}` }, content);
-  const ov = h('div', { class: 'overlay' }, box);
-  const close = () => {
-    ov.remove();
-    document.removeEventListener('keydown', onKey);
-    onClose?.();
-  };
-  const onKey = (e) => e.key === 'Escape' && close();
-  ov.addEventListener('mousedown', (e) => e.target === ov && close());
-  document.addEventListener('keydown', onKey);
-  document.body.append(ov);
-  return { close, box };
-}
-
-// ------------------------------------------------------------- layout
-
-const L = {};
-function buildLayout() {
-  L.sideList = h('div', { class: 'session-list' });
-  L.machinesEl = h('div', { class: 'machines' });
-  L.agentsCount = h('span', { class: 'count' });
-  L.themeBtn = h('button', { class: 'icon-btn', title: '切換深淺色', onclick: toggleTheme });
-  const search = h('input', {
-    type: 'search',
-    placeholder: '搜尋 sessions',
-    oninput: (e) => {
-      S.search = e.target.value.trim().toLowerCase();
-      renderSidebar();
-    },
-  });
-  L.sidebar = h(
-    'aside',
-    { class: 'sidebar' },
-    h(
-      'div',
-      { class: 'brand' },
-      h('span', { class: 'logo' }, icon('logo')),
-      'Agent Hub',
-      h('span', { class: 'spacer' }),
-      h('button', { class: 'icon-btn hide-mobile', title: '收合側欄', onclick: () => toggleSidebar() }, icon('sidebar')),
-      h('button', { class: 'icon-btn only-mobile', title: '關閉', onclick: () => closeDrawer() }, icon('x')),
-    ),
-    h('button', { class: 'new-btn', onclick: () => go('#/') }, icon('plus'), '新工作'),
-    h('div', { class: 'side-search' }, icon('search'), search),
-    L.machinesEl,
-    L.sideList,
-    h(
-      'div',
-      { class: 'side-foot' },
-      h('button', { class: 'agents-btn', onclick: () => openSettings() }, icon('gear'), 'Agents 設定', L.agentsCount),
-      L.themeBtn,
-    ),
-  );
-  L.main = h('main', { class: 'main' });
-  L.panel = h('aside', { class: 'panel hidden' });
-  L.root = h('div', { class: 'layout' }, L.sidebar, L.main, L.panel);
-  fill($app, L.root);
-  updateThemeBtn();
-}
-
-function toggleSidebar(force) {
-  if (innerWidth <= 760) {
-    const open = force ?? !L.root.classList.contains('sidebar-open');
-    L.root.classList.toggle('sidebar-open', open);
-    L.scrim?.remove();
-    if (open) {
-      L.scrim = h('div', { class: 'scrim', onclick: () => closeDrawer() });
-      document.body.append(L.scrim);
-    }
-  } else {
-    L.root.classList.toggle('sidebar-collapsed', force === undefined ? undefined : !force);
-    const collapsed = L.root.classList.contains('sidebar-collapsed');
-    for (const b of document.querySelectorAll('.sb-toggle')) b.style.display = collapsed ? '' : 'none';
-  }
-}
-
+// After picking a conversation on a phone.
 function closeDrawer() {
-  if (innerWidth <= 760) toggleSidebar(false);
+  $app.classList.remove('drawer');
 }
 
-function sidebarButton() {
-  return h(
-    'button',
-    {
-      class: 'icon-btn sb-toggle',
-      title: '側欄',
-      onclick: () => toggleSidebar(innerWidth <= 760 ? true : undefined),
-      style: innerWidth > 760 && !L.root.classList.contains('sidebar-collapsed') ? { display: 'none' } : null,
-    },
-    icon(innerWidth <= 760 ? 'menu' : 'sidebar'),
-  );
+function toggleSidebar(open) {
+  const mobile = window.matchMedia('(max-width: 760px)').matches;
+  if (mobile) $app.classList.toggle('drawer', open ?? !$app.classList.contains('drawer'));
+  else {
+    $app.classList.toggle('no-sidebar', open === undefined ? undefined : !open);
+    try {
+      localStorage.setItem('hubSidebar', $app.classList.contains('no-sidebar') ? 'hidden' : '');
+    } catch {}
+  }
+  renderToolbar();
 }
+try {
+  if (localStorage.getItem('hubSidebar') === 'hidden') $app.classList.add('no-sidebar');
+} catch {}
 
-function currentTheme() {
-  const t = document.documentElement.dataset.theme;
-  if (t) return t;
-  return matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-}
-function toggleTheme() {
-  const next = currentTheme() === 'dark' ? 'light' : 'dark';
-  document.documentElement.dataset.theme = next;
+// --------------------------------------------------------------- theme
+
+function applyTheme(t) {
+  if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+  else delete document.documentElement.dataset.theme;
   try {
-    localStorage.setItem('hubTheme', next);
+    if (t) localStorage.setItem('hubTheme', t);
+    else localStorage.removeItem('hubTheme');
   } catch {}
-  updateThemeBtn();
 }
-function updateThemeBtn() {
-  fill(L.themeBtn, icon(currentTheme() === 'dark' ? 'sun' : 'moon'));
-}
+const theme = () => document.documentElement.dataset.theme || 'auto';
 
-// ------------------------------------------------------------ sidebar
+// ------------------------------------------------------------- sidebar
+
+// One row per Kimi conversation on any connected machine: the ones the hub
+// already follows plus everything the machines report.
+function rows() {
+  const out = [];
+  const followed = new Map();
+  for (const s of S.sessions.values()) if (s.kimiSessionId) followed.set(`${s.machineId}:${s.kimiSessionId}`, s);
+  for (const m of S.machines) {
+    for (const k of m.sessions || []) {
+      const key = `${m.id}:${k.id}`;
+      const s = followed.get(key);
+      followed.delete(key);
+      const status = s ? s.status : k.busy ? (k.pending && k.pending !== 'none' ? 'awaiting_permission' : 'running') : k.lastTurn === 'failed' ? 'error' : 'idle';
+      out.push({ key, hub: s, kimi: k, machine: m, title: s?.title || k.title || '新對話', cwd: s?.cwd || k.cwd, status, updatedAt: Math.max(s?.updatedAt || 0, k.updatedAt || 0) });
+    }
+  }
+  for (const [key, s] of followed) out.push({ key, hub: s, machine: machineById(s.machineId), title: s.title, cwd: s.cwd, status: s.status, updatedAt: s.updatedAt, offline: !machineById(s.machineId)?.online });
+  return out.sort((a, b) => b.updatedAt - a.updatedAt);
+}
 
 let sideRaf = 0;
 function renderSidebar() {
@@ -221,1536 +180,1154 @@ function renderSidebar() {
   });
 }
 
-function statusClass(st) {
-  return st === 'running' ? 'running' : st === 'awaiting_permission' ? 'awaiting' : st === 'error' ? 'error' : '';
-}
-
-// ------------------------------------------------------------ machines
-
-function basename(p) {
-  return String(p || '').split(/[\\/]/).filter(Boolean).pop() || p || '';
-}
-
-function drawMachines() {
-  const el = L.machinesEl;
-  const head = h(
-    'div',
-    { class: 'machines-head' },
-    '我的機器',
-    h('span', { class: 'spacer' }),
-    h('button', { onclick: () => openConnect(), title: '把一台電腦連到這個中控台' }, icon('plus'), '連接機器'),
-  );
-  if (!S.machines.length) {
-    return fill(el, head, h('div', { class: 'machine-note', style: { paddingLeft: '8px' } }, '還沒有連接任何機器。點「連接機器」取得指令，在你的電腦上執行後，那台機器上的 Kimi 對話就會出現在這裡。'));
+function drawSidebar() {
+  const all = rows();
+  checkAttention(all);
+  const list = S.query ? all.filter((r) => r.title.toLowerCase().includes(S.query) || (r.cwd || '').toLowerCase().includes(S.query)) : all;
+  const multi = S.machines.length > 1;
+  const groups = new Map();
+  for (const r of list) {
+    const g = S.pins.has(r.key) ? '已釘選' : dayGroup(r.updatedAt || Date.now());
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push(r);
   }
-  const rows = [];
-  const list = [...S.machines].sort((a, b) => Number(b.online) - Number(a.online) || a.name.localeCompare(b.name));
-  for (const m of list) {
-    const open = m.online && !S.closedMachines.has(m.id);
-    const sub = !m.online ? '離線' : m.kimi?.available ? `Kimi ${m.kimi.version || ''}`.trim() : '未偵測到 Kimi';
-    rows.push(
-      h(
-        'div',
-        {
-          class: `machine-row ${open ? 'open' : ''}`,
-          title: m.platform || '',
-          onclick: () => {
-            if (S.closedMachines.has(m.id)) S.closedMachines.delete(m.id);
-            else S.closedMachines.add(m.id);
-            drawMachines();
-          },
-        },
-        h('span', { class: `mdot ${m.online ? 'on' : ''}` }),
-        h('span', { class: 'mname' }, m.name),
-        h('span', { class: 'msub' }, sub),
-        icon('chev', 'chev'),
-      ),
-    );
-    if (!open) continue;
-    if (!m.kimi?.available) {
-      rows.push(
+  const current = S.cur?.summary;
+  const items = [];
+  for (const [g, rs] of groups) {
+    items.push(h('div', { class: 'om-sidebar__section' }, g));
+    for (const r of rs) {
+      const href = r.hub ? `#/s/${r.hub.id}` : `#/k/${r.machine.id}/${r.kimi.id}`;
+      const active = current && ((r.hub && r.hub.id === current.id) || (r.kimi && current.kimiSessionId === r.kimi.id && current.machineId === r.machine?.id));
+      const owner = r.kimi?.owner || r.hub?.meta?.owner;
+      const sub = [owner === 'tui' ? '終端機' : null, multi && r.machine ? r.machine.name : null, r.cwd ? baseName(r.cwd) : null].filter(Boolean).join(' · ');
+      items.push(
         h(
-          'div',
-          { class: 'machine-note' },
-          '在這台機器的 Kimi 裡輸入 /web（或執行 kimi web），對話就會出現在這裡。 ',
-          h('button', { class: 'btn sm', style: { marginTop: '6px' }, onclick: () => post(`/machines/${m.id}/kimi/start`).then(() => toast('已在那台機器啟動 Kimi 伺服器')).catch(fail) }, '幫我啟動 Kimi'),
-        ),
-      );
-      continue;
-    }
-    // Conversations already taken over are listed with the hub's sessions.
-    const isAttached = (k) => [...S.sessions.values()].some((s) => s.kimiSessionId === k.id && s.machineId === m.id);
-    const all = [...(m.sessions || [])].sort((a, b) => b.updatedAt - a.updatedAt);
-    const sessions = all.filter((k) => !isAttached(k));
-    const taken = all.length - sessions.length;
-    if (!sessions.length) rows.push(h('div', { class: 'machine-note' }, taken ? `這台機器的 ${taken} 個對話都已接管（在下方清單）。` : '目前沒有對話。在 Kimi 裡輸入 /web 開放對話，或從「新工作」選這台機器開一個。'));
-    const showAll = S.machinesShowAll.has(m.id);
-    for (const k of showAll ? sessions : sessions.slice(0, 5)) {
-      const attached = [...S.sessions.values()].find((s) => s.kimiSessionId === k.id && s.machineId === m.id);
-      const badge =
-        k.pending === 'approval' || k.pending === 'question'
-          ? h('span', { class: 'badge wait' }, '等待確認')
-          : k.busy
-            ? h('span', { class: 'badge run' }, '執行中')
-            : attached
-              ? h('span', { class: 'badge att' }, '已接管')
-              : null;
-      rows.push(
-        h(
-          'div',
+          'a',
           {
-            class: `ksess ${attached && S.view?.sid === attached.id ? 'active' : ''}`,
-            title: k.cwd || '',
-            onclick: () => (attached ? go(`#/s/${attached.id}`) : attachKimi(m.id, k.id)),
+            class: `side-row${r.offline ? ' offline' : ''}`,
+            href,
+            role: 'listitem',
+            'aria-current': active ? 'page' : null,
+            title: r.cwd || '',
+            onclick: closeDrawer,
+            oncontextmenu: (e) => {
+              e.preventDefault();
+              rowMenu(r, pointAnchor(e.clientX, e.clientY));
+            },
           },
-          h('div', { class: 'kmain' }, h('div', { class: 'kt' }, k.title), h('div', { class: 'km' }, `${basename(k.cwd)} · ${relTime(k.updatedAt)}`)),
-          badge,
-        ),
-      );
-    }
-    if (sessions.length > 5) {
-      rows.push(
-        h(
-          'div',
-          { class: 'ksess-more' },
-          h('button', { onclick: () => (showAll ? S.machinesShowAll.delete(m.id) : S.machinesShowAll.add(m.id), drawMachines()) }, showAll ? '收合' : `顯示全部 ${sessions.length} 個對話`),
+          h('span', { class: 'row-text' }, h('span', { class: 'row-title' }, r.title), h('span', { class: 'row-sub' }, sub || relTime(r.updatedAt))),
+          r.status === 'awaiting_permission'
+            ? h('span', { class: 'om-badge om-badge--warning' }, '需要你')
+            : r.status === 'running'
+              ? h('span', { class: 'spinner', 'aria-label': '執行中' })
+              : r.status === 'error'
+                ? h('span', { class: 'row-err', title: '上一輪沒有完成' }, icon('alert'))
+                : null,
+          h(
+            'button',
+            {
+              class: 'row-more',
+              type: 'button',
+              title: '更多',
+              'aria-label': `「${r.title}」的選項`,
+              'aria-haspopup': 'menu',
+              onclick: (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                rowMenu(r, e.currentTarget);
+              },
+            },
+            icon('dots'),
+          ),
         ),
       );
     }
   }
-  fill(el, head, rows);
+  if (!all.length) {
+    items.push(h('div', { class: 'side-empty' }, S.machines.some((m) => m.online) ? '在任一台電腦的 Kimi 裡輸入 /web，或在這裡開一個新對話。' : '連接一台電腦後，它的 Kimi 對話會出現在這裡。'));
+  }
+  fill($list, ...items);
+  $search.parentElement.hidden = all.length < 8 && !S.query;
+  drawFoot();
+  updateTitle();
 }
 
-async function attachKimi(machineId, kimiSessionId) {
-  S.quietUntil = Date.now() + 4000; // no "needs approval" toast for the session being opened
-  toast('正在接管這個 Kimi 對話…', { timeout: 2000 });
+// Right-click (or the … button) on a conversation in the sidebar.
+function rowMenu(r, anchor) {
+  const href = r.hub ? `#/s/${r.hub.id}` : `#/k/${r.machine?.id}/${r.kimi?.id}`;
+  const reachable = r.machine?.online && r.machine.kimi?.available;
+  const kid = r.kimi?.id || r.hub?.kimiSessionId;
+  const mid = r.machine?.id || r.hub?.machineId;
+  openMenu(
+    anchor,
+    [
+      { label: '在新分頁開啟', onSelect: () => window.open(`${location.pathname}${href}`, '_blank', 'noopener') },
+      { label: '重新命名…', disabled: !reachable, onSelect: () => renameRow(r, mid, kid) },
+      { label: S.pins.has(r.key) ? '取消釘選' : '釘選', onSelect: () => togglePin(r.key) },
+      r.cwd ? { label: '複製資料夾路徑', onSelect: () => copyText(r.cwd).then(() => toast('已複製')) } : null,
+      { separator: true },
+      reachable || !r.hub ? { label: '刪除…', destructive: true, disabled: !reachable, onSelect: () => deleteRow(r, mid, kid) } : { label: '從中控台移除…', destructive: true, onSelect: () => forgetRow(r) },
+    ].filter(Boolean),
+    { width: 200 },
+  );
+}
+
+async function renameRow(r, mid, kid) {
+  const title = await promptDialog({ title: '要把對話改成什麼名稱？', value: r.title, action: '重新命名' });
+  if (!title?.trim() || title.trim() === r.title) return;
   try {
-    const s = await post(`/machines/${machineId}/kimi/${kimiSessionId}/attach`);
-    S.sessions.set(s.id, s);
-    closeDrawer();
-    go(`#/s/${s.id}`);
+    await post(`/machines/${mid}/kimi/${kid}/title`, { title: title.trim() });
   } catch (err) {
     fail(err);
   }
 }
 
-function copyButton(text) {
-  const btn = h('button', { class: 'btn sm', title: '複製' }, icon('copy'));
-  btn.onclick = async () => {
-    try {
-      await navigator.clipboard.writeText(text);
-      fill(btn, icon('check'));
-      setTimeout(() => fill(btn, icon('copy')), 1500);
-    } catch {
-      const sel = getSelection();
-      const range = document.createRange();
-      range.selectNodeContents(btn.previousSibling);
-      sel.removeAllRanges();
-      sel.addRange(range);
-      toast('請按 Ctrl+C / ⌘C 複製');
-    }
-  };
-  return btn;
-}
-
-async function openConnect() {
-  let info;
+async function deleteRow(r, mid, kid) {
+  const ok = await confirmDialog({ title: `要刪除「${r.title}」嗎？`, body: '它會從中控台和 Kimi 的對話清單移除。Kimi 會把它封存，紀錄仍留在那台電腦上。', action: '刪除', destructive: true });
+  if (!ok) return;
+  const here = S.cur?.summary && S.cur.summary.kimiSessionId === kid;
   try {
-    info = await get('/hub');
+    await post(`/machines/${mid}/kimi/${kid}/archive`);
+    S.pins.delete(r.key);
+    if (here) go('#/');
+    toast('已刪除對話');
   } catch (err) {
-    return fail(err);
+    fail(err);
   }
-  const origin = location.origin;
-  const script = `${origin}${info.bridgePath}`;
-  const unix = `curl -fsSL ${script} -o agent-hub-bridge.mjs && node agent-hub-bridge.mjs --hub ${origin} --key ${info.bridgeKey}`;
-  const win = `iwr ${script} -OutFile agent-hub-bridge.mjs; node agent-hub-bridge.mjs --hub ${origin} --key ${info.bridgeKey}`;
-  const local = /^(localhost|127\.|\[::1\])/.test(location.hostname);
-  const machinesList = h('div');
-  const drawList = () =>
-    fill(
-      machinesList,
-      S.machines.length ? h('div', { class: 'sec-label', style: { margin: '18px 0 6px', fontSize: '12px', fontWeight: 600, color: 'var(--text-3)' } }, '已連接的機器') : null,
-      S.machines.map((m) =>
-        h(
-          'div',
-          { class: 'machine-row', style: { cursor: 'default' } },
-          h('span', { class: `mdot ${m.online ? 'on' : ''}` }),
-          h('span', { class: 'mname' }, m.name),
-          h('span', { class: 'msub' }, m.online ? (m.kimi?.available ? `Kimi ${m.kimi.version || ''}` : '未偵測到 Kimi') : `離線 · ${relTime(m.lastSeen || Date.now())}`),
-          h('button', { class: 'btn sm ghost', title: '從清單移除', onclick: () => del(`/machines/${m.id}`).then(loadMachines).then(drawList).catch(fail) }, icon('trash')),
-        ),
-      ),
-    );
-  drawList();
-  const m = modal(
+}
+
+async function forgetRow(r) {
+  const ok = await confirmDialog({ title: `要從中控台移除「${r.title}」嗎？`, body: '那台電腦目前離線。這只會移除中控台裡的紀錄，不會動到 Kimi。', action: '移除', destructive: true });
+  if (!ok) return;
+  try {
+    await del(`/sessions/${r.hub.id}`);
+    if (S.cur?.id === r.hub.id) go('#/');
+  } catch (err) {
+    fail(err);
+  }
+}
+
+function drawFoot() {
+  const online = S.machines.filter((m) => m.online);
+  const ready = online.filter((m) => m.kimi?.available);
+  const label = !S.machines.length ? '連接電腦…' : online.length === 1 ? online[0].name : online.length ? `${online.length} 台電腦` : '電腦都離線了';
+  const state = !S.machines.length ? '' : !online.length ? 'off' : ready.length < online.length ? 'warn' : 'on';
+  fill(
+    $foot,
+    h('button', { class: 'om-sidebar__item machines-item', type: 'button', onclick: openMachines }, icon('computer'), h('span', { class: 'machines-label' }, label), state ? h('span', { class: `dot ${state}`, 'aria-hidden': 'true' }) : null, !S.online ? h('span', { class: 'om-badge om-badge--danger' }, '離線') : null),
+    h('button', { class: 'om-btn om-btn--toolbar', type: 'button', title: '設定', 'aria-label': '設定', onclick: (e) => settingsMenu(e.currentTarget) }, icon('dots')),
+  );
+}
+
+function settingsMenu(anchor) {
+  const t = theme();
+  const canNotify = typeof Notification !== 'undefined' && Notification.permission === 'default';
+  openMenu(
+    anchor,
     [
-      h('div', { class: 'modal-head' }, icon('plus'), h('h2', null, '連接一台機器'), h('span', { class: 'spacer' }), h('button', { class: 'icon-btn', onclick: () => m.close() }, icon('x'))),
-      h(
-        'div',
-        { style: { padding: '16px 20px 22px', overflowY: 'auto' } },
-        local ? h('div', { class: 'test-result bad', style: { marginTop: 0, marginBottom: '14px' } }, '你現在是用 localhost 開啟中控台。其他電腦要連線，請改用公網網址（例如 Cloudflare Tunnel 的網址）開啟中控台，再回來複製指令。') : null,
-        h(
-          'ol',
-          { class: 'steps' },
-          h('li', null, '在那台電腦安裝 Kimi Code CLI，並用你的 Kimi 帳號登入：', h('code', null, 'kimi login'), '。另外需要 Node.js 22 以上。'),
-          h(
-            'li',
-            null,
-            '在那台電腦的終端機執行：',
-            h('div', { class: 'muted', style: { fontSize: '12.5px', marginTop: '8px' } }, 'macOS / Linux'),
-            h('div', { class: 'cmd-box' }, h('pre', null, unix), copyButton(unix)),
-            h('div', { class: 'muted', style: { fontSize: '12.5px' } }, 'Windows（PowerShell）'),
-            h('div', { class: 'cmd-box' }, h('pre', null, win), copyButton(win)),
-          ),
-          h('li', null, '在那台電腦的 Kimi 裡輸入 ', h('code', null, '/web'), '（或執行 ', h('code', null, 'kimi web'), '）。之後那台機器的 Kimi 對話會出現在側欄「我的機器」，點一下就能接管。想讓連接器自動啟動 Kimi，可以在指令最後加上 ', h('code', null, '--start-kimi'), '。'),
-        ),
-        h('div', { class: 'callout', style: { marginTop: '16px', marginBottom: 0 } }, '連接金鑰只用來讓機器連上這個中控台，請不要分享給別人。Kimi 的登入資訊一直留在你的電腦上，不會傳到中控台。'),
-        machinesList,
-      ),
-    ],
-    { small: true },
+      { section: '外觀' },
+      { label: '跟系統一樣', checked: t === 'auto', onSelect: () => applyTheme(null) },
+      { label: '淺色', checked: t === 'light', onSelect: () => applyTheme('light') },
+      { label: '深色', checked: t === 'dark', onSelect: () => applyTheme('dark') },
+      { separator: true },
+      canNotify ? { label: '開啟通知', description: 'Kimi 需要你的時候通知你', onSelect: () => Notification.requestPermission().then(() => toast('已開啟通知')) } : null,
+      { label: '連接電腦…', onSelect: openMachines },
+      { label: '登出', destructive: true, onSelect: logout },
+    ].filter(Boolean),
+    { side: 'auto', width: 240 },
   );
 }
 
-function drawSidebar() {
-  drawMachines();
-  const all = [...S.sessions.values()];
-  const ready = S.agents.filter((a) => a.enabled && a.available).length;
-  L.agentsCount.textContent = `${ready} 可用`;
-  const q = S.search;
-  const match = (s) => !q || s.title.toLowerCase().includes(q) || agentName(s.agentId).toLowerCase().includes(q);
-
-  // Top-level entries: plain sessions and compare groups; delegated child
-  // sessions are nested under their parent.
-  const entries = [];
-  const groups = new Map();
-  for (const s of all) {
-    if (s.parentId && S.sessions.has(s.parentId)) continue;
-    if (s.groupId) {
-      if (!groups.has(s.groupId)) groups.set(s.groupId, []);
-      groups.get(s.groupId).push(s);
-    } else entries.push({ kind: 's', s, at: s.updatedAt });
-  }
-  for (const [gid, list] of groups) {
-    list.sort((a, b) => a.createdAt - b.createdAt);
-    entries.push({ kind: 'g', gid, list, at: Math.max(...list.map((x) => x.updatedAt)) });
-  }
-  entries.sort((a, b) => b.at - a.at);
-
-  const route = S.view || {};
-  const frag = document.createDocumentFragment();
-  let lastGroup = null;
-  let shown = 0;
-  const awaiting = all.filter((s) => s.status === 'awaiting_permission').length;
-  document.title = awaiting ? `(${awaiting}) 等待確認 · Agent Hub` : 'Agent Hub';
-
-  for (const e of entries) {
-    if (e.kind === 's' ? !match(e.s) : !e.list.some(match)) continue;
-    const label = dayGroup(e.at);
-    if (label !== lastGroup) {
-      frag.append(h('div', { class: 'group-label' }, label));
-      lastGroup = label;
-    }
-    shown++;
-    if (e.kind === 's') {
-      frag.append(sessionItem(e.s, route.sid === e.s.id));
-      for (const c of all.filter((x) => x.parentId === e.s.id).sort((a, b) => a.createdAt - b.createdAt)) {
-        frag.append(sessionItem(c, route.sid === c.id, true));
-      }
-    } else {
-      const st = e.list.find((s) => s.status === 'awaiting_permission')
-        ? 'awaiting_permission'
-        : e.list.find((s) => s.status === 'running')
-          ? 'running'
-          : 'idle';
-      const busy = statusClass(st);
-      frag.append(
-        h(
-          'a',
-          { class: `s-item ${route.gid === e.gid ? 'active' : ''}`, href: `#/g/${e.gid}`, onclick: () => closeDrawer() },
-          busy
-            ? h('span', { class: `status-dot ${busy}` })
-            : h('span', { class: 'stack-dots' }, e.list.slice(0, 4).map((s) => h('span', { style: { '--c': agentColor(s.agentId) } }))),
-          h(
-            'div',
-            { class: 's-main' },
-            h('div', { class: 's-title' }, e.list[0].title),
-            h('div', { class: 's-meta' }, `比較 · ${e.list.map((s) => agentName(s.agentId)).join(' / ')}`),
-          ),
-        ),
-      );
-    }
-  }
-  if (!shown) frag.append(h('div', { class: 'empty-side' }, q ? '沒有符合的 session' : '還沒有任何 session。\n從「新工作」開始吧。'));
-  fill(L.sideList, frag);
+function logout() {
+  setToken('');
+  location.hash = '#/';
+  location.reload();
 }
 
-function sessionItem(s, active, child = false) {
-  const st = statusClass(s.status);
-  const meta = h('div', { class: 's-meta' });
-  if (s.status === 'awaiting_permission') meta.append(h('span', { class: 'waiting' }, '等待確認'), ` · ${agentName(s.agentId)}`);
-  else if (s.status === 'error') meta.append(h('span', { class: 'err' }, '發生錯誤'), ` · ${agentName(s.agentId)}`);
-  else meta.append(`${agentName(s.agentId)} · ${relTime(s.updatedAt)}`);
-  return h(
-    'a',
-    { class: `s-item ${active ? 'active' : ''} ${child ? 'child' : ''}`, href: `#/s/${s.id}`, onclick: () => closeDrawer() },
-    h('span', { class: `status-dot ${st}`, style: { '--c': agentColor(s.agentId) } }),
-    h('div', { class: 's-main' }, h('div', { class: 's-title' }, child ? `↳ ${s.title}` : s.title), meta),
-  );
+// A conversation that starts waiting for you gets a toast (and a system
+// notification when the tab is in the background).
+function checkAttention(all) {
+  for (const r of all) {
+    const prev = S.seen.get(r.key);
+    S.seen.set(r.key, r.status);
+    if (prev === undefined || prev === r.status || r.status !== 'awaiting_permission') continue;
+    const here = S.cur?.summary && r.hub?.id === S.cur.summary.id;
+    if (here && document.hasFocus()) continue;
+    const open = () => go(r.hub ? `#/s/${r.hub.id}` : `#/k/${r.machine.id}/${r.kimi.id}`);
+    if (!here) toast(`「${r.title}」需要你核准`, { action: '查看', onAction: open });
+    notify('Kimi 需要你', r.title, open);
+  }
 }
 
-// ------------------------------------------------------------- router
+function updateTitle() {
+  const n = [...S.seen.values()].filter((s) => s === 'awaiting_permission').length;
+  const base = S.cur?.summary?.title || 'Agent Hub';
+  document.title = `${n ? `(${n}) ` : ''}${base}`;
+}
+
+// ------------------------------------------------------------- routing
 
 function go(hash) {
   if (location.hash === hash) route();
   else location.hash = hash;
 }
 
-function teardownView() {
-  S.view?.conv?.destroy();
-  for (const c of S.view?.convs?.values() || []) c.destroy();
-  S.view = null;
-}
+window.addEventListener('hashchange', route);
 
-function route() {
+async function route() {
+  const hash = location.hash || '#/';
   closeMenu();
-  teardownView();
-  const [, kind, id] = location.hash.match(/^#\/(s|g)\/([\w-]+)/) || [];
-  if (kind === 's') showSession(id);
-  else if (kind === 'g') showGroup(id);
-  else showHome();
-  renderSidebar();
+  let m;
+  if ((m = hash.match(/^#\/s\/([\w-]+)/))) return openSession(m[1]);
+  if ((m = hash.match(/^#\/k\/([\w-]+)\/([\w-]+)/))) return attachAndOpen(m[1], m[2]);
+  return showHome();
 }
 
-// ----------------------------------------------------------- composer
-
-function autoGrow(ta) {
-  ta.style.height = 'auto';
-  ta.style.height = `${Math.min(ta.scrollHeight, innerHeight * 0.4)}px`;
-}
-
-function readImage(file) {
-  return new Promise((resolve, reject) => {
-    if (!file.type.startsWith('image/')) return reject(new Error('只支援圖片'));
-    if (file.size > 8 * 1024 * 1024) return reject(new Error('圖片太大（上限 8MB）'));
-    const r = new FileReader();
-    r.onload = () => {
-      const url = String(r.result);
-      resolve({ url, mimeType: file.type, data: url.slice(url.indexOf(',') + 1) });
-    };
-    r.onerror = reject;
-    r.readAsDataURL(file);
-  });
-}
-
-// A composer box. `opts.pills()` returns the controls shown under the text,
-// `opts.submit(text, images)` sends, `opts.busy()` toggles the stop button.
-function createComposer(opts) {
-  const ta = h('textarea', { rows: 1, placeholder: opts.placeholder || '' });
-  const attachRow = h('div', { class: 'attach-row hidden' });
-  const row = h('div', { class: 'row' });
-  const pop = h('div', { class: 'slash-pop hidden' });
-  const box = h('div', { class: 'composer' }, pop, attachRow, ta, row);
-  const fileInput = h('input', { type: 'file', accept: 'image/*', multiple: true, class: 'hidden' });
-  box.append(fileInput);
-  let images = [];
-  let slashSel = 0;
-  let slashItems = [];
-
-  const key = opts.draftKey;
-  if (key && S.drafts.has(key)) ta.value = S.drafts.get(key);
-
-  const drawAttach = () => {
-    attachRow.classList.toggle('hidden', !images.length);
-    fill(attachRow, 
-      ...images.map((img, i) =>
-        h('div', { class: 'att' }, h('img', { src: img.url }), h('button', { title: '移除', onclick: () => (images.splice(i, 1), drawAttach(), drawRow()) }, icon('x'))),
-      ),
-    );
-  };
-  const addFiles = async (files) => {
-    for (const f of files) {
-      try {
-        images.push(await readImage(f));
-      } catch (err) {
-        fail(err);
-      }
-    }
-    drawAttach();
-    drawRow();
-  };
-  fileInput.onchange = () => {
-    addFiles([...fileInput.files]);
-    fileInput.value = '';
-  };
-
-  const canSend = () => (ta.value.trim() || images.length) && !(opts.busy?.() && !opts.allowWhileBusy);
-  let sendBtn;
-  const drawRow = () => {
-    const busy = opts.busy?.();
-    const pills = opts.pills?.() || [];
-    if (opts.images?.()) pills.unshift(h('button', { class: 'icon-btn', title: '附加圖片', onclick: () => fileInput.click() }, icon('image')));
-    sendBtn = busy && opts.stop
-      ? h('button', { class: 'send-btn stop', title: '停止 (Esc)', onclick: () => opts.stop() }, icon('stop'))
-      : h('button', { class: 'send-btn', title: '送出 (Enter)', disabled: !canSend(), onclick: submit }, icon('up'));
-    fill(row, ...pills, h('span', { class: 'spacer' }), ...(opts.extras?.() || []), sendBtn);
-  };
-
-  const submit = async () => {
-    const text = ta.value;
-    if (!canSend()) return;
-    const imgs = images;
-    ta.value = '';
-    images = [];
-    if (key) S.drafts.delete(key);
-    autoGrow(ta);
-    drawAttach();
-    hideSlash();
-    try {
-      await opts.submit(text, imgs.map(({ mimeType, data }) => ({ mimeType, data })));
-    } catch (err) {
-      ta.value = text;
-      images = imgs;
-      drawAttach();
-      fail(err);
-    }
-    drawRow();
-  };
-
-  const hideSlash = () => {
-    pop.classList.add('hidden');
-    slashItems = [];
-  };
-  const drawSlash = () => {
-    const cmds = opts.commands?.() || [];
-    const m = ta.value.match(/^\/(\S*)$/);
-    if (!m || !cmds.length) return hideSlash();
-    slashItems = cmds.filter((c) => c.name.toLowerCase().startsWith(m[1].toLowerCase())).slice(0, 30);
-    if (!slashItems.length) return hideSlash();
-    slashSel = Math.min(slashSel, slashItems.length - 1);
-    fill(pop, 
-      ...slashItems.map((c, i) =>
-        h('div', { class: `opt ${i === slashSel ? 'sel' : ''}`, onmousedown: (e) => (e.preventDefault(), pickSlash(i)) }, h('span', { class: 'n' }, `/${c.name}`), h('span', { class: 'd' }, c.description || '')),
-      ),
-    );
-    pop.classList.remove('hidden');
-  };
-  const pickSlash = (i) => {
-    const c = slashItems[i];
-    if (!c) return;
-    ta.value = `/${c.name} `;
-    hideSlash();
-    ta.focus();
-    drawRow();
-  };
-
-  ta.addEventListener('input', () => {
-    autoGrow(ta);
-    if (key) S.drafts.set(key, ta.value);
-    slashSel = 0;
-    drawSlash();
-    if (sendBtn && !sendBtn.classList.contains('stop')) sendBtn.disabled = !canSend();
-  });
-  ta.addEventListener('keydown', (e) => {
-    if (slashItems.length) {
-      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
-        e.preventDefault();
-        slashSel = (slashSel + (e.key === 'ArrowDown' ? 1 : -1) + slashItems.length) % slashItems.length;
-        return drawSlash();
-      }
-      if ((e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) || e.key === 'Tab') {
-        e.preventDefault();
-        return pickSlash(slashSel);
-      }
-      if (e.key === 'Escape') return hideSlash();
-    }
-    // Never send while an IME (Chinese/Japanese input) is composing.
-    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
-      e.preventDefault();
-      submit();
-    }
-    if (e.key === 'Escape' && opts.busy?.() && opts.stop) opts.stop();
-  });
-  ta.addEventListener('paste', (e) => {
-    if (!opts.images?.()) return;
-    const files = [...(e.clipboardData?.files || [])].filter((f) => f.type.startsWith('image/'));
-    if (files.length) {
-      e.preventDefault();
-      addFiles(files);
-    }
-  });
-  box.addEventListener('dragover', (e) => opts.images?.() && e.preventDefault());
-  box.addEventListener('drop', (e) => {
-    if (!opts.images?.()) return;
-    e.preventDefault();
-    addFiles([...e.dataTransfer.files]);
-  });
-
-  drawRow();
-  requestAnimationFrame(() => autoGrow(ta));
-  return { el: box, ta, refresh: drawRow, focus: () => ta.focus() };
-}
-
-function permPill(value, onChange, kimi = false) {
-  const sel = h(
-    'select',
-    { onchange: (e) => onChange(e.target.value), title: kimi ? 'Kimi 的權限模式（manual / yolo / auto）' : '權限模式：agent 要執行指令或修改檔案時的處理方式' },
-    Object.entries(kimi ? KIMI_PERM_LABELS : PERM_LABELS).map(([v, l]) => h('option', { value: v, selected: v === value }, l)),
-  );
-  return h('label', { class: `pill ${value === 'bypass' ? 'warn' : ''}` }, icon('shield'), sel);
-}
-
-function contextRing(ctx) {
-  if (!ctx?.size) return null;
-  const pct = Math.min(1, ctx.used / ctx.size);
-  const c = 2 * Math.PI * 8;
-  const color = pct > 0.85 ? 'var(--danger)' : pct > 0.6 ? 'var(--warn)' : 'var(--text-3)';
-  const wrap = h('span', { class: 'ctx', title: `Context 使用量：${fmtTokens(ctx.used)} / ${fmtTokens(ctx.size)} tokens` });
-  wrap.innerHTML = `<span>${Math.max(1, Math.round(pct * 100))}%</span><svg class="ctx-ring" viewBox="0 0 22 22"><circle cx="11" cy="11" r="8" fill="none" stroke="var(--border-strong)" stroke-width="2.5"/><circle cx="11" cy="11" r="8" fill="none" stroke="${color}" stroke-width="2.5" stroke-dasharray="${c}" stroke-dashoffset="${c * (1 - pct)}" transform="rotate(-90 11 11)" stroke-linecap="round"/></svg>`;
-  return wrap;
-}
-
-// --------------------------------------------------------------- home
-
-function agentAvailable(a) {
-  return a && a.enabled && a.available;
-}
-
-function showHome() {
-  const enabled = S.agents.filter((a) => a.enabled);
-  if (!agentAvailable(agentById(S.home.agentId))) S.home.agentId = (enabled.find((a) => a.available) || enabled[0])?.id || null;
-  const hour = new Date().getHours();
-  const greet = hour < 5 ? '夜深了' : hour < 11 ? '早安' : hour < 14 ? '午安' : hour < 18 ? '午後好' : '晚安';
-
-  const composer = createComposer({
-    placeholder: '交代一個任務，例如：幫我看看這個專案的結構，並修正測試失敗的地方',
-    draftKey: 'home',
-    images: () => S.home.mode === 'single' && agentById(S.home.agentId)?.type === 'acp',
-    pills: () => {
-      const pills = [];
-      if (S.home.mode === 'single') {
-        const a = agentById(S.home.agentId);
-        const pill = h('button', { class: 'pill' }, h('span', { class: 'dot', style: { '--c': a?.color } }), a ? a.name : '選擇 agent', icon('down'));
-        pill.onclick = (e) => {
-          e.stopPropagation();
-          openMenu(pill, agentMenuItems((id) => {
-            S.home.agentId = id;
-            try {
-              localStorage.setItem('hubAgent', id);
-            } catch {}
-            composer.refresh();
-          }, S.home.agentId), { above: innerHeight - pill.getBoundingClientRect().bottom < 360 });
-        };
-        pills.push(pill);
-      } else {
-        const sel = [...S.home.agentIds].filter((id) => agentAvailable(agentById(id)));
-        const pill = h(
-          'button',
-          { class: 'pill', dataset: { role: 'agents-pill' } },
-          sel.length ? h('span', { class: 'stack-dots', style: { marginTop: 0 } }, sel.map((id) => h('span', { style: { '--c': agentColor(id), borderColor: 'var(--surface)' } }))) : null,
-          sel.length ? `${sel.length} 個 agents` : '選擇要比較的 agents',
-          icon('down'),
-        );
-        pill.onclick = (e) => {
-          e.stopPropagation();
-          const items = agentMenuItems((id) => {
-            S.home.agentIds.has(id) ? S.home.agentIds.delete(id) : S.home.agentIds.add(id);
-            composer.refresh();
-            composer.el.querySelector('[data-role="agents-pill"]')?.click();
-          }, null, S.home.agentIds);
-          openMenu(pill, items.map((i) => (typeof i === 'object' ? { ...i, keepOpen: true } : i)));
-        };
-        pills.push(pill);
-      }
-      const seg = h(
-        'span',
-        { class: 'seg' },
-        h('button', { class: S.home.mode === 'single' ? 'on' : '', onclick: () => ((S.home.mode = 'single'), composer.refresh()) }, '單一'),
-        h('button', { class: S.home.mode === 'compare' ? 'on' : '', title: '同一個任務交給多個 agent 平行執行並排比較', onclick: () => ((S.home.mode = 'compare'), composer.refresh()) }, icon('columns'), '比較'),
-      );
-      // Folders live on the machine that runs the agent.
-      const sel = agentById(S.home.agentId);
-      const remote = S.home.mode === 'single' && sel?.type === 'kimi-remote' ? sel : null;
-      const where = remote?.machineId || null;
-      if (S.home.cwd && S.home.cwdMachine !== where) S.home.cwd = '';
-      const machine = remote && S.machines.find((m) => m.id === remote.machineId);
-      const setCwd = (p) => {
-        S.home.cwd = p;
-        S.home.cwdMachine = where;
-        composer.refresh();
-      };
-      const ws = h('button', { class: 'pill', title: S.home.cwd || '為這次工作建立一個新的空白資料夾' }, icon('folder'), S.home.cwd ? shortPath(S.home.cwd, remote ? machine?.home : S.config?.home) : remote ? `新資料夾 · ${machine?.name || ''}` : '新工作區', icon('down'));
-      ws.onclick = (e) => {
-        e.stopPropagation();
-        const recent = remote
-          ? [...new Set((machine?.sessions || []).map((k) => k.cwd))].filter(Boolean).slice(0, 6)
-          : [...new Set([...S.sessions.values()].filter((s) => !s.branch && !s.machineId).sort((a, b) => b.updatedAt - a.updatedAt).map((s) => s.cwd))]
-              .filter((p) => p && !p.startsWith(S.config?.workspacesDir || '\0'))
-              .slice(0, 6);
-        openMenu(ws, [
-          { label: remote ? `在 ${machine?.name || '那台機器'} 建立新資料夾` : '新的空白工作區', sub: remote ? '~/agent-hub-workspaces 底下，並初始化 git' : '自動建立資料夾並初始化 git', icon: 'plus', checked: !S.home.cwd, run: () => setCwd('') },
-          { label: '選擇資料夾…', sub: remote ? `瀏覽 ${machine?.name || '那台機器'} 上的資料夾` : '在既有專案中工作', icon: 'folder', run: () => pickFolder(setCwd, where) },
-          ...(recent.length ? ['sep', { header: '最近使用' }, ...recent.map((p) => ({ label: shortPath(p, remote ? machine?.home : S.config?.home), sub: p, checked: S.home.cwd === p, run: () => setCwd(p) }))] : []),
-        ], { above: innerHeight - ws.getBoundingClientRect().bottom < 320 });
-      };
-      pills.push(seg, ws, permPill(S.home.perm, (v) => {
-        S.home.perm = v;
-        try {
-          localStorage.setItem('hubPerm', v);
-        } catch {}
-        composer.refresh();
-      }));
-      return pills;
-    },
-    submit: async (text, images) => {
-      if (S.home.mode === 'compare') {
-        const ids = [...S.home.agentIds].filter((id) => agentAvailable(agentById(id)));
-        if (ids.length < 1) throw new Error('請先選擇至少一個可用的 agent');
-        const r = await post('/compare', { agentIds: ids, prompt: text, cwd: S.home.cwd || undefined, permissionMode: S.home.perm });
-        for (const s of r.sessions) S.sessions.set(s.id, s);
-        go(`#/g/${r.groupId}`);
-      } else {
-        const a = agentById(S.home.agentId);
-        if (!a) throw new Error('請先選擇 agent');
-        if (!a.available) throw new Error(`${a.name} 目前無法使用：${a.reason}`);
-        const s = await post('/sessions', { agentId: a.id, prompt: text, images, cwd: S.home.cwd || undefined, permissionMode: S.home.perm });
-        S.sessions.set(s.id, s);
-        go(`#/s/${s.id}`);
-      }
-    },
-  });
-
-  const cards = h('div', { class: 'cards' });
-  for (const a of enabled.sort((x, y) => Number(y.available) - Number(x.available))) {
-    cards.append(
-      h(
-        'button',
-        {
-          class: 'acard',
-          onclick: () => {
-            if (!a.available) return a.type === 'kimi-remote' ? openConnect() : openSettings(a.id);
-            S.home.mode = 'single';
-            S.home.agentId = a.id;
-            composer.refresh();
-            composer.focus();
-          },
-        },
-        h('div', { class: 'top' }, h('span', { class: 'avatar', style: { '--c': a.color } }, initials(a.name)), a.name, h('span', { class: 'tag', style: { marginLeft: 'auto' } }, a.type === 'kimi-remote' ? '遠端' : a.type.toUpperCase())),
-        h('div', { class: `st ${a.available ? 'ok' : ''}` }, a.available ? '● 可以使用' : a.reason),
-      ),
-    );
+async function attachAndOpen(machineId, kimiSessionId) {
+  leaveSession();
+  S.route = `k:${kimiSessionId}`;
+  fill($toolbar, sidebarToggle(), h('div', { class: 'toolbar-titles' }, h('div', { class: 'om-toolbar__title' }, rows().find((r) => r.kimi?.id === kimiSessionId)?.title || '載入中…')));
+  fill($view, h('div', { class: 'loading' }, h('span', { class: 'spinner' }), '正在載入對話…'));
+  try {
+    const s = await post(`/machines/${machineId}/kimi/${kimiSessionId}/attach`);
+    S.sessions.set(s.id, s);
+    if (S.route === `k:${kimiSessionId}`) location.replace(`#/s/${s.id}`);
+  } catch (err) {
+    fill($view, h('div', { class: 'loading' }, err.message));
   }
+}
 
-  fill(L.main, 
-    h('header', { class: 'topbar bare' }, sidebarButton(), h('span', { class: 'spacer' })),
+// ---------------------------------------------------------------- home
+
+let homeComposer = null;
+
+function homeMachine() {
+  const ready = S.machines.filter((m) => m.online && m.kimi?.available);
+  return machineById(S.home.machineId && ready.some((m) => m.id === S.home.machineId) ? S.home.machineId : ready[0]?.id) || null;
+}
+
+async function showHome() {
+  leaveSession();
+  S.route = 'home';
+  hidePanel();
+  renderToolbar();
+  const m = homeMachine();
+  if (!S.machines.length) {
+    fill(
+      $view,
+      h(
+        'div',
+        { class: 'home' },
+        h(
+          'div',
+          { class: 'home-inner empty' },
+          h('div', { class: 'large-title' }, '先連接一台電腦'),
+          h('p', { class: 'home-lead' }, '中控台透過你電腦上的連接器操作 Kimi Code。Kimi 只在你自己的電腦上登入，中控台不需要你的 Kimi 帳號。'),
+          h('button', { class: 'om-btn om-btn--primary om-btn--lg', type: 'button', onclick: openMachines }, '連接電腦…'),
+        ),
+      ),
+    );
+    return;
+  }
+  homeComposer ??= new Composer({
+    home: true,
+    placeholder: '要讓 Kimi 做什麼？輸入 / 看指令',
+    onSend: startSession,
+    onCommand: homeCommand,
+    onStop: () => {},
+    onConfig: (c) => {
+      if (c.model) S.home.model = c.model;
+      if (c.effort) S.home.effort = c.effort;
+      if (c.permission) S.home.permission = c.permission;
+      if ('planMode' in c) S.home.planMode = c.planMode;
+      saveHome();
+      updateHomeComposer();
+    },
+    onPickMachine: machineMenu,
+    onPickFolder: folderMenu,
+    onError: (t) => toast(t),
+  });
+  homeComposer.setKey('home');
+  fill(
+    $view,
     h(
       'div',
       { class: 'home' },
-      h('h1', { class: 'greet' }, icon('logo'), `${greet}，今天要交給哪個 agent？`),
-      h('p', { class: 'sub' }, '一個介面操控各家 coding agent —— Kimi Code、Gemini CLI、Qwen Code、OpenCode…'),
-      h('div', { class: 'composer-wrap' }, composer.el),
-      h('div', { class: 'agent-cards' }, h('h3', null, '已啟用的 agents', h('button', { class: 'btn sm ghost', onclick: () => openSettings() }, icon('gear'), '管理')), cards),
+      h(
+        'div',
+        { class: 'home-inner' },
+        h('div', { class: 'large-title' }, '要讓 Kimi 做什麼？'),
+        homeComposer.el,
+        h('p', { class: 'home-hint' }, m ? `會在「${m.name}」上的 Kimi 執行，用那台電腦登入的帳號。` : '連接的電腦目前都沒有執行中的 Kimi。在那台電腦的 Kimi 裡輸入 /web，或執行 kimi web。'),
+      ),
     ),
   );
-  hidePanel();
-  S.view = { kind: 'home', composer };
+  updateHomeComposer();
+  homeComposer.focus();
+  loadMachineModels(m);
+}
+
+const machineModels = new Map(); // machine id -> { models, defaultModel }
+async function loadMachineModels(m) {
+  if (!m || machineModels.has(m.id)) return;
+  try {
+    machineModels.set(m.id, await get(`/machines/${m.id}/models`));
+    updateHomeComposer();
+  } catch {}
+}
+
+function updateHomeComposer() {
+  if (!homeComposer) return;
+  const m = homeMachine();
+  const mm = m ? machineModels.get(m.id) : null;
+  const folder = S.home.cwdByMachine?.[m?.id];
+  homeComposer.update({
+    machineName: m?.name,
+    folderName: folder === null ? '新資料夾' : folder ? baseName(folder) : '新資料夾',
+    models: mm?.models || [],
+    defaultModel: mm?.defaultModel,
+    model: S.home.model && mm?.models?.some((x) => x.id === S.home.model) ? S.home.model : '',
+    effort: S.home.effort,
+    permission: S.home.permission || 'manual',
+    planMode: Boolean(S.home.planMode),
+  });
+}
+
+function homeCommand(name) {
+  if (['model', 'effort', 'permission'].includes(name)) return homeComposer.openControl(name) || toast('這台電腦的 Kimi 沒有提供這個選項');
+  if (name === 'plan') return homeComposer.opts.onConfig({ planMode: !S.home.planMode });
+  if (['yolo', 'auto', 'manual'].includes(name)) return homeComposer.opts.onConfig({ permission: name });
+}
+
+function machineMenu(anchor) {
+  const cur = homeMachine();
+  openMenu(
+    anchor,
+    [
+      ...S.machines.map((m) => ({
+        label: m.name,
+        description: !m.online ? '離線' : !m.kimi?.available ? '沒有執行中的 Kimi' : m.platform,
+        checked: cur?.id === m.id,
+        disabled: !m.online || !m.kimi?.available,
+        onSelect: () => {
+          S.home.machineId = m.id;
+          saveHome();
+          showHome();
+        },
+      })),
+      { separator: true },
+      { label: '連接其他電腦…', onSelect: openMachines },
+    ],
+    { width: 260 },
+  );
+}
+
+function folderMenu(anchor) {
+  const m = homeMachine();
+  if (!m) return openMachines();
+  const recent = [...new Set((m.sessions || []).map((s) => s.cwd).filter(Boolean))].slice(0, 6);
+  const pick = (cwd) => {
+    S.home.cwdByMachine = { ...(S.home.cwdByMachine || {}), [m.id]: cwd };
+    saveHome();
+    updateHomeComposer();
+  };
+  openMenu(
+    anchor,
+    [
+      recent.length ? { section: '最近使用' } : null,
+      ...recent.map((p) => ({ label: baseName(p), description: shortPath(p, m.home, 4), onSelect: () => pick(p) })),
+      recent.length ? { separator: true } : null,
+      { label: '瀏覽資料夾…', onSelect: () => browseFolders(m, pick) },
+      { label: '新的空白資料夾', description: '在 ~/agent-hub-workspaces 建立', onSelect: () => pick(null) },
+    ].filter(Boolean),
+    { width: 300 },
+  );
+}
+
+async function startSession({ text, images }) {
+  const m = homeMachine();
+  if (!m) return openMachines();
+  const cwd = S.home.cwdByMachine?.[m.id] || undefined;
+  const mm = machineModels.get(m.id);
+  const model = S.home.model && mm?.models?.some((x) => x.id === S.home.model) ? S.home.model : undefined;
+  const effort = model ? S.home.effort : undefined;
+  homeComposer.el.classList.add('sending');
+  try {
+    const s = await post('/sessions', { machineId: m.id, cwd, prompt: text, images, model, effort, permission: S.home.permission, planMode: S.home.planMode || undefined });
+    S.sessions.set(s.id, s);
+    go(`#/s/${s.id}`);
+  } catch (err) {
+    homeComposer.setText(text);
+    fail(err);
+  } finally {
+    homeComposer.el.classList.remove('sending');
+  }
+}
+
+// ------------------------------------------------------------- session
+
+let composer = null;
+let artifactView = null;
+
+function leaveSession() {
+  if (!S.cur) return;
+  S.cur.transcript.destroy();
+  S.cur = null;
+  S.artifacts = [];
+  artifactView?.destroy();
+  artifactView = null;
+}
+
+async function openSession(id) {
+  if (S.cur?.id === id) return;
+  leaveSession();
+  S.route = `s:${id}`;
+  if (S.panel?.tab === 'artifact') hidePanel();
+  const summary = S.sessions.get(id);
+  const cur = { id, summary, seq: 0, transcript: null, loading: true };
+  S.cur = cur;
+  cur.transcript = new Transcript({
+    cwd: summary?.cwd,
+    onRespond: respond,
+    onOpenArtifact: (path, version) => showArtifact(path, version),
+    onArtifacts: (list) => {
+      // A page Kimi starts writing now opens beside the conversation, so it
+      // can be watched as it is generated.
+      const fresh = !cur.loading && cur.knownArtifacts ? list.find((a) => !cur.knownArtifacts.has(a.path)) : null;
+      S.artifacts = list;
+      cur.knownArtifacts = new Set(list.map((a) => a.path));
+      renderToolbar();
+      if (fresh && window.matchMedia('(min-width: 1100px)').matches) showArtifact(fresh.path);
+      else syncArtifact();
+    },
+    artifactsCache: () => S.artifacts,
+    activeArtifact: () => (S.panel?.tab === 'artifact' ? S.panel.path : null),
+    onImage: lightbox,
+    onLoadEarlier: () => post(`/sessions/${id}/earlier`).catch(fail),
+  });
+  composer ??= new Composer({
+    onSend: sendMessage,
+    onCommand: sessionCommand,
+    onStop: interrupt,
+    onConfig: configure,
+    onCancelQueued: (pid) => S.cur && del(`/sessions/${S.cur.id}/queue/${pid}`).catch(fail),
+    onError: (t) => toast(t),
+    onHelp: openMachines,
+  });
+  composer.setKey(id);
+  fill($view, h('div', { class: 'session' }, cur.transcript.el, h('div', { class: 'composer-dock' }, composer.el)));
+  renderToolbar();
+  renderSidebar();
+  try {
+    const full = await get(`/sessions/${id}`);
+    if (S.cur !== cur) return;
+    applySnapshot(full);
+  } catch (err) {
+    if (S.cur !== cur) return;
+    if (err.status === 404) return go('#/');
+    fill($view, h('div', { class: 'loading' }, err.message));
+  }
   composer.focus();
 }
 
-function agentMenuItems(onPick, current, multi) {
-  const items = [];
-  for (const type of TYPE_ORDER) {
-    const list = S.agents.filter((a) => a.enabled && a.type === type);
-    if (!list.length) continue;
-    if (items.length) items.push('sep');
-    items.push({ header: TYPE_TITLES[type] });
-    for (const a of list) {
-      items.push({
-        label: a.name,
-        sub: a.available ? a.model || a.command || a.typeLabel : a.reason,
-        color: a.color,
-        disabled: !a.available,
-        checked: multi ? multi.has(a.id) : a.id === current,
-        run: () => (a.available ? onPick(a.id) : a.type === 'kimi-remote' ? openConnect() : openSettings(a.id)),
-        allowDisabled: true,
-      });
-    }
-  }
-  items.push('sep', { label: '連接一台機器（Kimi）…', icon: 'plus', run: () => openConnect() }, { label: '管理 agents…', icon: 'gear', run: () => openSettings() });
-  return items;
+function applySnapshot(full) {
+  const cur = S.cur;
+  const { events, seq, ...summary } = full;
+  cur.summary = summary;
+  cur.seq = seq;
+  cur.loading = false;
+  S.sessions.set(summary.id, summary);
+  cur.transcript.opts.cwd = summary.cwd;
+  cur.transcript.load(events);
+  cur.transcript.setStatus(summary.status, busy(summary.status) ? lastUserTs(events) : null);
+  S.artifacts = cur.transcript.artifacts();
+  cur.knownArtifacts = new Set(S.artifacts.map((a) => a.path));
+  updateComposer();
+  renderToolbar();
+  renderSidebar();
+  syncArtifact();
 }
 
-// ------------------------------------------------------------ session
+function lastUserTs(events) {
+  return [...events].reverse().find((e) => e.type === 'user')?.ts || Date.now();
+}
 
-// Live messages for a session that arrive while its snapshot is loading are
-// buffered and merged by sequence number.
-const pending = new Map();
-
-async function loadInto(conv) {
-  pending.set(conv.sid, []);
+async function resync() {
+  if (!S.cur) return;
+  const cur = S.cur;
   try {
-    const snap = await get(`/sessions/${conv.sid}`);
-    conv.seq = snap.seq;
-    conv.setEvents(snap.events);
-    for (const msg of pending.get(conv.sid) || []) applyToConv(conv, msg);
-    return snap;
-  } finally {
-    pending.delete(conv.sid);
-  }
-}
-
-function applyToConv(conv, msg) {
-  if (msg.seq != null && conv.seq != null && msg.seq <= conv.seq) return;
-  if (msg.seq != null) conv.seq = msg.seq;
-  if (msg.t === 'event') conv.append(msg.ev);
-  else if (msg.t === 'delta') conv.delta(msg.id, msg.field, msg.text);
-  else if (msg.t === 'patch') conv.patch(msg.id, msg.fields);
-}
-
-function convCtx(sid) {
-  const sAgent = () => agentById(S.sessions.get(sid)?.agentId);
-  return {
-    agentName: () => sAgent()?.name || 'Agent',
-    relPath: (p) => {
-      const cwd = S.sessions.get(sid)?.cwd;
-      return cwd && p?.startsWith(`${cwd}/`) ? p.slice(cwd.length + 1) : p;
-    },
-    onPermission: (eventId, optionId) => post(`/sessions/${sid}/permissions/${eventId}`, { optionId }).catch(fail),
-    canLogin: () => sAgent()?.type === 'acp',
-    openLogin: () => sAgent() && openSettings(sAgent().id, { login: true }),
-  };
-}
-
-async function showSession(sid) {
-  const conv = new Conversation({ sid, ctx: convCtx(sid) });
-  const scroller = h('div', { class: 'scroller' }, conv.el);
-  const top = h('header', { class: 'topbar' });
-  const composer = createComposer({
-    placeholder: '回覆…（Enter 送出，Shift+Enter 換行，/ 叫出指令）',
-    draftKey: sid,
-    allowWhileBusy: false,
-    busy: () => ['running', 'awaiting_permission'].includes(S.sessions.get(sid)?.status),
-    stop: () => post(`/sessions/${sid}/interrupt`).catch(fail),
-    images: () => {
-      const s = S.sessions.get(sid);
-      return agentById(s?.agentId)?.type === 'acp' && s?.meta?.imageInput !== false;
-    },
-    commands: () => S.sessions.get(sid)?.meta?.commands || [],
-    pills: () => sessionPills(sid),
-    extras: () => [contextRing(S.sessions.get(sid)?.meta?.context)],
-    submit: (text, images) => post(`/sessions/${sid}/messages`, { text, images }),
-  });
-  fill(L.main, top, scroller, h('div', { class: 'composer-wrap' }, composer.el));
-  S.view = { kind: 'session', sid, conv, composer, top };
-  drawTopbar();
-  if (S.panel.open) showPanel();
-  else hidePanel();
-  try {
-    const snap = await loadInto(conv);
-    S.sessions.set(sid, { ...(S.sessions.get(sid) || {}), ...stripEvents(snap) });
-    conv.setStatus(S.sessions.get(sid));
-    drawTopbar();
-    composer.refresh();
-    renderSidebar();
-  } catch (err) {
-    if (err.status === 404) {
-      toast('找不到這個 session');
-      return go('#/');
-    }
-    fail(err);
-  }
-  if (innerWidth > 760) composer.focus();
-}
-
-function stripEvents(snap) {
-  const { events, ...rest } = snap;
-  return rest;
-}
-
-function sessionPills(sid) {
-  const s = S.sessions.get(sid);
-  if (!s) return [];
-  const pills = [permPill(s.permissionMode, (v) => patch(`/sessions/${sid}`, { permissionMode: v }).catch(fail), agentById(s.agentId)?.type === 'kimi-remote')];
-  const meta = s.meta || {};
-  const cfg = (body) => post(`/sessions/${sid}/config`, body).catch(fail);
-  if (meta.modes?.availableModes?.length) {
-    pills.push(
-      h(
-        'label',
-        { class: 'pill', title: 'Agent 的模式' },
-        icon('bolt'),
-        h('select', { onchange: (e) => cfg({ modeId: e.target.value }) }, meta.modes.availableModes.map((m) => h('option', { value: m.id, selected: m.id === meta.modes.currentModeId }, m.name))),
-      ),
-    );
-  }
-  for (const o of meta.configOptions || []) {
-    if (o.id === 'mode' && meta.modes?.availableModes?.length) continue;
-    if (o.type === 'boolean') {
-      pills.push(
-        h('label', { class: 'pill', title: o.description || o.name }, h('input', { type: 'checkbox', checked: !!o.currentValue, onchange: (e) => cfg({ configId: o.id, value: e.target.checked }) }), o.name),
-      );
-    } else if (o.type === 'select' || Array.isArray(o.options)) {
-      const flat = (o.options || []).flatMap((x) => (x.options ? x.options.map((y) => ({ ...y, group: x.name })) : [x]));
-      pills.push(
-        h(
-          'label',
-          { class: 'pill', title: o.description || o.name },
-          h('span', { class: 'muted' }, o.name),
-          h('select', { onchange: (e) => cfg({ configId: o.id, value: e.target.value }) }, flat.map((x) => h('option', { value: x.value, selected: x.value === o.currentValue }, x.name))),
-        ),
-      );
-    }
-  }
-  return pills;
-}
-
-function drawTopbar() {
-  const v = S.view;
-  if (v?.kind !== 'session' || v.top.querySelector('.title-edit')) return;
-  const s = S.sessions.get(v.sid);
-  if (!s) return;
-  const a = agentById(s.agentId);
-  const info = s.meta?.agentInfo;
-  const title = h('div', { class: 'title', title: '點擊重新命名' }, s.title);
-  title.onclick = () => renameInline(title, s);
-  const handoffBtn = h('button', { class: 'btn sm ghost hide-mobile', title: '把這個工作交給另一個 agent 接手' }, icon('swap'), '交接');
-  handoffBtn.onclick = (e) => {
-    e.stopPropagation();
-    openMenu(handoffBtn, [
-      { header: '交給哪個 agent 接手？（同一個工作區）' },
-      ...S.agents
-        .filter((x) => x.enabled && x.id !== s.agentId)
-        .map((x) => ({
-          label: x.name,
-          sub: x.available ? '帶著目前的對話紀錄接手' : x.reason,
-          color: x.color,
-          disabled: !x.available,
-          run: async () => {
-            const text = v.composer.ta.value;
-            const ns = await post(`/sessions/${s.id}/handoff`, { agentId: x.id, text }).catch(fail);
-            if (ns) {
-              v.composer.ta.value = '';
-              S.sessions.set(ns.id, ns);
-              go(`#/s/${ns.id}`);
-            }
-          },
-        })),
-    ], { align: 'right' });
-  };
-  const more = h('button', { class: 'icon-btn', title: '更多' }, icon('dots'));
-  more.onclick = (e) => {
-    e.stopPropagation();
-    openMenu(more, [
-      { label: '重新命名', icon: 'pencil', run: () => renameInline(title, s) },
-      { label: '複製工作區路徑', icon: 'copy', run: () => navigator.clipboard?.writeText(s.cwd).then(() => toast('已複製路徑'), () => toast(s.cwd)) },
-      ...(s.parentId ? [{ label: '回到上層 session', icon: 'back', run: () => go(`#/s/${s.parentId}`) }] : []),
-      ...(s.groupId ? [{ label: '回到比較檢視', icon: 'columns', run: () => go(`#/g/${s.groupId}`) }] : []),
-      'sep',
-      {
-        label: '刪除 session',
-        icon: 'trash',
-        run: async () => {
-          if (!confirm('確定要刪除這個 session？（工作區資料夾不會被刪除）')) return;
-          await del(`/sessions/${s.id}`).catch(fail);
-        },
-      },
-    ], { align: 'right' });
-  };
-  fill(v.top, 
-    sidebarButton(),
-    title,
-    h('span', { class: 'chip', title: s.meta?.protocol || '' }, h('span', { class: 'dot', style: { '--c': a?.color } }), info?.name && info.name !== a?.name ? `${a?.name ?? ''} · ${info.name}${info.version ? ` ${info.version}` : ''}` : `${a?.name ?? s.agentId}${info?.version ? ` ${info.version}` : ''}`),
-    h('span', { class: 'chip path hide-mobile', title: s.cwd }, s.branch ? icon('branch') : icon('folder'), s.branch || shortPath(s.cwd, S.config?.home)),
-    h('span', { class: 'spacer' }),
-    handoffBtn,
-    h('button', { class: `icon-btn ${S.panel.open ? 'active' : ''}`, title: '工作區（變更 / 檔案）', onclick: () => togglePanel() }, icon('panel')),
-    more,
-  );
-}
-
-function renameInline(titleEl, s) {
-  const input = h('input', { class: 'title-edit', value: s.title });
-  titleEl.replaceWith(input);
-  input.focus();
-  input.select();
-  let done = false;
-  const finish = async (save) => {
-    if (done) return;
-    done = true;
-    if (save && input.value.trim() && input.value.trim() !== s.title) await patch(`/sessions/${s.id}`, { title: input.value.trim() }).catch(fail);
-    drawTopbar();
-  };
-  input.onkeydown = (e) => {
-    if (e.key === 'Enter' && !e.isComposing) finish(true);
-    if (e.key === 'Escape') finish(false);
-  };
-  input.onblur = () => finish(true);
-}
-
-// ------------------------------------------------------------- groups
-
-async function showGroup(gid) {
-  const top = h('header', { class: 'topbar' });
-  const grid = h('div', { class: 'grid-view' });
-  const convs = new Map();
-  const heads = new Map();
-  const composer = createComposer({
-    placeholder: '傳送後續指示給所有 agent…',
-    busy: () => [...convs.keys()].some((id) => ['running', 'awaiting_permission'].includes(S.sessions.get(id)?.status)),
-    allowWhileBusy: true,
-    stop: () => Promise.all([...convs.keys()].map((id) => post(`/sessions/${id}/interrupt`))).catch(fail),
-    submit: async (text) => {
-      const r = await post(`/groups/${gid}/messages`, { text });
-      if (r.sent < convs.size) toast(`已傳送給 ${r.sent} 個 agent（其餘仍在執行中）`);
-    },
-  });
-  fill(L.main, top, grid, h('div', { class: 'composer-wrap' }, composer.el));
-  hidePanel();
-  S.view = { kind: 'group', gid, convs, heads, composer, top };
-
-  const sessions = [...S.sessions.values()].filter((s) => s.groupId === gid).sort((a, b) => a.createdAt - b.createdAt);
-  if (!sessions.length) {
-    toast('找不到這個比較群組');
-    return go('#/');
-  }
-  top.append(sidebarButton(), h('div', { class: 'title', style: { cursor: 'default' } }, `比較：${sessions[0].title}`), h('span', { class: 'spacer' }), h('span', { class: 'chip hide-mobile' }, icon('columns'), `${sessions.length} 個 agents`));
-  for (const s of sessions) {
-    const conv = new Conversation({ sid: s.id, ctx: convCtx(s.id), compact: true });
-    const head = h('div', { class: 'gcol-head' });
-    heads.set(s.id, head);
-    convs.set(s.id, conv);
-    grid.append(h('div', { class: 'gcol' }, head, h('div', { class: 'scroller' }, conv.el)));
-    drawGroupHead(s.id);
-    loadInto(conv)
-      .then(() => conv.setStatus(S.sessions.get(s.id)))
-      .catch(fail);
-  }
-}
-
-function drawGroupHead(sid) {
-  const head = S.view?.heads?.get(sid);
-  const s = S.sessions.get(sid);
-  if (!head || !s) return;
-  const st = statusClass(s.status);
-  fill(head, 
-    h('span', { class: `status-dot ${st}`, style: { '--c': agentColor(s.agentId), marginTop: 0 } }),
-    agentName(s.agentId),
-    s.branch ? h('span', { class: 'chip path', title: s.cwd }, icon('branch'), s.branch.split('/').pop()) : null,
-    h('span', { class: 'spacer' }),
-    h('a', { class: 'btn sm ghost', href: `#/s/${sid}`, title: '單獨開啟' }, icon('ext')),
-  );
-}
-
-// -------------------------------------------------------------- panel
-
-function hidePanel() {
-  L.panel.classList.add('hidden');
-}
-function togglePanel(force) {
-  S.panel.open = force ?? !S.panel.open;
-  try {
-    localStorage.setItem('hubPanel', S.panel.open ? '1' : '0');
+    const full = await get(`/sessions/${cur.id}`);
+    if (S.cur === cur) applySnapshot(full);
   } catch {}
-  if (S.panel.open) showPanel();
-  else hidePanel();
-  drawTopbar();
 }
 
-function showPanel() {
-  const sid = S.view?.sid;
-  if (!sid) return hidePanel();
-  L.panel.classList.remove('hidden');
-  const body = h('div', { class: 'panel-body' });
-  const badge = h('span', { class: 'badge hidden' });
-  const tabs = h(
-    'div',
-    { class: 'tabs' },
-    h('button', { class: S.panel.tab === 'changes' ? 'on' : '', onclick: () => ((S.panel.tab = 'changes'), showPanel()) }, '變更', badge),
-    h('button', { class: S.panel.tab === 'files' ? 'on' : '', onclick: () => ((S.panel.tab = 'files'), showPanel()) }, '檔案'),
-  );
-  fill(L.panel, 
+function updateComposer() {
+  const s = S.cur?.summary;
+  if (!s || !composer) return;
+  const meta = s.meta || {};
+  composer.update({
+    running: s.status === 'running',
+    awaiting: s.status === 'awaiting_permission',
+    queue: meta.queue || [],
+    todos: meta.todos || [],
+    models: meta.models || [],
+    model: meta.model,
+    defaultModel: meta.defaultModel,
+    effort: meta.effort,
+    permission: meta.permission,
+    planMode: meta.planMode,
+    context: meta.context,
+    skills: meta.skills || [],
+    terminal: meta.owner === 'tui',
+    controllable: Boolean(meta.controllable),
+  });
+}
+
+function sidebarToggle() {
+  const hidden = $app.classList.contains('no-sidebar');
+  return h('button', { class: `om-btn om-btn--toolbar sidebar-toggle${hidden ? ' show' : ''}`, type: 'button', title: '顯示側欄', 'aria-label': '顯示側欄', onclick: () => toggleSidebar(true) }, icon('sidebar'));
+}
+
+function renderToolbar() {
+  const s = S.cur?.summary;
+  if (!s) {
+    fill($toolbar, sidebarToggle(), h('div', { class: 'toolbar-titles' }, h('div', { class: 'om-toolbar__title' }, '新對話')));
+    return;
+  }
+  const m = machineById(s.machineId);
+  const sub = [m?.name || s.meta?.machineName, s.cwd ? shortPath(s.cwd, m?.home, 3) : null].filter(Boolean).join(' · ');
+  const arts = S.artifacts.length;
+  fill(
+    $toolbar,
+    sidebarToggle(),
     h(
       'div',
-      { class: 'panel-head' },
-      tabs,
-      h('span', { class: 'spacer', style: { flex: 1 } }),
-      h('button', { class: 'icon-btn', title: '重新整理', onclick: () => showPanel() }, icon('refresh')),
-      h('button', { class: 'icon-btn', title: '關閉', onclick: () => togglePanel(false) }, icon('x')),
+      { class: 'toolbar-titles' },
+      h('div', { class: 'om-toolbar__title', title: s.title }, s.title || '新對話'),
+      h(
+        'div',
+        { class: 'om-toolbar__subtitle', title: s.cwd || '' },
+        sub,
+        m && !m.online ? h('span', { class: 'om-badge om-badge--danger' }, '電腦離線') : null,
+        s.meta?.owner === 'tui' ? h('span', { class: 'om-badge', title: s.meta.controllable ? '在終端機的 Kimi 裡執行，可以從這裡操作' : '在終端機的 Kimi 裡執行，這裡只能看' }, s.meta.controllable ? '終端機' : '終端機 · 唯讀') : null,
+      ),
     ),
-    body,
+    h('span', { class: 'om-toolbar__spacer' }),
+    arts ? h('button', { class: `om-btn om-btn--toolbar wide${S.panel?.tab === 'artifact' ? ' on' : ''}`, type: 'button', title: 'Artifact', onclick: () => (S.panel?.tab === 'artifact' ? hidePanel() : showArtifact()) }, icon('artifact'), h('span', { class: 'btn-label' }, 'Artifact'), arts > 1 ? h('span', { class: 'om-sidebar__count' }, String(arts)) : null) : null,
+    h('button', { class: `om-btn om-btn--toolbar wide${S.panel?.tab === 'changes' ? ' on' : ''}`, type: 'button', title: '檔案變更', onclick: () => (S.panel?.tab === 'changes' ? hidePanel() : showChanges()) }, icon('diff'), h('span', { class: 'btn-label' }, '變更')),
+    h('button', { class: 'om-btn om-btn--toolbar', type: 'button', title: '更多', 'aria-label': '更多', onclick: (e) => sessionMenu(e.currentTarget) }, icon('dots')),
   );
-  S.panelState = { sid, body, badge };
-  if (S.panel.tab === 'changes') loadChanges(sid, body, badge);
-  else loadFiles(sid, body);
 }
 
-let panelTimer = 0;
-function refreshPanelSoon(sid) {
-  if (!S.panel.open || S.view?.sid !== sid || S.panel.tab !== 'changes') return;
-  clearTimeout(panelTimer);
-  panelTimer = setTimeout(() => S.view?.sid === sid && showPanel(), 700);
-}
-
-async function loadChanges(sid, body, badge) {
-  fill(body, h('div', { class: 'panel-empty' }, '載入中…'));
-  try {
-    const ch = await get(`/sessions/${sid}/changes`);
-    if (!ch.git) return fill(body, h('div', { class: 'panel-empty' }, '這個工作區不是 git repo，無法顯示變更。\n可以切到「檔案」分頁瀏覽。'));
-    badge.textContent = ch.files.length;
-    badge.classList.toggle('hidden', !ch.files.length);
-    if (!ch.files.length) return fill(body, h('div', { class: 'panel-empty' }, '目前沒有任何變更'));
-    // Split the combined diff per file so each row can expand on its own.
-    const chunks = new Map();
-    let cur = null;
-    for (const line of ch.diff.split('\n')) {
-      const m = line.match(/^diff --git a\/(.+?) b\/(.+)$/);
-      if (m) {
-        cur = m[2];
-        chunks.set(cur, []);
-      }
-      if (cur) chunks.get(cur).push(line);
-    }
-    const tot = ch.files.reduce((n, f) => [n[0] + f.added, n[1] + f.removed], [0, 0]);
-    fill(body, 
-      h('div', { class: 'muted', style: { fontSize: '12.5px', padding: '0 8px 8px' } }, `${ch.files.length} 個檔案 · `, h('span', { class: 'add', style: { color: 'var(--diff-add-text)' } }, `+${tot[0]}`), ' ', h('span', { style: { color: 'var(--diff-del-text)' } }, `-${tot[1]}`)),
-      ...ch.files.map((f) => {
-        const holder = h('div');
-        const rowEl = h(
-          'div',
-          { class: 'change-row', title: f.path },
-          h('span', { class: `st-badge ${f.status}` }, f.status[0].toUpperCase()),
-          h('span', { class: 'p' }, f.path),
-          h('span', { class: 'add' }, `+${f.added}`),
-          h('span', { class: 'del' }, `-${f.removed}`),
-        );
-        rowEl.onclick = () => {
-          if (holder.firstChild) fill(holder);
-          else fill(holder, renderUnifiedDiff((chunks.get(f.path) || []).join('\n')));
-        };
-        if (ch.files.length <= 3) holder.append(renderUnifiedDiff((chunks.get(f.path) || []).join('\n')));
-        return h('div', { style: { marginBottom: '6px' } }, rowEl, holder);
-      }),
-    );
-  } catch (err) {
-    fill(body, h('div', { class: 'panel-empty' }, err.message));
-  }
-}
-
-async function loadFiles(sid, body) {
-  const tree = h('div');
-  fill(body, tree);
-  const renderDir = async (container, rel, depth) => {
-    let items;
-    try {
-      items = await get(`/sessions/${sid}/files?path=${encodeURIComponent(rel)}`);
-    } catch (err) {
-      return fill(container, h('div', { class: 'panel-empty' }, err.message));
-    }
-    if (!items.length && depth === 0) return fill(container, h('div', { class: 'panel-empty' }, '工作區是空的'));
-    fill(container, 
-      ...items.map((it) => {
-        const kids = h('div');
-        const rowEl = h('div', { class: 'file-row', style: { paddingLeft: `${8 + depth * 14}px` } }, icon(it.dir ? 'folder' : 'file'), h('span', { class: 'name' }, it.name));
-        rowEl.onclick = () => {
-          if (!it.dir) return openFile(sid, body, it.path, () => loadFiles(sid, body));
-          if (kids.firstChild) fill(kids);
-          else renderDir(kids, it.path, depth + 1);
-        };
-        return h('div', null, rowEl, kids);
-      }),
-    );
-  };
-  renderDir(tree, '.', 0);
-}
-
-async function openFile(sid, body, path, back) {
-  fill(body, h('div', { class: 'panel-empty' }, '載入中…'));
-  try {
-    const f = await get(`/sessions/${sid}/file?path=${encodeURIComponent(path)}`);
-    const head = h('div', { class: 'viewer-head' }, h('button', { class: 'icon-btn', onclick: back, title: '返回' }, icon('back')), h('span', { title: path }, path));
-    if (f.tooLarge || f.binary) return fill(body, head, h('div', { class: 'panel-empty' }, f.binary ? '二進位檔案，無法預覽' : '檔案太大，無法預覽'));
-    const lines = f.content.split('\n');
-    fill(body, head, h('div', { class: 'code-view' }, h('div', { class: 'ln' }, lines.map((_, i) => i + 1).join('\n')), h('div', { class: 'src' }, f.content)));
-  } catch (err) {
-    fill(body, h('div', { class: 'panel-empty' }, err.message));
-  }
-}
-
-// ---------------------------------------------------- folder picker
-
-function pickFolder(onPick, machineId = null) {
-  const list = h('div', { class: 'dir-list' });
-  const pathInput = h('input', { type: 'text', class: 'mono', style: { width: '100%' } });
-  const gitNote = h('span', { class: 'muted', style: { fontSize: '12.5px' } });
-  let cur = null;
-  const load = async (p) => {
-    try {
-      const q = new URLSearchParams();
-      if (p) q.set('path', p);
-      if (machineId) q.set('machine', machineId);
-      const r = await get(`/fs/dirs?${q}`);
-      cur = r.path;
-      pathInput.value = r.path;
-      gitNote.textContent = r.git ? '✓ git repo（比較模式會為每個 agent 建立獨立的 worktree）' : '';
-      fill(list, 
-        ...(r.parent ? [h('div', { class: 'file-row', onclick: () => load(r.parent) }, icon('back'), '..')] : []),
-        ...r.dirs.map((d) => h('div', { class: 'file-row', onclick: () => load(`${r.path.replace(/[\\/]+$/, '')}${r.path.includes('\\') && !r.path.includes('/') ? '\\' : '/'}${d}`) }, icon('folder'), h('span', { class: 'name' }, d))),
-      );
-    } catch (err) {
-      fail(err);
-    }
-  };
-  pathInput.onkeydown = (e) => e.key === 'Enter' && !e.isComposing && load(pathInput.value);
-  const m = modal(
+function sessionMenu(anchor) {
+  const s = S.cur?.summary;
+  if (!s) return;
+  openMenu(
+    anchor,
     [
-      h('div', { class: 'modal-head' }, h('h2', null, machineId ? `選擇資料夾 · ${S.machines.find((x) => x.id === machineId)?.name || ''}` : '選擇工作資料夾'), h('span', { class: 'spacer' }), h('button', { class: 'icon-btn', onclick: () => m.close() }, icon('x'))),
-      h(
-        'div',
-        { style: { padding: '14px 16px' } },
-        h('div', { class: 'field' }, pathInput),
-        list,
-        gitNote,
-        h('div', { class: 'form-actions', style: { justifyContent: 'flex-end', marginTop: '12px' } }, h('button', { class: 'btn', onclick: () => m.close() }, '取消'), h('button', { class: 'btn primary', onclick: () => (onPick(cur), m.close()) }, '使用這個資料夾')),
-      ),
+      { label: '重新命名…', onSelect: renameSession },
+      { label: '複製成新對話', hint: '/fork', onSelect: () => sessionCommand('fork', '') },
+      { label: '壓縮對話', hint: '/compact', onSelect: () => sessionCommand('compact', '') },
+      { label: '複製資料夾路徑', onSelect: () => copyText(s.cwd || '').then(() => toast('已複製')) },
+      { separator: true },
+      { label: '刪除對話…', destructive: true, onSelect: () => deleteRow({ key: `${s.machineId}:${s.kimiSessionId}`, title: s.title }, s.machineId, s.kimiSessionId) },
     ],
-    { small: true },
+    { align: 'end', width: 220 },
   );
-  load(S.home.cwdMachine === machineId ? S.home.cwd || '' : '');
 }
 
-// ------------------------------------------------------------ settings
-
-function openSettings(selectId, { login = false } = {}) {
-  const listEl = h('div', { class: 'alist' });
-  const formEl = h('div', { class: 'aform' });
-  const st = { selected: selectId || S.agents.find((a) => a.type === 'acp')?.id || S.agents[0]?.id, listEl, formEl, loginOut: null };
-  const m = modal(
-    [
-      h('div', { class: 'modal-head' }, icon('gear'), h('h2', null, 'Agents 設定'), h('span', { class: 'spacer' }), h('button', { class: 'icon-btn', onclick: () => m.close() }, icon('x'))),
-      h('div', { class: 'settings' }, listEl, formEl),
-    ],
-    { onClose: () => (S.settings = null) },
-  );
-  st.close = m.close;
-  S.settings = st;
-  drawSettings();
-  if (login) startLogin(st.selected);
+async function renameSession() {
+  const s = S.cur?.summary;
+  const title = await promptDialog({ title: '要把對話改成什麼名稱？', value: s.title, action: '重新命名' });
+  if (title?.trim()) sessionCommand('title', title.trim());
 }
 
-function drawSettings() {
-  const st = S.settings;
-  if (!st) return;
-  const rows = [h('button', { class: 'btn sm', style: { width: '100%', justifyContent: 'center', marginBottom: '4px' }, onclick: openTemplates }, icon('plus'), '新增 agent')];
-  for (const type of TYPE_ORDER) {
-    if (type === 'kimi-remote') continue;
-    const list = S.agents.filter((a) => a.type === type);
-    if (!list.length) continue;
-    rows.push(h('div', { class: 'grp' }, TYPE_TITLES[type]));
-    for (const a of list) {
-      rows.push(
-        h(
-          'div',
-          { class: `arow ${a.id === st.selected ? 'on' : ''} ${a.enabled ? '' : 'off'}`, onclick: () => ((st.selected = a.id), (st.test = null), drawSettings()) },
-          h('span', { class: 'avatar', style: { '--c': a.color } }, initials(a.name)),
-          h('span', { class: 'nm' }, a.name),
-          h('span', { class: `ok-dot ${a.enabled && a.available ? 'ok' : ''}`, title: a.available ? '可用' : a.reason }),
-        ),
-      );
-    }
-  }
-  fill(st.listEl, ...rows);
-  drawAgentForm();
-}
-
-function drawAgentForm() {
-  const st = S.settings;
-  const a = agentById(st.selected);
-  if (!a) return fill(st.formEl, h('div', { class: 'panel-empty' }, '選擇左側的 agent'));
-  const draft = { ...a };
-  const field = (label, key, { type = 'text', help, placeholder, mono, textarea } = {}) => {
-    const input = textarea
-      ? h('textarea', { placeholder: placeholder || '', oninput: (e) => (draft[key] = e.target.value) }, draft[key] ?? '')
-      : h('input', { type, value: draft[key] ?? '', placeholder: placeholder || '', class: mono ? 'mono' : '', oninput: (e) => (draft[key] = e.target.value) });
-    return h('div', { class: 'field' }, h('label', null, label), input, help ? h('div', { class: 'help' }, help) : null);
-  };
-  const envText = Object.entries(a.env || {}).map(([k, v]) => `${k}=${v}`).join('\n');
-  draft.envText = envText;
-
-  const parts = [
-    h(
-      'h3',
-      null,
-      h('span', { class: 'avatar', style: { '--c': a.color, width: '30px', height: '30px', borderRadius: '9px', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: '13px', background: a.color } }, initials(a.name)),
-      a.name,
-      h('span', { class: 'tag' }, a.typeLabel),
-      h('span', { style: { flex: 1 } }),
-      h('label', { class: 'switch' }, h('input', { type: 'checkbox', checked: a.enabled, onchange: (e) => saveAgent(a.id, { enabled: e.target.checked }) }), '啟用'),
-    ),
-    a.description ? h('p', { class: 'desc' }, a.description) : null,
-  ];
-  if (!a.available) parts.push(h('div', { class: 'test-result bad', style: { marginTop: 0, marginBottom: '14px' } }, a.reason));
-
-  if (a.type === 'acp') {
-    parts.push(
-      h(
-        'div',
-        { class: 'callout' },
-        '這類 agent 透過 ',
-        h('b', null, 'Agent Client Protocol (ACP)'),
-        ' 連線：中控台啟動 agent 程序，即時串流它的回覆、思考、工具呼叫與權限請求。登入沿用 agent 自己的帳號（例如 Kimi 會員訂閱），不需要 API key。',
-        a.install ? h('div', { style: { marginTop: '6px' } }, '安裝：', h('code', null, a.install)) : null,
-        a.login ? h('div', { style: { marginTop: '4px' } }, '登入：', h('code', null, a.login), '（或按下方「登入」在網頁完成）') : null,
-      ),
-      h('div', { class: 'fields-2' }, field('名稱', 'name'), field('顏色', 'color', { type: 'color' })),
-      h('div', { class: 'fields-2' }, field('啟動指令', 'command', { mono: true, help: '找不到時請填完整路徑（which kimi）' }), field('參數', 'args', { mono: true, help: '例如 Kimi Code：acp' })),
-      field('登入指令', 'login', { mono: true, placeholder: 'kimi login', help: '「登入」按鈕會執行這個指令並把輸出顯示在下方' }),
-      field('環境變數', 'envText', { textarea: true, placeholder: 'KEY=VALUE（每行一個）' }),
-    );
-  } else if (a.type === 'cli') {
-    parts.push(
-      h('div', { class: 'fields-2' }, field('名稱', 'name'), field('顏色', 'color', { type: 'color' })),
-      h('div', { class: 'fields-2' }, field('指令', 'command', { mono: true }), field('參數', 'args', { mono: true, help: '{prompt} 會被替換成提示詞' })),
-      h('div', { class: 'fields-2' }, field('模型（選填）', 'model', { mono: true }), h('div', { class: 'field' }, h('label', null, '輸出格式'), h('select', { onchange: (e) => (draft.cliKind = e.target.value) }, ['plain', 'aider'].map((k) => h('option', { value: k, selected: draft.cliKind === k }, k === 'plain' ? '一般（自動解析 JSON lines）' : 'Aider'))))),
-      field('環境變數', 'envText', { textarea: true, placeholder: 'KEY=VALUE（每行一個）' }),
-    );
-  } else if (a.type === 'openai') {
-    parts.push(
-      h('div', { class: 'callout' }, '透過 OpenAI 相容 API 呼叫模型（需要 API key，按量計費）。中控台提供工具（執行指令、讀寫檔案、搜尋、委派其他 agent）讓模型在工作區內工作。'),
-      h('div', { class: 'fields-2' }, field('名稱', 'name'), field('顏色', 'color', { type: 'color' })),
-      field('Base URL', 'baseUrl', { mono: true, placeholder: 'https://api.example.com/v1' }),
-      h('div', { class: 'fields-2' }, field('模型', 'model', { mono: true }), field('API key 環境變數', 'apiKeyEnv', { mono: true, help: a.apiKeyFromEnv ? '✓ 已偵測到此環境變數' : '未偵測到' })),
-      h(
-        'div',
-        { class: 'field' },
-        h('label', null, 'API key（選填，會以明文存在本機 data/agents.json）'),
-        h('input', { type: 'password', placeholder: a.hasApiKey ? '已設定（留空則不變更）' : '貼上 API key', oninput: (e) => (draft.apiKey = e.target.value) }),
-      ),
-      field('額外系統提示（選填）', 'systemPrompt', { textarea: true }),
-    );
-  } else {
-    parts.push(h('div', { class: 'fields-2' }, field('名稱', 'name'), field('顏色', 'color', { type: 'color' })));
-  }
-
-  const actions = h(
-    'div',
-    { class: 'form-actions' },
-    h(
-      'button',
-      {
-        class: 'btn primary',
-        onclick: () => {
-          const body = {};
-          for (const k of ['name', 'color', 'command', 'args', 'login', 'model', 'baseUrl', 'apiKeyEnv', 'systemPrompt', 'cliKind']) if (draft[k] !== a[k]) body[k] = draft[k];
-          if (draft.apiKey) body.apiKey = draft.apiKey;
-          if (draft.envText !== envText) {
-            body.env = Object.fromEntries(
-              draft.envText
-                .split('\n')
-                .map((l) => l.trim())
-                .filter((l) => l.includes('='))
-                .map((l) => [l.slice(0, l.indexOf('=')).trim(), l.slice(l.indexOf('=') + 1).trim()]),
-            );
-          }
-          saveAgent(a.id, body, true);
-        },
-      },
-      '儲存',
-    ),
-    h('button', { class: 'btn', onclick: () => testAgent(a.id) }, icon('bolt'), '測試連線'),
-    a.type === 'acp' ? h('button', { class: 'btn', onclick: () => startLogin(a.id) }, icon('login'), '登入') : null,
-    h('span', { style: { flex: 1 } }),
-    !a.builtin ? h('button', { class: 'btn danger', onclick: () => confirm(`刪除 ${a.name}？`) && del(`/agents/${a.id}`).then(() => ((S.settings.selected = null), loadAgents())).catch(fail) }, icon('trash'), '刪除') : null,
-  );
-  parts.push(actions);
-  if (st.test) parts.push(h('div', { class: `test-result ${st.test.ok ? 'ok' : 'bad'}` }, st.test.message));
-  if (st.login && st.login.agentId === a.id) parts.push(loginTerminal(a));
-  fill(st.formEl, ...parts.filter(Boolean));
-}
-
-async function saveAgent(id, body, notify) {
+async function sendMessage({ text, images }, from) {
+  const s = S.cur?.summary;
+  if (!s) return;
   try {
-    await put(`/agents/${id}`, body);
-    await loadAgents();
-    if (notify) toast('已儲存');
+    await post(`/sessions/${s.id}/messages`, { text, images, from });
+  } catch (err) {
+    if (!from) composer.setText(text);
+    fail(err);
+  }
+}
+
+async function interrupt() {
+  const s = S.cur?.summary;
+  if (!s || !busy(s.status)) return;
+  try {
+    await post(`/sessions/${s.id}/interrupt`);
   } catch (err) {
     fail(err);
   }
 }
 
-async function testAgent(id) {
-  const st = S.settings;
-  st.test = { ok: true, message: '測試中…（ACP agent 可能需要幾秒啟動）' };
-  drawAgentForm();
+async function configure(change) {
+  const s = S.cur?.summary;
+  if (!s) return;
   try {
-    st.test = await post(`/agents/${id}/test`);
+    await post(`/sessions/${s.id}/config`, change);
   } catch (err) {
-    st.test = { ok: false, message: err.message };
+    fail(err);
   }
-  if (S.settings === st && st.selected === id) drawAgentForm();
 }
 
-function startLogin(id) {
-  const st = S.settings;
-  if (!st) return;
-  st.selected = id;
-  st.login = { agentId: id, text: '', running: true };
-  drawSettings();
-  post(`/agents/${id}/login`).catch((err) => {
-    st.login.text += `\n${err.message}\n`;
-    st.login.running = false;
-    drawAgentForm();
-  });
+async function respond(ev, optionId, extra = {}) {
+  const s = S.cur?.summary;
+  try {
+    await post(`/sessions/${s.id}/permissions/${ev.id}`, { optionId, ...extra });
+  } catch (err) {
+    fail(err);
+    throw err;
+  }
 }
 
-function loginTerminal(a) {
-  const st = S.settings;
-  const out = h('pre', { class: 'term', html: linkify(st.login.text) || '啟動中…' });
-  st.loginOut = out;
-  const input = h('input', { placeholder: '需要輸入時在這裡回覆（Enter 送出）' });
-  input.onkeydown = (e) => {
-    if (e.key === 'Enter' && !e.isComposing) {
-      post(`/agents/${a.id}/login/input`, { text: input.value }).catch(fail);
-      input.value = '';
+async function sessionCommand(name, args) {
+  const s = S.cur?.summary;
+  if (!s) return;
+  const meta = s.meta || {};
+  switch (name) {
+    case 'model':
+    case 'effort':
+    case 'permission':
+      if (!composer.openControl(name)) toast('這個模型沒有提供這個選項');
+      return;
+    case 'plan':
+      return configure({ planMode: !meta.planMode });
+    case 'yolo':
+    case 'auto':
+    case 'manual':
+      await configure({ permission: name });
+      return toast(`權限模式：${PERMISSION_LABELS[name]}`);
+    case 'new':
+      S.home.machineId = s.machineId;
+      S.home.cwdByMachine = { ...(S.home.cwdByMachine || {}), [s.machineId]: s.cwd };
+      saveHome();
+      return go('#/');
+    case 'copy': {
+      const last = S.cur.transcript.all().reverse().find((e) => e.type === 'text' && !e.parent && e.text?.trim());
+      if (!last) return toast('還沒有回覆可以複製');
+      await copyText(last.text);
+      return toast('已複製 Kimi 的回覆');
     }
-  };
-  const box = h('div', { class: 'login-term' });
-  requestAnimationFrame(() => {
-    out.scrollTop = out.scrollHeight;
-    if (!st.login.scrolled) {
-      st.login.scrolled = true;
-      box.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-    }
-  });
-  return fill(
-    box,
-    h('div', { class: 'sec-label', style: { fontSize: '12.5px', fontWeight: 600, marginBottom: '6px', color: 'var(--text-2)' } }, st.login.running ? '登入中 — 打開下方網址並輸入代碼，用你的帳號（例如 Kimi 會員）授權' : '登入程序已結束'),
-    out,
-    st.login.running ? h('div', { class: 'in' }, input, h('button', { class: 'btn sm', onclick: () => post(`/agents/${a.id}/login/cancel`) }, '取消')) : null,
+    case 'init':
+      return sendMessage({ text: INIT_PROMPT, images: [] });
+  }
+  try {
+    const r = await post(`/sessions/${s.id}/command`, { name, args });
+    if (r.session) {
+      S.sessions.set(r.session.id, r.session);
+      toast('已複製成新對話', { action: '開啟', onAction: () => go(`#/s/${r.session.id}`) });
+    } else if (name === 'undo') toast('已撤回上一輪');
+    else if (name === 'goal') toast('已更新目標');
+  } catch (err) {
+    fail(err);
+  }
+}
+
+// --------------------------------------------------------------- panel
+
+function showPanel(tab) {
+  S.panel = { ...(S.panel || {}), tab };
+  $panel.hidden = false;
+  $app.classList.add('with-panel');
+  renderToolbar();
+}
+
+function hidePanel() {
+  S.panel = null;
+  $panel.hidden = true;
+  $app.classList.remove('with-panel', 'panel-wide');
+  artifactView?.destroy();
+  artifactView = null;
+  fill($panel);
+  renderToolbar();
+  S.cur?.transcript && S.artifacts.length && S.cur.transcript.order.forEach((id) => S.cur.transcript.get(id)?.name && S.cur.transcript.markDirty(id));
+}
+
+function panelHead(...right) {
+  const tab = S.panel?.tab;
+  return h(
+    'div',
+    { class: 'panel-head' },
+    h(
+      'div',
+      { class: 'om-seg om-seg--sm', role: 'group' },
+      S.artifacts.length ? h('button', { class: 'om-seg__item', type: 'button', 'aria-pressed': String(tab === 'artifact'), onclick: () => showArtifact() }, 'Artifact') : null,
+      h('button', { class: 'om-seg__item', type: 'button', 'aria-pressed': String(tab === 'changes'), onclick: showChanges }, '變更'),
+    ),
+    h('span', { class: 'om-toolbar__spacer' }),
+    ...right,
+    h('button', { class: 'om-btn om-btn--toolbar', type: 'button', title: '關閉', 'aria-label': '關閉面板', onclick: hidePanel }, icon('x')),
   );
 }
 
-function openTemplates() {
-  const grid = h('div', { class: 'tpl-grid' });
-  const m = modal([h('div', { class: 'modal-head' }, h('h2', null, '新增 agent'), h('span', { class: 'spacer' }), h('button', { class: 'icon-btn', onclick: () => m.close() }, icon('x'))), grid], { small: true });
-  get('/templates')
-    .then((tpls) => {
-      fill(grid, 
-        ...tpls.map((t) =>
-          h(
-            'button',
-            {
-              class: 'acard',
-              onclick: async () => {
-                try {
-                  const a = await post('/agents', { templateId: t.id, name: t.name });
-                  await loadAgents();
-                  m.close();
-                  if (S.settings) {
-                    S.settings.selected = a.id;
-                    drawSettings();
-                  }
-                } catch (err) {
-                  fail(err);
-                }
-              },
-            },
-            h('div', { class: 'top' }, h('span', { class: 'avatar', style: { '--c': t.color } }, initials(t.name)), t.name),
-            h('div', { class: 'st' }, t.description || t.typeLabel),
+// Artifact tab: the newest version of the chosen page, kept in sync while
+// Kimi writes it.
+function showArtifact(path, version) {
+  if (!S.artifacts.length) return;
+  const wasArtifact = S.panel?.tab === 'artifact';
+  const art = S.artifacts.find((a) => a.path === (path || S.panel?.path)) || S.artifacts.at(-1);
+  showPanel('artifact');
+  S.panel.path = art.path;
+  S.panel.version = version && version !== art.versions.at(-1).id ? version : null;
+  if (!artifactView) {
+    artifactView = new ArtifactView({
+      onSend: (text) => {
+        sendMessage({ text, images: [] }, 'artifact');
+        toast('已從 Artifact 送出訊息');
+      },
+      onFill: (text) => composer?.setText(text),
+    });
+  }
+  if (!wasArtifact || !$panel.contains(artifactView.el)) {
+    fill($panel, h('div', { class: 'panel-artifact' }, (S.panel.headEl = h('div')), artifactView.el));
+  }
+  drawArtifactHead();
+  syncArtifact(true);
+  S.cur?.transcript && markArtifactRows();
+}
+
+function markArtifactRows() {
+  const t = S.cur.transcript;
+  for (const a of S.artifacts) for (const v of a.versions) t.markDirty(v.id);
+}
+
+function drawArtifactHead() {
+  if (S.panel?.tab !== 'artifact' || !S.panel.headEl) return;
+  const art = S.artifacts.find((a) => a.path === S.panel.path);
+  if (!art) return;
+  const v = art.versions.find((x) => x.id === S.panel.version) || art.versions.at(-1);
+  const idx = art.versions.indexOf(v);
+  const step = (d) => {
+    const next = art.versions[idx + d];
+    if (!next) return;
+    S.panel.version = idx + d === art.versions.length - 1 ? null : next.id;
+    drawArtifactHead();
+    syncArtifact(true);
+  };
+  const head = panelHead(
+    art.versions.length > 1
+      ? h(
+          'div',
+          { class: 'versions' },
+          h('button', { class: 'om-btn om-btn--toolbar', type: 'button', title: '上一版', 'aria-label': '上一版', disabled: idx === 0, onclick: () => step(-1) }, icon('back')),
+          h('span', { class: 'versions-label' }, `${idx + 1}/${art.versions.length}`),
+          h('button', { class: 'om-btn om-btn--toolbar', type: 'button', title: '下一版', 'aria-label': '下一版', disabled: idx === art.versions.length - 1, onclick: () => step(1) }, icon('chev')),
+        )
+      : null,
+    h('button', { class: 'om-btn om-btn--toolbar', type: 'button', title: '重新載入', 'aria-label': '重新載入', onclick: () => syncArtifact(true, true) }, icon('refresh')),
+    h('button', { class: 'om-btn om-btn--toolbar', type: 'button', title: '下載 HTML', 'aria-label': '下載 HTML', onclick: () => artifactView?.html && downloadHtml(artifactView.html, art.path) }, icon('download')),
+    h('button', { class: 'om-btn om-btn--toolbar wide-only', type: 'button', title: $app.classList.contains('panel-wide') ? '縮小' : '放大', 'aria-label': '放大面板', onclick: () => ($app.classList.toggle('panel-wide'), drawArtifactHead()) }, icon($app.classList.contains('panel-wide') ? 'shrink' : 'expand')),
+  );
+  const titles = h(
+    'div',
+    { class: 'artifact-titles' },
+    S.artifacts.length > 1
+      ? h(
+          'button',
+          {
+            class: 'artifact-pick',
+            type: 'button',
+            onclick: (e) => openMenu(e.currentTarget, S.artifacts.map((a) => ({ label: a.title, description: a.path, checked: a.path === art.path, onSelect: () => showArtifact(a.path) })), { width: 300 }),
+          },
+          h('span', null, htmlTitle(v.html, art.path)),
+          icon('down', 'caret'),
+        )
+      : h('span', { class: 'artifact-name' }, htmlTitle(v.html, art.path)),
+    h('span', { class: 'artifact-path' }, art.path),
+  );
+  fill(S.panel.headEl, head, titles);
+}
+
+// Push the selected version into the frame. Versions we can only read from
+// disk (edits made before the hub saw the file) are fetched.
+async function syncArtifact(force = false, reload = false) {
+  if (S.panel?.tab !== 'artifact' || !artifactView) return;
+  const art = S.artifacts.find((a) => a.path === S.panel.path);
+  if (!art) return;
+  const v = art.versions.find((x) => x.id === S.panel.version) || art.versions.at(-1);
+  drawArtifactHead();
+  if (v.html != null && !reload) return artifactView.show(v.html, { streaming: v.streaming });
+  if (v.streaming) return artifactView.placeholder('正在產生頁面…');
+  const isLatest = v === art.versions.at(-1);
+  if (!isLatest) return artifactView.placeholder('沒辦法顯示這個版本');
+  if (!force && artifactView.loadedFrom === v.id) return;
+  artifactView.loadedFrom = v.id;
+  try {
+    const cwd = S.cur.summary.cwd;
+    const rel = cwd && art.path.startsWith(`${cwd}/`) ? art.path.slice(cwd.length + 1) : art.path;
+    const f = await get(`/sessions/${S.cur.id}/file?path=${encodeURIComponent(rel)}`);
+    if (f.content != null) artifactView.show(f.content);
+  } catch (err) {
+    artifactView.placeholder(`沒辦法讀取 ${art.path}：${err.message}`);
+  }
+}
+
+async function showChanges() {
+  const s = S.cur?.summary;
+  if (!s) return;
+  showPanel('changes');
+  artifactView?.destroy();
+  artifactView = null;
+  const body = h('div', { class: 'panel-body' }, h('div', { class: 'loading' }, h('span', { class: 'spinner' }), '正在讀取變更…'));
+  const refresh = h('button', { class: 'om-btn om-btn--toolbar', type: 'button', title: '重新整理', 'aria-label': '重新整理', onclick: showChanges }, icon('refresh'));
+  fill($panel, h('div', { class: 'panel-changes' }, panelHead(refresh), body));
+  try {
+    const r = await get(`/sessions/${s.id}/changes`);
+    if (S.panel?.tab !== 'changes') return;
+    if (!r.git) return fill(body, h('div', { class: 'panel-empty' }, '這個資料夾不是 git 專案，沒辦法列出變更。'));
+    const files = parseUnifiedDiff(r.diff);
+    if (!files.length) return fill(body, h('div', { class: 'panel-empty' }, r.branch ? `${r.branch} 上沒有未提交的變更。` : '沒有未提交的變更。'));
+    const added = files.reduce((n, f) => n + f.added, 0);
+    const removed = files.reduce((n, f) => n + f.removed, 0);
+    fill(
+      body,
+      h('div', { class: 'changes-sum' }, `${files.length} 個檔案`, h('span', { class: 'plus' }, ` +${added}`), h('span', { class: 'minus' }, ` −${removed}`), r.branch ? h('span', { class: 'muted' }, ` · ${r.branch}`) : null),
+      ...files.map((f) => {
+        const d = h('details', { class: 'change', open: files.length <= 6 });
+        d.append(
+          h('summary', null, icon('chev', 'chev'), h('span', { class: 'change-path' }, f.path), f.status === 'added' ? h('span', { class: 'om-badge om-badge--success' }, '新增') : f.status === 'deleted' ? h('span', { class: 'om-badge om-badge--danger' }, '刪除') : null, h('span', { class: 'change-stat' }, h('span', { class: 'plus' }, `+${f.added}`), h('span', { class: 'minus' }, ` −${f.removed}`))),
+          renderHunks(f.lines),
+        );
+        return d;
+      }),
+    );
+  } catch (err) {
+    fill(body, h('div', { class: 'panel-empty' }, err.message));
+  }
+}
+
+// ------------------------------------------------------------- dialogs
+
+let dialogClose = null;
+
+function dialog(content, { wide = false, onClose } = {}) {
+  dialogClose?.();
+  const box = h('div', { class: `dialog${wide ? ' wide' : ''}`, role: 'dialog', 'aria-modal': 'true' }, content);
+  const back = h('div', { class: 'dialog-back', onclick: (e) => e.target === back && close() }, box);
+  const prevFocus = document.activeElement;
+  function close() {
+    back.remove();
+    dialogClose = null;
+    onClose?.();
+    prevFocus?.focus?.();
+  }
+  dialogClose = close;
+  document.body.append(back);
+  setTimeout(() => box.querySelector('[autofocus], input, .om-btn--primary')?.focus(), 0);
+  return { box, close };
+}
+
+function confirmDialog({ title, body, action, destructive }) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      d.close();
+      resolve(v);
+    };
+    const d = dialog(
+      h(
+        'div',
+        { class: 'alert' },
+        h('div', { class: 'om-alert__title' }, title),
+        body ? h('p', { class: 'om-alert__body' }, body) : null,
+        h('div', { class: 'dialog-actions' }, h('button', { class: 'om-btn', type: 'button', onclick: () => finish(false) }, '取消'), h('button', { class: `om-btn ${destructive ? 'om-btn--destructive' : 'om-btn--primary'}`, type: 'button', autofocus: true, onclick: () => finish(true) }, action)),
+      ),
+      { onClose: () => finish(false) },
+    );
+  });
+}
+
+function promptDialog({ title, value = '', action }) {
+  return new Promise((resolve) => {
+    let done = false;
+    const input = h('input', { class: 'om-input', type: 'text', value, autofocus: true });
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      d.close();
+      resolve(v);
+    };
+    const form = h(
+      'form',
+      { class: 'alert', onsubmit: (e) => (e.preventDefault(), finish(input.value)) },
+      h('div', { class: 'om-alert__title' }, title),
+      input,
+      h('div', { class: 'dialog-actions' }, h('button', { class: 'om-btn', type: 'button', onclick: () => finish(null) }, '取消'), h('button', { class: 'om-btn om-btn--primary', type: 'submit' }, action)),
+    );
+    const d = dialog(form, { onClose: () => finish(null) });
+    setTimeout(() => input.select(), 0);
+  });
+}
+
+let machinesDialog = null;
+
+async function openMachines() {
+  let hub = { bridgeKey: '', bridgePath: '/bridge/agent-hub-bridge.mjs' };
+  try {
+    hub = await get('/hub');
+  } catch {}
+  const content = h('div', { class: 'machines' });
+  const d = dialog(content, { wide: true, onClose: () => (machinesDialog = null) });
+  machinesDialog = { draw: () => drawMachines(content, hub, d), close: d.close };
+  machinesDialog.draw();
+}
+
+function drawMachines(content, hub, d) {
+  const origin = location.origin;
+  const local = /^(localhost|127\.|\[::1\])/.test(location.hostname);
+  const unix = `curl -fsSL ${origin}${hub.bridgePath} -o agent-hub-bridge.mjs && node agent-hub-bridge.mjs --hub ${origin} --key ${hub.bridgeKey}`;
+  const win = `curl.exe -fsSL ${origin}${hub.bridgePath} -o agent-hub-bridge.mjs; node agent-hub-bridge.mjs --hub ${origin} --key ${hub.bridgeKey}`;
+  const os = d.os || (/Win/.test(navigator.platform) ? 'win' : 'unix');
+  const cmd = os === 'win' ? win : unix;
+  const status = (m) => (!m.online ? h('span', { class: 'om-badge' }, '離線') : h('span', { class: 'om-badge om-badge--success' }, icon('check'), '在線上'));
+  const wrap = 'node ~/.agent-hub/agent-hub-bridge.mjs kimi';
+  fill(
+    content,
+    h('div', { class: 'dialog-title' }, '你的電腦'),
+    S.machines.length
+      ? h(
+          'div',
+          { class: 'om-group' },
+          ...S.machines.map((m) =>
+            h(
+              'div',
+              { class: 'om-group__row' },
+              icon('computer'),
+              h(
+                'div',
+                { class: 'om-group__text' },
+                h('div', { class: 'om-group__label' }, m.name),
+                h('div', { class: 'om-group__hint' }, [m.platform, m.kimi?.version ? `Kimi Code ${m.kimi.version}` : null, m.online ? `${(m.sessions || []).length} 個對話` : `上次連線：${relTime(m.lastSeen || 0)}`].filter(Boolean).join(' · ')),
+              ),
+              status(m),
+              !m.online ? h('button', { class: 'om-btn om-btn--sm om-btn--destructive', type: 'button', onclick: () => removeMachine(m) }, '移除…') : null,
+            ),
           ),
+        )
+      : h('p', { class: 'dialog-text' }, '還沒有連接任何電腦。'),
+    h('div', { class: 'dialog-subtitle' }, '連接一台電腦'),
+    h(
+      'ol',
+      { class: 'steps' },
+      h('li', null, '在那台電腦安裝 Node.js 22 以上與 ', h('a', { href: 'https://github.com/MoonshotAI/kimi-code', target: '_blank', rel: 'noopener' }, 'Kimi Code'), '，並執行 ', h('code', null, 'kimi login'), ' 登入你的 Kimi 帳號。'),
+      h(
+        'li',
+        null,
+        '在那台電腦的終端機執行：',
+        h(
+          'div',
+          { class: 'om-seg om-seg--sm os-seg', role: 'group' },
+          h('button', { class: 'om-seg__item', type: 'button', 'aria-pressed': String(os === 'unix'), onclick: () => ((d.os = 'unix'), drawMachines(content, hub, d)) }, 'macOS / Linux'),
+          h('button', { class: 'om-seg__item', type: 'button', 'aria-pressed': String(os === 'win'), onclick: () => ((d.os = 'win'), drawMachines(content, hub, d)) }, 'Windows'),
         ),
-      );
-    })
-    .catch(fail);
-}
-
-// ----------------------------------------------------------- live data
-
-let agentsTimer = 0;
-function loadAgentsSoon() {
-  clearTimeout(agentsTimer);
-  agentsTimer = setTimeout(() => loadAgents().catch(() => {}), 300);
-}
-
-async function loadAgents() {
-  S.agents = await get('/agents');
-  renderSidebar();
-  if (S.settings) drawSettings();
-  if (S.view?.kind === 'home') S.view.composer.refresh();
-}
-
-async function loadSessions() {
-  const list = await get('/sessions');
-  S.sessions = new Map(list.map((s) => [s.id, s]));
-  renderSidebar();
-}
-
-function visibleConvs(sid) {
-  const v = S.view;
-  if (!v) return [];
-  if (v.kind === 'session' && v.sid === sid) return [v.conv];
-  if (v.kind === 'group' && v.convs.has(sid)) return [v.convs.get(sid)];
-  return [];
-}
-
-const notified = new Set();
-function onMessage(msg) {
-  switch (msg.t) {
-    case 'event':
-    case 'delta':
-    case 'patch': {
-      const buf = pending.get(msg.sid);
-      if (buf) buf.push(msg);
-      else for (const conv of visibleConvs(msg.sid)) applyToConv(conv, msg);
-      const st = msg.t === 'patch' ? msg.fields?.status : msg.t === 'event' ? msg.ev.status : null;
-      if (st === 'done' || st === 'error' || (msg.t === 'event' && msg.ev.type === 'turn_end')) refreshPanelSoon(msg.sid);
-      break;
-    }
-    case 'session': {
-      const prev = S.sessions.get(msg.session.id);
-      S.sessions.set(msg.session.id, msg.session);
-      renderSidebar();
-      for (const conv of visibleConvs(msg.session.id)) conv.setStatus(msg.session);
-      const v = S.view;
-      if (v?.kind === 'session' && v.sid === msg.session.id) {
-        drawTopbar();
-        v.composer.refresh();
-      } else if (v?.kind === 'group' && v.heads.has(msg.session.id)) {
-        drawGroupHead(msg.session.id);
-        v.composer.refresh();
-      }
-      // Surface approvals needed by sessions that are not on screen.
-      if (msg.session.status === 'awaiting_permission' && prev?.status !== 'awaiting_permission' && !visibleConvs(msg.session.id).length && Date.now() > (S.quietUntil || 0)) {
-        if (!notified.has(msg.session.id)) {
-          notified.add(msg.session.id);
-          setTimeout(() => notified.delete(msg.session.id), 3000);
-          toast(`${agentName(msg.session.agentId)} 需要你的確認：${msg.session.title}`, { action: { label: '前往', run: () => go(`#/s/${msg.session.id}`) }, timeout: 9000 });
-        }
-      }
-      break;
-    }
-    case 'deleted':
-      S.sessions.delete(msg.sid);
-      renderSidebar();
-      if (S.view?.sid === msg.sid || (S.view?.kind === 'group' && S.view.convs.has(msg.sid))) go('#/');
-      break;
-    case 'agents':
-      loadAgents().catch(() => {});
-      break;
-    case 'machine': {
-      const i = S.machines.findIndex((m) => m.id === msg.machine.id);
-      const prev = S.machines[i];
-      if (i === -1) S.machines.push(msg.machine);
-      else S.machines[i] = msg.machine;
-      renderSidebar();
-      // Remote Kimi agents come and go with their machine.
-      if (!prev || prev.online !== msg.machine.online || prev.kimi?.available !== msg.machine.kimi?.available) loadAgentsSoon();
-      for (const k of msg.machine.sessions || []) {
-        const was = prev?.sessions?.find((x) => x.id === k.id);
-        const attached = [...S.sessions.values()].some((s) => s.kimiSessionId === k.id);
-        if (!attached && k.pending === 'approval' && was?.pending !== 'approval') {
-          toast(`${msg.machine.name} 上的 Kimi 需要你的確認：${k.title}`, { action: { label: '接管', run: () => attachKimi(msg.machine.id, k.id) }, timeout: 9000 });
-        }
-      }
-      break;
-    }
-    case 'machines':
-      loadMachines().catch(() => {});
-      loadAgentsSoon();
-      break;
-    case 'reset':
-      for (const conv of visibleConvs(msg.sid)) loadInto(conv).then(() => conv.setStatus(S.sessions.get(msg.sid))).catch(() => {});
-      break;
-    case 'login': {
-      const st = S.settings;
-      if (st?.login?.agentId === msg.agentId) {
-        st.login.text += msg.text;
-        if (st.loginOut) {
-          st.loginOut.innerHTML = linkify(st.login.text);
-          st.loginOut.scrollTop = st.loginOut.scrollHeight;
-        }
-      }
-      break;
-    }
-    case 'login_end': {
-      const st = S.settings;
-      if (st?.login?.agentId === msg.agentId) {
-        st.login.running = false;
-        st.login.text += `\n[結束，代碼 ${msg.code}]\n`;
-        drawAgentForm();
-        if (msg.code === 0) testAgent(msg.agentId);
-      }
-      break;
-    }
-    default:
-  }
-}
-
-let banner = null;
-let everConnected = false;
-function onStatus(ok) {
-  S.connected = ok;
-  if (ok) {
-    banner?.remove();
-    banner = null;
-    if (everConnected) {
-      // Resync everything that may have changed while disconnected.
-      Promise.all([loadAgents(), loadSessions(), loadMachines()]).then(() => route()).catch(() => {});
-    }
-    everConnected = true;
-  } else if (!banner && everConnected) {
-    banner = h('div', { class: 'conn-banner' }, '與伺服器的連線中斷，重新連線中…');
-    L.main.append(banner);
-  }
-}
-
-// --------------------------------------------------------------- boot
-
-function showLogin() {
-  const input = h('input', { type: 'password', id: 'hub-token', placeholder: '登入密碼', autocomplete: 'current-password' });
-  const err = h('div', { class: 'err' });
-  const form = h(
-    'form',
-    { class: 'login-card' },
-    h('div', { class: 'logo' }, icon('logo')),
-    h('h1', null, 'Agent Hub'),
-    h('p', null, '輸入中控台啟動時顯示的登入密碼'),
-    input,
-    err,
-    h('button', { class: 'btn primary', type: 'submit' }, '登入'),
+        h('div', { class: 'cmd' }, h('code', null, cmd), h('button', { class: 'om-btn om-btn--sm', type: 'button', onclick: (e) => copyText(cmd).then(() => ((e.target.textContent = '已複製'), setTimeout(() => (e.target.textContent = '複製'), 1500))) }, '複製')),
+        local ? h('div', { class: 'om-field__help' }, '目前是用本機網址開啟。其他電腦要連上，請改用公網網址（npm run public 會印出來）開啟這個畫面再複製。') : null,
+      ),
+      h('li', null, '完成。那台電腦的 Kimi 對話（包含終端機裡正在跑的）會即時出現在左邊。'),
+    ),
+    h('div', { class: 'dialog-subtitle' }, '從這裡操作終端機裡的 Kimi'),
+    h('p', { class: 'dialog-text' }, '終端機裡的 Kimi 會自動同步到這裡。想從這裡送訊息、核准或停止它，改用這個指令啟動 Kimi（macOS / Linux，需要 python3）：'),
+    h('div', { class: 'cmd' }, h('code', null, wrap), h('button', { class: 'om-btn om-btn--sm', type: 'button', onclick: (e) => copyText(wrap).then(() => ((e.target.textContent = '已複製'), setTimeout(() => (e.target.textContent = '複製'), 1500))) }, '複製')),
+    h('p', { class: 'dialog-text muted' }, "可以加進 ~/.bashrc 或 ~/.zshrc：alias kimi-hub='node ~/.agent-hub/agent-hub-bridge.mjs kimi'。正在跑的 Kimi 也可以輸入 /web，把對話交給這裡。"),
+    h('p', { class: 'dialog-text muted' }, '連接器只會轉送 Kimi 的對話、權限請求與對話資料夾的檔案；Kimi 的登入資料留在那台電腦上。'),
+    h('div', { class: 'dialog-actions' }, h('button', { class: 'om-btn om-btn--primary', type: 'button', onclick: d.close }, '完成')),
   );
-  form.onsubmit = async (e) => {
-    e.preventDefault();
-    setToken(input.value.trim());
+}
+
+async function removeMachine(m) {
+  const ok = await confirmDialog({ title: `要移除「${m.name}」嗎？`, body: '之後要再連接時，在那台電腦重新執行連接指令就好。', action: '移除', destructive: true });
+  if (!ok) return;
+  try {
+    await del(`/machines/${m.id}`);
+    await loadMachines();
+  } catch (err) {
+    fail(err);
+  }
+  openMachines();
+}
+
+function browseFolders(m, pick) {
+  const list = h('div', { class: 'dirs' });
+  const crumb = h('div', { class: 'crumb' });
+  let current = null;
+  const choose = h('button', { class: 'om-btn om-btn--primary', type: 'button', onclick: () => (pick(current), d.close()) }, '選擇這個資料夾');
+  const d = dialog(h('div', { class: 'browse' }, h('div', { class: 'dialog-title' }, `「${m.name}」上的資料夾`), crumb, list, h('div', { class: 'dialog-actions' }, h('button', { class: 'om-btn', type: 'button', onclick: () => d.close() }, '取消'), choose)), { wide: true });
+  const load = async (path) => {
+    fill(list, h('div', { class: 'loading' }, h('span', { class: 'spinner' })));
     try {
-      await get('/config');
-      location.reload();
-    } catch (er) {
-      err.textContent = er.status === 401 ? '密碼不正確' : er.message;
+      const r = await get(`/fs/dirs?machine=${encodeURIComponent(m.id)}${path ? `&path=${encodeURIComponent(path)}` : ''}`);
+      current = r.path;
+      fill(crumb, icon('folder'), h('span', null, shortPath(r.path, m.home, 6)));
+      fill(
+        list,
+        r.parent ? h('button', { class: 'dir up', type: 'button', onclick: () => load(r.parent) }, icon('back'), '上一層') : null,
+        ...r.dirs.map((name) => h('button', { class: 'dir', type: 'button', ondblclick: () => (pick(`${r.path}/${name}`), d.close()), onclick: () => load(`${r.path.replace(/\/$/, '')}/${name}`) }, icon('folder'), name)),
+        !r.dirs.length ? h('div', { class: 'panel-empty' }, '這裡沒有子資料夾。') : null,
+      );
+    } catch (err) {
+      fill(list, h('div', { class: 'panel-empty' }, err.message));
     }
   };
-  fill($app, h('div', { class: 'login-wrap' }, form));
-  input.focus();
+  load(S.home.cwdByMachine?.[m.id] || '');
 }
+
+function lightbox(src) {
+  const d = dialog(h('img', { class: 'lightbox-img', src, alt: '圖片', onclick: () => d.close() }), { wide: true });
+  d.box.classList.add('lightbox');
+}
+
+// ---------------------------------------------------------------- login
+
+function showLogin(message) {
+  $app.className = 'app om login-mode';
+  const input = h('input', { class: 'om-input', type: 'password', placeholder: '登入密碼', autocomplete: 'current-password', autofocus: true, 'aria-label': '登入密碼' });
+  const err = h('div', { class: 'om-field__error', role: 'alert' }, message || '');
+  fill(
+    $app,
+    h(
+      'form',
+      {
+        class: 'login',
+        onsubmit: async (e) => {
+          e.preventDefault();
+          setToken(input.value.trim());
+          try {
+            await get('/config');
+            location.reload();
+          } catch {
+            err.textContent = '密碼不正確。';
+            input.select();
+          }
+        },
+      },
+      h('div', { class: 'login-mark' }, icon('sparkle')),
+      h('div', { class: 'login-title' }, 'Agent Hub'),
+      h('p', { class: 'login-text' }, '輸入中控台的登入密碼。密碼在啟動中控台時會印在終端機上。'),
+      input,
+      err,
+      h('button', { class: 'om-btn om-btn--primary om-btn--lg om-btn--block', type: 'submit' }, '登入'),
+    ),
+  );
+  setTimeout(() => input.focus(), 0);
+}
+
+// ------------------------------------------------------------ live data
 
 async function loadMachines() {
   S.machines = await get('/machines');
   renderSidebar();
 }
 
-async function boot() {
-  buildLayout();
+async function loadSessions() {
+  const list = await get('/sessions');
+  S.sessions = new Map(list.filter((s) => s.kimiSessionId).map((s) => [s.id, s]));
+  renderSidebar();
+}
+
+function upsertSession(s) {
+  if (!s.kimiSessionId) return;
+  const prev = S.sessions.get(s.id);
+  S.sessions.set(s.id, s);
+  renderSidebar();
+  if (S.cur?.id === s.id) {
+    const was = S.cur.summary?.status;
+    S.cur.summary = s;
+    if (was !== s.status) S.cur.transcript.setStatus(s.status, busy(s.status) && !busy(was) ? Date.now() : null);
+    updateComposer();
+    if (prev?.title !== s.title || prev?.cwd !== s.cwd) renderToolbar();
+    if (was && busy(was) && !busy(s.status) && S.panel?.tab === 'changes') showChanges();
+  }
+}
+
+function onMessage(m) {
+  switch (m.t) {
+    case 'session':
+      return upsertSession(m.session);
+    case 'deleted':
+      S.sessions.delete(m.sid);
+      if (S.cur?.id === m.sid) go('#/');
+      return renderSidebar();
+    case 'event':
+    case 'patch':
+    case 'delta':
+    case 'reset': {
+      const cur = S.cur;
+      if (!cur || cur.id !== m.sid || cur.loading) return;
+      if (m.t === 'reset' || m.seq !== cur.seq + 1) return resync();
+      cur.seq = m.seq;
+      const t = cur.transcript;
+      if (m.t === 'event') t.add(m.ev);
+      else if (m.t === 'patch') t.patch(m.id, m.fields);
+      else t.delta(m.id, m.field, m.text);
+      return;
+    }
+    case 'machine': {
+      const i = S.machines.findIndex((x) => x.id === m.machine.id);
+      const before = i === -1 ? null : S.machines[i];
+      if (i === -1) S.machines.push(m.machine);
+      else S.machines[i] = m.machine;
+      renderSidebar();
+      machinesDialog?.draw();
+      if (S.route === 'home' && (!before || before.online !== m.machine.online || before.kimi?.available !== m.machine.kimi?.available)) showHome();
+      return;
+    }
+    case 'machines':
+      return loadMachines().then(() => machinesDialog?.draw());
+    case 'kimi.session': {
+      const mc = machineById(m.machineId);
+      if (!mc) return;
+      mc.sessions ??= [];
+      if (m.removed) mc.sessions = mc.sessions.filter((x) => x.id !== m.id);
+      else {
+        const i = mc.sessions.findIndex((x) => x.id === m.session.id);
+        if (i === -1) mc.sessions.unshift(m.session);
+        else mc.sessions[i] = m.session;
+      }
+      return renderSidebar();
+    }
+  }
+}
+
+// ------------------------------------------------------------- startup
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !e.defaultPrevented) {
+    if (dialogClose) return dialogClose();
+    if (menuOpen()) return closeMenu();
+    if ($app.classList.contains('drawer')) return closeDrawer();
+    if (S.cur && busy(S.cur.summary?.status) && !e.target.closest?.('input, textarea')) interrupt();
+  }
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+    e.preventDefault();
+    go('#/');
+  }
+});
+window.addEventListener('focus', updateTitle);
+
+async function start() {
+  try {
+    applyTheme(localStorage.getItem('hubTheme'));
+  } catch {}
   try {
     S.config = await get('/config');
   } catch (err) {
     if (err.status === 401) return showLogin();
-    fill(L.main, h('div', { class: 'panel-empty' }, `無法連線到伺服器：${err.message}`));
+    fill($view, h('div', { class: 'loading' }, `連不上中控台：${err.message}`));
     return;
   }
-  await Promise.all([loadAgents(), loadSessions(), loadMachines()]);
-  connect(onMessage, onStatus);
-  addEventListener('hashchange', route);
-  addEventListener('resize', () => S.view?.kind && drawTopbar());
+  await Promise.all([loadMachines(), loadSessions()]).catch(fail);
+  connect(onMessage, (ok) => {
+    const was = S.online;
+    S.online = ok;
+    drawFoot();
+    if (ok && !was) Promise.all([loadMachines(), loadSessions()]).then(resync).catch(() => {});
+  });
   route();
 }
 
-boot();
+start();

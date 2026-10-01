@@ -95,7 +95,11 @@ cat <<EOF
   │  其他電腦要連上（在那台電腦執行）：
   │    curl -fsSL $URL/bridge/agent-hub-bridge.mjs -o agent-hub-bridge.mjs && node agent-hub-bridge.mjs --hub $URL --key $KEY
   │
-  │  然後在那台電腦的 Kimi 裡輸入 /web，對話就會出現在中控台。
+  │  那台電腦的 Kimi 對話（包含終端機裡正在跑的）會自動出現在中控台。
+  │  想從中控台操作終端機裡的 Kimi，改用這個指令啟動 Kimi：
+  │    node ~/.agent-hub/agent-hub-bridge.mjs kimi
+  │  （可以設成 alias kimi-hub）
+  │
   │  這個網址每次啟動都會不同；按 Ctrl+C 停止。
   └────────────────────────────────────────────────────────────
 

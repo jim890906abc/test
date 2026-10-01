@@ -5,7 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>Agent Hub</title>
     <meta name="color-scheme" content="light dark" />
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cg stroke='%23d97757' stroke-width='3.2' stroke-linecap='round'%3E%3Cpath d='M16 4v24M4 16h24M7.5 7.5l17 17M24.5 7.5l-17 17'/%3E%3C/g%3E%3C/svg%3E" />
+    <meta name="theme-color" content="#f0e8da" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#2b251f" media="(prefers-color-scheme: dark)" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2394501b'/%3E%3Cpath d='M16 7c.8 5.9 2.8 7.9 8.7 8.7-5.9.8-7.9 2.8-8.7 8.7-.8-5.9-2.8-7.9-8.7-8.7 5.9-.8 7.9-2.8 8.7-8.7z' fill='%23fffaf2'/%3E%3C/svg%3E" />
+    <link rel="stylesheet" href="/css/oatmeal.css" />
     <link rel="stylesheet" href="/css/app.css" />
     <script>
       try {
@@ -15,8 +18,7 @@
     </script>
   </head>
   <body>
-    <div id="app"></div>
-    <div id="toasts" aria-live="polite"></div>
+    <div id="app" class="app om"></div>
     <script type="module" src="/js/app.js"></script>
   </body>
 </html>

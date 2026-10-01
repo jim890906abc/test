@@ -37,8 +37,11 @@ export function loadAgents() {
     saved = [];
   }
   // Built-in presets are merged in by id so new presets show up after upgrades
-  // while user edits to existing ones are kept.
-  const byId = new Map(saved.map((a) => [a.id, a]));
+  // while user edits to existing ones are kept. Presets seeded by earlier
+  // versions (Demo Agent, other vendors) are dropped: only agents the user
+  // added, plus Kimi on connected machines, exist.
+  const keep = new Set(DEFAULT_AGENTS.map((a) => a.id));
+  const byId = new Map(saved.filter((a) => !a.builtin || keep.has(a.id)).map((a) => [a.id, a]));
   for (const preset of DEFAULT_AGENTS) {
     if (!byId.has(preset.id)) byId.set(preset.id, { ...preset });
     else byId.set(preset.id, { ...preset, ...byId.get(preset.id), builtin: true });

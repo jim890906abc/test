@@ -63,7 +63,7 @@ try {
   Write-Host "  其他電腦要連上（在那台電腦執行）："
   Write-Host "    curl -fsSL $url/bridge/agent-hub-bridge.mjs -o agent-hub-bridge.mjs && node agent-hub-bridge.mjs --hub $url --key $key"
   Write-Host ""
-  Write-Host "  然後在那台電腦的 Kimi 裡輸入 /web。按 Ctrl+C 停止。"
+  Write-Host "  那台電腦的 Kimi 對話會自動出現在中控台。按 Ctrl+C 停止。"
   Wait-Process -Id ($procs | ForEach-Object { $_.Id })
 } finally {
   $procs | ForEach-Object { Stop-Process -Id $_.Id -ErrorAction SilentlyContinue }

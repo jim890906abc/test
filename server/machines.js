@@ -10,6 +10,7 @@ const FILE = path.join(DATA_DIR, 'machines.json');
 const machines = new Map(); // id -> machine
 const listeners = new Set(); // (machineId, frame) => void   for Kimi events
 const onlineListeners = new Set(); // (machineId) => void
+const sessionListeners = new Set(); // (machineId, entry) => void
 let broadcast = () => {};
 
 export function setBroadcast(fn) {
@@ -21,6 +22,9 @@ export function onKimiEvent(fn) {
 }
 export function onMachineOnline(fn) {
   onlineListeners.add(fn);
+}
+export function onSessionChange(fn) {
+  sessionListeners.add(fn);
 }
 
 try {
@@ -66,6 +70,63 @@ function changed(m) {
   broadcast({ t: 'machine', machine: publicMachine(m) });
 }
 
+const sessionEntry = (s) => ({
+  id: s.id,
+  title: s.title || s.last_prompt || '',
+  cwd: s.metadata?.cwd,
+  workspaceId: s.workspace_id,
+  busy: Boolean(s.busy),
+  pending: s.pending_interaction || 'none',
+  lastTurn: s.last_turn_reason,
+  updatedAt: Date.parse(s.updated_at) || Date.now(),
+  // 'tui' while a terminal Kimi runs it; controllable when that Kimi was
+  // started through the bridge and accepts input from the hub.
+  owner: s.owner || null,
+  controllable: s.controllable ?? null,
+});
+
+function sessionChanged(m, entry) {
+  broadcast({ t: 'kimi.session', machineId: m.id, session: entry });
+  for (const fn of sessionListeners) fn(m.id, entry);
+}
+
+// Kimi pushes session-level changes (busy, waiting for approval, title, new
+// or archived sessions) to every connection. Apply them to the machine's
+// session list right away so the sidebar never waits for a refresh.
+function trackSession(m, frame) {
+  const p = frame.payload || {};
+  const id = frame.session_id || p.sessionId || p.session?.id;
+  if (!id) return;
+  const list = (m.sessions ??= []);
+  let entry = list.find((s) => s.id === id);
+  switch (frame.type) {
+    case 'event.session.created':
+      if (!entry && p.session) list.unshift(sessionEntry(p.session));
+      else return;
+      break;
+    case 'event.session.archived':
+    case 'event.session.deleted':
+      if (!entry) return;
+      m.sessions = list.filter((s) => s.id !== id);
+      broadcast({ t: 'kimi.session', machineId: m.id, id, removed: true });
+      return;
+    case 'event.session.work_changed':
+      if (!entry) return;
+      Object.assign(entry, { busy: Boolean(p.busy), pending: p.pending_interaction || 'none', lastTurn: p.last_turn_reason ?? entry.lastTurn, updatedAt: Date.now() });
+      break;
+    case 'session.meta.updated':
+      if (!entry || !(p.title || p.patch?.lastPrompt)) return;
+      if (p.title) entry.title = p.title;
+      else if (!entry.title) entry.title = p.patch.lastPrompt;
+      entry.updatedAt = Date.now();
+      break;
+    default:
+      return;
+  }
+  entry ??= list.find((s) => s.id === id);
+  if (entry) sessionChanged(m, entry);
+}
+
 // Called for each /bridge WebSocket after the key has been checked.
 export function attachBridge(ws) {
   let m = null;
@@ -108,18 +169,20 @@ export function attachBridge(ws) {
       if (msg.ok) p.resolve(msg.data);
       else p.reject(new Error(msg.error || '連接器回報錯誤'));
     } else if (msg.t === 'kimi.event') {
+      trackSession(m, msg.frame);
       for (const fn of listeners) fn(m.id, msg.frame);
     } else if (msg.t === 'kimi.sessions') {
-      m.sessions = (msg.items || []).map((s) => ({
-        id: s.id,
-        title: s.title || s.last_prompt || '(未命名)',
-        cwd: s.metadata?.cwd,
-        busy: s.busy,
-        pending: s.pending_interaction,
-        lastTurn: s.last_turn_reason,
-        updatedAt: Date.parse(s.updated_at) || Date.now(),
-      }));
+      m.sessions = (msg.items || []).map(sessionEntry);
       changed(m);
+      for (const e of m.sessions) for (const fn of sessionListeners) fn(m.id, e);
+    } else if (msg.t === 'kimi.session.update') {
+      const e = sessionEntry(msg.item || {});
+      if (!e.id) return;
+      m.sessions ??= [];
+      const i = m.sessions.findIndex((x) => x.id === e.id);
+      if (i === -1) m.sessions.unshift(e);
+      else m.sessions[i] = e;
+      sessionChanged(m, e);
     } else if (msg.t === 'kimi.status') {
       const wasAvailable = m.kimi?.available;
       m.kimi = msg.status;
@@ -180,6 +243,7 @@ export function kimiErrorText(env) {
     40401: '找不到這個 Kimi 對話（可能已被刪除或封存）',
     40901: 'Kimi 對話正在忙碌中',
     40902: '這個權限請求已經被處理了',
+    40999: '這個對話正在終端機的 Kimi 裡執行，中控台不能透過 Kimi 伺服器操作它',
   };
   return hints[code] || `Kimi 回報錯誤 ${code ?? ''}：${env?.msg || '未知錯誤'}`;
 }
