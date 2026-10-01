@@ -1,0 +1,23 @@
+{
+  "name": "agent-hub",
+  "version": "0.1.0",
+  "description": "A Claude-Code-web-style control center for driving coding agents from many vendors (Claude, OpenAI, Gemini, Codex, Claude Code CLI, Aider, ...) from one browser UI.",
+  "type": "module",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "node --watch server/index.js",
+    "test": "node --test test/*.test.mjs",
+    "check": "node --check server/index.js && for f in server/*.js server/adapters/*.js public/js/*.js; do node --check \"$f\" || exit 1; done"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "dompurify": "^3.4.16",
+    "express": "^5.2.1",
+    "marked": "^18.0.14",
+    "ws": "^8.22.0"
+  }
+}
