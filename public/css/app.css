@@ -2305,3 +2305,10 @@ pre.tail {
 .side-row[aria-current='page'].offline .row-title {
   color: inherit;
 }
+
+.steer-btn {
+  min-width: 0;
+}
+.queued .om-btn--sm:not(.om-btn--toolbar) {
+  flex: none;
+}

@@ -743,6 +743,7 @@ class Mirror {
     });
     this.turn = null;
     for (const [key, ev] of this.tools) if (!lives(ev)) this.tools.delete(key);
+    if (!this.batch && this.inTerminal()) setTimeout(() => this.flushTerminalQueue(), 400);
   }
 
   // ------------------------------------------------------------ actions
@@ -754,9 +755,10 @@ class Mirror {
     return content;
   }
 
-  // Sending while Kimi is busy queues the message and steers it into the
-  // running turn, so Kimi reads it at its next step, like typing ahead in the
-  // CLI. Until then it waits in the queue above the composer.
+  // Sending while Kimi is busy queues the message: it runs after the current
+  // turn. "Steer" (插隊, Kimi's Ctrl-S) slips it into the running turn so Kimi
+  // reads it at its next step, without stopping anything. Queued messages
+  // wait above the composer and can be steered or cancelled there.
   // A conversation open in a terminal Kimi is driven by typing into it (only
   // when that Kimi was started through the bridge); everything else goes
   // through Kimi's server.
@@ -764,19 +766,23 @@ class Mirror {
     return machines.rpc(this.machineId, 'kimi.tui.input', { sessionId: this.kid, ...args });
   }
 
-  async sendToTerminal(text, images, note) {
+  // A terminal Kimi gets queued messages from the hub only when its turn
+  // ends (Enter) or when you steer them (Ctrl-S), so they stay steerable.
+  async sendToTerminal(text, images, note, steer) {
     if (images.length) throw Object.assign(new Error('終端機裡的 Kimi 沒辦法從中控台接收圖片'), { status: 400 });
     this.tuiPending ??= [];
     const busy = ['running', 'awaiting_permission'].includes(this.session.status);
     const item = { text, queued: busy, promptId: `tui_${crypto.randomBytes(5).toString('hex')}` };
     this.tuiPending.push(item);
-    if (busy) this.meta({ queue: [...this.queue(), { promptId: item.promptId, text, images: [], note, steered: true, terminal: true }] });
-    else {
+    if (busy) {
+      this.meta({ queue: [...this.queue(), { promptId: item.promptId, text, images: [], note, steered: Boolean(steer), terminal: true }] });
+      if (!steer) return;
+    } else {
       this.ctx.emit({ type: 'user', text, images: [], source: 'hub', note });
       this.ctx.setStatus('running');
     }
     try {
-      await this.tui({ action: 'send', text });
+      await this.tui({ action: 'send', text, mode: busy ? 'steer' : 'enter' });
     } catch (err) {
       this.tuiPending.splice(this.tuiPending.indexOf(item), 1);
       if (busy) this.dequeue(item.promptId);
@@ -784,8 +790,26 @@ class Mirror {
     }
   }
 
-  async send(text, images = [], { note } = {}) {
-    if (this.inTerminal()) return this.sendToTerminal(text, images, note);
+  // After a terminal turn, type the next held message into Kimi.
+  async flushTerminalQueue() {
+    const next = this.queue().find((q) => q.terminal && !q.steered);
+    if (!next || ['running', 'awaiting_permission'].includes(this.session.status)) return;
+    this.meta({ queue: this.queue().map((q) => (q === next ? { ...q, steered: true } : q)) });
+    await this.tui({ action: 'send', text: next.text, mode: 'enter' }).catch(() => this.dequeue(next.promptId));
+  }
+
+  async steerQueued(promptId) {
+    const q = this.queue().find((x) => x.promptId === promptId);
+    if (!q || q.steered) return;
+    this.meta({ queue: this.queue().map((x) => (x === q ? { ...x, steered: true } : x)) });
+    if (q.terminal) {
+      const busy = ['running', 'awaiting_permission'].includes(this.session.status);
+      await this.tui({ action: 'send', text: q.text, mode: busy ? 'steer' : 'enter' });
+    } else await this.steer(promptId);
+  }
+
+  async send(text, images = [], { note, steer } = {}) {
+    if (this.inTerminal()) return this.sendToTerminal(text, images, note, steer);
     await ensureServer(this.machineId);
     const ctx = this.ctx;
     const promptId = newPromptId();
@@ -802,7 +826,7 @@ class Mirror {
     if (!this.session.meta?.model && this.defaultModel) body.model = this.defaultModel;
     try {
       const r = await this.api('POST', this.path('/prompts'), body);
-      if (r?.status === 'queued') await this.steer(promptId);
+      if (r?.status === 'queued' && steer) await this.steer(promptId);
     } catch (err) {
       this.dequeue(promptId);
       ctx.emit({ type: 'error', text: err.message });
@@ -819,6 +843,12 @@ class Mirror {
   }
 
   async cancelQueued(promptId) {
+    const q = this.queue().find((x) => x.promptId === promptId);
+    if (q?.terminal) {
+      if (q.steered) throw Object.assign(new Error('這則訊息已經送進終端機了'), { status: 409 });
+      this.tuiPending = (this.tuiPending || []).filter((x) => x.promptId !== promptId);
+      return this.dequeue(promptId);
+    }
     await this.api('POST', this.path(`/prompts/${promptId}:abort`), {}).catch(() => {});
     return this.dequeue(promptId);
   }
@@ -1006,11 +1036,12 @@ export async function createRemote({ machineId, cwd, nameHint }) {
   return { kimiSessionId: s.id, cwd: s.metadata?.cwd || dir };
 }
 
-export async function send(session, text, { images = [], note } = {}) {
+export async function send(session, text, { images = [], note, steer } = {}) {
   const m = mirrorFor(session);
   if (!session.events.length && !session.state.syncedAt) await m.attach();
-  await m.send(text, images, { note });
+  await m.send(text, images, { note, steer });
 }
+export const steerQueued = (session, promptId) => mirrorFor(session).steerQueued(promptId);
 
 // Refuse up front what cannot be delivered (a terminal Kimi not started
 // through the bridge only mirrors).

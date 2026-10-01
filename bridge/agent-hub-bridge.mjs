@@ -1067,7 +1067,8 @@ const tui = {
     return o?.kind === 'tui' ? this.byPid.get(o.pid) || null : null;
   },
 
-  async input(sid, { action, text = '', decision, feedback, index, confirm }) {
+  async input(sid, args) {
+    const { action, text = '', decision, feedback, index, confirm } = args;
     const o = disk.owner(sid);
     const c = this.controller(sid);
     if (!o) throw new Error('這個對話沒有在終端機裡執行');
@@ -1079,7 +1080,7 @@ const tui = {
       case 'send':
         // Enter starts a turn; while Kimi works, Ctrl-S slips the message
         // into the running turn (Kimi's "add guidance").
-        keys.push(paste(text), s?.status.busy ? '\x13' : '\r');
+        keys.push(paste(text), (args.mode ? args.mode === 'steer' : s?.status.busy) ? '\x13' : '\r');
         break;
       case 'command':
         keys.push(text, '\r');

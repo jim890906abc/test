@@ -641,6 +641,7 @@ async function openSession(id) {
     onStop: interrupt,
     onConfig: configure,
     onCancelQueued: (pid) => S.cur && del(`/sessions/${S.cur.id}/queue/${pid}`).catch(fail),
+    onSteerQueued: (pid) => S.cur && post(`/sessions/${S.cur.id}/queue/${pid}/steer`).catch(fail),
     onError: (t) => toast(t),
     onHelp: openMachines,
   });
@@ -776,11 +777,11 @@ async function renameSession() {
   if (title?.trim()) sessionCommand('title', title.trim());
 }
 
-async function sendMessage({ text, images }, from) {
+async function sendMessage({ text, images, steer }, from) {
   const s = S.cur?.summary;
   if (!s) return;
   try {
-    await post(`/sessions/${s.id}/messages`, { text, images, from });
+    await post(`/sessions/${s.id}/messages`, { text, images, from, steer: Boolean(steer) });
   } catch (err) {
     if (!from) composer.setText(text);
     fail(err);

@@ -250,17 +250,31 @@ test('todos are tracked, and a message sent while Kimi works is slipped into the
   assert.deepEqual(done.meta.todos.map((t) => t.status), ['done', 'in_progress', 'pending']);
   assert.ok(done.events.some((e) => e.type === 'tool_use' && e.todos?.length === 3));
 
-  await api('POST', `/sessions/${s.id}/messages`, { text: '慢工具' });
-  await until(async () => (await session(s.id)).status === 'running', 5000, 'running');
-  await new Promise((r) => setTimeout(r, 300));
-  await api('POST', `/sessions/${s.id}/messages`, { text: '聊天 插隊' });
-  done = await until(async () => {
-    const x = await session(s.id);
-    return x.status === 'idle' && !x.meta.queue?.length && x;
-  }, 20000, 'steered and idle');
-  const steered = done.events.find((e) => e.type === 'user' && e.text === '聊天 插隊');
-  assert.equal(steered.steered, true);
-  assert.ok(done.events.some((e) => e.type === 'text' && e.text.includes('收到：聊天 插隊')));
+  // Sent while busy: queued, runs as its own turn after the current one.
+  const busyThen = async (text, after) => {
+    await api('POST', `/sessions/${s.id}/messages`, { text: '慢工具' });
+    await until(async () => (await session(s.id)).status === 'running', 5000, 'running');
+    await new Promise((r) => setTimeout(r, 300));
+    await after(text);
+    return until(async () => {
+      const x = await session(s.id);
+      return x.status === 'idle' && !x.meta.queue?.length && x.events.some((e) => e.type === 'text' && e.text.includes(`收到：${text}`)) && x;
+    }, 20000, `${text} answered`);
+  };
+  done = await busyThen('聊天 排隊', (text) => api('POST', `/sessions/${s.id}/messages`, { text }));
+  assert.ok(!done.events.find((e) => e.type === 'user' && e.text === '聊天 排隊').steered);
+
+  // 插隊: steered into the running turn without interrupting it.
+  done = await busyThen('聊天 插隊', (text) => api('POST', `/sessions/${s.id}/messages`, { text, steer: true }));
+  assert.equal(done.events.find((e) => e.type === 'user' && e.text === '聊天 插隊').steered, true);
+
+  // A queued message can be steered later from the queue tray.
+  done = await busyThen('聊天 後插', async (text) => {
+    await api('POST', `/sessions/${s.id}/messages`, { text });
+    const q = await until(async () => (await session(s.id)).meta.queue?.find((x) => x.text === text), 5000, 'queued');
+    await api('POST', `/sessions/${s.id}/queue/${q.promptId}/steer`);
+  });
+  assert.equal(done.events.find((e) => e.type === 'user' && e.text === '聊天 後插').steered, true);
 });
 
 test('a conversation running in a terminal Kimi is followed live, read-only', { skip: SKIP_TTY }, async () => {
@@ -301,6 +315,20 @@ test('a terminal Kimi started with `agent-hub-bridge.mjs kimi` can be driven fro
       return x.status === 'idle' && x.events.some((e) => e.type === 'text' && e.text.includes('結論：指令成功')) && x;
     }, 20000, 'approved in the terminal');
     assert.equal(done.events.filter((e) => e.type === 'user' && e.text === '請執行指令').length, 1, 'shown once');
+
+    // While the terminal Kimi works: one message waits for the turn to end,
+    // the other is steered in with Ctrl-S.
+    await api('POST', `/sessions/${s.id}/messages`, { text: '慢工具' });
+    const slow = await pendingEvent(s.id);
+    await api('POST', `/sessions/${s.id}/permissions/${slow.id}`, { optionId: 'approved' });
+    await new Promise((r) => setTimeout(r, 300));
+    await api('POST', `/sessions/${s.id}/messages`, { text: '聊天 終端排隊' });
+    await api('POST', `/sessions/${s.id}/messages`, { text: '聊天 終端插隊', steer: true });
+    await until(async () => {
+      const x = await session(s.id);
+      const said = (t) => x.events.some((e) => e.type === 'text' && e.text.includes(`收到：${t}`));
+      return x.status === 'idle' && !x.meta.queue?.length && said('聊天 終端排隊') && said('聊天 終端插隊') && x;
+    }, 30000, 'terminal queue and steer');
   } finally {
     tty.stop();
   }

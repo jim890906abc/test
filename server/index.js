@@ -246,7 +246,7 @@ app.post('/api/sessions/:id/messages', wrap((req) => {
   const images = (req.body?.images || []).slice(0, 10);
   if (!text.trim() && !images.length) throw Object.assign(new Error('訊息是空的'), { status: 400 });
   const note = req.body?.from === 'artifact' ? '從 Artifact 送出' : undefined;
-  runner.startTurn(s, text, { images, note });
+  runner.startTurn(s, text, { images, note, steer: Boolean(req.body?.steer) });
 }));
 
 app.post('/api/sessions/:id/command', wrap(async (req) => {
@@ -266,6 +266,13 @@ app.post('/api/sessions/:id/earlier', wrap(async (req) => {
   const s = mustSession(req.params.id);
   if (!s.kimiSessionId) return {};
   await ADAPTERS['kimi-remote'].loadEarlier(s);
+}));
+
+// 插隊: slip a queued message into the running turn (Kimi's Ctrl-S).
+app.post('/api/sessions/:id/queue/:promptId/steer', wrap(async (req) => {
+  const s = mustSession(req.params.id);
+  if (!s.kimiSessionId) throw Object.assign(new Error('這個對話不支援插隊'), { status: 400 });
+  await ADAPTERS['kimi-remote'].steerQueued(s, req.params.promptId);
 }));
 
 app.delete('/api/sessions/:id/queue/:promptId', wrap(async (req) => {

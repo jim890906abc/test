@@ -241,9 +241,12 @@ export class Composer {
     fill(
       this.right,
       ring,
+      // While Kimi works: Enter queues the message for after this turn;
+      // 插隊 (Ctrl+S, like Kimi's CLI) slips it into the running turn.
+      busy && this.hasContent() ? h('button', { class: 'om-btn om-btn--sm steer-btn', type: 'button', title: '插隊：讓 Kimi 在下一步就讀到，不會中斷它（Ctrl+S）', onclick: () => this.submit({ steer: true }) }, '插隊') : null,
       stop
         ? h('button', { class: 'send stop', type: 'button', title: '停止（Esc）', 'aria-label': '停止', onclick: () => this.opts.onStop() }, icon('stop'))
-        : h('button', { class: 'send', type: 'button', title: busy ? '送出（Kimi 會在下一步讀到）' : '送出（Enter）', 'aria-label': '送出', disabled: !this.hasContent(), onclick: () => this.submit() }, icon('up')),
+        : h('button', { class: 'send', type: 'button', title: busy ? '排隊：這一輪結束後送出（Enter）' : '送出（Enter）', 'aria-label': busy ? '排隊送出' : '送出', disabled: !this.hasContent(), onclick: () => this.submit() }, icon('up')),
     );
   }
 
@@ -260,6 +263,7 @@ export class Composer {
           { class: 'queued' },
           h('span', { class: 'queued-label' }, q.steered ? '下一步插入' : '排隊中'),
           h('span', { class: 'queued-text' }, q.text || (q.images?.length ? `${q.images.length} 張圖片` : '')),
+          !q.steered && !q.foreign ? h('button', { class: 'om-btn om-btn--sm', type: 'button', title: '讓 Kimi 在下一步就讀到這則訊息，不會中斷它', onclick: () => this.opts.onSteerQueued(q.promptId) }, '插隊') : null,
           q.foreign ? null : h('button', { class: 'om-btn om-btn--toolbar om-btn--sm', type: 'button', title: '取消這則訊息', 'aria-label': '取消這則訊息', onclick: () => this.opts.onCancelQueued(q.promptId) }, icon('x')),
         ),
       );
@@ -307,13 +311,16 @@ export class Composer {
     if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
       e.preventDefault();
       this.submit();
+    } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's' && (this.state.running || this.state.awaiting)) {
+      e.preventDefault();
+      this.submit({ steer: true });
     } else if (e.key === 'Escape' && (this.state.running || this.state.awaiting)) {
       e.preventDefault();
       this.opts.onStop();
     }
   }
 
-  submit() {
+  submit({ steer = false } = {}) {
     const raw = this.input.value;
     const text = raw.trim();
     if (!text && !this.images.length) return;
@@ -326,7 +333,7 @@ export class Composer {
     }
     const images = this.images.map(({ mimeType, data, thumb }) => ({ mimeType, data, thumb }));
     this.clear();
-    this.opts.onSend({ text, images });
+    this.opts.onSend({ text, images, steer });
   }
 
   clear() {
