@@ -84,6 +84,7 @@ document.body.append($toasts);
 const $search = h('input', { class: 'om-input', type: 'search', placeholder: '搜尋對話', 'aria-label': '搜尋對話', oninput: () => ((S.query = $search.value.trim().toLowerCase()), renderSidebar()) });
 const $list = h('div', { class: 'side-list', role: 'list' });
 const $foot = h('div', { class: 'side-foot' });
+let $artifactsLink;
 const $sidebar = h(
   'nav',
   { class: 'sidebar om-sidebar', 'aria-label': '對話' },
@@ -95,6 +96,7 @@ const $sidebar = h(
     h('button', { class: 'om-btn om-btn--toolbar', type: 'button', title: '收合側欄', 'aria-label': '收合側欄', onclick: () => toggleSidebar(false) }, icon('sidebar')),
   ),
   h('a', { class: 'om-sidebar__item new-item', href: '#/' }, icon('plus'), '新對話'),
+  ($artifactsLink = h('a', { class: 'om-sidebar__item new-item', href: '#/artifacts', onclick: () => closeDrawer() }, icon('artifact'), 'Artifacts')),
   h('label', { class: 'om-search side-search' }, icon('search'), $search),
   $list,
   $foot,
@@ -366,10 +368,49 @@ window.addEventListener('hashchange', route);
 async function route() {
   const hash = location.hash || '#/';
   closeMenu();
+  $artifactsLink.removeAttribute('aria-current');
   let m;
   if ((m = hash.match(/^#\/s\/([\w-]+)/))) return openSession(m[1]);
   if ((m = hash.match(/^#\/k\/([\w-]+)\/([\w-]+)/))) return attachAndOpen(m[1], m[2]);
+  if (hash.startsWith('#/artifacts')) return showArtifacts();
   return showHome();
+}
+
+// All pages Kimi made, across conversations, like Claude's Artifacts list.
+async function showArtifacts() {
+  leaveSession();
+  hidePanel();
+  S.route = 'artifacts';
+  $artifactsLink.setAttribute('aria-current', 'page');
+  renderSidebar();
+  fill($toolbar, sidebarToggle(), h('div', { class: 'toolbar-titles' }, h('div', { class: 'om-toolbar__title' }, 'Artifacts')));
+  const body = h('div', { class: 'artifacts-page' }, h('div', { class: 'loading' }, h('span', { class: 'spinner' })));
+  fill($view, body);
+  let list = [];
+  try {
+    list = await get('/artifacts');
+  } catch (err) {
+    return fill(body, h('div', { class: 'panel-empty' }, err.message));
+  }
+  if (S.route !== 'artifacts') return;
+  if (!list.length) return fill(body, h('div', { class: 'artifacts-empty' }, h('div', { class: 'large-title' }, '還沒有 Artifact'), h('p', { class: 'home-lead' }, '請 Kimi 做一個頁面（例如輸入 /artifact 做一個進度頁），它寫的 HTML 會出現在這裡。')));
+  fill(
+    body,
+    h(
+      'div',
+      { class: 'artifacts-grid' },
+      ...list.map((a) =>
+        h(
+          'a',
+          { class: 'artifact-tile', href: `#/s/${a.sessionId}`, onclick: () => (S.openArtifact = a.path) },
+          h('span', { class: 'artifact-card-icon' }, icon('artifact')),
+          h('span', { class: 'artifact-tile-title' }, a.title),
+          h('span', { class: 'artifact-tile-sub' }, a.sessionTitle || ''),
+          h('span', { class: 'artifact-tile-meta' }, [machineById(a.machineId)?.name, relTime(a.updatedAt), a.versions > 1 ? `${a.versions} 個版本` : null].filter(Boolean).join(' · ')),
+        ),
+      ),
+    ),
+  );
 }
 
 async function attachAndOpen(machineId, kimiSessionId) {
@@ -634,7 +675,11 @@ function applySnapshot(full) {
   updateComposer();
   renderToolbar();
   renderSidebar();
-  syncArtifact();
+  // Opened from the Artifacts page.
+  const want = S.openArtifact;
+  S.openArtifact = null;
+  if (want && S.artifacts.some((a) => a.path === want)) showArtifact(want);
+  else syncArtifact();
 }
 
 function lastUserTs(events) {
@@ -817,6 +862,50 @@ async function sessionCommand(name, args) {
 
 // --------------------------------------------------------------- panel
 
+// Drag the panel's left edge to share the width with the conversation.
+const $grip = h('div', { class: 'panel-grip', role: 'separator', 'aria-orientation': 'vertical', 'aria-label': '拖曳調整寬度', tabindex: '0', title: '拖曳調整寬度，按兩下還原' });
+function panelWidth(w) {
+  const side = $app.classList.contains('no-sidebar') ? 0 : $sidebar.offsetWidth;
+  const max = window.innerWidth - side - 360;
+  if (w == null) {
+    $app.style.removeProperty('--panel-w');
+    try {
+      localStorage.removeItem('hubPanelW');
+    } catch {}
+    return;
+  }
+  w = Math.round(Math.max(320, Math.min(w, max)));
+  $app.style.setProperty('--panel-w', `${w}px`);
+  try {
+    localStorage.setItem('hubPanelW', String(w));
+  } catch {}
+}
+try {
+  const w = Number(localStorage.getItem('hubPanelW'));
+  if (w) $app.style.setProperty('--panel-w', `${w}px`);
+} catch {}
+$grip.addEventListener('pointerdown', (e) => {
+  e.preventDefault();
+  $grip.setPointerCapture(e.pointerId);
+  $app.classList.add('resizing');
+  const move = (ev) => panelWidth(window.innerWidth - ev.clientX);
+  const up = () => {
+    $app.classList.remove('resizing');
+    $grip.removeEventListener('pointermove', move);
+    $grip.removeEventListener('pointerup', up);
+    $grip.removeEventListener('pointercancel', up);
+  };
+  $grip.addEventListener('pointermove', move);
+  $grip.addEventListener('pointerup', up);
+  $grip.addEventListener('pointercancel', up);
+});
+$grip.addEventListener('dblclick', () => panelWidth(null));
+$grip.addEventListener('keydown', (e) => {
+  if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+  e.preventDefault();
+  panelWidth($panel.offsetWidth + (e.key === 'ArrowLeft' ? 32 : -32));
+});
+
 function showPanel(tab) {
   S.panel = { ...(S.panel || {}), tab };
   $panel.hidden = false;
@@ -827,7 +916,7 @@ function showPanel(tab) {
 function hidePanel() {
   S.panel = null;
   $panel.hidden = true;
-  $app.classList.remove('with-panel', 'panel-wide');
+  $app.classList.remove('with-panel');
   artifactView?.destroy();
   artifactView = null;
   fill($panel);
@@ -871,7 +960,7 @@ function showArtifact(path, version) {
     });
   }
   if (!wasArtifact || !$panel.contains(artifactView.el)) {
-    fill($panel, h('div', { class: 'panel-artifact' }, (S.panel.headEl = h('div')), artifactView.el));
+    fill($panel, $grip, h('div', { class: 'panel-artifact' }, (S.panel.headEl = h('div')), artifactView.el));
   }
   drawArtifactHead();
   syncArtifact(true);
@@ -908,7 +997,7 @@ function drawArtifactHead() {
       : null,
     h('button', { class: 'om-btn om-btn--toolbar', type: 'button', title: '重新載入', 'aria-label': '重新載入', onclick: () => syncArtifact(true, true) }, icon('refresh')),
     h('button', { class: 'om-btn om-btn--toolbar', type: 'button', title: '下載 HTML', 'aria-label': '下載 HTML', onclick: () => artifactView?.html && downloadHtml(artifactView.html, art.path) }, icon('download')),
-    h('button', { class: 'om-btn om-btn--toolbar wide-only', type: 'button', title: $app.classList.contains('panel-wide') ? '縮小' : '放大', 'aria-label': '放大面板', onclick: () => ($app.classList.toggle('panel-wide'), drawArtifactHead()) }, icon($app.classList.contains('panel-wide') ? 'shrink' : 'expand')),
+    h('button', { class: 'om-btn om-btn--toolbar wide-only', type: 'button', title: '放大', 'aria-label': '放大面板', onclick: () => panelWidth(window.innerWidth) }, icon('expand')),
   );
   const titles = h(
     'div',
@@ -962,7 +1051,7 @@ async function showChanges() {
   artifactView = null;
   const body = h('div', { class: 'panel-body' }, h('div', { class: 'loading' }, h('span', { class: 'spinner' }), '正在讀取變更…'));
   const refresh = h('button', { class: 'om-btn om-btn--toolbar', type: 'button', title: '重新整理', 'aria-label': '重新整理', onclick: showChanges }, icon('refresh'));
-  fill($panel, h('div', { class: 'panel-changes' }, panelHead(refresh), body));
+  fill($panel, $grip, h('div', { class: 'panel-changes' }, panelHead(refresh), body));
   try {
     const r = await get(`/sessions/${s.id}/changes`);
     if (S.panel?.tab !== 'changes') return;

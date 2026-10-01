@@ -13,7 +13,7 @@
 - **/ 指令**：輸入 `/` 跳出指令選單（/compact、/undo、/btw、/goal、/init、/fork、/title、/plan…，加上 Kimi 的 skills），方向鍵選、Tab 補完、Enter 執行。
 - **模型、思考強度、權限模式、計畫模式**：輸入框下方直接切換。
 - **圖片**：貼上、拖放或選檔，送給 Kimi。
-- **Artifact**：Kimi 寫的 HTML 頁面會在右邊面板**邊寫邊顯示**，可以切換版本、下載。頁面裡呼叫 `agentHub.send('…')` 就能把訊息送回對話，適合進度頁、方案選擇、報表。連接器會幫 Kimi 裝好 `/artifact` skill，Kimi 會知道怎麼用。
+- **Artifact**：Kimi 寫的 HTML 頁面會在右邊面板**邊寫邊顯示**，可以切換版本、下載；拖曳面板左緣調整寬度（按兩下還原）。左上角的「Artifacts」列出所有對話做過的頁面。頁面裡呼叫 `agentHub.send('…')` 就能把訊息送回對話，適合進度頁、方案選擇、報表。連接器會幫 Kimi 裝好 `/artifact` skill，Kimi 會知道怎麼用。
 - **檔案變更**：右邊面板看目前資料夾的 git diff。
 - **側欄右鍵**：重新命名、釘選、刪除、在新分頁開啟。
 - 淺色是 Oatmeal 米色 Mac 風格，深色照 Claude 的深色配色；手機版面；中文輸入法選字時按 Enter 不會誤送出。

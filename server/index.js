@@ -166,6 +166,29 @@ app.post('/api/agents/:id/test', wrap(async (req) => {
 
 // -------------------------------------------------------------- sessions
 
+// Every HTML page Kimi wrote (Write / Edit on *.html) in the conversations
+// the hub follows, newest first — the "Artifacts" page.
+app.get('/api/artifacts', wrap(() => {
+  const out = [];
+  for (const s of store.listSessions()) {
+    if (!s.kimiSessionId) continue;
+    const byPath = new Map();
+    for (const ev of s.events || []) {
+      if (ev.type !== 'tool_use' || !/^(Write|Edit|MultiEdit|WriteFile|StrReplaceFile)$/.test(ev.name) || ev.status === 'error') continue;
+      const p = ev.input?.path || ev.input?.file_path;
+      if (!/\.html?$/i.test(p || '')) continue;
+      const a = byPath.get(p) || { sessionId: s.id, sessionTitle: s.title, machineId: s.machineId, path: p, versions: 0, title: '' };
+      a.versions++;
+      a.updatedAt = ev.ts;
+      const t = typeof ev.input?.content === 'string' && /<title[^>]*>([^<]*)<\/title>/i.exec(ev.input.content)?.[1]?.trim();
+      if (t) a.title = t;
+      byPath.set(p, a);
+    }
+    out.push(...byPath.values());
+  }
+  return out.map((a) => ({ ...a, title: a.title || a.path.split('/').pop() })).sort((a, b) => b.updatedAt - a.updatedAt);
+}));
+
 app.get('/api/sessions', wrap(() =>
   store.listSessions().map(runner.summarize).sort((a, b) => b.updatedAt - a.updatedAt),
 ));
