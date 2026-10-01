@@ -2,8 +2,6 @@
 
 用瀏覽器（電腦或手機）看、操作你每一台電腦上的 Kimi Code，體驗參考 Claude Code 網頁版。Kimi 留在你自己的電腦上，用那台電腦登入的 Kimi 帳號（訂閱制可用）。
 
-- 介面預覽（模擬資料）：https://claude.ai/artifact/3TnExCg1NUnBjz43psKJ1U
-
 ## 功能
 
 - **所有對話集中在左邊**：每台電腦上的 Kimi 對話都會列出來，包含**終端機裡正在跑的**。狀態（執行中、等你核准）、標題、內容都即時同步。
@@ -154,7 +152,5 @@ public/                  前端（原生 ES modules，不需要建置）
   css/oatmeal.css        Oatmeal 設計系統（tokens 與元件）
 scripts/
   start-public.sh / .ps1 一鍵公網（Cloudflare Tunnel）
-  build-preview.mjs      產生介面預覽頁
-preview/mock-backend.js  預覽頁用的模擬後端
 test/                    端到端測試
 ```

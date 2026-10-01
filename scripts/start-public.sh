@@ -45,7 +45,8 @@ if [ -z "$CF" ]; then
   fi
 fi
 
-PIDS=()
+PIDS=()      # stopped on exit
+WAIT=()      # the script ends when one of these exits
 cleanup() {
   echo
   say "關閉中…"
@@ -56,7 +57,7 @@ trap cleanup EXIT INT TERM
 
 say "啟動中控台（port $PORT）…"
 PORT="$PORT" HOST=127.0.0.1 node server/index.js >"$LOGDIR/hub.log" 2>&1 &
-PIDS+=($!)
+PIDS+=($!); WAIT+=($!)
 for _ in $(seq 1 50); do grep -q "已啟動" "$LOGDIR/hub.log" 2>/dev/null && break; sleep 0.2; done
 grep -q "已啟動" "$LOGDIR/hub.log" || { cat "$LOGDIR/hub.log"; die "中控台啟動失敗"; }
 
@@ -65,7 +66,7 @@ KEY="${AGENT_HUB_BRIDGE_KEY:-$(node -p "require('./data/hub.json').bridgeKey")}"
 
 say "開啟 Cloudflare 公網通道…"
 "$CF" tunnel --no-autoupdate --url "http://127.0.0.1:$PORT" >"$LOGDIR/cf.log" 2>&1 &
-PIDS+=($!)
+PIDS+=($!); WAIT+=($!)
 URL=""
 for _ in $(seq 1 150); do
   URL="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$LOGDIR/cf.log" | head -1 || true)"
@@ -106,5 +107,7 @@ cat <<EOF
 EOF
 
 # Keep running until a child exits or the user presses Ctrl+C.
-wait -n "${PIDS[@]}" 2>/dev/null || true
+# (The bridge may exit right away when one is already running for this
+# computer, e.g. started by kimi-hub; that one keeps serving it.)
+wait -n "${WAIT[@]}" 2>/dev/null || true
 tail -5 "$LOGDIR/hub.log" "$LOGDIR/cf.log" 2>/dev/null || true

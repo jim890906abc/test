@@ -8,10 +8,9 @@
     "start": "node server/index.js",
     "dev": "node --watch server/index.js",
     "test": "node --test test/*.test.mjs",
-    "check": "for f in server/*.js server/adapters/*.js public/js/*.js bridge/*.mjs scripts/*.mjs; do node --check \"$f\" || exit 1; done",
+    "check": "for f in server/*.js server/adapters/*.js public/js/*.js bridge/*.mjs test/*.mjs; do node --check \"$f\" || exit 1; done",
     "public": "bash scripts/start-public.sh",
-    "bridge": "node bridge/agent-hub-bridge.mjs",
-    "preview": "node scripts/build-preview.mjs"
+    "bridge": "node bridge/agent-hub-bridge.mjs"
   },
   "engines": {
     "node": ">=20"
