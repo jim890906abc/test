@@ -81,30 +81,19 @@ const $app = document.getElementById('app');
 const $toasts = h('div', { class: 'toasts', 'aria-live': 'polite' });
 document.body.append($toasts);
 
-const traffic = h(
-  'div',
-  { class: 'om-traffic' },
-  h('button', { class: 'om-traffic__btn om-traffic__btn--close', type: 'button', 'aria-label': '關閉對話', title: '關閉對話', onclick: () => go('#/') }, svgGlyph('M2 2l4 4M6 2 2 6')),
-  h('button', { class: 'om-traffic__btn om-traffic__btn--minimize', type: 'button', 'aria-label': '收合側欄', title: '收合側欄', onclick: () => toggleSidebar(false) }, svgGlyph('M1.5 4h5')),
-  h('button', { class: 'om-traffic__btn om-traffic__btn--zoom', type: 'button', 'aria-label': '全螢幕', title: '全螢幕', onclick: toggleFullscreen }, svgGlyph('M4 1.5v5M1.5 4h5')),
-);
-function svgGlyph(d) {
-  const s = h('span');
-  s.innerHTML = `<svg viewBox="0 0 8 8" aria-hidden="true"><path d="${d}"/></svg>`;
-  return s.firstChild;
-}
-function toggleFullscreen() {
-  if (document.fullscreenElement) document.exitFullscreen?.();
-  else document.documentElement.requestFullscreen?.().catch(() => {});
-}
-
 const $search = h('input', { class: 'om-input', type: 'search', placeholder: '搜尋對話', 'aria-label': '搜尋對話', oninput: () => ((S.query = $search.value.trim().toLowerCase()), renderSidebar()) });
 const $list = h('div', { class: 'side-list', role: 'list' });
 const $foot = h('div', { class: 'side-foot' });
 const $sidebar = h(
   'nav',
   { class: 'sidebar om-sidebar', 'aria-label': '對話' },
-  h('div', { class: 'om-sidebar__top' }, traffic, h('span', { class: 'brand' }, 'Agent Hub'), h('span', { class: 'om-toolbar__spacer' }), h('button', { class: 'om-btn om-btn--toolbar', type: 'button', title: '新對話', 'aria-label': '新對話', onclick: () => go('#/') }, icon('plus'))),
+  h(
+    'div',
+    { class: 'om-sidebar__top' },
+    h('span', { class: 'brand' }, 'Agent Hub'),
+    h('span', { class: 'om-toolbar__spacer' }),
+    h('button', { class: 'om-btn om-btn--toolbar', type: 'button', title: '收合側欄', 'aria-label': '收合側欄', onclick: () => toggleSidebar(false) }, icon('sidebar')),
+  ),
   h('a', { class: 'om-sidebar__item new-item', href: '#/' }, icon('plus'), '新對話'),
   h('label', { class: 'om-search side-search' }, icon('search'), $search),
   $list,

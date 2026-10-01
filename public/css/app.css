@@ -173,27 +173,6 @@ kbd {
 .app.no-sidebar .sidebar {
   visibility: hidden;
 }
-@media (min-width: 1100px) {
-  :root:not([data-theme='dark']) body {
-    padding: 10px;
-  }
-  :root:not([data-theme='dark']) .app {
-    height: calc(100dvh - 20px);
-    border-radius: var(--radius-window);
-    box-shadow: var(--shadow-window);
-  }
-}
-@media (min-width: 1100px) and (prefers-color-scheme: dark) {
-  :root:not([data-theme='light']) body {
-    padding: 0;
-  }
-  :root:not([data-theme='light']) .app {
-    height: 100dvh;
-    border-radius: 0;
-    box-shadow: none;
-  }
-}
-
 /* ------------------------------------------------------------- sidebar */
 
 .sidebar {
@@ -2043,9 +2022,6 @@ pre.tail {
 /* -------------------------------------------- dark: Claude's look */
 
 @media (prefers-color-scheme: dark) {
-  :root:not([data-theme='light']) .om-traffic {
-    display: none;
-  }
   :root:not([data-theme='light']) .om-btn--plain {
     color: var(--link);
   }
@@ -2055,9 +2031,6 @@ pre.tail {
   :root:not([data-theme='light']) .composer-box {
     border-radius: 18px;
   }
-}
-:root[data-theme='dark'] .om-traffic {
-  display: none;
 }
 :root[data-theme='dark'] .om-btn--plain {
   color: var(--link);
@@ -2105,9 +2078,6 @@ pre.tail {
   }
   .sidebar-toggle {
     display: inline-flex;
-  }
-  .om-traffic {
-    display: none;
   }
   .toolbar {
     padding: 0 var(--space-2);
@@ -2207,22 +2177,10 @@ pre.tail {
   white-space: nowrap;
 }
 .brand {
-  display: none;
   font-size: 13px;
   font-weight: 600;
 }
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme='light']) .brand {
-    display: inline;
-  }
-}
-:root[data-theme='dark'] .brand {
-  display: inline;
-}
 @media (max-width: 760px) {
-  .brand {
-    display: inline;
-  }
   .ctx-label {
     display: none;
   }
