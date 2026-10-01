@@ -48,7 +48,7 @@ before(async () => {
   fakePort = fake.address().port;
   server = spawn(process.execPath, ['server/index.js'], {
     cwd: ROOT,
-    env: { ...process.env, PORT: String(PORT), AGENT_HUB_DATA: path.join(TMP, 'data'), AGENT_HUB_WORKSPACES: path.join(TMP, 'ws') },
+    env: { ...process.env, PORT: String(PORT), AGENT_HUB_TOKEN: 'none', AGENT_HUB_DATA: path.join(TMP, 'data'), AGENT_HUB_WORKSPACES: path.join(TMP, 'ws') },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   await new Promise((resolve) => server.stdout.on('data', (d) => d.toString().includes('已啟動') && resolve()));

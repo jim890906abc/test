@@ -5,6 +5,7 @@ import * as store from './store.js';
 import { TOOL_DEFS, toolKind, validateInput, executeTool } from './tools.js';
 import { ADAPTERS } from './adapters/index.js';
 import { createWorkspace, createWorktree, isGitRepo } from './workspace.js';
+import * as machines from './machines.js';
 
 let broadcast = () => {};
 export function setBroadcast(fn) {
@@ -25,6 +26,8 @@ export function summarize(s) {
     parentId: s.parentId,
     groupId: s.groupId,
     permissionMode: s.permissionMode,
+    machineId: s.machineId,
+    kimiSessionId: s.kimiSessionId,
     meta: s.meta,
     usage: s.usage,
     createdAt: s.createdAt,
@@ -33,6 +36,7 @@ export function summarize(s) {
 }
 
 function setStatus(session, status) {
+  if (session.status === status) return;
   session.status = status;
   store.saveSession(session);
   broadcast({ t: 'session', session: summarize(session) });
@@ -62,6 +66,66 @@ function delta(session, ev, text, field = 'text') {
   session.seq = (session.seq || 0) + 1;
   store.saveSession(session);
   broadcast({ t: 'delta', sid: session.id, seq: session.seq, id: ev.id, field, text });
+}
+
+// ----------------------------------------------------------- agents
+
+// Agents come from the store, plus one virtual "Kimi Code" agent per machine
+// connected through the bridge.
+export function remoteAgents() {
+  return machines.listMachines().map((m) => ({
+    id: `kimi@${m.id}`,
+    name: `Kimi Code · ${m.name}`,
+    type: 'kimi-remote',
+    machineId: m.id,
+    color: '#1a73e8',
+    enabled: true,
+    remote: true,
+    description: `${m.name} 上的 Kimi Code（透過連接器，使用那台機器登入的 Kimi 帳號）`,
+  }));
+}
+
+export function agentFor(id) {
+  if (String(id).startsWith('kimi@')) return remoteAgents().find((a) => a.id === id) || null;
+  return store.getAgent(id);
+}
+
+const adapterFor = (session) => ADAPTERS[agentFor(session.agentId)?.type];
+
+// Context for live adapters (Kimi on a remote machine), which push events at
+// any time rather than only inside a hub-started turn.
+export function liveContext(session) {
+  return {
+    session,
+    emit: (fields) => emit(session, fields),
+    patch: (ev, fields) => patch(session, ev, fields),
+    delta: (ev, text, field) => delta(session, ev, text, field),
+    setStatus: (st) => setStatus(session, st),
+    setMeta(fields) {
+      session.meta = { ...(session.meta || {}), ...fields };
+      store.saveSession(session);
+      broadcast({ t: 'session', session: summarize(session) });
+    },
+    setTitle(title) {
+      if (!title || title === session.title) return;
+      session.title = title;
+      session.titled = true;
+      store.saveSession(session);
+      broadcast({ t: 'session', session: summarize(session) });
+    },
+    replaceEvents(events) {
+      session.events = events;
+      session.seq = (session.seq || 0) + 1;
+      store.saveSession(session);
+      broadcast({ t: 'reset', sid: session.id, seq: session.seq });
+    },
+  };
+}
+ADAPTERS['kimi-remote'].init(liveContext);
+
+export function restoreLiveSessions() {
+  for (const s of store.listSessions()) if (s.kimiSessionId) ADAPTERS['kimi-remote'].restore(s);
+  machines.onMachineOnline((machineId) => ADAPTERS['kimi-remote'].onMachineOnline(machineId, store.listSessions()));
 }
 
 // Plain-text transcript of a session, used for hand-offs and for CLI agents
@@ -279,7 +343,7 @@ async function delegate(parent, input, ev, signal) {
 
 export async function runTurn(session, text, opts = {}) {
   if (running.has(session.id)) throw Object.assign(new Error('這個 session 正在執行中'), { status: 409 });
-  const agent = store.getAgent(session.agentId);
+  const agent = agentFor(session.agentId);
   if (!agent) throw Object.assign(new Error(`找不到 agent：${session.agentId}`), { status: 400 });
   const adapter = ADAPTERS[agent.type];
   if (!adapter) throw Object.assign(new Error(`不支援的 agent 類型：${agent.type}`), { status: 400 });
@@ -337,6 +401,15 @@ export async function runTurn(session, text, opts = {}) {
 
 // Fire-and-forget entry point for HTTP handlers.
 export function startTurn(session, text, opts) {
+  const adapter = adapterFor(session);
+  if (adapter?.live) {
+    if (['running', 'awaiting_permission'].includes(session.status)) throw Object.assign(new Error('Kimi 正在處理中，請等它完成或先中斷'), { status: 409 });
+    adapter.send(session, text, opts).catch((err) => {
+      emit(session, { type: 'error', text: err.message });
+      setStatus(session, 'idle');
+    });
+    return;
+  }
   if (running.has(session.id)) throw Object.assign(new Error('這個 session 正在執行中'), { status: 409 });
   runTurn(session, text, opts).catch((err) => console.error(`[runner] ${session.id}:`, err));
 }
@@ -347,20 +420,27 @@ export function isRunning(id) {
 
 export function interrupt(id) {
   running.get(id)?.ac.abort();
+  const session = store.getSession(id);
+  const adapter = session && adapterFor(session);
+  if (adapter?.live) return adapter.interrupt(session);
 }
 
-export function resolvePermission(sid, eventId, optionId) {
+export async function resolvePermission(sid, eventId, optionId) {
   const resolve = pendingPermissions.get(`${sid}:${eventId}`);
-  if (!resolve) return false;
-  resolve(String(optionId));
-  return true;
+  if (resolve) {
+    resolve(String(optionId));
+    return true;
+  }
+  const session = store.getSession(sid);
+  const adapter = session && adapterFor(session);
+  if (adapter?.live) return adapter.respond(session, eventId, String(optionId));
+  return false;
 }
 
 // Mode / model / config changes requested from the UI, forwarded to adapters
 // that support them (ACP agents).
 export async function configure(session, change) {
-  const agent = store.getAgent(session.agentId);
-  const adapter = ADAPTERS[agent?.type];
+  const adapter = adapterFor(session);
   if (!adapter?.configure) throw Object.assign(new Error('此 agent 不支援切換設定'), { status: 400 });
   const meta = await adapter.configure(session, change);
   if (meta) {
@@ -371,18 +451,27 @@ export async function configure(session, change) {
 }
 
 export function disposeSession(session) {
-  interrupt(session.id);
-  const agent = store.getAgent(session.agentId);
-  ADAPTERS[agent?.type]?.dispose?.(session);
+  running.get(session.id)?.ac.abort();
+  adapterFor(session)?.dispose?.(session);
 }
 
 // ------------------------------------------------------- session creation
 
 export async function newSession({ agentId, cwd, prompt, nameHint, permissionMode = 'ask', groupId, branch, title }) {
-  const agent = store.getAgent(agentId);
+  const agent = agentFor(agentId);
   if (!agent) throw Object.assign(new Error(`找不到 agent：${agentId}`), { status: 400 });
-  const dir = cwd || (await createWorkspace(nameHint || prompt || agent.name));
-  const session = store.createSession({ agentId, cwd: dir, permissionMode, groupId, branch, title: title || 'New session' });
+  let session;
+  if (agent.type === 'kimi-remote') {
+    const availability = ADAPTERS['kimi-remote'].available(agent);
+    if (!availability.ok) throw Object.assign(new Error(availability.reason), { status: 409 });
+    const r = await ADAPTERS['kimi-remote'].createRemote({ machineId: agent.machineId, cwd, nameHint: nameHint || prompt });
+    session = store.createSession({ agentId, cwd: r.cwd, machineId: agent.machineId, kimiSessionId: r.kimiSessionId, permissionMode, groupId, title: title || 'New session' });
+    ADAPTERS['kimi-remote'].restore(session);
+    await ADAPTERS['kimi-remote'].attach(session);
+  } else {
+    const dir = cwd || (await createWorkspace(nameHint || prompt || agent.name));
+    session = store.createSession({ agentId, cwd: dir, permissionMode, groupId, branch, title: title || 'New session' });
+  }
   broadcast({ t: 'session', session: summarize(session) });
   if (prompt) startTurn(session, prompt);
   return session;
@@ -398,11 +487,12 @@ export async function newCompareGroup({ agentIds, prompt, cwd, permissionMode = 
   for (const agentId of agentIds) {
     let dir;
     let branch;
-    if (!cwd) dir = await createWorkspace(`${prompt}-${agentId}`);
+    if (agentFor(agentId)?.type === 'kimi-remote') dir = undefined;
+    else if (!cwd) dir = await createWorkspace(`${prompt}-${agentId}`);
     else if (git) ({ dir, branch } = await createWorktree(cwd, agentId));
     else dir = cwd;
-    const s = await newSession({ agentId, cwd: dir, branch, permissionMode, groupId });
-    if (cwd && !git) emit(s, { type: 'info', text: '此資料夾不是 git repo，所有 agent 共用同一個工作區' });
+    const s = await newSession({ agentId, cwd: dir, branch, permissionMode, groupId, nameHint: prompt });
+    if (cwd && !git && dir) emit(s, { type: 'info', text: '此資料夾不是 git repo，所有 agent 共用同一個工作區' });
     sessions.push(s);
   }
   for (const s of sessions) startTurn(s, prompt);
@@ -410,15 +500,42 @@ export async function newCompareGroup({ agentIds, prompt, cwd, permissionMode = 
 }
 
 export async function handoff(from, { agentId, text }) {
-  const prev = store.getAgent(from.agentId);
+  const prev = agentFor(from.agentId);
+  const target = agentFor(agentId);
+  // A workspace can only be shared with an agent on the same machine.
+  const sameMachine = (target?.machineId || null) === (from.machineId || null);
   const transcript = transcriptText(from);
   const prompt =
     `You are taking over a task that another agent (${prev?.name ?? from.agentId}) was working on in this same workspace.\n` +
     `Here is the conversation so far:\n\n<previous_conversation>\n${transcript}\n</previous_conversation>\n\n` +
     (text?.trim() ? `New request from the user:\n${text.trim()}` : 'Review the current state of the workspace and continue the task.');
-  const s = await newSession({ agentId, cwd: from.cwd, branch: from.branch, permissionMode: from.permissionMode, title: `${from.title}` });
+  const s = await newSession({ agentId, cwd: sameMachine ? from.cwd : undefined, branch: from.branch, permissionMode: from.permissionMode, title: `${from.title}`, nameHint: from.title });
   s.handoffFrom = from.id;
   s.titled = true;
   startTurn(s, prompt);
   return s;
+}
+
+// Take over a Kimi session that already exists on a machine (e.g. one handed
+// to the local Kimi server with /web). Reuses the hub session if attached.
+export async function attachKimi(machineId, kimiSessionId) {
+  const existing = ADAPTERS['kimi-remote'].findByKimi(machineId, kimiSessionId);
+  if (existing && store.getSession(existing)) {
+    const s = store.getSession(existing);
+    await ADAPTERS['kimi-remote'].attach(s).catch(() => {});
+    return s;
+  }
+  const info = await machines.kimiApi(machineId, 'GET', `/api/v1/sessions/${kimiSessionId}`);
+  const session = store.createSession({
+    agentId: `kimi@${machineId}`,
+    machineId,
+    kimiSessionId,
+    cwd: info.metadata?.cwd,
+    title: info.title || info.last_prompt || 'Kimi 對話',
+    titled: true,
+  });
+  ADAPTERS['kimi-remote'].restore(session);
+  broadcast({ t: 'session', session: summarize(session) });
+  await ADAPTERS['kimi-remote'].attach(session, { force: true });
+  return session;
 }

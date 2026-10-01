@@ -1,6 +1,6 @@
 {
   "name": "agent-hub",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A Claude-Code-web-style control center for driving coding agents from many vendors (Claude, OpenAI, Gemini, Codex, Claude Code CLI, Aider, ...) from one browser UI.",
   "type": "module",
   "main": "server/index.js",
@@ -8,7 +8,10 @@
     "start": "node server/index.js",
     "dev": "node --watch server/index.js",
     "test": "node --test test/*.test.mjs",
-    "check": "node --check server/index.js && for f in server/*.js server/adapters/*.js public/js/*.js; do node --check \"$f\" || exit 1; done"
+    "check": "for f in server/*.js server/adapters/*.js public/js/*.js bridge/*.mjs scripts/*.mjs; do node --check \"$f\" || exit 1; done",
+    "public": "bash scripts/start-public.sh",
+    "bridge": "node bridge/agent-hub-bridge.mjs",
+    "preview": "node scripts/build-preview.mjs"
   },
   "engines": {
     "node": ">=20"

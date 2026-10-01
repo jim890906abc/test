@@ -14,13 +14,29 @@ import * as workspace from './workspace.js';
 import { ADAPTERS, TYPE_LABELS } from './adapters/index.js';
 import { TEMPLATES } from './adapters/presets.js';
 import { splitArgs, loginHint, disposeAll } from './adapters/acp.js';
+import * as machines from './machines.js';
 
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '127.0.0.1';
-const LOOPBACK = ['127.0.0.1', 'localhost', '::1'].includes(HOST);
-// Agents can run shell commands on this machine, so anything reachable from
-// the network must be protected by a token.
-const TOKEN = process.env.AGENT_HUB_TOKEN || (LOOPBACK ? '' : crypto.randomBytes(16).toString('hex'));
+// Agents can run shell commands (here and on every connected machine), so the
+// hub always requires a login token, generated once and kept in data/hub.json.
+// Machines connect with a separate bridge key. AGENT_HUB_TOKEN=none turns the
+// login off for purely local use.
+function loadSecrets() {
+  const file = path.join(store.DATA_DIR, 'hub.json');
+  let secrets = {};
+  try {
+    secrets = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {}
+  let dirty = false;
+  if (!secrets.token) (secrets.token = crypto.randomBytes(16).toString('hex')), (dirty = true);
+  if (!secrets.bridgeKey) (secrets.bridgeKey = `bk_${crypto.randomBytes(18).toString('hex')}`), (dirty = true);
+  if (dirty) fs.writeFileSync(file, JSON.stringify(secrets, null, 2), { mode: 0o600 });
+  return secrets;
+}
+const SECRETS = loadSecrets();
+const TOKEN = process.env.AGENT_HUB_TOKEN === 'none' ? '' : process.env.AGENT_HUB_TOKEN || SECRETS.token;
+const BRIDGE_KEY = process.env.AGENT_HUB_BRIDGE_KEY || SECRETS.bridgeKey;
 
 store.loadAgents();
 store.loadSessions();
@@ -28,12 +44,12 @@ store.loadSessions();
 const app = express();
 app.use(express.json({ limit: '25mb' }));
 
-function tokenOk(provided) {
-  if (!TOKEN) return true;
+function secretEq(provided, expected) {
   const a = Buffer.from(String(provided || ''));
-  const b = Buffer.from(TOKEN);
+  const b = Buffer.from(String(expected));
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
+const tokenOk = (provided) => !TOKEN || secretEq(provided, TOKEN);
 
 app.use('/api', (req, res, next) => {
   if (tokenOk(req.get('x-hub-token') || req.query.token)) return next();
@@ -75,13 +91,20 @@ const EDITABLE = ['name', 'enabled', 'color', 'command', 'args', 'env', 'login',
 // ------------------------------------------------------------------ meta
 
 app.get('/api/config', wrap(() => ({
-  version: '0.1.0',
+  version: '0.2.0',
   workspacesDir: store.WORKSPACES_DIR,
   home: os.homedir(),
   host: HOST,
 })));
 
 app.get('/api/fs/dirs', wrap(async (req) => {
+  if (req.query.machine) {
+    const mid = String(req.query.machine);
+    let p = req.query.path ? String(req.query.path) : '';
+    if (!p) p = (await machines.kimiApi(mid, 'GET', '/api/v1/fs:home')).home;
+    const r = await machines.kimiApi(mid, 'GET', `/api/v1/fs:browse?path=${encodeURIComponent(p)}`);
+    return { path: r.path, parent: r.parent, git: false, dirs: (r.entries || []).map((e) => e.name).filter((n) => !n.startsWith('.')).sort((a, b) => a.localeCompare(b)) };
+  }
   const dir = workspace.validateDir(String(req.query.path || os.homedir()));
   const entries = await fs.promises.readdir(dir, { withFileTypes: true }).catch(() => []);
   return {
@@ -98,7 +121,7 @@ app.get('/api/fs/dirs', wrap(async (req) => {
 
 // ---------------------------------------------------------------- agents
 
-app.get('/api/agents', wrap(() => store.listAgents().map(publicAgent)));
+app.get('/api/agents', wrap(() => [...store.listAgents(), ...runner.remoteAgents()].map(publicAgent)));
 app.get('/api/templates', wrap(() => TEMPLATES.map(({ apiKey, ...t }) => ({ ...t, typeLabel: TYPE_LABELS[t.type] }))));
 
 app.post('/api/agents', wrap((req) => {
@@ -229,12 +252,12 @@ app.post('/api/sessions/:id/messages', wrap((req) => {
   runner.startTurn(s, text, { images });
 }));
 
-app.post('/api/sessions/:id/interrupt', wrap((req) => {
-  runner.interrupt(mustSession(req.params.id).id);
+app.post('/api/sessions/:id/interrupt', wrap(async (req) => {
+  await runner.interrupt(mustSession(req.params.id).id);
 }));
 
-app.post('/api/sessions/:id/permissions/:eventId', wrap((req) => {
-  const ok = runner.resolvePermission(req.params.id, req.params.eventId, req.body?.optionId);
+app.post('/api/sessions/:id/permissions/:eventId', wrap(async (req) => {
+  const ok = await runner.resolvePermission(req.params.id, req.params.eventId, req.body?.optionId);
   if (!ok) throw Object.assign(new Error('這個權限請求已經失效'), { status: 409 });
 }));
 
@@ -247,9 +270,30 @@ app.post('/api/sessions/:id/handoff', wrap(async (req) => {
   return runner.summarize(await runner.handoff(s, req.body || {}));
 }));
 
-app.get('/api/sessions/:id/files', wrap((req) => workspace.listDir(mustSession(req.params.id).cwd, String(req.query.path || '.'))));
-app.get('/api/sessions/:id/file', wrap((req) => workspace.readFile(mustSession(req.params.id).cwd, String(req.query.path || ''))));
-app.get('/api/sessions/:id/changes', wrap((req) => workspace.getChanges(mustSession(req.params.id).cwd)));
+const kimiRemote = ADAPTERS['kimi-remote'];
+app.get('/api/sessions/:id/files', wrap((req) => {
+  const s = mustSession(req.params.id);
+  const rel = String(req.query.path || '.');
+  return s.kimiSessionId ? kimiRemote.listFiles(s, rel) : workspace.listDir(s.cwd, rel);
+}));
+app.get('/api/sessions/:id/file', wrap((req) => {
+  const s = mustSession(req.params.id);
+  const rel = String(req.query.path || '');
+  return s.kimiSessionId ? kimiRemote.readFile(s, rel) : workspace.readFile(s.cwd, rel);
+}));
+app.get('/api/sessions/:id/changes', wrap((req) => {
+  const s = mustSession(req.params.id);
+  return s.kimiSessionId ? kimiRemote.getChanges(s, workspace.summarizeDiff) : workspace.getChanges(s.cwd);
+}));
+
+// ------------------------------------------------------------- machines
+
+app.get('/api/hub', wrap(() => ({ bridgeKey: BRIDGE_KEY, bridgePath: '/bridge/agent-hub-bridge.mjs' })));
+app.get('/api/machines', wrap(() => machines.listMachines()));
+app.delete('/api/machines/:id', wrap((req) => machines.removeMachine(req.params.id)));
+app.post('/api/machines/:id/refresh', wrap((req) => machines.rpc(req.params.id, 'kimi.status')));
+app.post('/api/machines/:id/kimi/start', wrap((req) => machines.rpc(req.params.id, 'kimi.start', {}, 40_000)));
+app.post('/api/machines/:mid/kimi/:kid/attach', wrap(async (req) => runner.summarize(await runner.attachKimi(req.params.mid, req.params.kid))));
 
 // ----------------------------------------------------------- compare mode
 
@@ -277,15 +321,26 @@ app.post('/api/groups/:gid/messages', wrap((req) => {
 const ROOT = store.ROOT_DIR;
 app.get('/vendor/marked.esm.js', (req, res) => res.sendFile(path.join(ROOT, 'node_modules/marked/lib/marked.esm.js')));
 app.get('/vendor/purify.es.mjs', (req, res) => res.sendFile(path.join(ROOT, 'node_modules/dompurify/dist/purify.es.mjs')));
+// The bridge script holds no secrets; serving it lets machines fetch it with curl.
+app.get('/bridge/agent-hub-bridge.mjs', (req, res) => res.type('text/javascript').sendFile(path.join(ROOT, 'bridge/agent-hub-bridge.mjs')));
 app.use(express.static(path.join(ROOT, 'public'), { index: 'index.html' }));
-app.get(/^\/(?!api|ws|vendor).*/, (req, res) => res.sendFile(path.join(ROOT, 'public/index.html')));
+app.get(/^\/(?!api|ws|vendor|bridge).*/, (req, res) => res.sendFile(path.join(ROOT, 'public/index.html')));
 
 // ------------------------------------------------------------- websocket
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
+const bridgeWss = new WebSocketServer({ noServer: true });
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url, 'http://x');
+  if (url.pathname === '/bridge') {
+    return bridgeWss.handleUpgrade(req, socket, head, (ws) => {
+      if (!secretEq(url.searchParams.get('key'), BRIDGE_KEY)) return ws.close(4401, 'bad key');
+      ws.isAlive = true;
+      ws.on('pong', () => (ws.isAlive = true));
+      machines.attachBridge(ws);
+    });
+  }
   if (url.pathname !== '/ws' || !tokenOk(url.searchParams.get('token'))) {
     socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
     return socket.destroy();
@@ -304,9 +359,11 @@ function broadcast(msg) {
   for (const ws of wss.clients) if (ws.readyState === 1) ws.send(data);
 }
 runner.setBroadcast(broadcast);
+machines.setBroadcast(broadcast);
+runner.restoreLiveSessions();
 
 setInterval(() => {
-  for (const ws of wss.clients) {
+  for (const ws of [...wss.clients, ...bridgeWss.clients]) {
     if (!ws.isAlive) ws.terminate();
     else {
       ws.isAlive = false;
@@ -317,8 +374,9 @@ setInterval(() => {
 
 server.listen(PORT, HOST, () => {
   const url = `http://${HOST.includes(':') ? `[${HOST}]` : HOST}:${PORT}/${TOKEN ? `#token=${TOKEN}` : ''}`;
-  console.log(`\n  Agent Hub 已啟動 → ${url}\n`);
-  if (!LOOPBACK && !process.env.AGENT_HUB_TOKEN) console.log('  （對外開放模式：已自動產生存取權杖，請使用上面的完整網址）\n');
+  console.log(`\n  Agent Hub 已啟動 → ${url}`);
+  if (TOKEN) console.log(`  登入密碼（token）：${TOKEN}`);
+  console.log('  連接其他機器：在網頁上點側欄的「連接機器」取得指令\n');
 });
 
 function shutdown() {

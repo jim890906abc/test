@@ -4,3 +4,5 @@ workspaces/
 .env
 *.log
 .DS_Store
+bin/
+dist/

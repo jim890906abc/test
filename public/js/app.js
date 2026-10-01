@@ -1,21 +1,27 @@
 // Agent Hub UI: sidebar of sessions, conversation view, compare grid,
 // workspace panel and agent settings — all driven by one WebSocket stream.
 import { h, fill, icon, initials, relTime, dayGroup, shortPath, linkify, fmtTokens } from './dom.js';
-import { get, post, put, patch, del, connect } from './api.js';
+import { get, post, put, patch, del, connect, setToken } from './api.js';
 import { Conversation, renderUnifiedDiff } from './render.js';
 
 const PERM_LABELS = { ask: '每次詢問', auto_edits: '自動接受編輯', bypass: '全部自動允許' };
-const TYPE_ORDER = ['acp', 'cli', 'openai', 'demo'];
-const TYPE_TITLES = { acp: 'ACP agents（訂閱帳號登入）', cli: 'CLI agents', openai: 'API（API key）', demo: '示範' };
+// Kimi's own modes: manual / yolo (asks only for risky actions) / auto (never asks).
+const KIMI_PERM_LABELS = { ask: '每次詢問', auto_edits: '只問高風險操作', bypass: '全部自動' };
+const TYPE_ORDER = ['kimi-remote', 'acp', 'cli', 'openai', 'demo'];
+const TYPE_TITLES = { 'kimi-remote': '我的機器上的 Kimi', acp: 'ACP agents（本機）', cli: 'CLI agents（本機）', openai: 'API（API key）', demo: '示範' };
 
 const S = {
   config: null,
   agents: [],
+  machines: [],
+  openMachines: new Set(),
+  closedMachines: new Set(),
+  machinesShowAll: new Set(),
   sessions: new Map(),
   connected: false,
   search: '',
   drafts: new Map(),
-  home: { mode: 'single', agentId: null, agentIds: new Set(), cwd: '', perm: 'ask' },
+  home: { mode: 'single', agentId: null, agentIds: new Set(), cwd: '', cwdMachine: null, perm: 'ask' },
   panel: { open: false, tab: 'changes' },
   settings: null,
   view: null,
@@ -113,6 +119,7 @@ function modal(content, { small = false, onClose } = {}) {
 const L = {};
 function buildLayout() {
   L.sideList = h('div', { class: 'session-list' });
+  L.machinesEl = h('div', { class: 'machines' });
   L.agentsCount = h('span', { class: 'count' });
   L.themeBtn = h('button', { class: 'icon-btn', title: '切換深淺色', onclick: toggleTheme });
   const search = h('input', {
@@ -133,10 +140,11 @@ function buildLayout() {
       'Agent Hub',
       h('span', { class: 'spacer' }),
       h('button', { class: 'icon-btn hide-mobile', title: '收合側欄', onclick: () => toggleSidebar() }, icon('sidebar')),
-      h('button', { class: 'icon-btn only-mobile', title: '關閉', onclick: () => toggleSidebar(false) }, icon('x')),
+      h('button', { class: 'icon-btn only-mobile', title: '關閉', onclick: () => closeDrawer() }, icon('x')),
     ),
     h('button', { class: 'new-btn', onclick: () => go('#/') }, icon('plus'), '新工作'),
     h('div', { class: 'side-search' }, icon('search'), search),
+    L.machinesEl,
     L.sideList,
     h(
       'div',
@@ -158,7 +166,7 @@ function toggleSidebar(force) {
     L.root.classList.toggle('sidebar-open', open);
     L.scrim?.remove();
     if (open) {
-      L.scrim = h('div', { class: 'scrim', onclick: () => toggleSidebar(false) });
+      L.scrim = h('div', { class: 'scrim', onclick: () => closeDrawer() });
       document.body.append(L.scrim);
     }
   } else {
@@ -166,6 +174,10 @@ function toggleSidebar(force) {
     const collapsed = L.root.classList.contains('sidebar-collapsed');
     for (const b of document.querySelectorAll('.sb-toggle')) b.style.display = collapsed ? '' : 'none';
   }
+}
+
+function closeDrawer() {
+  if (innerWidth <= 760) toggleSidebar(false);
 }
 
 function sidebarButton() {
@@ -213,7 +225,195 @@ function statusClass(st) {
   return st === 'running' ? 'running' : st === 'awaiting_permission' ? 'awaiting' : st === 'error' ? 'error' : '';
 }
 
+// ------------------------------------------------------------ machines
+
+function basename(p) {
+  return String(p || '').split(/[\\/]/).filter(Boolean).pop() || p || '';
+}
+
+function drawMachines() {
+  const el = L.machinesEl;
+  const head = h(
+    'div',
+    { class: 'machines-head' },
+    '我的機器',
+    h('span', { class: 'spacer' }),
+    h('button', { onclick: () => openConnect(), title: '把一台電腦連到這個中控台' }, icon('plus'), '連接機器'),
+  );
+  if (!S.machines.length) {
+    return fill(el, head, h('div', { class: 'machine-note', style: { paddingLeft: '8px' } }, '還沒有連接任何機器。點「連接機器」取得指令，在你的電腦上執行後，那台機器上的 Kimi 對話就會出現在這裡。'));
+  }
+  const rows = [];
+  const list = [...S.machines].sort((a, b) => Number(b.online) - Number(a.online) || a.name.localeCompare(b.name));
+  for (const m of list) {
+    const open = m.online && !S.closedMachines.has(m.id);
+    const sub = !m.online ? '離線' : m.kimi?.available ? `Kimi ${m.kimi.version || ''}`.trim() : '未偵測到 Kimi';
+    rows.push(
+      h(
+        'div',
+        {
+          class: `machine-row ${open ? 'open' : ''}`,
+          title: m.platform || '',
+          onclick: () => {
+            if (S.closedMachines.has(m.id)) S.closedMachines.delete(m.id);
+            else S.closedMachines.add(m.id);
+            drawMachines();
+          },
+        },
+        h('span', { class: `mdot ${m.online ? 'on' : ''}` }),
+        h('span', { class: 'mname' }, m.name),
+        h('span', { class: 'msub' }, sub),
+        icon('chev', 'chev'),
+      ),
+    );
+    if (!open) continue;
+    if (!m.kimi?.available) {
+      rows.push(
+        h(
+          'div',
+          { class: 'machine-note' },
+          '在這台機器的 Kimi 裡輸入 /web（或執行 kimi web），對話就會出現在這裡。 ',
+          h('button', { class: 'btn sm', style: { marginTop: '6px' }, onclick: () => post(`/machines/${m.id}/kimi/start`).then(() => toast('已在那台機器啟動 Kimi 伺服器')).catch(fail) }, '幫我啟動 Kimi'),
+        ),
+      );
+      continue;
+    }
+    // Conversations already taken over are listed with the hub's sessions.
+    const isAttached = (k) => [...S.sessions.values()].some((s) => s.kimiSessionId === k.id && s.machineId === m.id);
+    const all = [...(m.sessions || [])].sort((a, b) => b.updatedAt - a.updatedAt);
+    const sessions = all.filter((k) => !isAttached(k));
+    const taken = all.length - sessions.length;
+    if (!sessions.length) rows.push(h('div', { class: 'machine-note' }, taken ? `這台機器的 ${taken} 個對話都已接管（在下方清單）。` : '目前沒有對話。在 Kimi 裡輸入 /web 開放對話，或從「新工作」選這台機器開一個。'));
+    const showAll = S.machinesShowAll.has(m.id);
+    for (const k of showAll ? sessions : sessions.slice(0, 5)) {
+      const attached = [...S.sessions.values()].find((s) => s.kimiSessionId === k.id && s.machineId === m.id);
+      const badge =
+        k.pending === 'approval' || k.pending === 'question'
+          ? h('span', { class: 'badge wait' }, '等待確認')
+          : k.busy
+            ? h('span', { class: 'badge run' }, '執行中')
+            : attached
+              ? h('span', { class: 'badge att' }, '已接管')
+              : null;
+      rows.push(
+        h(
+          'div',
+          {
+            class: `ksess ${attached && S.view?.sid === attached.id ? 'active' : ''}`,
+            title: k.cwd || '',
+            onclick: () => (attached ? go(`#/s/${attached.id}`) : attachKimi(m.id, k.id)),
+          },
+          h('div', { class: 'kmain' }, h('div', { class: 'kt' }, k.title), h('div', { class: 'km' }, `${basename(k.cwd)} · ${relTime(k.updatedAt)}`)),
+          badge,
+        ),
+      );
+    }
+    if (sessions.length > 5) {
+      rows.push(
+        h(
+          'div',
+          { class: 'ksess-more' },
+          h('button', { onclick: () => (showAll ? S.machinesShowAll.delete(m.id) : S.machinesShowAll.add(m.id), drawMachines()) }, showAll ? '收合' : `顯示全部 ${sessions.length} 個對話`),
+        ),
+      );
+    }
+  }
+  fill(el, head, rows);
+}
+
+async function attachKimi(machineId, kimiSessionId) {
+  S.quietUntil = Date.now() + 4000; // no "needs approval" toast for the session being opened
+  toast('正在接管這個 Kimi 對話…', { timeout: 2000 });
+  try {
+    const s = await post(`/machines/${machineId}/kimi/${kimiSessionId}/attach`);
+    S.sessions.set(s.id, s);
+    closeDrawer();
+    go(`#/s/${s.id}`);
+  } catch (err) {
+    fail(err);
+  }
+}
+
+function copyButton(text) {
+  const btn = h('button', { class: 'btn sm', title: '複製' }, icon('copy'));
+  btn.onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      fill(btn, icon('check'));
+      setTimeout(() => fill(btn, icon('copy')), 1500);
+    } catch {
+      const sel = getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(btn.previousSibling);
+      sel.removeAllRanges();
+      sel.addRange(range);
+      toast('請按 Ctrl+C / ⌘C 複製');
+    }
+  };
+  return btn;
+}
+
+async function openConnect() {
+  let info;
+  try {
+    info = await get('/hub');
+  } catch (err) {
+    return fail(err);
+  }
+  const origin = location.origin;
+  const script = `${origin}${info.bridgePath}`;
+  const unix = `curl -fsSL ${script} -o agent-hub-bridge.mjs && node agent-hub-bridge.mjs --hub ${origin} --key ${info.bridgeKey}`;
+  const win = `iwr ${script} -OutFile agent-hub-bridge.mjs; node agent-hub-bridge.mjs --hub ${origin} --key ${info.bridgeKey}`;
+  const local = /^(localhost|127\.|\[::1\])/.test(location.hostname);
+  const machinesList = h('div');
+  const drawList = () =>
+    fill(
+      machinesList,
+      S.machines.length ? h('div', { class: 'sec-label', style: { margin: '18px 0 6px', fontSize: '12px', fontWeight: 600, color: 'var(--text-3)' } }, '已連接的機器') : null,
+      S.machines.map((m) =>
+        h(
+          'div',
+          { class: 'machine-row', style: { cursor: 'default' } },
+          h('span', { class: `mdot ${m.online ? 'on' : ''}` }),
+          h('span', { class: 'mname' }, m.name),
+          h('span', { class: 'msub' }, m.online ? (m.kimi?.available ? `Kimi ${m.kimi.version || ''}` : '未偵測到 Kimi') : `離線 · ${relTime(m.lastSeen || Date.now())}`),
+          h('button', { class: 'btn sm ghost', title: '從清單移除', onclick: () => del(`/machines/${m.id}`).then(loadMachines).then(drawList).catch(fail) }, icon('trash')),
+        ),
+      ),
+    );
+  drawList();
+  const m = modal(
+    [
+      h('div', { class: 'modal-head' }, icon('plus'), h('h2', null, '連接一台機器'), h('span', { class: 'spacer' }), h('button', { class: 'icon-btn', onclick: () => m.close() }, icon('x'))),
+      h(
+        'div',
+        { style: { padding: '16px 20px 22px', overflowY: 'auto' } },
+        local ? h('div', { class: 'test-result bad', style: { marginTop: 0, marginBottom: '14px' } }, '你現在是用 localhost 開啟中控台。其他電腦要連線，請改用公網網址（例如 Cloudflare Tunnel 的網址）開啟中控台，再回來複製指令。') : null,
+        h(
+          'ol',
+          { class: 'steps' },
+          h('li', null, '在那台電腦安裝 Kimi Code CLI，並用你的 Kimi 帳號登入：', h('code', null, 'kimi login'), '。另外需要 Node.js 22 以上。'),
+          h(
+            'li',
+            null,
+            '在那台電腦的終端機執行：',
+            h('div', { class: 'muted', style: { fontSize: '12.5px', marginTop: '8px' } }, 'macOS / Linux'),
+            h('div', { class: 'cmd-box' }, h('pre', null, unix), copyButton(unix)),
+            h('div', { class: 'muted', style: { fontSize: '12.5px' } }, 'Windows（PowerShell）'),
+            h('div', { class: 'cmd-box' }, h('pre', null, win), copyButton(win)),
+          ),
+          h('li', null, '在那台電腦的 Kimi 裡輸入 ', h('code', null, '/web'), '（或執行 ', h('code', null, 'kimi web'), '）。之後那台機器的 Kimi 對話會出現在側欄「我的機器」，點一下就能接管。想讓連接器自動啟動 Kimi，可以在指令最後加上 ', h('code', null, '--start-kimi'), '。'),
+        ),
+        h('div', { class: 'callout', style: { marginTop: '16px', marginBottom: 0 } }, '連接金鑰只用來讓機器連上這個中控台，請不要分享給別人。Kimi 的登入資訊一直留在你的電腦上，不會傳到中控台。'),
+        machinesList,
+      ),
+    ],
+    { small: true },
+  );
+}
+
 function drawSidebar() {
+  drawMachines();
   const all = [...S.sessions.values()];
   const ready = S.agents.filter((a) => a.enabled && a.available).length;
   L.agentsCount.textContent = `${ready} 可用`;
@@ -267,7 +467,7 @@ function drawSidebar() {
       frag.append(
         h(
           'a',
-          { class: `s-item ${route.gid === e.gid ? 'active' : ''}`, href: `#/g/${e.gid}`, onclick: () => toggleSidebar(false) },
+          { class: `s-item ${route.gid === e.gid ? 'active' : ''}`, href: `#/g/${e.gid}`, onclick: () => closeDrawer() },
           busy
             ? h('span', { class: `status-dot ${busy}` })
             : h('span', { class: 'stack-dots' }, e.list.slice(0, 4).map((s) => h('span', { style: { '--c': agentColor(s.agentId) } }))),
@@ -293,7 +493,7 @@ function sessionItem(s, active, child = false) {
   else meta.append(`${agentName(s.agentId)} · ${relTime(s.updatedAt)}`);
   return h(
     'a',
-    { class: `s-item ${active ? 'active' : ''} ${child ? 'child' : ''}`, href: `#/s/${s.id}`, onclick: () => toggleSidebar(false) },
+    { class: `s-item ${active ? 'active' : ''} ${child ? 'child' : ''}`, href: `#/s/${s.id}`, onclick: () => closeDrawer() },
     h('span', { class: `status-dot ${st}`, style: { '--c': agentColor(s.agentId) } }),
     h('div', { class: 's-main' }, h('div', { class: 's-title' }, child ? `↳ ${s.title}` : s.title), meta),
   );
@@ -491,11 +691,11 @@ function createComposer(opts) {
   return { el: box, ta, refresh: drawRow, focus: () => ta.focus() };
 }
 
-function permPill(value, onChange) {
+function permPill(value, onChange, kimi = false) {
   const sel = h(
     'select',
-    { onchange: (e) => onChange(e.target.value), title: '權限模式：agent 要執行指令或修改檔案時的處理方式' },
-    Object.entries(PERM_LABELS).map(([v, l]) => h('option', { value: v, selected: v === value }, l)),
+    { onchange: (e) => onChange(e.target.value), title: kimi ? 'Kimi 的權限模式（manual / yolo / auto）' : '權限模式：agent 要執行指令或修改檔案時的處理方式' },
+    Object.entries(kimi ? KIMI_PERM_LABELS : PERM_LABELS).map(([v, l]) => h('option', { value: v, selected: v === value }, l)),
   );
   return h('label', { class: `pill ${value === 'bypass' ? 'warn' : ''}` }, icon('shield'), sel);
 }
@@ -568,16 +768,29 @@ function showHome() {
         h('button', { class: S.home.mode === 'single' ? 'on' : '', onclick: () => ((S.home.mode = 'single'), composer.refresh()) }, '單一'),
         h('button', { class: S.home.mode === 'compare' ? 'on' : '', title: '同一個任務交給多個 agent 平行執行並排比較', onclick: () => ((S.home.mode = 'compare'), composer.refresh()) }, icon('columns'), '比較'),
       );
-      const ws = h('button', { class: 'pill', title: S.home.cwd || '為這次工作建立一個新的空白資料夾' }, icon('folder'), S.home.cwd ? shortPath(S.home.cwd, S.config?.home) : '新工作區', icon('down'));
+      // Folders live on the machine that runs the agent.
+      const sel = agentById(S.home.agentId);
+      const remote = S.home.mode === 'single' && sel?.type === 'kimi-remote' ? sel : null;
+      const where = remote?.machineId || null;
+      if (S.home.cwd && S.home.cwdMachine !== where) S.home.cwd = '';
+      const machine = remote && S.machines.find((m) => m.id === remote.machineId);
+      const setCwd = (p) => {
+        S.home.cwd = p;
+        S.home.cwdMachine = where;
+        composer.refresh();
+      };
+      const ws = h('button', { class: 'pill', title: S.home.cwd || '為這次工作建立一個新的空白資料夾' }, icon('folder'), S.home.cwd ? shortPath(S.home.cwd, remote ? machine?.home : S.config?.home) : remote ? `新資料夾 · ${machine?.name || ''}` : '新工作區', icon('down'));
       ws.onclick = (e) => {
         e.stopPropagation();
-        const recent = [...new Set([...S.sessions.values()].filter((s) => !s.branch).sort((a, b) => b.updatedAt - a.updatedAt).map((s) => s.cwd))]
-          .filter((p) => p && !p.startsWith(S.config?.workspacesDir || '\0'))
-          .slice(0, 6);
+        const recent = remote
+          ? [...new Set((machine?.sessions || []).map((k) => k.cwd))].filter(Boolean).slice(0, 6)
+          : [...new Set([...S.sessions.values()].filter((s) => !s.branch && !s.machineId).sort((a, b) => b.updatedAt - a.updatedAt).map((s) => s.cwd))]
+              .filter((p) => p && !p.startsWith(S.config?.workspacesDir || '\0'))
+              .slice(0, 6);
         openMenu(ws, [
-          { label: '新的空白工作區', sub: '自動建立資料夾並初始化 git', icon: 'plus', checked: !S.home.cwd, run: () => ((S.home.cwd = ''), composer.refresh()) },
-          { label: '選擇資料夾…', sub: '在既有專案中工作', icon: 'folder', run: () => pickFolder((p) => ((S.home.cwd = p), composer.refresh())) },
-          ...(recent.length ? ['sep', { header: '最近使用' }, ...recent.map((p) => ({ label: shortPath(p, S.config?.home), sub: p, checked: S.home.cwd === p, run: () => ((S.home.cwd = p), composer.refresh()) }))] : []),
+          { label: remote ? `在 ${machine?.name || '那台機器'} 建立新資料夾` : '新的空白工作區', sub: remote ? '~/agent-hub-workspaces 底下，並初始化 git' : '自動建立資料夾並初始化 git', icon: 'plus', checked: !S.home.cwd, run: () => setCwd('') },
+          { label: '選擇資料夾…', sub: remote ? `瀏覽 ${machine?.name || '那台機器'} 上的資料夾` : '在既有專案中工作', icon: 'folder', run: () => pickFolder(setCwd, where) },
+          ...(recent.length ? ['sep', { header: '最近使用' }, ...recent.map((p) => ({ label: shortPath(p, remote ? machine?.home : S.config?.home), sub: p, checked: S.home.cwd === p, run: () => setCwd(p) }))] : []),
         ], { above: innerHeight - ws.getBoundingClientRect().bottom < 320 });
       };
       pills.push(seg, ws, permPill(S.home.perm, (v) => {
@@ -615,14 +828,14 @@ function showHome() {
         {
           class: 'acard',
           onclick: () => {
-            if (!a.available) return openSettings(a.id);
+            if (!a.available) return a.type === 'kimi-remote' ? openConnect() : openSettings(a.id);
             S.home.mode = 'single';
             S.home.agentId = a.id;
             composer.refresh();
             composer.focus();
           },
         },
-        h('div', { class: 'top' }, h('span', { class: 'avatar', style: { '--c': a.color } }, initials(a.name)), a.name, h('span', { class: 'tag', style: { marginLeft: 'auto' } }, a.type.toUpperCase())),
+        h('div', { class: 'top' }, h('span', { class: 'avatar', style: { '--c': a.color } }, initials(a.name)), a.name, h('span', { class: 'tag', style: { marginLeft: 'auto' } }, a.type === 'kimi-remote' ? '遠端' : a.type.toUpperCase())),
         h('div', { class: `st ${a.available ? 'ok' : ''}` }, a.available ? '● 可以使用' : a.reason),
       ),
     );
@@ -658,12 +871,12 @@ function agentMenuItems(onPick, current, multi) {
         color: a.color,
         disabled: !a.available,
         checked: multi ? multi.has(a.id) : a.id === current,
-        run: () => (a.available ? onPick(a.id) : openSettings(a.id)),
+        run: () => (a.available ? onPick(a.id) : a.type === 'kimi-remote' ? openConnect() : openSettings(a.id)),
         allowDisabled: true,
       });
     }
   }
-  items.push('sep', { label: '管理 agents…', icon: 'gear', run: () => openSettings() });
+  items.push('sep', { label: '連接一台機器（Kimi）…', icon: 'plus', run: () => openConnect() }, { label: '管理 agents…', icon: 'gear', run: () => openSettings() });
   return items;
 }
 
@@ -757,7 +970,7 @@ function stripEvents(snap) {
 function sessionPills(sid) {
   const s = S.sessions.get(sid);
   if (!s) return [];
-  const pills = [permPill(s.permissionMode, (v) => patch(`/sessions/${sid}`, { permissionMode: v }).catch(fail))];
+  const pills = [permPill(s.permissionMode, (v) => patch(`/sessions/${sid}`, { permissionMode: v }).catch(fail), agentById(s.agentId)?.type === 'kimi-remote')];
   const meta = s.meta || {};
   const cfg = (body) => post(`/sessions/${sid}/config`, body).catch(fail);
   if (meta.modes?.availableModes?.length) {
@@ -829,7 +1042,7 @@ function drawTopbar() {
     e.stopPropagation();
     openMenu(more, [
       { label: '重新命名', icon: 'pencil', run: () => renameInline(title, s) },
-      { label: '複製工作區路徑', icon: 'copy', run: () => (navigator.clipboard?.writeText(s.cwd), toast('已複製路徑')) },
+      { label: '複製工作區路徑', icon: 'copy', run: () => navigator.clipboard?.writeText(s.cwd).then(() => toast('已複製路徑'), () => toast(s.cwd)) },
       ...(s.parentId ? [{ label: '回到上層 session', icon: 'back', run: () => go(`#/s/${s.parentId}`) }] : []),
       ...(s.groupId ? [{ label: '回到比較檢視', icon: 'columns', run: () => go(`#/g/${s.groupId}`) }] : []),
       'sep',
@@ -1065,20 +1278,23 @@ async function openFile(sid, body, path, back) {
 
 // ---------------------------------------------------- folder picker
 
-function pickFolder(onPick) {
+function pickFolder(onPick, machineId = null) {
   const list = h('div', { class: 'dir-list' });
   const pathInput = h('input', { type: 'text', class: 'mono', style: { width: '100%' } });
   const gitNote = h('span', { class: 'muted', style: { fontSize: '12.5px' } });
   let cur = null;
   const load = async (p) => {
     try {
-      const r = await get(`/fs/dirs${p ? `?path=${encodeURIComponent(p)}` : ''}`);
+      const q = new URLSearchParams();
+      if (p) q.set('path', p);
+      if (machineId) q.set('machine', machineId);
+      const r = await get(`/fs/dirs?${q}`);
       cur = r.path;
       pathInput.value = r.path;
       gitNote.textContent = r.git ? '✓ git repo（比較模式會為每個 agent 建立獨立的 worktree）' : '';
       fill(list, 
         ...(r.parent ? [h('div', { class: 'file-row', onclick: () => load(r.parent) }, icon('back'), '..')] : []),
-        ...r.dirs.map((d) => h('div', { class: 'file-row', onclick: () => load(`${r.path}/${d}`) }, icon('folder'), h('span', { class: 'name' }, d))),
+        ...r.dirs.map((d) => h('div', { class: 'file-row', onclick: () => load(`${r.path.replace(/[\\/]+$/, '')}${r.path.includes('\\') && !r.path.includes('/') ? '\\' : '/'}${d}`) }, icon('folder'), h('span', { class: 'name' }, d))),
       );
     } catch (err) {
       fail(err);
@@ -1087,7 +1303,7 @@ function pickFolder(onPick) {
   pathInput.onkeydown = (e) => e.key === 'Enter' && !e.isComposing && load(pathInput.value);
   const m = modal(
     [
-      h('div', { class: 'modal-head' }, h('h2', null, '選擇工作資料夾'), h('span', { class: 'spacer' }), h('button', { class: 'icon-btn', onclick: () => m.close() }, icon('x'))),
+      h('div', { class: 'modal-head' }, h('h2', null, machineId ? `選擇資料夾 · ${S.machines.find((x) => x.id === machineId)?.name || ''}` : '選擇工作資料夾'), h('span', { class: 'spacer' }), h('button', { class: 'icon-btn', onclick: () => m.close() }, icon('x'))),
       h(
         'div',
         { style: { padding: '14px 16px' } },
@@ -1099,7 +1315,7 @@ function pickFolder(onPick) {
     ],
     { small: true },
   );
-  load(S.home.cwd || '');
+  load(S.home.cwdMachine === machineId ? S.home.cwd || '' : '');
 }
 
 // ------------------------------------------------------------ settings
@@ -1126,6 +1342,7 @@ function drawSettings() {
   if (!st) return;
   const rows = [h('button', { class: 'btn sm', style: { width: '100%', justifyContent: 'center', marginBottom: '4px' }, onclick: openTemplates }, icon('plus'), '新增 agent')];
   for (const type of TYPE_ORDER) {
+    if (type === 'kimi-remote') continue;
     const list = S.agents.filter((a) => a.type === type);
     if (!list.length) continue;
     rows.push(h('div', { class: 'grp' }, TYPE_TITLES[type]));
@@ -1348,6 +1565,12 @@ function openTemplates() {
 
 // ----------------------------------------------------------- live data
 
+let agentsTimer = 0;
+function loadAgentsSoon() {
+  clearTimeout(agentsTimer);
+  agentsTimer = setTimeout(() => loadAgents().catch(() => {}), 300);
+}
+
 async function loadAgents() {
   S.agents = await get('/agents');
   renderSidebar();
@@ -1396,7 +1619,7 @@ function onMessage(msg) {
         v.composer.refresh();
       }
       // Surface approvals needed by sessions that are not on screen.
-      if (msg.session.status === 'awaiting_permission' && prev?.status !== 'awaiting_permission' && !visibleConvs(msg.session.id).length) {
+      if (msg.session.status === 'awaiting_permission' && prev?.status !== 'awaiting_permission' && !visibleConvs(msg.session.id).length && Date.now() > (S.quietUntil || 0)) {
         if (!notified.has(msg.session.id)) {
           notified.add(msg.session.id);
           setTimeout(() => notified.delete(msg.session.id), 3000);
@@ -1412,6 +1635,30 @@ function onMessage(msg) {
       break;
     case 'agents':
       loadAgents().catch(() => {});
+      break;
+    case 'machine': {
+      const i = S.machines.findIndex((m) => m.id === msg.machine.id);
+      const prev = S.machines[i];
+      if (i === -1) S.machines.push(msg.machine);
+      else S.machines[i] = msg.machine;
+      renderSidebar();
+      // Remote Kimi agents come and go with their machine.
+      if (!prev || prev.online !== msg.machine.online || prev.kimi?.available !== msg.machine.kimi?.available) loadAgentsSoon();
+      for (const k of msg.machine.sessions || []) {
+        const was = prev?.sessions?.find((x) => x.id === k.id);
+        const attached = [...S.sessions.values()].some((s) => s.kimiSessionId === k.id);
+        if (!attached && k.pending === 'approval' && was?.pending !== 'approval') {
+          toast(`${msg.machine.name} 上的 Kimi 需要你的確認：${k.title}`, { action: { label: '接管', run: () => attachKimi(msg.machine.id, k.id) }, timeout: 9000 });
+        }
+      }
+      break;
+    }
+    case 'machines':
+      loadMachines().catch(() => {});
+      loadAgentsSoon();
+      break;
+    case 'reset':
+      for (const conv of visibleConvs(msg.sid)) loadInto(conv).then(() => conv.setStatus(S.sessions.get(msg.sid))).catch(() => {});
       break;
     case 'login': {
       const st = S.settings;
@@ -1447,7 +1694,7 @@ function onStatus(ok) {
     banner = null;
     if (everConnected) {
       // Resync everything that may have changed while disconnected.
-      Promise.all([loadAgents(), loadSessions()]).then(() => route()).catch(() => {});
+      Promise.all([loadAgents(), loadSessions(), loadMachines()]).then(() => route()).catch(() => {});
     }
     everConnected = true;
   } else if (!banner && everConnected) {
@@ -1458,22 +1705,48 @@ function onStatus(ok) {
 
 // --------------------------------------------------------------- boot
 
+function showLogin() {
+  const input = h('input', { type: 'password', id: 'hub-token', placeholder: '登入密碼', autocomplete: 'current-password' });
+  const err = h('div', { class: 'err' });
+  const form = h(
+    'form',
+    { class: 'login-card' },
+    h('div', { class: 'logo' }, icon('logo')),
+    h('h1', null, 'Agent Hub'),
+    h('p', null, '輸入中控台啟動時顯示的登入密碼'),
+    input,
+    err,
+    h('button', { class: 'btn primary', type: 'submit' }, '登入'),
+  );
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    setToken(input.value.trim());
+    try {
+      await get('/config');
+      location.reload();
+    } catch (er) {
+      err.textContent = er.status === 401 ? '密碼不正確' : er.message;
+    }
+  };
+  fill($app, h('div', { class: 'login-wrap' }, form));
+  input.focus();
+}
+
+async function loadMachines() {
+  S.machines = await get('/machines');
+  renderSidebar();
+}
+
 async function boot() {
   buildLayout();
   try {
     S.config = await get('/config');
   } catch (err) {
-    if (err.status === 401) {
-      const t = prompt('這個 Agent Hub 需要存取權杖（啟動時印在終端機的網址中 #token= 後面）：');
-      if (t) {
-        (await import('./api.js')).setToken(t.trim());
-        return location.reload();
-      }
-    }
+    if (err.status === 401) return showLogin();
     fill(L.main, h('div', { class: 'panel-empty' }, `無法連線到伺服器：${err.message}`));
     return;
   }
-  await Promise.all([loadAgents(), loadSessions()]);
+  await Promise.all([loadAgents(), loadSessions(), loadMachines()]);
   connect(onMessage, onStatus);
   addEventListener('hashchange', route);
   addEventListener('resize', () => S.view?.kind && drawTopbar());

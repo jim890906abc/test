@@ -120,7 +120,7 @@ export async function getChanges(cwd) {
   return { git: true, files: summarizeDiff(diff), diff };
 }
 
-function summarizeDiff(diff) {
+export function summarizeDiff(diff) {
   const files = [];
   let cur = null;
   for (const line of diff.split('\n')) {

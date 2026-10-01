@@ -16,7 +16,7 @@ export function renderMarkdown(text) {
   for (const pre of div.querySelectorAll('pre')) {
     const btn = h('button', { class: 'btn sm ghost copy', title: '複製' }, icon('copy'));
     btn.onclick = () => {
-      navigator.clipboard?.writeText(pre.querySelector('code')?.innerText ?? pre.innerText);
+      navigator.clipboard?.writeText(pre.querySelector('code')?.innerText ?? pre.innerText).catch(() => {});
       fill(btn, icon('check'));
       setTimeout(() => fill(btn, icon('copy')), 1200);
     };
@@ -109,6 +109,30 @@ const HUB_LABELS = {
   search: '搜尋',
   delegate_to_agent: '委派',
 };
+// Kimi Code's tool names (Server API).
+const KIMI_LABELS = {
+  Bash: '執行',
+  Shell: '執行',
+  Read: '讀取',
+  ReadFile: '讀取',
+  Write: '寫入',
+  WriteFile: '寫入',
+  Edit: '編輯',
+  MultiEdit: '編輯',
+  StrReplaceFile: '編輯',
+  Glob: '搜尋',
+  Grep: '搜尋',
+  WebSearch: '網路搜尋',
+  SearchWeb: '網路搜尋',
+  WebFetch: '擷取網頁',
+  FetchURL: '擷取網頁',
+  Task: '子代理',
+  Agent: '子代理',
+  TodoWrite: '待辦清單',
+  SetTodoList: '待辦清單',
+  AskUserQuestion: '提問',
+  ExitPlanMode: '計畫',
+};
 const KIND_LABELS = {
   read: '讀取',
   edit: '編輯',
@@ -148,10 +172,27 @@ function clip(s, n = 20000) {
   return s.length > n ? `${s.slice(0, n)}\n… (已截斷 ${s.length - n} 字元)` : s;
 }
 
+function kimiBody(ev, sec, parts) {
+  const d = ev.display;
+  const input = ev.input;
+  if (d?.kind === 'command') sec('指令', h('pre', { class: 'term' }, `$ ${d.command}`));
+  else if (d?.kind === 'diff') parts.push(renderLineDiff(d.path, d.before, d.after));
+  else if (d?.kind === 'file_io' && (d.before != null || d.after != null)) parts.push(renderLineDiff(d.path, d.before ?? '', d.after ?? ''));
+  else if (d?.kind === 'file_io' && d.content != null) parts.push(renderLineDiff(d.path, '', clip(d.content, 30000)));
+  else if (d?.kind === 'search') sec('搜尋', h('pre', { class: 'term' }, `${d.query}${d.scope ? `  (${d.scope})` : ''}`));
+  else if (d?.kind === 'url_fetch') sec('網址', h('pre', { class: 'term' }, d.url));
+  else if (input != null && pretty(input).trim() && pretty(input) !== '{}') sec('輸入', h('pre', { class: 'term' }, clip(pretty(input), 6000)));
+  else if (ev.argsText) sec('輸入', h('pre', { class: 'term' }, clip(ev.argsText, 6000)));
+  if (ev.questionItems?.length > 1) sec('其他問題', h('div', { class: 'md' }, ev.questionItems.slice(1).map((q) => q.question).join('\n')));
+  if (ev.output) sec('輸出', h('pre', { class: 'term out' }, clip(ev.output)));
+}
+
 function toolBody(ev, ctx) {
   const parts = [];
   const sec = (label, node) => parts.push(h('div', { class: 'sec-label' }, label), node);
-  if (ev.source === 'acp') {
+  if (ev.source === 'kimi') {
+    kimiBody(ev, sec, parts);
+  } else if (ev.source === 'acp') {
     const content = Array.isArray(ev.content) ? ev.content : [];
     const hasDiff = content.some((c) => c.type === 'diff');
     if (ev.input != null && !hasDiff && pretty(ev.input).trim()) sec('輸入', h('pre', { class: 'term' }, clip(pretty(ev.input), 4000)));
@@ -192,16 +233,33 @@ function renderPermission(ev, ctx) {
   }
   const btns = (p.options || []).map((o) => {
     const cls = o.kind?.startsWith('reject') ? 'btn sm danger' : o.kind === 'allow_once' ? 'btn sm primary' : 'btn sm';
-    return h('button', { class: cls, onclick: (e) => (e.currentTarget.disabled = true, ctx.onPermission(ev.id, o.optionId)) }, o.name);
+    const choose = (e) => {
+      // One answer per request: lock every option as soon as one is chosen.
+      for (const b of e.currentTarget.parentNode.querySelectorAll('button')) b.disabled = true;
+      ctx.onPermission(ev.id, o.optionId);
+    };
+    return h('button', { class: cls, title: o.description || '', onclick: choose }, o.name);
   });
-  return h('div', { class: 'perm' }, h('div', { class: 'q' }, `${ctx.agentName()} 想要${KIND_LABELS[ev.kind] || HUB_LABELS[ev.name] || '使用工具'}：${ev.title || ev.name}`), h('div', { class: 'opts' }, btns));
+  const q = p.question
+    ? `${ctx.agentName()} 問你：${ev.title}`
+    : `${ctx.agentName()} 想要${toolLabel(ev)}：${ev.title || ev.name}`;
+  return h('div', { class: 'perm' }, h('div', { class: 'q' }, q), h('div', { class: 'opts' }, btns));
+}
+
+function toolLabel(ev) {
+  if (ev.source === 'kimi') return KIMI_LABELS[ev.name] || ev.name || '工具';
+  if (ev.source === 'acp') return KIND_LABELS[ev.kind] || ev.name || '工具';
+  return HUB_LABELS[ev.name] || ev.name;
 }
 
 function renderTool(ev, ctx, conv) {
   const awaiting = ev.permission && !ev.permission.chosen;
-  const label = ev.source === 'acp' ? KIND_LABELS[ev.kind] || ev.name || '工具' : HUB_LABELS[ev.name] || ev.name;
+  const label = toolLabel(ev);
   const wasOpen = conv.openState.get(ev.id);
-  const autoOpen = awaiting || (ev.source === 'acp' && ev.kind === 'edit' && ev.content?.some?.((c) => c.type === 'diff'));
+  const autoOpen =
+    awaiting ||
+    (ev.source === 'acp' && ev.kind === 'edit' && ev.content?.some?.((c) => c.type === 'diff')) ||
+    (ev.source === 'kimi' && ['diff', 'file_io'].includes(ev.display?.kind) && /Edit|Write|StrReplace/.test(ev.name || ''));
   const open = wasOpen ?? autoOpen;
   const card = h('div', { class: `tool ${open ? 'open' : ''} ${awaiting ? 'awaiting' : ''}` });
   const head = h(
@@ -232,6 +290,7 @@ function renderEvent(ev, ctx, conv) {
       const box = h('div', { class: `ev-user ${long ? 'long' : ''}` });
       if (ev.images?.length) box.append(h('div', { class: 'imgs' }, ev.images.map((src) => h('img', { src }))));
       box.append(h('div', { class: 'body' }, ev.text));
+      if (ev.note) box.append(h('div', { class: 'note' }, ev.note));
       if (long) {
         const more = h('button', { class: 'more' }, '顯示全部');
         more.onclick = () => {
