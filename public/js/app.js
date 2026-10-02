@@ -546,6 +546,7 @@ function updateHomeComposer() {
 }
 
 function homeCommand(name) {
+  if (name === 'usage' || name === 'status') return homeMachine() ? accountDialog(homeMachine().id) : openMachines();
   if (['model', 'effort', 'permission'].includes(name)) return homeComposer.openControl(name) || toast('這台電腦的 Kimi 沒有提供這個選項');
   if (name === 'plan') return homeComposer.opts.onConfig({ planMode: !S.home.planMode });
   if (['yolo', 'auto', 'manual'].includes(name)) return homeComposer.opts.onConfig({ permission: name });
@@ -873,6 +874,20 @@ async function sessionCommand(name, args) {
     }
     case 'init':
       return sendMessage({ text: INIT_PROMPT, images: [] });
+    case 'usage':
+      return accountDialog(s.machineId);
+    case 'status': {
+      const model = (meta.models || []).find((x) => x.id === meta.model);
+      const ctx = meta.context;
+      return accountDialog(s.machineId, [
+        ['模型', model?.name || meta.model || 'Kimi 的預設模型'],
+        meta.effort ? ['思考強度', EFFORT_LABELS[meta.effort] || meta.effort] : null,
+        ['權限', `${PERMISSION_LABELS[meta.permission] || PERMISSION_LABELS.manual}${meta.planMode ? ' · 計畫模式' : ''}`],
+        ctx?.size ? ['Context', `${Math.round((ctx.used / ctx.size) * 100)}% · ${fmtK(ctx.used)} / ${fmtK(ctx.size)} tokens`] : null,
+        ['資料夾', s.cwd || '—'],
+        meta.owner === 'tui' ? ['執行在', meta.controllable ? '終端機（kimi-hub，可操作）' : '終端機（唯讀）'] : null,
+      ]);
+    }
   }
   try {
     const r = await post(`/sessions/${s.id}/command`, { name, args });
@@ -1175,6 +1190,57 @@ function promptDialog({ title, value = '', action }) {
 }
 
 let machinesDialog = null;
+
+const fmtK = (n) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 100_000 ? 0 : 1)}k` : String(n || 0));
+
+// /usage and /status: the plan quota of the Kimi account on that machine,
+// plus (for /status) the conversation's own settings.
+async function accountDialog(machineId, rows = null) {
+  const m = machineById(machineId);
+  const body = h('div', { class: 'account' }, h('div', { class: 'dialog-title' }, rows ? '狀態' : '用量'), h('div', { class: 'muted' }, '讀取中…'));
+  const d = dialog(body);
+  let data = {};
+  try {
+    data = await get(`/machines/${machineId}/usage`);
+  } catch (err) {
+    data = { usage: { kind: 'error', message: err.message } };
+  }
+  const WINDOWS = { limit5h: '5 小時', limit7d: '7 天', monthTotal: '本月總額度', monthCode: '本月 Code 額度' };
+  const until = (t) => {
+    const ms = Date.parse(t) - Date.now();
+    if (!(ms > 0)) return '';
+    const hrs = ms / 3_600_000;
+    return hrs < 1 ? `${Math.ceil(ms / 60_000)} 分鐘後重置` : hrs < 48 ? `${Math.round(hrs)} 小時後重置` : `${Math.round(hrs / 24)} 天後重置`;
+  };
+  const u = data.usage;
+  const quota = u?.kind === 'ok' ? u.quota : null;
+  const bars = Object.entries(quota?.usages || {})
+    .filter(([, v]) => v && typeof v.usedRatio === 'number')
+    .map(([k, v]) => {
+      const pct = Math.round(Math.min(1, v.usedRatio) * 100);
+      return h(
+        'div',
+        { class: 'quota' },
+        h('div', { class: 'quota-head' }, h('span', null, WINDOWS[k] || k), h('span', { class: 'muted' }, `已用 ${pct}%${v.resetAt ? ` · ${until(v.resetAt)}` : ''}`)),
+        h('div', { class: `quota-bar${pct >= 90 ? ' danger' : pct >= 75 ? ' warning' : ''}` }, h('span', { style: { width: `${pct}%` } })),
+      );
+    });
+  const x = quota?.extraUsage;
+  const money = (c) => `${(c / 100).toFixed(2)} ${x?.currency || ''}`.trim();
+  const info = [
+    ...(rows || []).filter(Boolean),
+    data.user ? ['帳號', [data.user.nickname, data.user.userLevelName].filter(Boolean).join(' · ')] : null,
+    m ? ['電腦', `${m.name}${m.kimi?.version ? ` · Kimi Code ${m.kimi.version}` : ''}`] : null,
+    x ? ['加購額度', `餘額 ${money(x.balanceCents)}${x.monthlyUsedCents ? ` · 本月用了 ${money(x.monthlyUsedCents)}` : ''}`] : null,
+  ].filter(Boolean);
+  fill(
+    body,
+    h('div', { class: 'dialog-title' }, rows ? '狀態' : '用量'),
+    bars.length ? h('div', { class: 'quotas' }, bars) : h('p', { class: 'dialog-text muted' }, u?.kind === 'error' ? (/no token|login/i.test(u.message || '') ? '這台電腦的 Kimi 沒有用 Kimi 帳號登入，看不到方案用量。在那台電腦執行 kimi login。' : `讀不到方案用量：${u.message}`) : '這個帳號沒有方案額度資訊（例如用 API key 而不是 Kimi 帳號登入）。'),
+    info.length ? h('dl', { class: 'kv' }, info.flatMap(([k, v]) => [h('dt', null, k), h('dd', null, v)])) : null,
+    h('div', { class: 'dialog-actions' }, h('button', { class: 'om-btn om-btn--primary', type: 'button', onclick: () => d.close() }, '好')),
+  );
+}
 
 async function openSettings() {
   const m = homeMachine();

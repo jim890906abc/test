@@ -32,11 +32,15 @@ export const COMMANDS = [
   { name: 'title', description: '修改對話標題', args: true, hint: '<標題>' },
   { name: 'new', description: '在同一個資料夾開新對話', aliases: ['clear'] },
   { name: 'copy', description: '複製 Kimi 最後一則回覆' },
+  { name: 'usage', description: '方案用量：5 小時、7 天與本月額度' },
+  { name: 'status', description: '目前的模型、權限、context、帳號與電腦' },
 ];
-const HOME_COMMANDS = ['model', 'effort', 'plan', 'permission', 'yolo', 'auto', 'manual'];
+const HOME_COMMANDS = ['model', 'effort', 'plan', 'permission', 'yolo', 'auto', 'manual', 'usage', 'status'];
 // A Kimi running in a terminal runs its own slash commands; these are the
 // ones that work without its on-screen pickers.
 const TERMINAL_COMMANDS = [
+  { name: 'usage', description: '方案用量：5 小時、7 天與本月額度' },
+  { name: 'status', description: '目前的模型、權限、context、帳號與電腦' },
   { name: 'compact', description: '壓縮對話內容，騰出 context 空間', args: true, hint: '[補充指示]' },
   { name: 'undo', description: '撤回上一輪對話' },
   { name: 'btw', description: '順便問一個問題，不影響主對話', args: true, hint: '<問題>' },

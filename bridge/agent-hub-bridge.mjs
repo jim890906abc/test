@@ -317,6 +317,7 @@ function installSelf() {
 // shuts the server down is refused here, whatever the hub asks for.
 const ALLOW = [
   ['GET', /^\/api\/v1\/(meta|auth|models|healthz|config)$/],
+  ['GET', /^\/api\/v1\/oauth\/(usage|userinfo)$/],
   ['GET', /^\/api\/v1\/fs:(browse|home)(\?.*)?$/],
   ['GET', /^\/api\/v1\/sessions(\?.*)?$/],
   ['GET', /^\/api\/v1\/workspaces\/[\w.-]+\/skills$/],

@@ -349,6 +349,16 @@ app.delete('/api/machines/:id', wrap((req) => machines.removeMachine(req.params.
 app.post('/api/machines/:id/refresh', wrap((req) => machines.rpc(req.params.id, 'kimi.status')));
 app.post('/api/machines/:id/kimi/start', wrap((req) => machines.rpc(req.params.id, 'kimi.start', {}, 40_000)));
 // Models the machine's Kimi offers, for the new-conversation screen.
+// The Kimi account's plan quota and who is logged in on that machine.
+app.get('/api/machines/:id/usage', wrap(async (req) => {
+  await kimiRemote.ensureServer(req.params.id);
+  const [usage, user] = await Promise.all([
+    machines.kimiApi(req.params.id, 'GET', '/api/v1/oauth/usage').catch((err) => ({ kind: 'error', message: err.message })),
+    machines.kimiApi(req.params.id, 'GET', '/api/v1/oauth/userinfo').catch(() => null),
+  ]);
+  return { usage, user: user?.kind === 'ok' ? user.userInfo : null };
+}));
+
 app.get('/api/machines/:id/models', wrap(async (req) => {
   if (!machines.getMachine(req.params.id)?.kimi?.server) return { defaultModel: '', models: [] };
   return kimiRemote.modelsFor(req.params.id);

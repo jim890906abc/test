@@ -1917,6 +1917,50 @@ pre.tail {
   gap: var(--space-2);
   margin-top: var(--space-4);
 }
+.quotas {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.quota-head {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-2);
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+.quota-bar {
+  height: 8px;
+  border-radius: 4px;
+  background: var(--fill-hover);
+  overflow: hidden;
+}
+.quota-bar > span {
+  display: block;
+  height: 100%;
+  border-radius: 4px;
+  background: var(--accent);
+}
+.quota-bar.warning > span {
+  background: var(--warning, #c98a1b);
+}
+.quota-bar.danger > span {
+  background: var(--danger);
+}
+.kv {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px var(--space-4);
+  margin: var(--space-4) 0 0;
+  font-size: 13px;
+}
+.kv dt {
+  color: var(--ink-secondary);
+}
+.kv dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
 .settings {
   display: flex;
   flex-direction: column;
