@@ -1,4 +1,4 @@
-# One command to put Agent Hub on the public internet from this Windows PC:
+﻿# One command to put Agent Hub on the public internet from this Windows PC:
 # starts the hub, opens a Cloudflare quick tunnel (free, no account) and
 # connects this PC's Kimi Code. Prints the public URL, the login password and
 # the command for other machines.
