@@ -335,6 +335,7 @@ const server = {
   version: null,
   seen: new Map(), // session id -> last time the server reported activity for it
   busy: new Set(), // sessions the server says are busy
+  mine: new Map(), // session id -> when the hub created, drove or unlocked it through the server
 
   alive(pid) {
     try {
@@ -391,8 +392,8 @@ const server = {
     // A conversation running in a terminal must not be loaded by the server
     // too: two processes would write the same session.
     const sid = p.match(/^\/api\/v1\/sessions\/(session_[\w-]+)/)?.[1];
-    if (sid && disk.owner(sid)?.kind === 'tui') return { code: 40999, msg: '這個對話正在終端機的 Kimi 裡執行', data: null };
-    if (sid && method === 'POST' && /\/prompts$/.test(p)) this.seen.set(sid, Date.now());
+    if (sid && disk.owner(sid)?.kind === 'tui') return { code: 40999, msg: '這個對話可能正在終端機的 Kimi 裡執行', data: null };
+    if (sid && method === 'POST' && /\/prompts$/.test(p)) this.seen.set(sid, Date.now()), this.mine.set(sid, Date.now());
     const res = await fetch(this.base() + p, {
       method,
       headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json' },
@@ -401,7 +402,9 @@ const server = {
     });
     const text = await res.text();
     try {
-      return JSON.parse(text);
+      const j = JSON.parse(text);
+      if (method === 'POST' && p.split('?')[0] === '/api/v1/sessions' && j?.data?.id) this.mine.set(j.data.id, Date.now());
+      return j;
     } catch {
       return { code: res.status === 200 ? 0 : res.status, msg: text.slice(0, 300), data: null };
     }
@@ -683,6 +686,20 @@ class DiskSession {
     this.init();
   }
 
+  realCwd() {
+    const cwd = this.state?.cwd;
+    if (!cwd) return null;
+    if (this.cwdKey !== cwd) {
+      this.cwdKey = cwd;
+      try {
+        this.cwdReal = fs.realpathSync(cwd);
+      } catch {
+        this.cwdReal = cwd;
+      }
+    }
+    return this.cwdReal;
+  }
+
   wireFile(agent) {
     return path.join(this.dir, 'agents', agent, 'wire.jsonl');
   }
@@ -825,7 +842,9 @@ class DiskSession {
       updated_at: new Date(this.mtime || st.updatedAt || Date.now()).toISOString(),
       archived: Boolean(st.archived),
       owner: o?.kind || (server.busy.has(this.id) ? 'server' : null),
-      controllable: o?.kind === 'tui' ? Boolean(tui.byPid.get(o.pid)) : null,
+      controllable: o?.kind === 'tui' ? o.exact && Boolean(tui.byPid.get(o.pid)) : null,
+      // Not sure the terminal Kimi has this one open; locked to be safe.
+      guess: o?.kind === 'tui' && !o.exact ? true : undefined,
     };
   }
 
@@ -881,7 +900,8 @@ class DiskSession {
 
 const disk = {
   sessions: new Map(), // id -> DiskSession
-  owners: new Map(), // session id -> { kind: 'tui', pid }
+  tuis: [], // terminal Kimis: { pid, cwd, started }
+  best: new Map(), // session id -> pid of the terminal Kimi that surely has it open
   lastList: '',
 
   get(id) {
@@ -949,8 +969,18 @@ const disk = {
     }
   },
 
+  // A terminal Kimi does not say which conversation it has open. The one in
+  // its folder it wrote since it started is surely it; any other in that
+  // folder might be (opened with /resume or -c and not written yet), so it
+  // is locked too unless the hub drove it through the server since then.
   owner(id) {
-    return this.owners.get(id) || null;
+    const pid = this.best.get(id);
+    if (pid) return { kind: 'tui', pid, exact: true };
+    if (!this.tuis.length) return null;
+    const cwd = (this.sessions.get(id) || this.get(id))?.realCwd();
+    const mine = server.mine.get(id) || 0;
+    const p = cwd && this.tuis.find((t) => t.cwd === cwd && mine < t.started);
+    return p ? { kind: 'tui', pid: p.pid, exact: false } : null;
   },
 
   list() {
@@ -979,34 +1009,30 @@ const procs = {
         } catch {}
       }
     } catch {}
-    const tuis = list.filter((p) => !servers.has(p.pid) && p.pid !== process.pid);
-    const owners = new Map();
-    const real = (p) => {
+    const real = (d) => {
       try {
-        return fs.realpathSync(p);
+        return fs.realpathSync(d);
       } catch {
-        return p;
+        return d;
       }
     };
+    const tuis = list.filter((p) => !servers.has(p.pid) && p.pid !== process.pid).map((p) => ({ ...p, cwd: real(p.cwd) }));
+    const best = new Map();
     for (const p of tuis) {
-      let best = null;
+      let pick = null;
       for (const s of disk.sessions.values()) {
-        const cwd = s.state?.cwd;
-        if (!cwd || real(cwd) !== p.cwd) continue;
-        if (s.mtime < p.started - 2000) continue;
-        if (!best || s.mtime > best.mtime) best = s;
+        if (s.realCwd() !== p.cwd || s.mtime < p.started - 2000) continue;
+        if ((server.mine.get(s.id) || 0) >= p.started) continue;
+        if (!pick || s.mtime > pick.mtime) pick = s;
       }
-      if (best) owners.set(best.id, { kind: 'tui', pid: p.pid });
+      if (pick) best.set(pick.id, p.pid);
     }
-    const key = JSON.stringify([...owners]);
+    const key = JSON.stringify([tuis.map((p) => [p.pid, p.cwd]), [...best], [...server.mine.keys()]]);
     if (key !== this.last) {
-      const changed = new Set([...owners.keys(), ...disk.owners.keys()]);
-      disk.owners = owners;
+      disk.tuis = tuis;
+      disk.best = best;
       this.last = key;
-      for (const id of changed) {
-        const s = disk.sessions.get(id);
-        if (s) hub.pushSession(s, true);
-      }
+      for (const s of disk.sessions.values()) hub.pushSession(s);
     }
   },
 
@@ -1041,7 +1067,7 @@ const procs = {
     const found = [];
     for (const line of ps.split('\n')) {
       const m = line.match(/^\s*(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+[\d:]+\s+\d{4})\s+(.*)$/);
-      if (m && /^kimi-code\b|\/kimi(\s|$)/.test(m[3])) found.push({ pid: Number(m[1]), started: Date.parse(m[2]) });
+      if (m && /^kimi-code\b|\/kimi(\s|$)|kimi-code\/dist\/main\.mjs/.test(m[3]) && !/agent-hub-bridge|python/.test(m[3])) found.push({ pid: Number(m[1]), started: Date.parse(m[2]) });
     }
     if (!found.length) return [];
     const lsof = execFileSync('lsof', ['-a', '-d', 'cwd', '-Fpn', '-p', found.map((p) => p.pid).join(',')], { encoding: 'utf8' });
@@ -1064,7 +1090,7 @@ const tui = {
 
   controller(sid) {
     const o = disk.owner(sid);
-    return o?.kind === 'tui' ? this.byPid.get(o.pid) || null : null;
+    return o?.kind === 'tui' && o.exact ? this.byPid.get(o.pid) || null : null;
   },
 
   async input(sid, args) {
@@ -1072,6 +1098,7 @@ const tui = {
     const o = disk.owner(sid);
     const c = this.controller(sid);
     if (!o) throw new Error('這個對話沒有在終端機裡執行');
+    if (!o.exact) throw new Error('這個資料夾有終端機的 Kimi 開著，但看不出它開的是不是這個對話，所以先設成唯讀。');
     if (!c) throw new Error('這個對話正在終端機的 Kimi 裡執行，但那個 Kimi 不是用 kimi-hub 啟動的，所以中控台只能看、不能操作。在那個 Kimi 裡輸入 /web 交給中控台，或之後改用 kimi-hub 啟動 Kimi。');
     const s = disk.get(sid);
     const paste = (t) => `\x1b[200~${t}\x1b[201~`;
@@ -1135,7 +1162,7 @@ function listenLocal() {
             pid = m.pid;
             tui.byPid.set(pid, { sock, cwd: m.cwd });
             log(`✓ 終端機的 Kimi（pid ${pid}，${m.cwd}）可以從中控台操作`);
-            for (const [sid, o] of disk.owners) if (o.pid === pid) hub.pushSession(disk.sessions.get(sid), true);
+            for (const [sid, p] of disk.best) if (p === pid) hub.pushSession(disk.sessions.get(sid), true);
           }
         } catch {}
       }
@@ -1307,6 +1334,13 @@ const hub = {
       case 'kimi.info': {
         const s = disk.get(String(args.sessionId || ''));
         return s ? s.info() : null;
+      }
+      case 'kimi.unlock': {
+        const sid = String(args.sessionId || '');
+        if (disk.best.has(sid)) throw new Error('終端機的 Kimi 正開著這個對話，不能解除唯讀');
+        server.mine.set(sid, Date.now());
+        procs.scan();
+        return { ok: true };
       }
       case 'kimi.tui.input':
         return tui.input(String(args.sessionId || ''), args);

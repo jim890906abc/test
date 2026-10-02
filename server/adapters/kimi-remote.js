@@ -210,7 +210,7 @@ class Mirror {
     const busy = Boolean(info.busy);
     const pending = info.pending_interaction && info.pending_interaction !== 'none';
     this.ctx.setStatus(busy ? (pending ? 'awaiting_permission' : 'running') : info.last_turn_reason === 'failed' ? 'error' : 'idle');
-    const f = { owner: info.owner || null, controllable: info.controllable ?? null };
+    const f = { owner: info.owner || null, controllable: info.controllable ?? null, guess: Boolean(info.guess) };
     if (Array.isArray(info.todos)) f.todos = info.todos;
     this.meta(f);
     this.applyStatus({ model: info.model, effort: info.effort, permission: info.permission, contextTokens: info.contextTokens || undefined });
@@ -805,7 +805,11 @@ class Mirror {
     if (q.terminal) {
       const busy = ['running', 'awaiting_permission'].includes(this.session.status);
       await this.tui({ action: 'send', text: q.text, mode: busy ? 'steer' : 'enter' });
-    } else await this.steer(promptId);
+    } else {
+      const post = this.inflight?.get(promptId);
+      if (post && (await post.catch(() => null))?.status !== 'queued') return;
+      await this.steer(promptId);
+    }
   }
 
   async send(text, images = [], { note, steer } = {}) {
@@ -824,13 +828,18 @@ class Mirror {
     const body = { prompt_id: promptId, content: this.content(text, images) };
     if (this.defaultModel === undefined) await this.loadModels().catch(() => {});
     if (!this.session.meta?.model && this.defaultModel) body.model = this.defaultModel;
+    // 插隊 from the tray can come before Kimi has the prompt: it waits.
+    const post = this.api('POST', this.path('/prompts'), body);
+    (this.inflight ??= new Map()).set(promptId, post);
     try {
-      const r = await this.api('POST', this.path('/prompts'), body);
+      const r = await post;
       if (r?.status === 'queued' && steer) await this.steer(promptId);
     } catch (err) {
       this.dequeue(promptId);
       ctx.emit({ type: 'error', text: err.message });
       if (!busy) ctx.setStatus('idle');
+    } finally {
+      this.inflight.delete(promptId);
     }
   }
 
@@ -1042,6 +1051,8 @@ export async function send(session, text, { images = [], note, steer } = {}) {
   await m.send(text, images, { note, steer });
 }
 export const steerQueued = (session, promptId) => mirrorFor(session).steerQueued(promptId);
+// Take a conversation locked only because a terminal Kimi runs in its folder.
+export const unlock = (session) => machines.rpc(session.machineId, 'kimi.unlock', { sessionId: session.kimiSessionId });
 
 // Refuse up front what cannot be delivered (a terminal Kimi not started
 // through the bridge only mirrors).
@@ -1065,7 +1076,7 @@ machines.onSessionChange((machineId, entry) => {
   const sid = byKimi.get(`${machineId}:${entry.id}`);
   const m = sid && mirrors.get(sid);
   if (!m) return;
-  m.meta({ owner: entry.owner || null, controllable: entry.controllable ?? null });
+  m.meta({ owner: entry.owner || null, controllable: entry.controllable ?? null, guess: Boolean(entry.guess) });
 });
 
 export function dispose(session) {

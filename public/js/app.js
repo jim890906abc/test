@@ -642,6 +642,7 @@ async function openSession(id) {
     onConfig: configure,
     onCancelQueued: (pid) => S.cur && del(`/sessions/${S.cur.id}/queue/${pid}`).catch(fail),
     onSteerQueued: (pid) => S.cur && post(`/sessions/${S.cur.id}/queue/${pid}/steer`).catch(fail),
+    onUnlock: () => S.cur && post(`/sessions/${S.cur.id}/unlock`).catch(fail),
     onError: (t) => toast(t),
     onHelp: openMachines,
   });
@@ -715,6 +716,7 @@ function updateComposer() {
     skills: meta.skills || [],
     terminal: meta.owner === 'tui',
     controllable: Boolean(meta.controllable),
+    guess: Boolean(meta.guess),
   });
 }
 
@@ -744,7 +746,7 @@ function renderToolbar() {
         { class: 'om-toolbar__subtitle', title: s.cwd || '' },
         sub,
         m && !m.online ? h('span', { class: 'om-badge om-badge--danger' }, '電腦離線') : null,
-        s.meta?.owner === 'tui' ? h('span', { class: 'om-badge', title: s.meta.controllable ? '在終端機的 Kimi 裡執行，可以從這裡操作' : '在終端機的 Kimi 裡執行，這裡只能看' }, s.meta.controllable ? '終端機' : '終端機 · 唯讀') : null,
+        s.meta?.owner === 'tui' ? h('span', { class: 'om-badge', title: s.meta.guess ? '同一個資料夾有終端機的 Kimi 開著，可能正在用這個對話，這裡先只能看' : s.meta.controllable ? '在終端機的 Kimi 裡執行，可以從這裡操作' : '在終端機的 Kimi 裡執行，這裡只能看' }, s.meta.controllable ? '終端機' : '終端機 · 唯讀') : null,
       ),
     ),
     h('span', { class: 'om-toolbar__spacer' }),

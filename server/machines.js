@@ -83,6 +83,8 @@ const sessionEntry = (s) => ({
   // started through the bridge and accepts input from the hub.
   owner: s.owner || null,
   controllable: s.controllable ?? null,
+  // Locked only because a terminal Kimi runs in the same folder.
+  guess: Boolean(s.guess),
 });
 
 function sessionChanged(m, entry) {

@@ -298,6 +298,40 @@ test('a conversation running in a terminal Kimi is followed live, read-only', { 
   }
 });
 
+test('other conversations in the folder of a terminal Kimi are locked until unlocked', { skip: SKIP_TTY }, async () => {
+  // An older conversation in the project folder, started on the Kimi side.
+  const ks = await kimiApi('POST', '/sessions', { metadata: { cwd: PROJECT } });
+  await kimiApi('POST', `/sessions/${ks.id}/prompts`, { content: [{ type: 'text', text: '聊天 舊對話' }], model: 'fake/fake-1' });
+  await listed((s) => s.id === ks.id && !s.busy && s.title, 'older conversation');
+  const older = await api('POST', `/machines/${machineId}/kimi/${ks.id}/attach`);
+  const tty = terminalKimi([KIMI, '--auto']);
+  try {
+    await new Promise((r) => setTimeout(r, 4000));
+    tty.type('');
+    await new Promise((r) => setTimeout(r, 1000));
+    tty.type('聊天 另一個');
+    await listed((s) => s.title === '聊天 另一個' && s.owner === 'tui' && !s.guess, 'terminal conversation');
+    // The terminal Kimi could have the older one open (/resume): read-only.
+    const locked = await until(async () => {
+      const x = await session(older.id);
+      return x.meta.owner === 'tui' && x.meta.guess && x;
+    }, 8000, 'older conversation locked');
+    assert.equal(locked.meta.controllable, false);
+    await assert.rejects(api('POST', `/sessions/${older.id}/messages`, { text: '聊天 不該送出' }), (e) => e.status === 409);
+    // A new one from the hub in the same folder is the hub's.
+    const fresh = await api('POST', '/sessions', { machineId, cwd: PROJECT, prompt: '聊天 新對話', permission: 'auto' });
+    assert.ok((await idle(fresh.id)).events.some((e) => e.type === 'text' && e.text.includes('收到：聊天 新對話')));
+    assert.notEqual((await session(fresh.id)).meta.owner, 'tui');
+    // Unlocking on request.
+    await api('POST', `/sessions/${older.id}/unlock`);
+    await until(async () => (await session(older.id)).meta.owner !== 'tui', 8000, 'unlocked');
+    await api('POST', `/sessions/${older.id}/messages`, { text: '聊天 解除後' });
+    await until(async () => (await session(older.id)).events.some((e) => e.type === 'text' && e.text.includes('收到：聊天 解除後')), 20000, 'answered after unlock');
+  } finally {
+    tty.stop();
+  }
+});
+
 test('a terminal Kimi started with `agent-hub-bridge.mjs kimi` can be driven from the hub', { skip: SKIP_TTY }, async () => {
   const tty = terminalKimi([process.execPath, path.join(ROOT, 'bridge/agent-hub-bridge.mjs'), 'kimi']);
   try {
