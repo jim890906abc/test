@@ -186,7 +186,7 @@ app.get('/api/artifacts', wrap(() => {
     }
     out.push(...byPath.values());
   }
-  return out.map((a) => ({ ...a, title: a.title || a.path.split('/').pop() })).sort((a, b) => b.updatedAt - a.updatedAt);
+  return out.map((a) => ({ ...a, title: a.title || a.path.split(/[\\/]/).pop() })).sort((a, b) => b.updatedAt - a.updatedAt);
 }));
 
 app.get('/api/sessions', wrap(() =>

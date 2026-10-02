@@ -2,6 +2,7 @@
 // computing the "Changes" view from git without touching the user's index.
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { WORKSPACES_DIR } from './store.js';
@@ -66,7 +67,7 @@ export async function createWorktree(repoDir, name) {
 }
 
 export function validateDir(dir) {
-  const abs = path.resolve(dir.replace(/^~(?=$|\/)/, process.env.HOME || '~'));
+  const abs = path.resolve(dir.replace(/^~(?=$|[\\/])/, os.homedir()));
   if (!fs.existsSync(abs) || !fs.statSync(abs).isDirectory()) throw new Error(`資料夾不存在：${abs}`);
   return abs;
 }

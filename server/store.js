@@ -3,9 +3,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import { DEFAULT_AGENTS } from './adapters/presets.js';
 
-export const ROOT_DIR = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+export const ROOT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 export const DATA_DIR = path.resolve(process.env.AGENT_HUB_DATA || path.join(ROOT_DIR, 'data'));
 export const WORKSPACES_DIR = path.resolve(process.env.AGENT_HUB_WORKSPACES || path.join(ROOT_DIR, 'workspaces'));
 
