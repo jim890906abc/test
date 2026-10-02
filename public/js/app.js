@@ -163,6 +163,7 @@ function rows() {
 }
 
 let sideRaf = 0;
+let lastSidebar = '';
 function renderSidebar() {
   if (sideRaf) return;
   sideRaf = requestAnimationFrame(() => {
@@ -183,6 +184,16 @@ function drawSidebar() {
     groups.get(g).push(r);
   }
   const current = S.cur?.summary;
+  // Conversations update every few seconds; redraw only what would change.
+  const sig = JSON.stringify([
+    current?.id,
+    multi,
+    all.length,
+    S.machines.some((m) => m.online),
+    [...groups].map(([g, rs]) => [g, rs.map((r) => [r.key, r.title, r.cwd, r.status, r.offline, r.kimi?.owner || r.hub?.meta?.owner, r.machine?.name, relTime(r.updatedAt)])]),
+  ]);
+  if (sig === lastSidebar) return;
+  lastSidebar = sig;
   const items = [];
   for (const [g, rs] of groups) {
     items.push(h('div', { class: 'om-sidebar__section' }, g));
@@ -871,27 +882,33 @@ function panelWidth(w) {
   const side = $app.classList.contains('no-sidebar') ? 0 : $sidebar.offsetWidth;
   const max = window.innerWidth - side - 360;
   if (w == null) {
-    $app.style.removeProperty('--panel-w');
+    $panel.style.removeProperty('--panel-w');
     try {
       localStorage.removeItem('hubPanelW');
     } catch {}
     return;
   }
   w = Math.round(Math.max(320, Math.min(w, max)));
-  $app.style.setProperty('--panel-w', `${w}px`);
+  // On the panel itself: set on .app it would restyle the whole page.
+  $panel.style.setProperty('--panel-w', `${w}px`);
   try {
     localStorage.setItem('hubPanelW', String(w));
   } catch {}
 }
 try {
   const w = Number(localStorage.getItem('hubPanelW'));
-  if (w) $app.style.setProperty('--panel-w', `${w}px`);
+  if (w) $panel.style.setProperty('--panel-w', `${w}px`);
 } catch {}
 $grip.addEventListener('pointerdown', (e) => {
   e.preventDefault();
   $grip.setPointerCapture(e.pointerId);
   $app.classList.add('resizing');
-  const move = (ev) => panelWidth(window.innerWidth - ev.clientX);
+  let raf = 0;
+  let x = e.clientX;
+  const move = (ev) => {
+    x = ev.clientX;
+    raf ||= requestAnimationFrame(() => ((raf = 0), panelWidth(window.innerWidth - x)));
+  };
   const up = () => {
     $app.classList.remove('resizing');
     $grip.removeEventListener('pointermove', move);

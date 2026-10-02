@@ -76,11 +76,17 @@ export class Transcript {
       this.stick = this.el.scrollHeight - this.el.scrollTop - this.el.clientHeight < 80;
     });
     this.tick = setInterval(() => this.renderWorking(), 1000);
+    // Messages out of view are laid out lazily (content-visibility), so the
+    // column keeps settling after a render: stay pinned to the end while
+    // following it.
+    this.resize = new ResizeObserver(() => this.stick && this.scrollToEnd());
+    this.resize.observe(this.column);
   }
 
   destroy() {
     cancelAnimationFrame(this.raf);
     clearInterval(this.tick);
+    this.resize.disconnect();
   }
 
   load(events) {
