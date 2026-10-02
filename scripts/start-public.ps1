@@ -16,7 +16,7 @@ New-Item -ItemType Directory -Force -Path $Logs | Out-Null
 function Say($m) { Write-Host "▸ $m" -ForegroundColor DarkYellow }
 
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) { throw '需要 Node.js 22 以上：https://nodejs.org' }
-$major = [int](node -p 'process.versions.node.split(".")[0]')
+$major = [int]((node -v).TrimStart('v').Split('.')[0])
 if ($major -lt 22) { throw "Node.js 版本太舊（$(node -v)），需要 22 以上" }
 if (-not (Test-Path node_modules)) { Say '安裝相依套件（npm install）…'; npm install --omit=dev --no-audit --no-fund | Out-Null }
 
