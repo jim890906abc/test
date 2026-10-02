@@ -671,7 +671,8 @@ function translate(rec, sid, fileAgent = 'main') {
     case 'token_counting.turn_recorded':
       return a === 'main' ? [f('agent.status.updated', { contextTokens: rec.tokens })] : [];
     case 'profile.bind':
-      return a === 'main' ? [f('agent.status.updated', { model: rec.modelAlias, thinkingEffort: rec.thinkingEffort })] : [];
+      // Subagents bind their own model and thinking too.
+      return [f('agent.status.updated', { model: rec.modelAlias, thinkingEffort: rec.thinkingEffort })];
     case 'permission.set_mode':
       return a === 'main' ? [f('agent.status.updated', { permission: rec.mode })] : [];
     case 'tools.update_store':

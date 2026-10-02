@@ -734,6 +734,11 @@ class Mirror {
             context: p.maxContextTokens ? { used: p.contextTokens || 0, size: p.maxContextTokens } : undefined,
             contextTokens: p.contextTokens,
           });
+        } else if (p.model || p.thinkingEffort) {
+          // A subagent's own model and thinking, shown with it.
+          const a = this.agents.get(agentId);
+          const card = a && this.events().find((e) => e.id === a.parent);
+          if (card?.subagent) this.ctx.patch(card, { subagent: { ...card.subagent, model: p.model || card.subagent.model, effort: p.thinkingEffort || card.subagent.effort } });
         }
         return;
       case 'hub.todos':

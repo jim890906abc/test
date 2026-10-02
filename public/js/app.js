@@ -1144,6 +1144,14 @@ function showAgents(id) {
   drawAgentList();
 }
 
+// "K3-256k · 思考 最高": the model and thinking a subagent runs with.
+function agentModel(a) {
+  const models = S.cur?.summary?.meta?.models || [];
+  const m = a.model && (models.find((x) => x.id === a.model)?.name || a.model.split('/').pop());
+  const e = a.effort && a.effort !== 'off' ? `思考 ${EFFORT_LABELS[a.effort] || a.effort}` : a.effort === 'off' ? '不思考' : '';
+  return [m, e].filter(Boolean).join(' · ');
+}
+
 function drawAgentList() {
   if (!agentPanel || !S.cur) return;
   const all = S.cur.transcript.agentList();
@@ -1158,7 +1166,12 @@ function drawAgentList() {
         'button',
         { class: `agent-item${a.id === agentPanel.id ? ' on' : ''}`, type: 'button', onclick: () => a.id !== agentPanel.id && showAgents(a.id) },
         icon('agents'),
-        h('span', { class: 'agent-item-text' }, h('span', { class: 'agent-item-name' }, a.name ? `子代理 · ${a.name}` : '子代理', a.background ? h('span', { class: 'om-badge' }, '背景') : null), h('span', { class: 'agent-item-desc' }, a.running && a.activity ? `${a.description} · ${a.activity}` : a.description)),
+        h(
+          'span',
+          { class: 'agent-item-text' },
+          h('span', { class: 'agent-item-name' }, a.name ? `子代理 · ${a.name}` : '子代理', a.background ? h('span', { class: 'om-badge' }, '背景') : null, agentModel(a) ? h('span', { class: 'agent-item-model' }, agentModel(a)) : null),
+          h('span', { class: 'agent-item-desc' }, a.running && a.activity ? `${a.description} · ${a.activity}` : a.description),
+        ),
         a.steps ? h('span', { class: 'agent-item-meta' }, `${a.steps} 步`) : null,
         status(a),
       ),

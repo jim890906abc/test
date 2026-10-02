@@ -242,6 +242,8 @@ export class Transcript {
         activity: activity.slice(0, 120),
         steps: kids.filter((k) => k.type === 'tool_use').length,
         background: Boolean(sub.background),
+        model: sub.model || '',
+        effort: sub.effort || '',
         running,
         failed,
         stopped: sub.status === 'cancelled' || ev.status === 'interrupted',

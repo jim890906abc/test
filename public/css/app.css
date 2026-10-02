@@ -1977,6 +1977,11 @@ pre.tail {
   gap: 6px;
   font-weight: 600;
 }
+.agent-item-model {
+  font-weight: 400;
+  color: var(--ink-secondary);
+  font-variant-numeric: tabular-nums;
+}
 .agent-item-desc {
   overflow: hidden;
   text-overflow: ellipsis;
