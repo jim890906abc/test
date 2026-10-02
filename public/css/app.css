@@ -1608,6 +1608,49 @@ pre.tail {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.agent-tray {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: 6px var(--space-3);
+  background: var(--window-raised);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+}
+.agent-tray:hover {
+  background: var(--fill-hover);
+}
+.agent-tray .om-icon {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  color: var(--ink-secondary);
+}
+.agent-tray-name {
+  flex: none;
+  font-weight: 600;
+}
+.agent-tray-desc {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agent-tray-now,
+.agent-tray-meta {
+  color: var(--ink-secondary);
+}
+.agent-tray-meta {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
 .todo-tray {
   background: var(--window-raised);
   border: 1px solid var(--line);

@@ -68,6 +68,7 @@ export class Transcript {
     this.pin = h('button', { class: 'prompt-pin', type: 'button', title: '跳到這個問題', onclick: () => this.toPrompt() }, icon('up'), this.pinText);
     this.pinBar = h('div', { class: 'prompt-pin-bar', hidden: true }, this.pin);
     this.users = []; // top-level user message ids, in order
+    this.agentIds = []; // top-level subagent calls
     this.el = h('div', { class: 'transcript', tabindex: '-1' }, this.pinBar, this.column, this.working, this.jumpBar);
     this.events = new Map();
     this.order = [];
@@ -111,6 +112,7 @@ export class Transcript {
     this.waiting.clear();
     this.groupOf.clear();
     this.users = [];
+    this.agentIds = [];
     this.pinBar.hidden = true;
     this.column.replaceChildren();
     for (const ev of events) this.add(ev, true);
@@ -124,6 +126,7 @@ export class Transcript {
     this.order.push(ev.id);
     this.grew = true;
     if (ev.type === 'user' && !ev.parent) this.users.push(ev.id);
+    if (ev.type === 'tool_use' && !ev.parent && isAgent(ev)) this.agentIds.push(ev.id);
     const node = this.makeNode(ev);
     this.nodes.set(ev.id, node);
     this.mount(node);
@@ -195,10 +198,45 @@ export class Transcript {
     if (this.stick) this.scrollToEnd();
     else if (this.grew) this.jump.classList.add('new');
     this.grew = false;
+    this.opts.onFlush?.();
   }
 
   scrollToEnd() {
     this.el.scrollTop = this.el.scrollHeight;
+  }
+
+  // Subagents still working (background ones included), for the tray
+  // under the conversation: what each is doing right now.
+  runningAgents() {
+    const out = [];
+    for (const id of this.agentIds) {
+      const ev = this.events.get(id);
+      const sub = ev?.subagent || {};
+      if (!ev || !(sub.status === 'running' || (!sub.status && ACTIVE.includes(ev.status)))) continue;
+      const kids = this.order.filter((k) => this.events.get(k).parent === id).map((k) => this.events.get(k));
+      const last = [...kids].reverse().find((k) => k.type === 'tool_use' || (k.type === 'text' && k.text?.trim()));
+      const activity = !last ? '' : last.type === 'tool_use' ? `${(TOOLS[last.name] || [null, last.name])[1]} ${last.title || ''}`.trim() : last.text.trim().split('\n').pop();
+      out.push({
+        id,
+        name: sub.name && !['subagent', 'btw'].includes(sub.name) ? sub.name : '',
+        description: sub.description || ev.input?.description || ev.title || '',
+        activity: activity.slice(0, 120),
+        steps: kids.filter((k) => k.type === 'tool_use').length,
+        background: Boolean(sub.background),
+      });
+    }
+    return out;
+  }
+
+  // Open a subagent's card and bring it into view.
+  focusAgent(id) {
+    const node = this.nodes.get(id);
+    if (!node) return;
+    this.open.add(id);
+    this.shut.delete(id);
+    this.markDirty(id);
+    this.stick = false;
+    node.el.scrollIntoView({ block: 'start', behavior: 'smooth' });
   }
 
   // The newest question whose bubble is entirely above the visible area.

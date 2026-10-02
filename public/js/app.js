@@ -661,6 +661,15 @@ async function openSession(id) {
     activeArtifact: () => (S.panel?.tab === 'artifact' ? S.panel.path : null),
     onImage: lightbox,
     onLoadEarlier: () => post(`/sessions/${id}/earlier`).catch(fail),
+    // Working subagents go to the tray under the conversation.
+    onFlush: () => {
+      if (S.cur !== cur || !composer) return;
+      const agents = cur.transcript.runningAgents();
+      const sig = JSON.stringify(agents);
+      if (sig === cur.agentSig) return;
+      cur.agentSig = sig;
+      composer.update({ agents });
+    },
   });
   composer ??= new Composer({
     onSend: sendMessage,
@@ -672,8 +681,10 @@ async function openSession(id) {
     onUnlock: () => S.cur && post(`/sessions/${S.cur.id}/unlock`).catch(fail),
     onError: (t) => toast(t),
     onHelp: openMachines,
+    onFocusAgent: (aid) => S.cur?.transcript.focusAgent(aid),
   });
   composer.setKey(id);
+  composer.update({ agents: [] });
   fill($view, h('div', { class: 'session' }, cur.transcript.el, h('div', { class: 'composer-dock' }, composer.el)));
   renderToolbar();
   renderSidebar();
