@@ -1917,6 +1917,36 @@ pre.tail {
   gap: var(--space-2);
   margin-top: var(--space-4);
 }
+.settings {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+.settings .dialog-title,
+.settings .dialog-subtitle {
+  margin: 0;
+}
+.settings .settings-lead {
+  margin: calc(var(--space-3) * -1) 0 0;
+  color: var(--ink-secondary);
+}
+.settings .om-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.settings select.om-input {
+  width: 100%;
+}
+.settings-switch {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+.settings-switch > span {
+  display: flex;
+  flex-direction: column;
+}
 .alert .dialog-actions {
   margin-top: var(--space-1);
 }

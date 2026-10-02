@@ -89,12 +89,38 @@ const EDITABLE = ['name', 'enabled', 'color', 'command', 'args', 'env', 'login',
 
 // ------------------------------------------------------------------ meta
 
+// Defaults for new conversations (model, thinking, permission, plan mode),
+// kept on the hub so every browser and phone gets the same ones.
+const SETTINGS_FILE = path.join(store.DATA_DIR, 'settings.json');
+function readSettings() {
+  try {
+    return JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
+  } catch {
+    return { defaults: {} };
+  }
+}
+
 app.get('/api/config', wrap(() => ({
   version: '0.3.0',
   workspacesDir: store.WORKSPACES_DIR,
   home: os.homedir(),
   host: HOST,
+  settings: readSettings(),
 })));
+
+app.put('/api/settings', wrap((req) => {
+  const d = req.body?.defaults || {};
+  const str = (v) => (typeof v === 'string' && v.length <= 200 ? v : '');
+  const defaults = {
+    model: str(d.model),
+    effort: str(d.effort),
+    permission: ['manual', 'yolo', 'auto'].includes(d.permission) ? d.permission : 'manual',
+    planMode: Boolean(d.planMode),
+  };
+  const settings = { ...readSettings(), defaults };
+  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2));
+  return settings;
+}));
 
 app.get('/api/fs/dirs', wrap(async (req) => {
   if (req.query.machine) {

@@ -1,10 +1,10 @@
 // Agent Hub — Kimi Code on all your machines, in one window.
 import { h, fill, icon, relTime, dayGroup, shortPath, baseName, copyText } from './dom.js';
-import { get, post, del, connect, setToken } from './api.js';
+import { get, post, put, del, connect, setToken } from './api.js';
 import { renderHunks, parseUnifiedDiff } from './markdown.js';
 import { openMenu, closeMenu, menuOpen, pointAnchor } from './menu.js';
 import { Transcript } from './transcript.js';
-import { Composer, PERMISSION_LABELS } from './composer.js';
+import { Composer, PERMISSION_LABELS, EFFORT_LABELS } from './composer.js';
 import { ArtifactView, downloadHtml, htmlTitle } from './artifacts.js';
 
 const S = {
@@ -48,6 +48,16 @@ function togglePin(key) {
     localStorage.setItem('hubPins', JSON.stringify([...S.pins]));
   } catch {}
   renderSidebar();
+}
+
+// New conversations start from the defaults in 設定; what is picked on the
+// home screen applies to that one conversation.
+const defaults = () => S.config?.settings?.defaults || {};
+function resetHomeChoices() {
+  const d = defaults();
+  Object.assign(S.home, { model: d.model || '', effort: d.effort || '', permission: d.permission || 'manual', planMode: Boolean(d.planMode) });
+  saveHome();
+  updateHomeComposer();
 }
 
 function saveHome() {
@@ -333,6 +343,7 @@ function settingsMenu(anchor) {
       { label: '深色', checked: t === 'dark', onSelect: () => applyTheme('dark') },
       { separator: true },
       canNotify ? { label: '開啟通知', description: 'Kimi 需要你的時候通知你', onSelect: () => Notification.requestPermission().then(() => toast('已開啟通知')) } : null,
+      { label: '設定…', description: '新對話預設的模型、思考強度、權限', onSelect: openSettings },
       { label: '連接電腦…', onSelect: openMachines },
       { label: '登出', destructive: true, onSelect: logout },
     ].filter(Boolean),
@@ -596,6 +607,7 @@ async function startSession({ text, images }) {
   try {
     const s = await post('/sessions', { machineId: m.id, cwd, prompt: text, images, model, effort, permission: S.home.permission, planMode: S.home.planMode || undefined });
     S.sessions.set(s.id, s);
+    resetHomeChoices(); // the next new conversation starts from the defaults again
     go(`#/s/${s.id}`);
   } catch (err) {
     homeComposer.setText(text);
@@ -1164,6 +1176,53 @@ function promptDialog({ title, value = '', action }) {
 
 let machinesDialog = null;
 
+async function openSettings() {
+  const m = homeMachine();
+  if (m) await loadMachineModels(m);
+  const models = (m && machineModels.get(m.id)?.models) || [];
+  const d0 = defaults();
+  const form = h('form', { class: 'settings' });
+  const modelSel = h('select', { class: 'om-input', name: 'model' }, h('option', { value: '' }, 'Kimi 的預設模型'), ...models.map((x) => h('option', { value: x.id, selected: x.id === d0.model }, x.name || x.id)));
+  if (d0.model && !models.some((x) => x.id === d0.model)) modelSel.append(h('option', { value: d0.model, selected: true }, d0.model));
+  const effortSel = h('select', { class: 'om-input', name: 'effort' });
+  const fillEfforts = () => {
+    const mod = models.find((x) => x.id === modelSel.value);
+    const list = mod?.efforts || [];
+    const cur = effortSel.value || d0.effort;
+    fill(effortSel, h('option', { value: '' }, '模型預設'), ...list.map((e) => h('option', { value: e, selected: e === cur }, `${EFFORT_LABELS[e] || e}${e === mod.defaultEffort ? '（模型預設）' : ''}`)));
+    effortSel.disabled = list.length < 2;
+  };
+  modelSel.addEventListener('change', fillEfforts);
+  fillEfforts();
+  const permSel = h('select', { class: 'om-input', name: 'permission' }, ...Object.entries(PERMISSION_LABELS).map(([k, v]) => h('option', { value: k, selected: k === (d0.permission || 'manual') }, v)));
+  const plan = h('input', { class: 'om-switch', type: 'checkbox', checked: Boolean(d0.planMode) });
+  const field = (label, control, help) => h('label', { class: 'om-field' }, h('span', { class: 'om-field__label' }, label), control, help ? h('span', { class: 'om-field__help' }, help) : null);
+  const save = async (e) => {
+    e.preventDefault();
+    try {
+      S.config.settings = await put('/settings', { defaults: { model: modelSel.value, effort: effortSel.disabled ? '' : effortSel.value, permission: permSel.value, planMode: plan.checked } });
+      resetHomeChoices();
+      d.close();
+      toast('已儲存設定');
+    } catch (err) {
+      fail(err);
+    }
+  };
+  fill(
+    form,
+    h('div', { class: 'dialog-title' }, '設定'),
+    h('div', { class: 'dialog-subtitle first' }, '新對話的預設'),
+    h('p', { class: 'dialog-text settings-lead' }, '從中控台開新對話時用這些設定。開始後仍然可以在輸入框下方切換，已經開始的對話不受影響。'),
+    field('模型', modelSel, models.length ? (m && S.machines.length > 1 ? `「${m.name}」上可用的模型` : null) : '連上一台有 Kimi 的電腦後，就能選擇模型'),
+    field('思考強度', effortSel),
+    field('權限', permSel, '每次詢問：每個指令與修改都先問你 · 需要時詢問：只有風險高的才問 · 全部自動：不會打斷你'),
+    h('label', { class: 'settings-switch' }, plan, h('span', null, h('span', { class: 'om-field__label' }, '計畫模式'), h('span', { class: 'om-field__help' }, '先規劃，你同意後才動手'))),
+    h('div', { class: 'dialog-actions' }, h('button', { class: 'om-btn', type: 'button', onclick: () => d.close() }, '取消'), h('button', { class: 'om-btn om-btn--primary', type: 'submit' }, '儲存')),
+  );
+  form.addEventListener('submit', save);
+  const d = dialog(form);
+}
+
 async function openMachines() {
   let hub = { bridgeKey: '', bridgePath: '/bridge/agent-hub-bridge.mjs' };
   try {
@@ -1413,6 +1472,7 @@ async function start() {
   } catch {}
   try {
     S.config = await get('/config');
+    resetHomeChoices();
   } catch (err) {
     if (err.status === 401) return showLogin();
     fill($view, h('div', { class: 'loading' }, `連不上中控台：${err.message}`));
