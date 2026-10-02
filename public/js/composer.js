@@ -304,13 +304,13 @@ export class Composer {
       const now = todos.find((t) => t.status === 'in_progress') || open[0];
       const btn = h(
         'button',
-        { class: 'todo-chip', type: 'button', 'aria-expanded': String(Boolean(this.todosOpen)), onclick: () => ((this.todosOpen = !this.todosOpen), this.renderTray()) },
+        { class: 'todo-chip', type: 'button', title: '看完整的待辦清單', onclick: () => (this.opts.onOpenTodos ? this.opts.onOpenTodos() : ((this.todosOpen = !this.todosOpen), this.renderTray())) },
         icon('todo'),
         h('span', { class: 'todo-progress' }, `${done}/${todos.length}`),
         h('span', { class: 'todo-now' }, now?.title || ''),
-        icon(this.todosOpen ? 'down' : 'chev', 'caret'),
+        icon(this.todosOpen && !this.opts.onOpenTodos ? 'down' : 'chev', 'caret'),
       );
-      items.push(h('div', { class: 'todo-tray' }, btn, this.todosOpen ? todoList(todos) : null));
+      items.push(h('div', { class: 'todo-tray' }, btn, this.todosOpen && !this.opts.onOpenTodos ? todoList(todos) : null));
     }
     fill(this.tray, ...items);
     this.tray.hidden = !items.length;

@@ -1,9 +1,9 @@
 // Agent Hub — Kimi Code on all your machines, in one window.
 import { h, fill, icon, relTime, dayGroup, shortPath, baseName, copyText } from './dom.js';
 import { get, post, put, del, connect, setToken } from './api.js';
-import { renderHunks, parseUnifiedDiff } from './markdown.js';
+import { renderHunks, parseUnifiedDiff, renderMarkdown } from './markdown.js';
 import { openMenu, closeMenu, menuOpen, pointAnchor } from './menu.js';
-import { Transcript } from './transcript.js';
+import { Transcript, todoList } from './transcript.js';
 import { Composer, PERMISSION_LABELS, EFFORT_LABELS } from './composer.js';
 import { ArtifactView, downloadHtml, htmlTitle } from './artifacts.js';
 
@@ -625,6 +625,7 @@ let artifactView = null;
 
 function leaveSession() {
   if (!S.cur) return;
+  if (['agents', 'todos'].includes(S.panel?.tab)) hidePanel();
   clearInterval(S.cur.ping);
   S.cur.transcript.destroy();
   S.cur = null;
@@ -662,8 +663,9 @@ async function openSession(id) {
     onImage: lightbox,
     onLoadEarlier: () => post(`/sessions/${id}/earlier`).catch(fail),
     // Working subagents go to the tray under the conversation.
-    onFlush: () => {
+    onFlush: (ids) => {
       if (S.cur !== cur || !composer) return;
+      syncAgentPanel(ids);
       const agents = cur.transcript.runningAgents();
       const sig = JSON.stringify(agents);
       if (sig === cur.agentSig) return;
@@ -681,7 +683,8 @@ async function openSession(id) {
     onUnlock: () => S.cur && post(`/sessions/${S.cur.id}/unlock`).catch(fail),
     onError: (t) => toast(t),
     onHelp: openMachines,
-    onFocusAgent: (aid) => S.cur?.transcript.focusAgent(aid),
+    onFocusAgent: (aid) => showAgents(aid),
+    onOpenTodos: showTodos,
   });
   composer.setKey(id);
   composer.update({ agents: [] });
@@ -738,6 +741,10 @@ async function resync() {
 function updateComposer() {
   const s = S.cur?.summary;
   if (!s || !composer) return;
+  if (S.panel?.tab === 'todos' && JSON.stringify(s.meta?.todos || []) !== S.panel.todosSig) {
+    S.panel.todosSig = JSON.stringify(s.meta?.todos || []);
+    drawTodos();
+  }
   const meta = s.meta || {};
   composer.update({
     running: s.status === 'running',
@@ -975,6 +982,7 @@ function showPanel(tab) {
 }
 
 function hidePanel() {
+  closeAgentPanel();
   S.panel = null;
   $panel.hidden = true;
   $app.classList.remove('with-panel');
@@ -995,6 +1003,8 @@ function panelHead(...right) {
       { class: 'om-seg om-seg--sm', role: 'group' },
       S.artifacts.length ? h('button', { class: 'om-seg__item', type: 'button', 'aria-pressed': String(tab === 'artifact'), onclick: () => showArtifact() }, 'Artifact') : null,
       h('button', { class: 'om-seg__item', type: 'button', 'aria-pressed': String(tab === 'changes'), onclick: showChanges }, '變更'),
+      S.cur?.transcript?.agentIds.length ? h('button', { class: 'om-seg__item', type: 'button', 'aria-pressed': String(tab === 'agents'), onclick: () => showAgents() }, '子代理') : null,
+      S.cur?.summary?.meta?.todos?.length ? h('button', { class: 'om-seg__item', type: 'button', 'aria-pressed': String(tab === 'todos'), onclick: showTodos }, '待辦') : null,
     ),
     h('span', { class: 'om-toolbar__spacer' }),
     ...right,
@@ -1008,6 +1018,7 @@ function showArtifact(path, version) {
   if (!S.artifacts.length) return;
   const wasArtifact = S.panel?.tab === 'artifact';
   const art = S.artifacts.find((a) => a.path === (path || S.panel?.path)) || S.artifacts.at(-1);
+  closeAgentPanel();
   showPanel('artifact');
   S.panel.path = art.path;
   S.panel.version = version && version !== art.versions.at(-1).id ? version : null;
@@ -1104,10 +1115,111 @@ async function syncArtifact(force = false, reload = false) {
   }
 }
 
+// 子代理 tab: every subagent of the conversation, and the steps of the
+// chosen one, live while it works.
+let agentPanel = null; // { id, transcript, list, summary, ids:Set, sig }
+
+function closeAgentPanel() {
+  agentPanel?.transcript.destroy();
+  agentPanel = null;
+}
+
+function showAgents(id) {
+  const t = S.cur?.transcript;
+  if (!t) return;
+  const all = t.agentList();
+  if (!all.length) return;
+  const pick = id || agentPanel?.id || all.findLast((a) => a.running)?.id || all.at(-1).id;
+  artifactView?.destroy();
+  artifactView = null;
+  closeAgentPanel();
+  showPanel('agents');
+  const steps = new Transcript({ cwd: S.cur.summary?.cwd, onRespond: respond, onImage: lightbox });
+  agentPanel = { id: pick, transcript: steps, list: h('div', { class: 'agent-list' }), summary: h('div', { class: 'agent-report' }), ids: new Set([pick]), sig: '' };
+  const evs = t.descendants(pick);
+  for (const e of evs) agentPanel.ids.add(e.id);
+  steps.load(evs.map((e) => ({ ...e, parent: e.parent === pick ? undefined : e.parent })));
+  steps.setStatus(t.agentList().find((a) => a.id === pick)?.running ? 'running' : 'idle');
+  fill($panel, $grip, h('div', { class: 'panel-agents' }, panelHead(), agentPanel.list, steps.el, agentPanel.summary));
+  drawAgentList();
+}
+
+function drawAgentList() {
+  if (!agentPanel || !S.cur) return;
+  const all = S.cur.transcript.agentList();
+  const sig = JSON.stringify([agentPanel.id, all]);
+  if (sig === agentPanel.sig) return;
+  agentPanel.sig = sig;
+  const status = (a) => (a.running ? h('span', { class: 'spinner', 'aria-label': '執行中' }) : a.failed ? h('span', { class: 'om-badge om-badge--danger' }, '失敗') : a.stopped ? h('span', { class: 'om-badge' }, '已中斷') : h('span', { class: 'om-badge om-badge--success' }, '完成'));
+  fill(
+    agentPanel.list,
+    ...[...all].reverse().map((a) =>
+      h(
+        'button',
+        { class: `agent-item${a.id === agentPanel.id ? ' on' : ''}`, type: 'button', onclick: () => a.id !== agentPanel.id && showAgents(a.id) },
+        icon('agents'),
+        h('span', { class: 'agent-item-text' }, h('span', { class: 'agent-item-name' }, a.name ? `子代理 · ${a.name}` : '子代理', a.background ? h('span', { class: 'om-badge' }, '背景') : null), h('span', { class: 'agent-item-desc' }, a.running && a.activity ? `${a.description} · ${a.activity}` : a.description)),
+        a.steps ? h('span', { class: 'agent-item-meta' }, `${a.steps} 步`) : null,
+        status(a),
+      ),
+    ),
+  );
+  const cur = all.find((a) => a.id === agentPanel.id);
+  agentPanel.transcript.setStatus(cur?.running ? 'running' : 'idle');
+  fill(agentPanel.summary, cur?.summary ? [h('div', { class: 'agent-summary-label' }, '子代理回報'), renderMarkdown(cur.summary)] : null);
+  agentPanel.summary.hidden = !cur?.summary;
+}
+
+// New steps of the chosen subagent, as the conversation updates.
+function syncAgentPanel(ids) {
+  if (!agentPanel || S.panel?.tab !== 'agents' || !S.cur) return;
+  const t = S.cur.transcript;
+  for (const id of ids) {
+    const e = t.get(id);
+    if (!e?.parent || !agentPanel.ids.has(e.parent)) continue;
+    agentPanel.ids.add(id);
+    agentPanel.transcript.add({ ...e, parent: e.parent === agentPanel.id ? undefined : e.parent });
+  }
+  drawAgentList();
+}
+
+// 待辦 tab: the conversation's whole todo list.
+function showTodos() {
+  if (!S.cur) return;
+  artifactView?.destroy();
+  artifactView = null;
+  closeAgentPanel();
+  showPanel('todos');
+  drawTodos();
+}
+
+function drawTodos() {
+  if (S.panel?.tab !== 'todos' || !S.cur) return;
+  const todos = S.cur.summary?.meta?.todos || [];
+  const done = todos.filter((t) => t.status === 'done' || t.status === 'completed').length;
+  fill(
+    $panel,
+    $grip,
+    h(
+      'div',
+      { class: 'panel-todos' },
+      panelHead(),
+      h(
+        'div',
+        { class: 'panel-body' },
+        todos.length
+          ? [h('div', { class: 'todo-sum' }, h('span', { class: 'todo-progress' }, `${done}/${todos.length} 完成`), h('div', { class: 'quota-bar' }, h('span', { style: { width: `${Math.round((done / todos.length) * 100)}%` } }))), todoList(todos)]
+          : h('div', { class: 'panel-empty' }, 'Kimi 還沒有列待辦。'),
+      ),
+    ),
+  );
+}
+
 async function showChanges() {
   const s = S.cur?.summary;
   if (!s) return;
   showPanel('changes');
+  closeAgentPanel();
   artifactView?.destroy();
   artifactView = null;
   const body = h('div', { class: 'panel-body' }, h('div', { class: 'loading' }, h('span', { class: 'spinner' }), '正在讀取變更…'));

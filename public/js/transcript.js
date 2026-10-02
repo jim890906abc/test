@@ -198,7 +198,7 @@ export class Transcript {
     if (this.stick) this.scrollToEnd();
     else if (this.grew) this.jump.classList.add('new');
     this.grew = false;
-    this.opts.onFlush?.();
+    this.opts.onFlush?.(ids);
   }
 
   scrollToEnd() {
@@ -208,12 +208,31 @@ export class Transcript {
   // Subagents still working (background ones included), for the tray
   // under the conversation: what each is doing right now.
   runningAgents() {
+    return this.agentList(true);
+  }
+
+  // Every subagent this conversation started (newest last), or only the
+  // ones still working.
+  agentList(onlyRunning = false) {
+    const isRunning = (ev) => {
+      const sub = ev.subagent || {};
+      return sub.status === 'running' || (!sub.status && ACTIVE.includes(ev.status));
+    };
+    const ids = this.agentIds.filter((id) => this.events.has(id) && (!onlyRunning || isRunning(this.events.get(id))));
+    if (!ids.length) return [];
+    // One pass for every agent's direct steps.
+    const kidsOf = new Map(ids.map((id) => [id, []]));
+    for (const k of this.order) {
+      const e = this.events.get(k);
+      if (e.parent && kidsOf.has(e.parent)) kidsOf.get(e.parent).push(e);
+    }
     const out = [];
-    for (const id of this.agentIds) {
+    for (const id of ids) {
       const ev = this.events.get(id);
-      const sub = ev?.subagent || {};
-      if (!ev || !(sub.status === 'running' || (!sub.status && ACTIVE.includes(ev.status)))) continue;
-      const kids = this.order.filter((k) => this.events.get(k).parent === id).map((k) => this.events.get(k));
+      const sub = ev.subagent || {};
+      const running = isRunning(ev);
+      const failed = sub.status === 'error' || ev.status === 'error';
+      const kids = kidsOf.get(id);
       const last = [...kids].reverse().find((k) => k.type === 'tool_use' || (k.type === 'text' && k.text?.trim()));
       const activity = !last ? '' : last.type === 'tool_use' ? `${(TOOLS[last.name] || [null, last.name])[1]} ${last.title || ''}`.trim() : last.text.trim().split('\n').pop();
       out.push({
@@ -223,7 +242,25 @@ export class Transcript {
         activity: activity.slice(0, 120),
         steps: kids.filter((k) => k.type === 'tool_use').length,
         background: Boolean(sub.background),
+        running,
+        failed,
+        stopped: sub.status === 'cancelled' || ev.status === 'interrupted',
+        summary: running ? '' : sub.summary || '',
       });
+    }
+    return out;
+  }
+
+  // Everything a subagent did (its nested subagents included), oldest first.
+  descendants(agentId) {
+    const inside = new Set([agentId]);
+    const out = [];
+    for (const id of this.order) {
+      const ev = this.events.get(id);
+      if (ev.parent && inside.has(ev.parent)) {
+        inside.add(id);
+        out.push(ev);
+      }
     }
     return out;
   }

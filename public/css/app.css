@@ -1920,6 +1920,103 @@ pre.tail {
   overflow: auto;
   padding: var(--space-3) var(--space-4) var(--space-6);
 }
+.panel-agents,
+.panel-todos {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+.agent-list {
+  flex: none;
+  max-height: 32%;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space-2);
+  border-bottom: 1px solid var(--line);
+}
+.agent-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: 6px var(--space-2);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+  font-size: 12px;
+  line-height: 17px;
+  cursor: pointer;
+}
+.agent-item:hover {
+  background: var(--fill-hover);
+}
+.agent-item.on {
+  background: var(--fill-selected, var(--fill-hover));
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.agent-item > .om-icon {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  color: var(--ink-secondary);
+}
+.agent-item-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+.agent-item-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+}
+.agent-item-desc {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink-secondary);
+}
+.agent-item-meta {
+  flex: none;
+  color: var(--ink-secondary);
+  font-variant-numeric: tabular-nums;
+}
+.panel-agents > .transcript {
+  flex: 1;
+  min-height: 0;
+  padding: var(--space-4) var(--space-4) var(--space-3);
+}
+.panel-agents > .transcript .column {
+  max-width: none;
+}
+.panel-agents > .transcript .working {
+  display: none;
+}
+.agent-report {
+  flex: none;
+  max-height: 30%;
+  overflow-y: auto;
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--line);
+  font-size: 13px;
+}
+.todo-sum {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: var(--space-3);
+  font-size: 13px;
+}
+.panel-todos .todos {
+  font-size: 13px;
+}
 .panel-empty {
   padding: var(--space-6) var(--space-2);
   text-align: center;
