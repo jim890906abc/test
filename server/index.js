@@ -89,16 +89,7 @@ const EDITABLE = ['name', 'enabled', 'color', 'command', 'args', 'env', 'login',
 
 // ------------------------------------------------------------------ meta
 
-// Defaults for new conversations (model, thinking, permission, plan mode),
-// kept on the hub so every browser and phone gets the same ones.
-const SETTINGS_FILE = path.join(store.DATA_DIR, 'settings.json');
-function readSettings() {
-  try {
-    return JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
-  } catch {
-    return { defaults: {} };
-  }
-}
+const { readSettings, SETTINGS_FILE } = store;
 
 app.get('/api/config', wrap(() => ({
   version: '0.3.0',

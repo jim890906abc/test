@@ -5,6 +5,7 @@
 // hub as they happen.
 import crypto from 'node:crypto';
 import * as machines from '../machines.js';
+import * as store from '../store.js';
 
 export const live = true;
 
@@ -210,6 +211,26 @@ class Mirror {
     await Promise.all([this.loadModels(), this.loadSkills(info?.workspace_id)].map((p) => p.catch(() => {})));
     this.touch();
     this.live = true;
+    await this.applyDefaults();
+  }
+
+  // The first time the hub opens a conversation, it gets the model,
+  // thinking and permission from 設定 (plan mode is left as it was).
+  // Changed afterwards in the conversation, it stays changed.
+  async applyDefaults() {
+    if (this.session.state.defaultsApplied || this.inTerminal()) return;
+    const d = store.readSettings().defaults || {};
+    const meta = this.session.meta || {};
+    const change = {};
+    const model = d.model && (meta.models || []).find((x) => x.id === d.model);
+    if (model && meta.model !== d.model) change.model = d.model;
+    const efforts = (model || (meta.models || []).find((x) => x.id === meta.model))?.efforts || [];
+    if (d.effort && efforts.includes(d.effort) && meta.effort !== d.effort) change.effort = d.effort;
+    if (PERMISSIONS.includes(d.permission) && meta.permission !== d.permission) change.permission = d.permission;
+    this.session.state.defaultsApplied = true;
+    store.saveSession(this.session);
+    if (!Object.keys(change).length) return;
+    await this.configure(change).catch((err) => console.warn(`[kimi] defaults for ${this.session.id}: ${err.message}`));
   }
 
   // Follow the machine again before acting on a conversation that stopped.
@@ -1142,6 +1163,19 @@ export async function listFiles(session, rel = '.') {
 }
 
 export async function readFile(session, rel) {
+  // A page outside the conversation's folder: the bridge reads it, if Kimi
+  // wrote it in this conversation.
+  const viaBridge = () => machines.rpc(session.machineId, 'kimi.artifact', { sessionId: session.kimiSessionId, path: rel }).then((r) => ({ path: rel, size: r.content.length, binary: false, content: r.content }));
+  if (/\.html?$/i.test(rel) && (rel.startsWith('/') || /^[A-Za-z]:[\\/]/.test(rel) || rel.startsWith('..'))) return viaBridge();
+  try {
+    return await readInFolder(session, rel);
+  } catch (err) {
+    if (/\.html?$/i.test(rel)) return viaBridge().catch(() => Promise.reject(err));
+    throw err;
+  }
+}
+
+async function readInFolder(session, rel) {
   const r = await machines.kimiApi(session.machineId, 'POST', `/api/v1/sessions/${session.kimiSessionId}/fs:read`, { path: rel, encoding: 'auto' });
   const binary = r.encoding === 'base64' || r.is_binary;
   return { path: rel, size: r.size, binary, tooLarge: r.truncated && r.size > 2 * 1024 * 1024, content: binary ? '' : r.content };

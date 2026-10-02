@@ -1292,7 +1292,7 @@ async function openSettings() {
     form,
     h('div', { class: 'dialog-title' }, '設定'),
     h('div', { class: 'dialog-subtitle first' }, '新對話的預設'),
-    h('p', { class: 'dialog-text settings-lead' }, '從中控台開新對話時用這些設定。開始後仍然可以在輸入框下方切換，已經開始的對話不受影響。'),
+    h('p', { class: 'dialog-text settings-lead' }, '從中控台開新對話、或第一次在中控台打開舊對話時，會套用這些設定。之後在對話裡改的，會保留在那個對話。'),
     field('模型', modelSel, models.length ? (m && S.machines.length > 1 ? `「${m.name}」上可用的模型` : null) : '連上一台有 Kimi 的電腦後，就能選擇模型'),
     field('思考強度', effortSel),
     field('權限', permSel, '每次詢問：每個指令與修改都先問你 · 需要時詢問：只有風險高的才問 · 全部自動：不會打斷你'),

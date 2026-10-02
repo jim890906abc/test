@@ -158,3 +158,14 @@ export function flushAll() {
     if (s) saveSessionNow(s);
   }
 }
+
+// Defaults for conversations (model, thinking, permission, plan mode), kept
+// on the hub so every browser and phone gets the same ones.
+export const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
+export function readSettings() {
+  try {
+    return JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
+  } catch {
+    return { defaults: {} };
+  }
+}

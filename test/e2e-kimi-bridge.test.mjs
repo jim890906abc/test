@@ -396,6 +396,40 @@ test('a conversation from a terminal Kimi that was closed is continued from the 
   assert.ok(done.events.some((e) => e.type === 'text' && e.text.includes('收到：聊天 關掉之前')), 'earlier turns are there');
 });
 
+test('opening an existing conversation applies the defaults from 設定 once', { skip: SKIP }, async () => {
+  await api('PUT', '/settings', { defaults: { permission: 'auto' } });
+  try {
+    const ks = await kimiApi('POST', '/sessions', { metadata: { cwd: PROJECT } });
+    await kimiApi('POST', `/sessions/${ks.id}/prompts`, { content: [{ type: 'text', text: '聊天 舊的對話' }], model: 'fake/fake-1', permission_mode: 'manual' });
+    await listed((s) => s.id === ks.id && !s.busy && s.title, 'conversation started in Kimi');
+    const s = await api('POST', `/machines/${machineId}/kimi/${ks.id}/attach`);
+    await until(async () => (await session(s.id)).meta.permission === 'auto', 15000, 'permission from the defaults');
+    // Changed in the conversation afterwards, it stays changed.
+    await api('POST', `/sessions/${s.id}/config`, { permission: 'yolo' });
+    await api('POST', `/machines/${machineId}/kimi/${ks.id}/attach`);
+    await new Promise((r) => setTimeout(r, 1500));
+    assert.equal((await session(s.id)).meta.permission, 'yolo');
+  } finally {
+    await api('PUT', '/settings', { defaults: {} });
+  }
+});
+
+test('a page Kimi wrote outside the conversation folder still opens; other files do not', { skip: SKIP }, async () => {
+  const dir = path.join(TMP, 'elsewhere');
+  fs.mkdirSync(dir, { recursive: true });
+  const page = path.join(dir, 'report.html');
+  const secret = path.join(dir, 'other.html');
+  fs.writeFileSync(page, '<h1>報告</h1>');
+  fs.writeFileSync(secret, '<h1>不該讀到</h1>');
+  const ks = await kimiApi('POST', '/sessions', { metadata: { cwd: PROJECT } });
+  await kimiApi('POST', `/sessions/${ks.id}/prompts`, { content: [{ type: 'text', text: `聊天 頁面在 ${page}` }], model: 'fake/fake-1' });
+  await listed((s) => s.id === ks.id && !s.busy && s.title, 'conversation');
+  const s = await api('POST', `/machines/${machineId}/kimi/${ks.id}/attach`);
+  const f = await api('GET', `/sessions/${s.id}/file?path=${encodeURIComponent(page)}`);
+  assert.equal(f.content, '<h1>報告</h1>');
+  await assert.rejects(api('GET', `/sessions/${s.id}/file?path=${encodeURIComponent(secret)}`));
+});
+
 // Last: it replaces the Kimi server the other tests talk to directly.
 test('when the Kimi server goes away, the bridge starts a new one on the next message', { skip: SKIP }, async () => {
   const s = await api('POST', '/sessions', { machineId, prompt: '聊天 伺服器在', permission: 'auto' });

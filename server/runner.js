@@ -482,6 +482,7 @@ export async function newSession({ agentId, cwd, prompt, nameHint, permissionMod
     if (!availability.ok) throw Object.assign(new Error(availability.reason), { status: 409 });
     const r = await kimi.createRemote({ machineId: agent.machineId, cwd, nameHint: nameHint || prompt });
     session = store.createSession({ agentId, cwd: r.cwd, machineId: agent.machineId, kimiSessionId: r.kimiSessionId, permissionMode, title: title || '新對話' });
+    session.state.defaultsApplied = true; // started with what was picked on the home screen
     kimi.restore(session);
     await kimi.attach(session);
     if (config && Object.values(config).some((v) => v !== undefined && v !== '')) await kimi.configure(session, config).catch((err) => console.warn(`[kimi] configure: ${err.message}`));

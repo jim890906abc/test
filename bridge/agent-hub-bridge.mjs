@@ -1411,6 +1411,37 @@ const hub = {
         const s = disk.get(String(args.sessionId || ''));
         return s ? s.info() : null;
       }
+      // An HTML page Kimi wrote in this conversation, wherever it is (Kimi's
+      // own file API only reads inside the conversation's folder). Only
+      // .html files whose path appears in the conversation's journal.
+      case 'kimi.artifact': {
+        const s = disk.get(String(args.sessionId || ''));
+        if (!s) throw new Error('找不到這個 Kimi 對話');
+        const p = String(args.path || '');
+        if (!/\.html?$/i.test(p)) throw new Error('只能讀取 HTML 頁面');
+        const abs = path.resolve(s.state?.cwd || os.homedir(), p);
+        const esc = (x) => JSON.stringify(x).slice(1, -1);
+        const needles = [...new Set([p, abs, path.relative(s.state?.cwd || '', abs)])].filter(Boolean).flatMap((x) => [esc(x), esc(esc(x))]);
+        const agents = (() => {
+          try {
+            return fs.readdirSync(path.join(s.dir, 'agents'));
+          } catch {
+            return [];
+          }
+        })();
+        const known = agents.some((a) => {
+          try {
+            const text = fs.readFileSync(path.join(s.dir, 'agents', a, 'wire.jsonl'), 'utf8');
+            return needles.some((n) => text.includes(n));
+          } catch {
+            return false;
+          }
+        });
+        if (!known) throw new Error('這個頁面不是 Kimi 在這個對話裡寫的');
+        const st = fs.statSync(abs);
+        if (st.size > 5 * 1024 * 1024) throw new Error('頁面超過 5 MB');
+        return { path: abs, content: fs.readFileSync(abs, 'utf8') };
+      }
       case 'kimi.unlock': {
         const sid = String(args.sessionId || '');
         if (disk.best.has(sid)) throw new Error('終端機的 Kimi 正開著這個對話，不能解除唯讀');
