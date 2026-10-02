@@ -47,6 +47,9 @@ export const TOOLS = {
 };
 
 const ACTIVE = ['pending', 'running', 'awaiting'];
+// Look-around tools: a run of them folds into one line, like Claude Code.
+const LOOK = /^(Read|ReadFile|ReadMediaFile|Glob|Grep|FetchURL|WebFetch|WebSearch|SearchWeb)$/;
+const lineCount = (t) => (t ? String(t).replace(/\n+$/, '').split('\n').length : 0);
 const isAgent = (ev) => Boolean(ev.subagent) || /^(Agent|AgentSwarm|Task)$/.test(ev.name);
 const isTodo = (ev) => /^(TodoList|TodoWrite|SetTodoList)$/.test(ev.name);
 
@@ -61,6 +64,8 @@ export class Transcript {
     this.order = [];
     this.nodes = new Map();
     this.waiting = new Map(); // parent id -> child ids that arrived first
+    this.groupOf = new Map(); // event id -> the look-around group it sits in
+    this.dirtyGroups = new Set();
     this.dirty = new Set();
     this.open = new Set(); // ids the user expanded
     this.shut = new Set(); // ids the user collapsed
@@ -83,6 +88,7 @@ export class Transcript {
     this.order = [];
     this.nodes.clear();
     this.waiting.clear();
+    this.groupOf.clear();
     this.column.replaceChildren();
     for (const ev of events) this.add(ev, true);
     this.flush();
@@ -141,6 +147,8 @@ export class Transcript {
 
   markDirty(id, batch) {
     this.dirty.add(id);
+    const g = this.groupOf.get(id);
+    if (g) this.dirtyGroups.add(g);
     if (!batch && !this.raf) this.raf = requestAnimationFrame(() => this.flush());
   }
 
@@ -152,6 +160,8 @@ export class Transcript {
       const node = this.nodes.get(id);
       if (node) this.render(node);
     }
+    for (const g of this.dirtyGroups) this.renderGroup(g);
+    this.dirtyGroups.clear();
     if (this.artifactsChanged) {
       this.artifactsChanged = false;
       this.opts.onArtifacts?.(this.artifacts());
@@ -187,7 +197,8 @@ export class Transcript {
         list.push(ev.id);
         this.waiting.set(ev.parent, list);
       }
-    } else this.column.append(node.el);
+    } else if ((ev.type === 'tool_use' && LOOK.test(ev.name)) || ev.type === 'thinking') this.joinGroup(node);
+    else this.column.append(node.el);
     const kids = this.waiting.get(ev.id);
     if (kids && node.children) {
       this.waiting.delete(ev.id);
@@ -260,13 +271,72 @@ export class Transcript {
   toggle(id, wasOpen) {
     if (wasOpen) (this.open.delete(id), this.shut.add(id));
     else (this.open.add(id), this.shut.delete(id));
-    this.markDirty(id);
+    if (id.startsWith('g:')) this.markDirty(id.slice(2));
+    else this.markDirty(id);
   }
 
   expanded(ev, byDefault) {
     if (this.open.has(ev.id)) return true;
     if (this.shut.has(ev.id)) return false;
     return byDefault;
+  }
+
+  // ------------------------------------------------------------ groups
+  // Reads, searches and the thinking between them collapse into one row
+  // ("讀取 3 個檔案、搜尋 2 次") that opens to show each step.
+
+  joinGroup(node) {
+    const last = this.column.lastElementChild;
+    let g = last && this.groupEls?.get(last);
+    if (!g) {
+      g = { id: `g:${node.ev.id}`, members: [], head: h('div', { class: 'tool-head' }), body: h('div', { class: 'group-body' }) };
+      g.el = h('div', { class: 'ev tool-group' }, g.head, g.body);
+      (this.groupEls ??= new WeakMap()).set(g.el, g);
+      this.column.append(g.el);
+    }
+    g.members.push(node.ev.id);
+    g.body.append(node.el);
+    this.groupOf.set(node.ev.id, g);
+    this.dirtyGroups.add(g);
+  }
+
+  renderGroup(g) {
+    const evs = g.members.map((id) => this.events.get(id));
+    const tools = evs.filter((e) => e.type === 'tool_use');
+    const solo = tools.length < 2;
+    g.el.className = `ev tool-group ${solo ? `solo ev-${(tools[0] || evs[0]).type}` : 'ev-tool_use'}`;
+    if (solo) {
+      fill(g.head);
+      g.body.hidden = false;
+      return;
+    }
+    const busy = tools.some((e) => ACTIVE.includes(e.status) && this.status === 'running');
+    const urgent = tools.some((e) => e.status === 'error' || (e.permission && !e.permission.chosen));
+    const open = urgent || this.expanded({ id: g.id }, false);
+    const n = (re) => tools.filter((e) => re.test(e.name)).length;
+    const parts = [
+      [n(/^Read/), (k) => `讀取 ${k} 個檔案`],
+      [n(/^Grep$/), (k) => `搜尋 ${k} 次`],
+      [n(/^Glob$/), (k) => `找檔案 ${k} 次`],
+      [n(/^(WebSearch|SearchWeb)$/), (k) => `搜尋網路 ${k} 次`],
+      [n(/^(FetchURL|WebFetch)$/), (k) => `讀取 ${k} 個網頁`],
+    ]
+      .filter(([k]) => k)
+      .map(([k, f]) => f(k));
+    const current = busy ? tools.at(-1) : null;
+    fill(
+      g.head,
+      h(
+        'button',
+        { class: 'tool-row', type: 'button', 'aria-expanded': String(open), onclick: () => !urgent && this.toggle(g.id, open) },
+        h('span', { class: 'tool-icon' }, icon('search')),
+        h('span', { class: 'tool-verb' }, parts.join('、')),
+        h('span', { class: 'tool-target' }, current ? this.target(current) : null),
+        busy ? h('span', { class: 'spinner', 'aria-label': '執行中' }) : null,
+        urgent ? null : icon('chev', 'chev'),
+      ),
+    );
+    g.body.hidden = !open;
   }
 
   // ------------------------------------------------------------- tools
@@ -339,11 +409,30 @@ export class Transcript {
 
   // Collapsed rows still show what matters: live output while a command
   // runs, the first line of an error.
+  // Finished ones get a one-line result under them, like Claude Code's
+  // "⎿ Read 120 lines": the first lines of a command's output, how many
+  // lines were read, how many matches were found.
   peek(ev) {
-    if (ev.status === 'running' && ev.output && /^(Bash|Shell)$/.test(ev.name)) {
+    const bash = /^(Bash|Shell)$/.test(ev.name);
+    if (ev.status === 'running' && ev.output && bash) {
       return [h('pre', { class: 'tail' }, ev.output.replace(/\n$/, '').split('\n').slice(-3).join('\n'))];
     }
-    return [];
+    if (ev.status !== 'done') return [];
+    const out = String(ev.output || '').replace(/\s+$/, '');
+    const n = lineCount(out);
+    const line = (text) => [h('div', { class: 'result' }, text)];
+    if (bash) {
+      if (!out) return line('（沒有輸出）');
+      const lines = out.split('\n');
+      return [h('pre', { class: 'result-out' }, lines.slice(0, 3).join('\n')), lines.length > 3 ? h('div', { class: 'result' }, `… 還有 ${lines.length - 3} 行`) : null].filter(Boolean);
+    }
+    if (/^Read/.test(ev.name)) return line(n ? `讀了 ${n} 行` : '空的檔案');
+    if (ev.name === 'Grep') return line(n ? `找到 ${n} 筆` : '沒有找到');
+    if (ev.name === 'Glob') return line(n ? `找到 ${n} 個檔案` : '沒有找到');
+    if (/^(Write|WriteFile|Edit|MultiEdit|StrReplaceFile|TodoList|TodoWrite|SetTodoList|ExitPlanMode|EnterPlanMode|AskUserQuestion)$/.test(ev.name)) return [];
+    if (!out) return [];
+    const first = out.split('\n')[0];
+    return line(n > 1 ? `${first.slice(0, 120)} …` : first.slice(0, 160));
   }
 
   toolBody(ev) {
