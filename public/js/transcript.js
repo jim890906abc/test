@@ -62,7 +62,13 @@ export class Transcript {
     // Back to the newest message when scrolled up (lit when more arrived).
     this.jump = h('button', { class: 'jump-end', type: 'button', title: '到最新訊息', 'aria-label': '到最新訊息', onclick: () => this.toEnd() }, icon('down'));
     this.jumpBar = h('div', { class: 'jump-bar', hidden: true }, this.jump);
-    this.el = h('div', { class: 'transcript', tabindex: '-1' }, this.column, this.working, this.jumpBar);
+    // The question being answered on screen, once it has scrolled out of
+    // view above (like Claude Code's CLI): click to go back to it.
+    this.pinText = h('span', { class: 'prompt-pin-text' });
+    this.pin = h('button', { class: 'prompt-pin', type: 'button', title: '跳到這個問題', onclick: () => this.toPrompt() }, icon('up'), this.pinText);
+    this.pinBar = h('div', { class: 'prompt-pin-bar', hidden: true }, this.pin);
+    this.users = []; // top-level user message ids, in order
+    this.el = h('div', { class: 'transcript', tabindex: '-1' }, this.pinBar, this.column, this.working, this.jumpBar);
     this.events = new Map();
     this.order = [];
     this.nodes = new Map();
@@ -82,6 +88,7 @@ export class Transcript {
       this.stick = atEnd;
       this.jumpBar.hidden = this.stick;
       if (this.stick) this.jump.classList.remove('new');
+      this.pinRaf ||= requestAnimationFrame(() => ((this.pinRaf = 0), this.updatePin()));
     });
     this.tick = setInterval(() => this.renderWorking(), 1000);
     // Messages out of view are laid out lazily (content-visibility), so the
@@ -103,6 +110,8 @@ export class Transcript {
     this.nodes.clear();
     this.waiting.clear();
     this.groupOf.clear();
+    this.users = [];
+    this.pinBar.hidden = true;
     this.column.replaceChildren();
     for (const ev of events) this.add(ev, true);
     this.flush();
@@ -114,6 +123,7 @@ export class Transcript {
     this.events.set(ev.id, ev);
     this.order.push(ev.id);
     this.grew = true;
+    if (ev.type === 'user' && !ev.parent) this.users.push(ev.id);
     const node = this.makeNode(ev);
     this.nodes.set(ev.id, node);
     this.mount(node);
@@ -189,6 +199,36 @@ export class Transcript {
 
   scrollToEnd() {
     this.el.scrollTop = this.el.scrollHeight;
+  }
+
+  // The newest question whose bubble is entirely above the visible area.
+  updatePin() {
+    // Under the bar itself counts as out of view.
+    const top = this.el.getBoundingClientRect().top + (this.pinBar.hidden ? 0 : this.pin.offsetHeight) + 4;
+    let found = null;
+    for (let i = this.users.length - 1; i >= 0; i--) {
+      const el = this.nodes.get(this.users[i])?.el;
+      if (!el || el.hidden) continue;
+      const r = el.getBoundingClientRect();
+      if (r.bottom <= top) {
+        found = this.users[i];
+        break;
+      }
+    }
+    this.pinned = found;
+    this.pinBar.hidden = !found;
+    if (found) {
+      const ev = this.events.get(found);
+      this.pinText.textContent = (ev.text || (ev.images?.length ? `${ev.images.length} 張圖片` : '')).replace(/\s+/g, ' ').trim();
+    }
+  }
+
+  toPrompt() {
+    const el = this.pinned && this.nodes.get(this.pinned)?.el;
+    if (!el) return;
+    this.stick = false;
+    const y = el.getBoundingClientRect().top - this.el.getBoundingClientRect().top + this.el.scrollTop - this.pin.offsetHeight - 12;
+    this.el.scrollTo({ top: Math.max(0, y) });
   }
 
   toEnd() {

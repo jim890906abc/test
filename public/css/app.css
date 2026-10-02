@@ -462,7 +462,8 @@ kbd {
   min-height: 0;
   overflow-y: auto;
   overflow-anchor: none;
-  padding: var(--space-6) var(--space-5) var(--space-3);
+  --tpad: var(--space-6);
+  padding: var(--tpad) var(--space-5) var(--space-3);
   outline: none;
 }
 .column,
@@ -481,6 +482,47 @@ kbd {
 .ev {
   min-width: 0;
 }
+/* The question on screen, pinned at the top once scrolled past */
+.prompt-pin-bar {
+  position: sticky;
+  /* flush with the top edge, above the transcript's own padding */
+  top: calc(var(--tpad) * -1);
+  height: 0;
+  z-index: 3;
+}
+.prompt-pin {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  max-width: var(--col);
+  margin: 0 auto;
+  padding: 8px var(--space-3);
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  background: color-mix(in srgb, var(--window) 92%, transparent);
+  backdrop-filter: blur(8px);
+  color: var(--ink-secondary);
+  font-size: 13px;
+  line-height: 18px;
+  text-align: left;
+  cursor: pointer;
+}
+.prompt-pin:hover {
+  color: var(--ink);
+}
+.prompt-pin .om-icon {
+  flex: none;
+  width: 14px;
+  height: 14px;
+}
+.prompt-pin-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* "到最新訊息": floats above the composer while scrolled up */
 .jump-bar {
   position: sticky;
@@ -2237,7 +2279,8 @@ pre.tail {
     display: none;
   }
   .transcript {
-    padding: var(--space-4) var(--space-3) var(--space-2);
+    --tpad: var(--space-4);
+    padding: var(--tpad) var(--space-3) var(--space-2);
   }
   .composer-dock {
     padding: 0 var(--space-2) var(--space-2);
