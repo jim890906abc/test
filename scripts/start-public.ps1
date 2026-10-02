@@ -34,7 +34,12 @@ try {
   Say "啟動中控台（port $Port）…"
   $env:HOST = '127.0.0.1'; $env:PORT = $Port
   $procs += Start-Process node -ArgumentList 'server/index.js' -RedirectStandardOutput "$Logs\hub.log" -RedirectStandardError "$Logs\hub.err" -PassThru -NoNewWindow
-  for ($i = 0; $i -lt 50 -and -not (Select-String -Path "$Logs\hub.log" -Pattern '已啟動' -Quiet -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Milliseconds 200 }
+  $up = $false
+  for ($i = 0; $i -lt 100 -and -not $up; $i++) {
+    Start-Sleep -Milliseconds 200
+    try { Invoke-WebRequest "http://127.0.0.1:$Port/" -UseBasicParsing -TimeoutSec 2 | Out-Null; $up = $true } catch {}
+  }
+  if (-not $up) { Get-Content "$Logs\hub.log", "$Logs\hub.err" -Tail 20 -ErrorAction SilentlyContinue; throw '中控台沒有啟動起來' }
 
   $secrets = Get-Content data\hub.json -Raw | ConvertFrom-Json
   $token = if ($env:AGENT_HUB_TOKEN) { $env:AGENT_HUB_TOKEN } else { $secrets.token }
