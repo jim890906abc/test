@@ -652,7 +652,7 @@ async function openSession(id) {
       // A page Kimi starts writing now opens beside the conversation, so it
       // can be watched as it is generated.
       const fresh = !cur.loading && cur.knownArtifacts ? list.find((a) => !cur.knownArtifacts.has(a.path)) : null;
-      S.artifacts = list;
+      S.artifacts = withOpened(list);
       cur.knownArtifacts = new Set(list.map((a) => a.path));
       renderToolbar();
       if (fresh && window.matchMedia('(min-width: 1100px)').matches) showArtifact(fresh.path);
@@ -662,6 +662,7 @@ async function openSession(id) {
     activeArtifact: () => (S.panel?.tab === 'artifact' ? S.panel.path : null),
     onImage: lightbox,
     onLoadEarlier: () => post(`/sessions/${id}/earlier`).catch(fail),
+    onLink: openFileLink,
     // Working subagents go to the tray under the conversation.
     onFlush: (ids) => {
       if (S.cur !== cur || !composer) return;
@@ -713,7 +714,7 @@ function applySnapshot(full) {
   cur.transcript.opts.cwd = summary.cwd;
   cur.transcript.load(events);
   cur.transcript.setStatus(summary.status, busy(summary.status) ? lastUserTs(events) : null);
-  S.artifacts = cur.transcript.artifacts();
+  S.artifacts = withOpened(cur.transcript.artifacts());
   cur.knownArtifacts = new Set(S.artifacts.map((a) => a.path));
   updateComposer();
   renderToolbar();
@@ -1115,6 +1116,50 @@ async function syncArtifact(force = false, reload = false) {
   }
 }
 
+// Pages opened from a link in the conversation (not written in the loaded
+// turns) join the conversation's artifacts.
+function withOpened(list) {
+  const extra = (S.cur?.opened || []).filter((x) => !list.some((a) => a.path === x.path));
+  return [...list, ...extra];
+}
+
+// A link in Kimi's reply to an .html file on the machine: show it in the
+// Artifact panel. Relative links are tried against the conversation's
+// folder and the folders of the pages already known.
+function openFileLink(href) {
+  if (!S.cur || !href || /^(https?|mailto|data|javascript):/i.test(href) || href.startsWith('#')) return false;
+  let p = href.replace(/^file:\/\//i, '').replace(/[?#].*$/, '');
+  try {
+    p = decodeURIComponent(p);
+  } catch {}
+  if (!/\.html?$/i.test(p)) return false;
+  const rel = p.replace(/^\.\//, '');
+  const known = S.artifacts.find((a) => a.path === p || a.path.endsWith(`/${rel}`));
+  if (known) {
+    showArtifact(known.path);
+    return true;
+  }
+  const absolute = p.startsWith('/') || /^[A-Za-z]:[\\/]/.test(p);
+  const dirs = [S.cur.summary?.cwd, ...S.artifacts.map((a) => a.path.replace(/\/[^/]*$/, ''))].filter(Boolean);
+  const candidates = absolute ? [p] : [...new Set(dirs.map((d) => `${d}/${rel}`))];
+  (async () => {
+    for (const c of candidates) {
+      try {
+        const f = await get(`/sessions/${S.cur.id}/file?path=${encodeURIComponent(c)}`);
+        if (f.content == null) continue;
+        const art = { path: c, versions: [{ id: `file:${c}`, html: f.content }], title: htmlTitle(f.content, c), updated: `file:${c}` };
+        S.cur.opened = [...(S.cur.opened || []).filter((x) => x.path !== c), art];
+        S.artifacts = withOpened(S.artifacts.filter((a) => a.path !== c));
+        renderToolbar();
+        showArtifact(c);
+        return;
+      } catch {}
+    }
+    toast(`找不到 ${rel}`, { kind: 'error' });
+  })();
+  return true;
+}
+
 // 子代理 tab: every subagent of the conversation, and the steps of the
 // chosen one, live while it works.
 let agentPanel = null; // { id, transcript, list, summary, ids:Set, sig }
@@ -1134,7 +1179,7 @@ function showAgents(id) {
   artifactView = null;
   closeAgentPanel();
   showPanel('agents');
-  const steps = new Transcript({ cwd: S.cur.summary?.cwd, onRespond: respond, onImage: lightbox });
+  const steps = new Transcript({ cwd: S.cur.summary?.cwd, onRespond: respond, onImage: lightbox, onLink: openFileLink });
   agentPanel = { id: pick, transcript: steps, list: h('div', { class: 'agent-list' }), summary: h('div', { class: 'agent-report' }), ids: new Set([pick]), sig: '' };
   const evs = t.descendants(pick);
   for (const e of evs) agentPanel.ids.add(e.id);

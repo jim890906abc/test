@@ -92,6 +92,13 @@ export class Transcript {
       this.pinRaf ||= requestAnimationFrame(() => ((this.pinRaf = 0), this.updatePin()));
     });
     this.tick = setInterval(() => this.renderWorking(), 1000);
+    // Links in Kimi's replies to local files (a page it wrote) open in the
+    // panel instead of a browser tab.
+    this.el.addEventListener('click', (e) => {
+      const a = e.target.closest?.('a[href]');
+      if (!a || !this.column.contains(a) || e.metaKey || e.ctrlKey) return;
+      if (this.opts.onLink?.(a.getAttribute('href'))) e.preventDefault();
+    });
     // Messages out of view are laid out lazily (content-visibility), so the
     // column keeps settling after a render: stay pinned to the end while
     // following it.
