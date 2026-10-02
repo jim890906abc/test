@@ -402,7 +402,7 @@ const server = {
     return `http://${this.instance.host}:${this.instance.port}`;
   },
 
-  async request(method, p, body) {
+  async request(method, p, body, retried = false) {
     // The server may have gone away (closed with the Kimi that ran /web):
     // start one in the background instead of failing.
     if (!this.instance || !(await this.healthy())) await this.start();
@@ -423,6 +423,21 @@ const server = {
     const text = await res.text();
     try {
       const j = JSON.parse(text);
+      // A restarted server writes a new token: read it again and retry once.
+      if (j?.code === 40101 && !retried) {
+        let token = this.token;
+        try {
+          token = fs.readFileSync(path.join(KIMI_HOME, 'server.token'), 'utf8').trim();
+        } catch {}
+        if (token !== this.token) {
+          this.token = token;
+          this.ws?.close();
+          this.ws = null;
+          this.connect();
+        }
+        await new Promise((r) => setTimeout(r, 500));
+        return this.request(method, p, body, true);
+      }
       if (method === 'POST' && p.split('?')[0] === '/api/v1/sessions' && j?.data?.id) this.mine.set(j.data.id, Date.now());
       return j;
     } catch {

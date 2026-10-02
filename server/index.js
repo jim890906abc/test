@@ -238,7 +238,14 @@ app.post('/api/sessions', wrap(async (req) => {
 
 app.get('/api/sessions/:id', wrap((req) => {
   const s = mustSession(req.params.id);
+  if (s.kimiSessionId) kimiRemote.view(s);
   return { ...runner.summarize(s), seq: s.seq || 0, events: s.events, allowedTools: s.allowedTools };
+}));
+
+// The page pings while a conversation is open, so it stays followed.
+app.post('/api/sessions/:id/viewing', wrap((req) => {
+  const s = mustSession(req.params.id);
+  if (s.kimiSessionId) kimiRemote.view(s);
 }));
 
 app.patch('/api/sessions/:id', wrap((req) => {

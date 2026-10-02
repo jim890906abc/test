@@ -625,6 +625,7 @@ let artifactView = null;
 
 function leaveSession() {
   if (!S.cur) return;
+  clearInterval(S.cur.ping);
   S.cur.transcript.destroy();
   S.cur = null;
   S.artifacts = [];
@@ -640,6 +641,8 @@ async function openSession(id) {
   const summary = S.sessions.get(id);
   const cur = { id, summary, seq: 0, transcript: null, loading: true };
   S.cur = cur;
+  // Keeps the conversation followed on the machine while it is open.
+  cur.ping = setInterval(() => document.visibilityState === 'visible' && post(`/sessions/${id}/viewing`).catch(() => {}), 60_000);
   cur.transcript = new Transcript({
     cwd: summary?.cwd,
     onRespond: respond,

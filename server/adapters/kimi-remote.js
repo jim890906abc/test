@@ -22,6 +22,11 @@ const APPROVAL_OPTIONS = [
   { optionId: 'rejected', name: '拒絕', kind: 'reject_once' },
 ];
 const PERMISSIONS = ['manual', 'yolo', 'auto'];
+// Turns loaded when a conversation is opened, and per 「載入更早的對話」.
+const HISTORY_TURNS = 10;
+// A conversation nobody has open, that is not working, stops following the
+// machine after this long; opening it again catches up from Kimi's journal.
+const IDLE_FOLLOW_MS = 15 * 60_000;
 const MAX_IMAGE_URL = 600_000; // history images larger than this become a placeholder
 
 export function available(agent) {
@@ -136,6 +141,8 @@ class Mirror {
     this.machineId = session.machineId;
     this.kid = session.kimiSessionId;
     this.mine = new Set(session.state.mine || []); // prompt ids sent from the hub
+    this.live = false; // subscribed to the machine and caught up
+    this.viewedAt = 0; // last time someone had it open
     this.reset();
   }
 
@@ -191,7 +198,7 @@ class Mirror {
     this.meta({ machineName: machine?.name || '', kimiVersion: machine?.kimi?.version || '' });
     let info = null;
     try {
-      const h = await machines.rpc(this.machineId, 'kimi.history', { sessionId: this.kid, turns: 60 }, 30_000);
+      const h = await machines.rpc(this.machineId, 'kimi.history', { sessionId: this.kid, turns: HISTORY_TURNS }, 30_000);
       this.replay(h.frames, { more: h.more, before: h.before });
       info = h.info;
     } catch (err) {
@@ -202,6 +209,25 @@ class Mirror {
     if (info) this.applyInfo(info);
     await Promise.all([this.loadModels(), this.loadSkills(info?.workspace_id)].map((p) => p.catch(() => {})));
     this.touch();
+    this.live = true;
+  }
+
+  // Follow the machine again before acting on a conversation that stopped.
+  async ensureLive() {
+    this.viewedAt = now();
+    if (!this.live) await (this.attaching ??= this.attach().finally(() => (this.attaching = null)));
+  }
+
+  busy() {
+    return ['running', 'awaiting_permission'].includes(this.session.status) || this.queue().length > 0 || (this.tuiPending?.length ?? 0) > 0;
+  }
+
+  // Stop following a conversation nobody is looking at (frees the machine
+  // from polling and streaming it).
+  release() {
+    if (!this.live || this.busy() || now() - this.viewedAt < IDLE_FOLLOW_MS) return;
+    this.live = false;
+    machines.rpc(this.machineId, 'kimi.unsubscribe', { sessionIds: [this.kid] }).catch(() => {});
   }
 
   // Conversation state as the bridge sees it on disk (or the server reports).
@@ -322,7 +348,8 @@ class Mirror {
   async loadEarlier() {
     const marker = this.session.events.find((e) => e.more);
     if (!marker) return;
-    const h = await machines.rpc(this.machineId, 'kimi.history', { sessionId: this.kid, turns: 200, before: marker.before }, 30_000);
+    this.viewedAt = now();
+    const h = await machines.rpc(this.machineId, 'kimi.history', { sessionId: this.kid, turns: HISTORY_TURNS, before: marker.before }, 30_000);
     this.replay(h.frames, { more: h.more, before: h.before, prepend: true });
   }
 
@@ -1022,16 +1049,33 @@ export function restore(session) {
   mirrorFor(session);
 }
 
+// A machine (re)connected: catch up only the conversations someone has
+// open or that are working; the rest catch up when they are opened.
 export async function onMachineOnline(machineId, sessions) {
   for (const s of sessions) {
     if (s.machineId !== machineId || !s.kimiSessionId) continue;
+    const m = mirrorFor(s);
+    m.live = false;
+    if (!m.busy() && now() - m.viewedAt > IDLE_FOLLOW_MS) continue;
     try {
-      await mirrorFor(s).attach();
+      await m.attach();
     } catch (err) {
       console.warn(`[kimi] re-attach ${s.id} failed: ${err.message}`);
     }
   }
 }
+
+// Someone has this conversation open: keep it followed, catching up first
+// if it had stopped (in the background; a catch-up resets the view).
+export function view(session) {
+  const m = mirrorFor(session);
+  m.viewedAt = now();
+  if (!m.live && machines.getMachine(session.machineId)?.online) m.ensureLive().catch((err) => console.warn(`[kimi] catch up ${session.id} failed: ${err.message}`));
+}
+
+setInterval(() => {
+  for (const m of mirrors.values()) m.release();
+}, 60_000).unref();
 
 export async function attach(session, opts) {
   await mirrorFor(session).attach(opts);
@@ -1047,7 +1091,7 @@ export async function createRemote({ machineId, cwd, nameHint }) {
 
 export async function send(session, text, { images = [], note, steer } = {}) {
   const m = mirrorFor(session);
-  if (!session.events.length && !session.state.syncedAt) await m.attach();
+  await m.ensureLive();
   await m.send(text, images, { note, steer });
 }
 export const steerQueued = (session, promptId) => mirrorFor(session).steerQueued(promptId);
@@ -1066,8 +1110,13 @@ export function cannotSend(session) {
 
 export const interrupt = (session) => mirrorFor(session).interrupt();
 export const respond = (session, eventId, optionId, extra) => mirrorFor(session).respond(eventId, optionId, extra);
-export const configure = (session, change) => mirrorFor(session).configure(change);
-export const command = (session, name, args) => mirrorFor(session).command(name, args);
+const followed = async (session) => {
+  const m = mirrorFor(session);
+  await m.ensureLive();
+  return m;
+};
+export const configure = async (session, change) => (await followed(session)).configure(change);
+export const command = async (session, name, args) => (await followed(session)).command(name, args);
 export const cancelQueued = (session, promptId) => mirrorFor(session).cancelQueued(promptId);
 export const loadEarlier = (session) => mirrorFor(session).loadEarlier();
 
