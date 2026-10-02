@@ -481,6 +481,43 @@ kbd {
 .ev {
   min-width: 0;
 }
+/* "到最新訊息": floats above the composer while scrolled up */
+.jump-bar {
+  position: sticky;
+  bottom: var(--space-3);
+  height: 0;
+  display: flex;
+  justify-content: center;
+  align-items: flex-end;
+  pointer-events: none;
+  z-index: 2;
+}
+.jump-end {
+  pointer-events: auto;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: var(--window-raised);
+  color: var(--ink-secondary);
+  box-shadow: var(--shadow-popover);
+  cursor: pointer;
+  transition: color 0.12s ease, background-color 0.12s ease;
+}
+.jump-end:hover {
+  color: var(--ink);
+}
+.jump-end.new {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--on-accent);
+}
+.jump-end .om-icon {
+  width: 16px;
+  height: 16px;
+}
 /* Long conversations: messages out of view skip layout and paint, so
    typing, resizing the panel and streaming stay fast. The browser
    remembers each one's last height. */

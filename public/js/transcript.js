@@ -59,7 +59,10 @@ export class Transcript {
     this.opts = opts;
     this.column = h('div', { class: 'column' });
     this.working = h('div', { class: 'working', hidden: true });
-    this.el = h('div', { class: 'transcript', tabindex: '-1' }, this.column, this.working);
+    // Back to the newest message when scrolled up (lit when more arrived).
+    this.jump = h('button', { class: 'jump-end', type: 'button', title: '到最新訊息', 'aria-label': '到最新訊息', onclick: () => this.toEnd() }, icon('down'));
+    this.jumpBar = h('div', { class: 'jump-bar', hidden: true }, this.jump);
+    this.el = h('div', { class: 'transcript', tabindex: '-1' }, this.column, this.working, this.jumpBar);
     this.events = new Map();
     this.order = [];
     this.nodes = new Map();
@@ -73,7 +76,12 @@ export class Transcript {
     this.raf = 0;
     this.status = 'idle';
     this.el.addEventListener('scroll', () => {
-      this.stick = this.el.scrollHeight - this.el.scrollTop - this.el.clientHeight < 80;
+      const atEnd = this.el.scrollHeight - this.el.scrollTop - this.el.clientHeight < 80;
+      if (this.jumping && !atEnd) return; // mid smooth-scroll to the end
+      this.jumping = false;
+      this.stick = atEnd;
+      this.jumpBar.hidden = this.stick;
+      if (this.stick) this.jump.classList.remove('new');
     });
     this.tick = setInterval(() => this.renderWorking(), 1000);
     // Messages out of view are laid out lazily (content-visibility), so the
@@ -105,6 +113,7 @@ export class Transcript {
     if (this.events.has(ev.id)) return this.patch(ev.id, ev);
     this.events.set(ev.id, ev);
     this.order.push(ev.id);
+    this.grew = true;
     const node = this.makeNode(ev);
     this.nodes.set(ev.id, node);
     this.mount(node);
@@ -126,6 +135,7 @@ export class Transcript {
     const ev = this.events.get(id);
     if (!ev) return;
     ev[field] = (ev[field] || '') + text;
+    this.grew = true;
     this.markDirty(id);
     if (ev.parent) this.markDirty(ev.parent);
     if (field === 'argsText' && artifactOf(ev)) this.artifactsChanged = true;
@@ -173,10 +183,20 @@ export class Transcript {
       this.opts.onArtifacts?.(this.artifacts());
     }
     if (this.stick) this.scrollToEnd();
+    else if (this.grew) this.jump.classList.add('new');
+    this.grew = false;
   }
 
   scrollToEnd() {
     this.el.scrollTop = this.el.scrollHeight;
+  }
+
+  toEnd() {
+    this.stick = true;
+    this.jumping = true;
+    this.jumpBar.hidden = true;
+    this.jump.classList.remove('new');
+    this.el.scrollTo({ top: this.el.scrollHeight, behavior: 'smooth' });
   }
 
   // ------------------------------------------------------------ nodes
