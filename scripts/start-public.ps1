@@ -33,13 +33,21 @@ $procs = @()
 try {
   Say "啟動中控台（port $Port）…"
   $env:HOST = '127.0.0.1'; $env:PORT = $Port
-  $procs += Start-Process node -ArgumentList 'server/index.js' -RedirectStandardOutput "$Logs\hub.log" -RedirectStandardError "$Logs\hub.err" -PassThru -NoNewWindow
+  $hub = Start-Process node -ArgumentList 'server/index.js' -RedirectStandardOutput "$Logs\hub.log" -RedirectStandardError "$Logs\hub.err" -PassThru -NoNewWindow
+  $procs += $hub
+  # Wait for the port to open (a plain TCP check: no proxy settings involved).
   $up = $false
-  for ($i = 0; $i -lt 100 -and -not $up; $i++) {
+  for ($i = 0; $i -lt 75 -and -not $up -and -not $hub.HasExited; $i++) {
     Start-Sleep -Milliseconds 200
-    try { Invoke-WebRequest "http://127.0.0.1:$Port/" -UseBasicParsing -TimeoutSec 2 | Out-Null; $up = $true } catch {}
+    $tcp = New-Object Net.Sockets.TcpClient
+    try { $up = $tcp.ConnectAsync('127.0.0.1', [int]$Port).Wait(300) -and $tcp.Connected } catch {} finally { $tcp.Close() }
   }
-  if (-not $up) { Get-Content "$Logs\hub.log", "$Logs\hub.err" -Tail 20 -ErrorAction SilentlyContinue; throw '中控台沒有啟動起來' }
+  if (-not $up) {
+    Write-Host '--- 中控台的錯誤訊息 ---' -ForegroundColor Red
+    Get-Content "$Logs\hub.log", "$Logs\hub.err" -Tail 30 -ErrorAction SilentlyContinue
+    throw "中控台沒有啟動起來（記錄在 $Logs）。也可以在這個資料夾直接執行 node server/index.js 看錯誤"
+  }
+  Say "中控台已啟動：http://127.0.0.1:$Port"
 
   $secrets = Get-Content data\hub.json -Raw | ConvertFrom-Json
   $token = if ($env:AGENT_HUB_TOKEN) { $env:AGENT_HUB_TOKEN } else { $secrets.token }
