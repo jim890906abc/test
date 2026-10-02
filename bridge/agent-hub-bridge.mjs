@@ -64,6 +64,7 @@ function saveState(state) {
 const STATE = loadState();
 
 const KIMI_HOME = path.resolve(String(opt('kimi-home', process.env.KIMI_CODE_HOME || path.join(os.homedir(), '.kimi-code'))));
+const IS_WIN = process.platform === 'win32';
 const KIMI_BIN = String(opt('kimi-bin', process.env.AGENT_HUB_KIMI_BIN || STATE.kimiBin || 'kimi'));
 const HUB = String(opt('hub', process.env.AGENT_HUB_URL || '')).replace(/\/+$/, '');
 const KEY = String(opt('key', process.env.AGENT_HUB_BRIDGE_KEY || ''));
@@ -201,7 +202,7 @@ async function runKimi(args) {
   const env = { ...process.env, KIMI_CODE_HOME: process.env.KIMI_CODE_HOME || KIMI_HOME };
   if (!py) {
     console.error('（找不到 python3，這個 Kimi 只能在終端機使用。要從中控台操作，請在 Kimi 裡輸入 /web）');
-    const c = spawn(KIMI_BIN, args, { stdio: 'inherit', env });
+    const c = spawn(KIMI_BIN, args, { stdio: 'inherit', env, shell: IS_WIN });
     c.on('exit', (code) => process.exit(code ?? 0));
     return;
   }
@@ -281,7 +282,7 @@ async function runBridge() {
 
   log(`Agent Hub 連接器 ${VERSION} · Kimi 資料夾 ${KIMI_HOME}`);
   try {
-    STATE.kimiVersion = execFileSync(KIMI_BIN, ['--version'], { encoding: 'utf8', timeout: 8000, stdio: ['ignore', 'pipe', 'ignore'] }).match(/\d+\.\d+\.\d+/)?.[0] || STATE.kimiVersion;
+    STATE.kimiVersion = execFileSync(KIMI_BIN, ['--version'], { encoding: 'utf8', timeout: 8000, stdio: ['ignore', 'pipe', 'ignore'], shell: IS_WIN, windowsHide: true }).match(/\d+\.\d+\.\d+/)?.[0] || STATE.kimiVersion;
   } catch {
     log(`… 找不到 Kimi Code（${KIMI_BIN}）。安裝：npm i -g @moonshot-ai/kimi-code`);
   }
@@ -332,6 +333,7 @@ const server = {
   token: null,
   ws: null,
   subs: new Set(),
+  acks: new Map(), // ws request id -> resolve(ack)
   version: null,
   seen: new Map(), // session id -> last time the server reported activity for it
   busy: new Set(), // sessions the server says are busy
@@ -382,18 +384,35 @@ const server = {
     return this.instance;
   },
 
+  // The cached instance can be stale for a few seconds after it exits.
+  async healthy() {
+    if (Date.now() - (this.okAt || 0) < 5000) return true;
+    try {
+      const ok = (await fetch(`${this.base()}/api/v1/healthz`, { signal: AbortSignal.timeout(1500) })).ok;
+      if (ok) this.okAt = Date.now();
+      return ok;
+    } catch {
+      await this.discover();
+      return Boolean(this.instance);
+    }
+  },
+
   base() {
     return `http://${this.instance.host}:${this.instance.port}`;
   },
 
   async request(method, p, body) {
-    if (!this.instance) throw new Error('這台電腦沒有執行中的 Kimi 伺服器。在 Kimi 裡輸入 /web，或執行 kimi web');
+    // The server may have gone away (closed with the Kimi that ran /web):
+    // start one in the background instead of failing.
+    if (!this.instance || !(await this.healthy())) await this.start();
+    await this.ready;
     if (!allowed(method, p)) throw new Error(`連接器拒絕了這個請求：${method} ${p.split('?')[0]}`);
     // A conversation running in a terminal must not be loaded by the server
     // too: two processes would write the same session.
     const sid = p.match(/^\/api\/v1\/sessions\/(session_[\w-]+)/)?.[1];
     if (sid && disk.owner(sid)?.kind === 'tui') return { code: 40999, msg: '這個對話可能正在終端機的 Kimi 裡執行', data: null };
     if (sid && method === 'POST' && /\/prompts$/.test(p)) this.seen.set(sid, Date.now()), this.mine.set(sid, Date.now());
+    if (sid && method === 'POST') await this.follow(sid);
     const res = await fetch(this.base() + p, {
       method,
       headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json' },
@@ -414,9 +433,15 @@ const server = {
     if (!this.instance) return;
     const ws = new WebSocket(`ws://${this.instance.host}:${this.instance.port}/api/v1/ws`, [`kimi-code.bearer.${this.token}`]);
     this.ws = ws;
+    this.accepted = new Set(); // subscriptions this server took
+    // Requests wait for this, so no event of what they start is missed.
+    let ready;
+    this.ready = new Promise((r) => (ready = r));
+    setTimeout(ready, 5000);
     ws.onopen = () => {
       ws.send(JSON.stringify({ type: 'client_hello', id: 'hello', payload: { client_id: `agent-hub-bridge-${HOME_TAG}` } }));
       if (this.subs.size) ws.send(JSON.stringify({ type: 'subscribe', id: 'resub', payload: { session_ids: [...this.subs] } }));
+      else ready();
     };
     ws.onmessage = (e) => {
       let m;
@@ -426,6 +451,12 @@ const server = {
         return;
       }
       if (m.type === 'ping') return ws.send(JSON.stringify({ type: 'pong', payload: m.payload }));
+      if (m.type === 'ack' && m.id === 'resub') ready();
+      if (m.type === 'ack') {
+        for (const id of m.payload?.accepted || []) this.accepted.add(id);
+        this.acks.get(m.id)?.(m);
+        this.acks.delete(m.id);
+      }
       if (m.type === 'server_hello' || m.type === 'ack' || m.type === 'pong') return;
       const sid = m.session_id || m.payload?.sessionId;
       if (sid) {
@@ -450,7 +481,25 @@ const server = {
 
   subscribe(ids) {
     for (const id of ids) this.subs.add(id);
-    if (this.ws?.readyState === 1) this.ws.send(JSON.stringify({ type: 'subscribe', id: crypto.randomUUID(), payload: { session_ids: ids } }));
+    if (this.ws?.readyState !== 1) return Promise.resolve(null);
+    const id = crypto.randomUUID();
+    const acked = new Promise((r) => {
+      this.acks.set(id, r);
+      setTimeout(() => (this.acks.delete(id), r(null)), 5000);
+    });
+    this.ws.send(JSON.stringify({ type: 'subscribe', id, payload: { session_ids: ids } }));
+    return acked;
+  },
+
+  // A server only streams a conversation it has loaded: one it has not
+  // opened yet answers a subscription with not_found, and everything Kimi
+  // then does in it would never reach the hub. Load it, then subscribe,
+  // before the request that makes Kimi work.
+  async follow(sid) {
+    if (!this.subs.has(sid) || this.accepted?.has(sid)) return;
+    // Reading its status is what makes the server load a conversation.
+    await fetch(`${this.base()}/api/v1/sessions/${sid}/status`, { headers: { authorization: `Bearer ${this.token}` }, signal: AbortSignal.timeout(15_000) }).catch(() => {});
+    await this.subscribe([sid]);
   },
 
   unsubscribe(ids) {
@@ -458,15 +507,26 @@ const server = {
     if (this.ws?.readyState === 1) this.ws.send(JSON.stringify({ type: 'unsubscribe', id: crypto.randomUUID(), payload: { session_ids: ids } }));
   },
 
-  async start() {
+  // One start at a time, however many requests are waiting for it.
+  start() {
+    this.starting ??= this.launch().finally(() => (this.starting = null));
+    return this.starting;
+  },
+
+  async launch() {
     if (await this.discover()) return this.instance;
     log('啟動 kimi web --no-open …');
-    const child = spawn(KIMI_BIN, ['web', '--no-open'], { detached: true, stdio: 'ignore', env: { ...process.env, KIMI_CODE_HOME: KIMI_HOME } });
-    child.on('error', (err) => log(`✗ 無法啟動 Kimi：${err.code === 'ENOENT' ? `找不到指令 ${KIMI_BIN}` : err.message}`));
+    let failed = null;
+    let exited = null;
+    const child = spawn(KIMI_BIN, ['web', '--no-open'], { detached: true, stdio: 'ignore', windowsHide: true, shell: IS_WIN, env: { ...process.env, KIMI_CODE_HOME: KIMI_HOME } });
+    child.on('error', (err) => (failed = err.code === 'ENOENT' ? `找不到 Kimi Code 的指令「${KIMI_BIN}」。安裝 Kimi Code，或用 --kimi-bin 指定路徑` : err.message));
+    child.on('exit', (code) => (exited = code));
     child.unref();
     for (let i = 0; i < 40; i++) {
       await new Promise((r) => setTimeout(r, 500));
       if (await this.discover()) return this.instance;
+      if (failed) throw new Error(`無法啟動 Kimi：${failed}`);
+      if (exited !== null && i > 4) throw new Error(`kimi web 啟動後馬上結束了（代碼 ${exited}）。在這台電腦執行 kimi web 看看錯誤訊息，也確認已經 kimi login`);
     }
     throw new Error('Kimi 伺服器沒有在 20 秒內啟動');
   },

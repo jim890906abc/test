@@ -164,7 +164,7 @@ before(async () => {
   fs.mkdirSync(HOME, { recursive: true });
   fs.writeFileSync(path.join(PROJECT, 'a.txt'), 'hello\n');
   await startFakeModel();
-  await run(KIMI, ['web', '--no-open', '--port', String(KIMI_PORT)], { KIMI_CODE_HOME: KIMI_HOME }, /Kimi server ready/);
+  kimiWeb = await run(KIMI, ['web', '--no-open', '--port', String(KIMI_PORT)], { KIMI_CODE_HOME: KIMI_HOME }, /Kimi server ready/);
   kimiToken = fs.readFileSync(path.join(KIMI_HOME, 'server.token'), 'utf8').trim();
   await kimiApi('POST', '/providers', { id: 'fake', type: 'openai', api_key: 'sk-fake', base_url: `http://127.0.0.1:${fake.address().port}/v1`, default_model: 'fake-1', models: [{ model: 'fake-1', max_context_size: 128000 }] });
   await kimiApi('POST', '/models/fake%2Ffake-1:set_default');
@@ -175,8 +175,17 @@ before(async () => {
   machineId = m.id;
 });
 
+let kimiWeb;
 after(() => {
   for (const p of procs) p.kill('SIGTERM');
+  // A Kimi server the bridge started on its own.
+  try {
+    for (const f of fs.readdirSync(path.join(KIMI_HOME, 'server', 'instances'))) {
+      try {
+        process.kill(JSON.parse(fs.readFileSync(path.join(KIMI_HOME, 'server', 'instances', f), 'utf8')).pid, 'SIGTERM');
+      } catch {}
+    }
+  } catch {}
   fake?.close();
   setTimeout(() => fs.rmSync(TMP, { recursive: true, force: true }), 500);
 });
@@ -366,4 +375,33 @@ test('a terminal Kimi started with `agent-hub-bridge.mjs kimi` can be driven fro
   } finally {
     tty.stop();
   }
+});
+
+test('a conversation from a terminal Kimi that was closed is continued from the hub', { skip: SKIP_TTY }, async () => {
+  const tty = terminalKimi([KIMI, '--auto']);
+  await new Promise((r) => setTimeout(r, 4000));
+  tty.type('');
+  await new Promise((r) => setTimeout(r, 1000));
+  tty.type('聊天 關掉之前');
+  const k = await listed((s) => s.title === '聊天 關掉之前' && s.owner === 'tui', 'terminal conversation');
+  await new Promise((r) => setTimeout(r, 1500));
+  tty.stop();
+  await listed((s) => s.id === k.id && s.owner !== 'tui', 'terminal closed');
+  const s = await api('POST', `/machines/${machineId}/kimi/${k.id}/attach`);
+  await api('POST', `/sessions/${s.id}/messages`, { text: '聊天 關掉之後' });
+  const done = await until(async () => {
+    const x = await session(s.id);
+    return x.events.some((e) => e.type === 'text' && e.text.includes('收到：聊天 關掉之後')) && x;
+  }, 30000, 'answered from the hub');
+  assert.ok(done.events.some((e) => e.type === 'text' && e.text.includes('收到：聊天 關掉之前')), 'earlier turns are there');
+});
+
+// Last: it replaces the Kimi server the other tests talk to directly.
+test('when the Kimi server goes away, the bridge starts a new one on the next message', { skip: SKIP }, async () => {
+  const s = await api('POST', '/sessions', { machineId, prompt: '聊天 伺服器在', permission: 'auto' });
+  await idle(s.id);
+  kimiWeb.kill('SIGKILL');
+  await new Promise((r) => setTimeout(r, 5000)); // the bridge notices it is gone
+  await api('POST', `/sessions/${s.id}/messages`, { text: '聊天 伺服器重開' });
+  await until(async () => (await session(s.id)).events.some((e) => e.type === 'text' && e.text.includes('收到：聊天 伺服器重開')), 40000, 'answered by a new Kimi server');
 });
