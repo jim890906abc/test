@@ -141,12 +141,21 @@ try {
 
 // --------------------------------------------------------------- theme
 
-function applyTheme(t) {
+// Light until someone chooses otherwise; 跟系統一樣 is stored as a choice
+// of its own, so it is not mistaken for "nothing chosen yet".
+const savedTheme = () => {
+  try {
+    return localStorage.getItem('hubTheme') || 'light';
+  } catch {
+    return 'light';
+  }
+};
+function applyTheme(t, { save = true } = {}) {
   if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
   else delete document.documentElement.dataset.theme;
+  if (!save) return;
   try {
-    if (t) localStorage.setItem('hubTheme', t);
-    else localStorage.removeItem('hubTheme');
+    localStorage.setItem('hubTheme', t === 'light' || t === 'dark' ? t : 'auto');
   } catch {}
 }
 const theme = () => document.documentElement.dataset.theme || 'auto';
@@ -1990,7 +1999,7 @@ window.addEventListener('focus', updateTitle);
 
 async function start() {
   try {
-    applyTheme(localStorage.getItem('hubTheme'));
+    applyTheme(savedTheme(), { save: false });
   } catch {}
   try {
     S.config = await get('/config');
