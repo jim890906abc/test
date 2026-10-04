@@ -560,13 +560,6 @@ kbd {
   width: 16px;
   height: 16px;
 }
-/* Long conversations: messages out of view skip layout and paint, so
-   typing, resizing the panel and streaming stay fast. The browser
-   remembers each one's last height. */
-.column > .ev {
-  content-visibility: auto;
-  contain-intrinsic-size: auto 60px;
-}
 .ev + .ev {
   margin-top: var(--space-3);
 }

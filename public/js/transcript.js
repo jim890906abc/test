@@ -84,8 +84,6 @@ export class Transcript {
     this.status = 'idle';
     this.el.addEventListener('scroll', () => {
       const atEnd = this.el.scrollHeight - this.el.scrollTop - this.el.clientHeight < 80;
-      if (this.jumping && !atEnd) return; // mid smooth-scroll to the end
-      this.jumping = false;
       this.stick = atEnd;
       this.jumpBar.hidden = this.stick;
       if (this.stick) this.jump.classList.remove('new');
@@ -99,9 +97,8 @@ export class Transcript {
       if (!a || !this.column.contains(a) || e.metaKey || e.ctrlKey) return;
       if (this.opts.onLink?.(a.getAttribute('href'))) e.preventDefault();
     });
-    // Messages out of view are laid out lazily (content-visibility), so the
-    // column keeps settling after a render: stay pinned to the end while
-    // following it.
+    // The column can still settle after a render (an image loads, a tool's
+    // output arrives): stay pinned to the end while following it.
     this.resize = new ResizeObserver(() => this.stick && this.scrollToEnd());
     this.resize.observe(this.column);
   }
@@ -318,10 +315,9 @@ export class Transcript {
 
   toEnd() {
     this.stick = true;
-    this.jumping = true;
     this.jumpBar.hidden = true;
     this.jump.classList.remove('new');
-    this.el.scrollTo({ top: this.el.scrollHeight, behavior: 'smooth' });
+    this.scrollToEnd();
   }
 
   // ------------------------------------------------------------ nodes
