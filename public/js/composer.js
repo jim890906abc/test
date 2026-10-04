@@ -402,7 +402,7 @@ export class Composer {
   renderSlash(items, index) {
     closeMenu();
     if (!this.slash) {
-      const el = h('div', { class: 'om-menu popover slash-menu', role: 'listbox', 'aria-label': '指令' });
+      const el = h('div', { class: 'om om-menu popover slash-menu', role: 'listbox', 'aria-label': '指令' });
       document.body.append(el);
       const away = (e) => {
         if (!el.contains(e.target) && e.target !== this.input) this.closeSlash();

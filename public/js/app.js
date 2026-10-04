@@ -88,7 +88,7 @@ function notify(title, body, onClick) {
 // --------------------------------------------------------------- shell
 
 const $app = document.getElementById('app');
-const $toasts = h('div', { class: 'toasts', 'aria-live': 'polite' });
+const $toasts = h('div', { class: 'om toasts', 'aria-live': 'polite' });
 document.body.append($toasts);
 
 const $search = h('input', { class: 'om-input', type: 'search', placeholder: '搜尋對話', 'aria-label': '搜尋對話', oninput: () => ((S.query = $search.value.trim().toLowerCase()), renderSidebar()) });
@@ -796,8 +796,7 @@ function renderToolbar() {
       ),
     ),
     h('span', { class: 'om-toolbar__spacer' }),
-    arts ? h('button', { class: `om-btn om-btn--toolbar wide${S.panel?.tab === 'artifact' ? ' on' : ''}`, type: 'button', title: 'Artifact', onclick: () => (S.panel?.tab === 'artifact' ? hidePanel() : showArtifact()) }, icon('artifact'), h('span', { class: 'btn-label' }, 'Artifact'), arts > 1 ? h('span', { class: 'om-sidebar__count' }, String(arts)) : null) : null,
-    h('button', { class: `om-btn om-btn--toolbar wide${S.panel?.tab === 'changes' ? ' on' : ''}`, type: 'button', title: '檔案變更', onclick: () => (S.panel?.tab === 'changes' ? hidePanel() : showChanges()) }, icon('diff'), h('span', { class: 'btn-label' }, '變更')),
+    h('button', { class: `om-btn om-btn--toolbar wide${S.panel ? ' on' : ''}`, type: 'button', title: '面板：Artifact、變更、子代理、待辦', onclick: () => (S.panel ? hidePanel() : openPanel()) }, icon('panelRight'), h('span', { class: 'btn-label' }, '面板')),
     h('button', { class: 'om-btn om-btn--toolbar', type: 'button', title: '更多', 'aria-label': '更多', onclick: (e) => sessionMenu(e.currentTarget) }, icon('dots')),
   );
 }
@@ -975,6 +974,25 @@ $grip.addEventListener('keydown', (e) => {
   panelWidth($panel.offsetWidth + (e.key === 'ArrowLeft' ? 32 : -32));
 });
 
+// A pane with nothing in it yet: the tabs stay, so the others are a click
+// away.
+function emptyPane(tab, text) {
+  artifactView?.destroy();
+  artifactView = null;
+  closeAgentPanel();
+  showPanel(tab);
+  fill($panel, $grip, h('div', { class: 'panel-changes' }, panelHead(), h('div', { class: 'panel-body' }, h('div', { class: 'panel-empty' }, text))));
+}
+
+// The panel's default tab when opened from the toolbar: whatever is most
+// useful right now. Every available pane shows as a tab in the head.
+function openPanel() {
+  if (S.artifacts.length) return showArtifact();
+  if (S.cur?.transcript?.runningAgents().length) return showAgents();
+  if (S.cur?.summary?.meta?.todos?.length) return showTodos();
+  return showChanges();
+}
+
 function showPanel(tab) {
   S.panel = { ...(S.panel || {}), tab };
   $panel.hidden = false;
@@ -1002,10 +1020,12 @@ function panelHead(...right) {
     h(
       'div',
       { class: 'om-seg om-seg--sm', role: 'group' },
-      S.artifacts.length ? h('button', { class: 'om-seg__item', type: 'button', 'aria-pressed': String(tab === 'artifact'), onclick: () => showArtifact() }, 'Artifact') : null,
+      // Every pane is always listed, so the panel button brings them all
+      // out; an empty one says so when opened.
+      h('button', { class: 'om-seg__item', type: 'button', 'aria-pressed': String(tab === 'artifact'), onclick: () => showArtifact() }, 'Artifact', S.artifacts.length > 1 ? h('span', { class: 'tab-count' }, String(S.artifacts.length)) : null),
       h('button', { class: 'om-seg__item', type: 'button', 'aria-pressed': String(tab === 'changes'), onclick: showChanges }, '變更'),
-      S.cur?.transcript?.agentIds.length ? h('button', { class: 'om-seg__item', type: 'button', 'aria-pressed': String(tab === 'agents'), onclick: () => showAgents() }, '子代理') : null,
-      S.cur?.summary?.meta?.todos?.length ? h('button', { class: 'om-seg__item', type: 'button', 'aria-pressed': String(tab === 'todos'), onclick: showTodos }, '待辦') : null,
+      h('button', { class: 'om-seg__item', type: 'button', 'aria-pressed': String(tab === 'agents'), onclick: () => showAgents() }, '子代理', S.cur?.transcript?.agentIds.length ? h('span', { class: 'tab-count' }, String(S.cur.transcript.agentIds.length)) : null),
+      h('button', { class: 'om-seg__item', type: 'button', 'aria-pressed': String(tab === 'todos'), onclick: showTodos }, '待辦'),
     ),
     h('span', { class: 'om-toolbar__spacer' }),
     ...right,
@@ -1016,7 +1036,7 @@ function panelHead(...right) {
 // Artifact tab: the newest version of the chosen page, kept in sync while
 // Kimi writes it.
 function showArtifact(path, version) {
-  if (!S.artifacts.length) return;
+  if (!S.artifacts.length) return emptyPane('artifact', 'Kimi 還沒有在這個對話裡做出頁面。它寫的 HTML 會顯示在這裡。');
   const wasArtifact = S.panel?.tab === 'artifact';
   const art = S.artifacts.find((a) => a.path === (path || S.panel?.path)) || S.artifacts.at(-1);
   closeAgentPanel();
@@ -1173,7 +1193,7 @@ function showAgents(id) {
   const t = S.cur?.transcript;
   if (!t) return;
   const all = t.agentList();
-  if (!all.length) return;
+  if (!all.length) return emptyPane('agents', '這個對話還沒有用到子代理。');
   const pick = id || agentPanel?.id || all.findLast((a) => a.running)?.id || all.at(-1).id;
   artifactView?.destroy();
   artifactView = null;
@@ -1494,7 +1514,7 @@ let dialogClose = null;
 function dialog(content, { wide = false, onClose } = {}) {
   dialogClose?.();
   const box = h('div', { class: `dialog${wide ? ' wide' : ''}`, role: 'dialog', 'aria-modal': 'true' }, content);
-  const back = h('div', { class: 'dialog-back', onclick: (e) => e.target === back && close() }, box);
+  const back = h('div', { class: 'om dialog-back', onclick: (e) => e.target === back && close() }, box);
   const prevFocus = document.activeElement;
   function close() {
     back.remove();
@@ -1668,7 +1688,9 @@ function drawMachines(content, hub, d) {
   const local = /^(localhost|127\.|\[::1\])/.test(location.hostname);
   const unix = `curl -fsSL ${origin}${hub.bridgePath} -o agent-hub-bridge.mjs && node agent-hub-bridge.mjs --hub ${origin} --key ${hub.bridgeKey}`;
   const win = `curl.exe -fsSL ${origin}${hub.bridgePath} -o agent-hub-bridge.mjs; node agent-hub-bridge.mjs --hub ${origin} --key ${hub.bridgeKey}`;
-  const os = d.os || (/Win/.test(navigator.platform) ? 'win' : 'unix');
+  // The machine being connected is usually Linux or a Mac, whatever this
+  // browser runs on; Windows stays one click away.
+  const os = d.os || 'unix';
   const cmd = os === 'win' ? win : unix;
   const status = (m) => (!m.online ? h('span', { class: 'om-badge' }, '離線') : h('span', { class: 'om-badge om-badge--success' }, icon('check'), '在線上'));
   const wrap = 'node ~/.agent-hub/agent-hub-bridge.mjs kimi';
@@ -1682,7 +1704,7 @@ function drawMachines(content, hub, d) {
           ...S.machines.map((m) =>
             h(
               'div',
-              { class: 'om-group__row' },
+              { class: 'om-group__row machine-row' },
               icon('computer'),
               h(
                 'div',
@@ -1690,8 +1712,7 @@ function drawMachines(content, hub, d) {
                 h('div', { class: 'om-group__label' }, m.name),
                 h('div', { class: 'om-group__hint' }, [m.platform, m.kimi?.version ? `Kimi Code ${m.kimi.version}` : null, m.online ? `${(m.sessions || []).length} 個對話` : `上次連線：${relTime(m.lastSeen || 0)}`].filter(Boolean).join(' · ')),
               ),
-              status(m),
-              !m.online ? h('button', { class: 'om-btn om-btn--sm om-btn--destructive', type: 'button', onclick: () => removeMachine(m) }, '移除…') : null,
+              h('div', { class: 'machine-right' }, status(m), !m.online ? h('button', { class: 'om-btn om-btn--sm om-btn--destructive', type: 'button', onclick: () => removeMachine(m) }, '移除…') : null),
             ),
           ),
         )

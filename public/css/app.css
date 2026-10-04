@@ -1819,6 +1819,12 @@ pre.tail {
   display: flex;
   flex-direction: column;
 }
+.tab-count {
+  margin-left: 5px;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.7;
+}
 .panel-head {
   flex: none;
   display: flex;
@@ -2332,6 +2338,22 @@ pre.tail {
 }
 .machines .om-group__row > .om-icon {
   color: var(--ink-secondary);
+}
+.machine-row {
+  gap: var(--space-3);
+}
+.machine-row .om-group__label {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.machine-row .om-group__hint {
+  overflow-wrap: anywhere;
+}
+.machine-right {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
 }
 .machines .om-badge .om-icon {
   width: 11px;

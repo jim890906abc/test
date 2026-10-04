@@ -86,6 +86,7 @@ export function openMenu(anchor, entries, { align = 'start', side = 'auto', widt
       el.append(item);
     }
   }
+  el.classList.add('om');
   document.body.append(el);
   place(el, anchor, { align, side });
   open = { el, anchor, onClose };
