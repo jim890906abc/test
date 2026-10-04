@@ -620,7 +620,6 @@ class Mirror {
         if (!main) return;
         this.closeBlock();
         this.turn = { started: now(), input: 0, output: 0, id: p.turnId };
-        this.meta({ tps: 0 });
         const kind = p.origin?.kind;
         const text = promptLabel(p);
         if (text != null) this.showPrompt(p.promptId, text, contentImages(p.promptAttachments));
@@ -713,12 +712,15 @@ class Mirror {
           this.turn.output += p.usage.output || 0;
           // Kimi times each step's streaming, so tokens per second is the
           // generated tokens over the time actually spent generating.
-          if (p.llmStreamDurationMs > 0) {
-            this.turn.genTokens = (this.turn.genTokens || 0) + (p.usage.output || 0);
-            this.turn.genMs = (this.turn.genMs || 0) + p.llmStreamDurationMs;
-            // Enough of a sample to be worth showing.
-            if (this.turn.genMs >= 250 && this.turn.genTokens >= 20) this.meta({ tps: Math.round((this.turn.genTokens / this.turn.genMs) * 1000) });
-          }
+        }
+        // Kimi times each step's streaming and counts what it generated, so
+        // the recent steps give a generation rate. A rolling window keeps it
+        // steady: it stays put while a tool runs, instead of blinking out.
+        if (main && p.usage?.output > 0 && p.llmStreamDurationMs > 0) {
+          this.rates = [...(this.rates || []), { tokens: p.usage.output, ms: p.llmStreamDurationMs }].slice(-10);
+          const tokens = this.rates.reduce((a, r) => a + r.tokens, 0);
+          const ms = this.rates.reduce((a, r) => a + r.ms, 0);
+          if (ms >= 100) this.meta({ tps: Math.round((tokens / ms) * 1000) });
         }
         return;
       case 'turn.ended':
