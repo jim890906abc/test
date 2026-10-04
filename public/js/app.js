@@ -1181,6 +1181,7 @@ function showAgents(id) {
   showPanel('agents');
   const steps = new Transcript({ cwd: S.cur.summary?.cwd, onRespond: respond, onImage: lightbox, onLink: openFileLink });
   const section = (label, ...right) => h('div', { class: 'agent-sec' }, h('span', { class: 'agent-sec-label' }, label), h('span', { class: 'om-toolbar__spacer' }), ...right);
+  applyAgentSizes();
   agentPanel = {
     id: pick,
     transcript: steps,
@@ -1195,7 +1196,11 @@ function showAgents(id) {
   for (const e of evs) agentPanel.ids.add(e.id);
   steps.load(evs.map((e) => ({ ...e, parent: e.parent === pick ? undefined : e.parent })));
   steps.setStatus(t.agentList().find((a) => a.id === pick)?.running ? 'running' : 'idle');
-  agentPanel.report = h('div', { class: 'agent-report' }, section('子代理回報'), agentPanel.summary);
+  const stepsBar = section('步驟', agentPanel.stepsLabel);
+  const reportBar = section('子代理回報');
+  agentSplit(stepsBar, 'list');
+  agentSplit(reportBar, 'report');
+  agentPanel.report = h('div', { class: 'agent-report' }, reportBar, agentPanel.summary);
   fill(
     $panel,
     $grip,
@@ -1203,12 +1208,66 @@ function showAgents(id) {
       'div',
       { class: 'panel-agents' },
       panelHead(),
-      h('div', { class: 'agent-pane' }, section('子代理', agentPanel.count), agentPanel.list),
-      h('div', { class: 'agent-pane agent-steps' }, section('步驟', agentPanel.stepsLabel), steps.el),
+      h('div', { class: 'agent-pane agent-top' }, section('子代理', agentPanel.count), agentPanel.list),
+      h('div', { class: 'agent-pane agent-steps' }, stepsBar, steps.el),
       agentPanel.report,
     ),
   );
   drawAgentList();
+}
+
+// The 子代理 panes: the list is short (about three subagents) and the
+// steps take the rest. The 步驟 and 子代理回報 bars double as splitters,
+// so the shares can be dragged; double-click resets one.
+const AGENT_SIZES = { list: 186, report: 200 };
+const agentSizes = () => {
+  try {
+    return { ...AGENT_SIZES, ...JSON.parse(localStorage.getItem('hubAgentPanes') || '{}') };
+  } catch {
+    return { ...AGENT_SIZES };
+  }
+};
+function applyAgentSizes() {
+  const s = agentSizes();
+  $panel.style.setProperty('--agent-list-h', `${s.list}px`);
+  $panel.style.setProperty('--agent-report-h', `${s.report}px`);
+}
+function setAgentSize(which, px) {
+  const min = which === 'list' ? 52 : 72;
+  const other = which === 'list' ? agentSizes().report : agentSizes().list;
+  const max = Math.max(min, $panel.offsetHeight - other - 180);
+  const next = { ...agentSizes(), [which]: Math.round(Math.max(min, Math.min(px, max))) };
+  try {
+    localStorage.setItem('hubAgentPanes', JSON.stringify(next));
+  } catch {}
+  applyAgentSizes();
+}
+function agentSplit(bar, which) {
+  bar.classList.add('agent-sec--grip');
+  bar.title = '拖曳調整高度，按兩下還原';
+  bar.addEventListener('pointerdown', (e) => {
+    if (e.target.closest('button')) return;
+    e.preventDefault();
+    bar.setPointerCapture(e.pointerId);
+    const startY = e.clientY;
+    const from = agentSizes()[which];
+    let raf = 0;
+    let y = startY;
+    const move = (ev) => {
+      y = ev.clientY;
+      raf ||= requestAnimationFrame(() => ((raf = 0), setAgentSize(which, from + (which === 'list' ? y - startY : startY - y))));
+    };
+    const up = () => {
+      cancelAnimationFrame(raf);
+      bar.removeEventListener('pointermove', move);
+      bar.removeEventListener('pointerup', up);
+      bar.removeEventListener('pointercancel', up);
+    };
+    bar.addEventListener('pointermove', move);
+    bar.addEventListener('pointerup', up);
+    bar.addEventListener('pointercancel', up);
+  });
+  bar.addEventListener('dblclick', () => setAgentSize(which, AGENT_SIZES[which]));
 }
 
 // "K3-256k · 思考 最高": the model and thinking a subagent runs with.

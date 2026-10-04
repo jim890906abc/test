@@ -1934,12 +1934,14 @@ pre.tail {
   flex-direction: column;
   min-height: 0;
 }
-.agent-pane:first-of-type {
+.agent-top {
   flex: none;
-  max-height: 34%;
+  height: var(--agent-list-h, 186px);
 }
+/* the steps get whatever is left */
 .agent-steps {
   flex: 1;
+  min-height: 120px;
 }
 .agent-sec {
   display: flex;
@@ -1953,6 +1955,14 @@ pre.tail {
   font-size: 11px;
   line-height: 16px;
   color: var(--ink-secondary);
+}
+.agent-sec--grip {
+  cursor: row-resize;
+  user-select: none;
+  touch-action: none;
+}
+.agent-sec--grip:hover {
+  background: var(--fill-hover);
 }
 .agent-sec-label {
   flex: none;
@@ -2054,7 +2064,7 @@ pre.tail {
   display: flex;
   flex-direction: column;
   min-height: 0;
-  max-height: 34%;
+  height: var(--agent-report-h, 200px);
 }
 .agent-report-body {
   flex: 1;
