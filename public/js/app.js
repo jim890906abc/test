@@ -1558,29 +1558,101 @@ async function removeMachine(m) {
   openMachines();
 }
 
+// A folder tree on the machine: click a row to select it, the caret (or
+// clicking the selected row again) to open it; double-click picks it.
 function browseFolders(m, pick) {
-  const list = h('div', { class: 'dirs' });
-  const crumb = h('div', { class: 'crumb' });
-  let current = null;
-  const choose = h('button', { class: 'om-btn om-btn--primary', type: 'button', onclick: () => (pick(current), d.close()) }, '選擇這個資料夾');
-  const d = dialog(h('div', { class: 'browse' }, h('div', { class: 'dialog-title' }, `「${m.name}」上的資料夾`), crumb, list, h('div', { class: 'dialog-actions' }, h('button', { class: 'om-btn', type: 'button', onclick: () => d.close() }, '取消'), choose)), { wide: true });
-  const load = async (path) => {
-    fill(list, h('div', { class: 'loading' }, h('span', { class: 'spinner' })));
+  const tree = h('div', { class: 'tree', role: 'tree', 'aria-label': '資料夾' });
+  const chosen = h('div', { class: 'tree-path' });
+  const up = h('button', { class: 'om-btn om-btn--sm', type: 'button', disabled: true }, '上一層');
+  let selected = null;
+  let root = null;
+  const join = (p, name) => `${p.replace(/\/$/, '')}/${name}`;
+  const list = (path) => get(`/fs/dirs?machine=${encodeURIComponent(m.id)}${path ? `&path=${encodeURIComponent(path)}` : ''}`);
+  const choose = h('button', { class: 'om-btn om-btn--primary', type: 'button', disabled: true, onclick: () => selected && (pick(selected), d.close()) }, '選擇這個資料夾');
+  const select = (path, row) => {
+    selected = path;
+    for (const r of tree.querySelectorAll('.tree-row[aria-selected="true"]')) r.setAttribute('aria-selected', 'false');
+    row?.setAttribute('aria-selected', 'true');
+    chosen.textContent = shortPath(path, m.home, 8);
+    choose.disabled = false;
+  };
+  // One folder: its row, and its subfolders once opened.
+  const node = (path, name, depth) => {
+    const kids = h('div', { class: 'tree-kids', role: 'group', hidden: true });
+    const caret = h('span', { class: 'tree-caret', 'aria-hidden': 'true' });
+    const row = h('div', { class: 'tree-row', role: 'treeitem', tabindex: '0', 'aria-expanded': 'false', 'aria-selected': 'false', style: { paddingLeft: `${8 + depth * 16}px` } }, caret, h('span', { class: 'tree-name' }, name));
+    const el = h('div', { class: 'tree-node' }, row, kids);
+    let loaded = false;
+    el.toggle = async (open = kids.hidden) => {
+      if (open && !loaded) {
+        loaded = true;
+        fill(kids, h('div', { class: 'tree-note', style: { paddingLeft: `${28 + depth * 16}px` } }, '讀取中…'));
+        try {
+          const r = await list(path);
+          fill(kids, ...r.dirs.map((n) => node(join(r.path, n), n, depth + 1)), !r.dirs.length ? h('div', { class: 'tree-note', style: { paddingLeft: `${28 + depth * 16}px` } }, '沒有子資料夾') : null);
+        } catch (err) {
+          loaded = false;
+          fill(kids, h('div', { class: 'tree-note', style: { paddingLeft: `${28 + depth * 16}px` } }, err.message));
+        }
+      }
+      kids.hidden = !open;
+      row.setAttribute('aria-expanded', String(open));
+    };
+    caret.addEventListener('click', (e) => (e.stopPropagation(), el.toggle()));
+    row.addEventListener('click', () => (selected === path ? el.toggle() : (select(path, row), el.toggle(true))));
+    row.addEventListener('dblclick', () => (pick(path), d.close()));
+    row.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') (pick(path), d.close());
+      else if (e.key === 'ArrowRight') el.toggle(true);
+      else if (e.key === 'ArrowLeft') el.toggle(false);
+      else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        const rows = [...tree.querySelectorAll('.tree-row')].filter((x) => x.offsetParent);
+        rows[rows.indexOf(row) + (e.key === 'ArrowDown' ? 1 : -1)]?.focus();
+      } else return;
+      e.preventDefault();
+    });
+    row.addEventListener('focus', () => select(path, row));
+    el.path = path;
+    return el;
+  };
+  // Show `path` as the top of the tree, opened; then open down to `target`.
+  const showRoot = async (path, target) => {
+    fill(tree, h('div', { class: 'tree-note' }, '讀取中…'));
     try {
-      const r = await get(`/fs/dirs?machine=${encodeURIComponent(m.id)}${path ? `&path=${encodeURIComponent(path)}` : ''}`);
-      current = r.path;
-      fill(crumb, icon('folder'), h('span', null, shortPath(r.path, m.home, 6)));
-      fill(
-        list,
-        r.parent ? h('button', { class: 'dir up', type: 'button', onclick: () => load(r.parent) }, icon('back'), '上一層') : null,
-        ...r.dirs.map((name) => h('button', { class: 'dir', type: 'button', ondblclick: () => (pick(`${r.path}/${name}`), d.close()), onclick: () => load(`${r.path.replace(/\/$/, '')}/${name}`) }, icon('folder'), name)),
-        !r.dirs.length ? h('div', { class: 'panel-empty' }, '這裡沒有子資料夾。') : null,
-      );
+      root = await list(path);
+      up.disabled = !root.parent;
+      const top = node(root.path, shortPath(root.path, m.home, 8), 0);
+      fill(tree, top);
+      await top.toggle(true);
+      select(root.path, top.firstChild);
+      if (target && target.startsWith(`${root.path.replace(/\/$/, '')}/`)) {
+        let at = top;
+        for (const name of target.slice(root.path.replace(/\/$/, '').length + 1).split('/').filter(Boolean)) {
+          at = [...at.lastChild.children].find((c) => c.path === join(at.path, name));
+          if (!at) break;
+          await at.toggle(true);
+          select(at.path, at.firstChild);
+        }
+        tree.querySelector('.tree-row[aria-selected="true"]')?.scrollIntoView({ block: 'center' });
+      }
     } catch (err) {
-      fill(list, h('div', { class: 'panel-empty' }, err.message));
+      fill(tree, h('div', { class: 'tree-note' }, err.message));
     }
   };
-  load(S.home.cwdByMachine?.[m.id] || '');
+  up.addEventListener('click', () => root?.parent && showRoot(root.parent, selected));
+  const d = dialog(
+    h(
+      'div',
+      { class: 'browse' },
+      h('div', { class: 'browse-head' }, h('div', { class: 'dialog-title' }, `「${m.name}」上的資料夾`), up),
+      tree,
+      h('div', { class: 'browse-foot' }, h('span', { class: 'muted' }, '選擇：'), chosen),
+      h('div', { class: 'dialog-actions' }, h('button', { class: 'om-btn', type: 'button', onclick: () => d.close() }, '取消'), choose),
+    ),
+    { wide: true },
+  );
+  const start = S.home.cwdByMachine?.[m.id];
+  showRoot('', start);
 }
 
 function lightbox(src) {
