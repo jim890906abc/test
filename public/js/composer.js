@@ -251,7 +251,7 @@ export class Composer {
     const s = this.state;
     const busy = s.running || s.awaiting;
     const ctx = s.context;
-    const ring = ctx?.size ? contextRing(ctx, () => this.opts.onCommand('compact', '')) : null;
+    const ring = ctx?.size ? contextRing(ctx, () => this.opts.onCommand('compact', ''), this.opts.onQuotaNode) : null;
     const stop = busy && !this.hasContent();
     fill(
       this.right,
@@ -517,7 +517,7 @@ async function readImage(file) {
   return { mimeType, data, thumb, name: file.name };
 }
 
-function contextRing(ctx, onCompact) {
+function contextRing(ctx, onCompact, quotaNode) {
   const pct = Math.min(1, ctx.used / ctx.size);
   const r = 7;
   const c = 2 * Math.PI * r;
@@ -529,8 +529,21 @@ function contextRing(ctx, onCompact) {
     type: 'button',
     title: `${title}\n點一下可以壓縮對話`,
     'aria-label': title,
-    onclick: (e) =>
-      openMenu(e.currentTarget, [{ section: title }, { label: '壓縮對話', hint: '/compact', onSelect: onCompact }], { align: 'end', width: 260 }),
+    onclick: (e) => {
+      // Context first, then the plan's 5-hour and 7-day quota.
+      const quota = quotaNode?.();
+      openMenu(
+        e.currentTarget,
+        [
+          { section: 'Context' },
+          { node: h('div', { class: 'menu-quota' }, h('div', { class: 'quota' }, h('div', { class: 'quota-head' }, h('span', null, `${fmtTokens(ctx.used)} / ${fmtTokens(ctx.size)}`), h('span', { class: 'muted' }, `已用 ${Math.round(pct * 100)}%`)), h('div', { class: `quota-bar${level ? ` ${level}` : ''}` }, h('span', { style: { width: `${Math.round(pct * 100)}%` } })))) },
+          ...(quota ? [{ separator: true }, { section: '方案用量' }, { node: quota }] : []),
+          { separator: true },
+          { label: '壓縮對話', hint: '/compact', onSelect: onCompact },
+        ],
+        { align: 'end', width: 260 },
+      );
+    },
     html: `<svg viewBox="0 0 18 18" aria-hidden="true"><circle cx="9" cy="9" r="${r}" class="track"/><circle cx="9" cy="9" r="${r}" class="bar" stroke-dasharray="${c.toFixed(2)}" stroke-dashoffset="${(c * (1 - pct)).toFixed(2)}"/></svg><span class="ctx-label">${Math.round(pct * 100)}% · ${fmtTokens(ctx.used)}/${fmtTokens(ctx.size)}</span>`,
   });
   return btn;

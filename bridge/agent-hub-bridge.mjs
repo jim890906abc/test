@@ -633,7 +633,7 @@ function translate(rec, sid, fileAgent = 'main') {
       }
       if (e.type === 'tool.call') return [f('tool.call.started', { turnId, toolCallId: e.toolCallId, name: e.name, args: clipArgs(e.args), display: e.display, description: e.description })];
       if (e.type === 'tool.result') return [f('tool.result', { turnId, toolCallId: e.toolCallId, output: clipOutput(e.result?.output), isError: Boolean(e.result?.isError ?? e.result?.is_error) })];
-      if (e.type === 'step.end') return [f('turn.step.completed', { turnId, usage: e.usage })];
+      if (e.type === 'step.end') return [f('turn.step.completed', { turnId, usage: e.usage, llmStreamDurationMs: e.llmStreamDurationMs })];
       return [];
     }
     case 'interaction.request': {

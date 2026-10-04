@@ -2259,6 +2259,16 @@ pre.tail {
   gap: var(--space-2);
   margin-top: var(--space-4);
 }
+.menu-quota {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3) var(--space-3);
+  font-size: 12px;
+}
+.menu-quota .quota-head {
+  font-size: 12px;
+}
 .quotas {
   display: flex;
   flex-direction: column;

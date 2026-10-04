@@ -694,6 +694,7 @@ async function openSession(id) {
     onError: (t) => toast(t),
     onHelp: openMachines,
     onFocusAgent: (aid) => showAgents(aid),
+    onQuotaNode: quotaMenuNode,
     onOpenTodos: showTodos,
   });
   composer.setKey(id);
@@ -722,7 +723,7 @@ function applySnapshot(full) {
   S.sessions.set(summary.id, summary);
   cur.transcript.opts.cwd = summary.cwd;
   cur.transcript.load(events);
-  cur.transcript.setStatus(summary.status, busy(summary.status) ? lastUserTs(events) : null);
+  cur.transcript.setStatus(summary.status, busy(summary.status) ? lastUserTs(events) : null, summary.meta?.tps || 0);
   S.artifacts = withOpened(cur.transcript.artifacts());
   cur.knownArtifacts = new Set(S.artifacts.map((a) => a.path));
   updateComposer();
@@ -1587,36 +1588,65 @@ const fmtK = (n) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 100_000 ? 0 : 1)}k` 
 
 // /usage and /status: the plan quota of the Kimi account on that machine,
 // plus (for /status) the conversation's own settings.
-async function accountDialog(machineId, rows = null) {
-  const m = machineById(machineId);
-  const body = h('div', { class: 'account' }, h('div', { class: 'dialog-title' }, rows ? '狀態' : '用量'), h('div', { class: 'muted' }, '讀取中…'));
-  const d = dialog(body);
-  let data = {};
-  try {
-    data = await get(`/machines/${machineId}/usage`);
-  } catch (err) {
-    data = { usage: { kind: 'error', message: err.message } };
-  }
-  const WINDOWS = { limit5h: '5 小時', limit7d: '7 天', monthTotal: '本月總額度', monthCode: '本月 Code 額度' };
-  const until = (t) => {
-    const ms = Date.parse(t) - Date.now();
-    if (!(ms > 0)) return '';
-    const hrs = ms / 3_600_000;
-    return hrs < 1 ? `${Math.ceil(ms / 60_000)} 分鐘後重置` : hrs < 48 ? `${Math.round(hrs)} 小時後重置` : `${Math.round(hrs / 24)} 天後重置`;
-  };
-  const u = data.usage;
-  const quota = u?.kind === 'ok' ? u.quota : null;
-  const bars = Object.entries(quota?.usages || {})
-    .filter(([, v]) => v && typeof v.usedRatio === 'number')
+const QUOTA_WINDOWS = { limit5h: '5 小時', limit7d: '7 天', monthTotal: '本月總額度', monthCode: '本月 Code 額度' };
+const resetIn = (t) => {
+  const ms = Date.parse(t) - Date.now();
+  if (!(ms > 0)) return '';
+  const hrs = ms / 3_600_000;
+  return hrs < 1 ? `${Math.ceil(ms / 60_000)} 分鐘後重置` : hrs < 48 ? `${Math.round(hrs)} 小時後重置` : `${Math.round(hrs / 24)} 天後重置`;
+};
+
+// The plan's quota windows, as Kimi reports them. `only` picks which.
+function quotaBars(quota, only) {
+  return Object.entries(quota?.usages || {})
+    .filter(([k, v]) => v && typeof v.usedRatio === 'number' && (!only || only.includes(k)))
+    .sort(([a], [b]) => (only ? only.indexOf(a) - only.indexOf(b) : 0))
     .map(([k, v]) => {
       const pct = Math.round(Math.min(1, v.usedRatio) * 100);
       return h(
         'div',
         { class: 'quota' },
-        h('div', { class: 'quota-head' }, h('span', null, WINDOWS[k] || k), h('span', { class: 'muted' }, `已用 ${pct}%${v.resetAt ? ` · ${until(v.resetAt)}` : ''}`)),
+        h('div', { class: 'quota-head' }, h('span', null, QUOTA_WINDOWS[k] || k), h('span', { class: 'muted' }, `已用 ${pct}%${v.resetAt ? ` · ${resetIn(v.resetAt)}` : ''}`)),
         h('div', { class: `quota-bar${pct >= 90 ? ' danger' : pct >= 75 ? ' warning' : ''}` }, h('span', { style: { width: `${pct}%` } })),
       );
     });
+}
+
+// Shared by the context menu and 用量; a minute of cache keeps the menu
+// from asking the machine on every click.
+const usageCache = new Map();
+function fetchUsage(machineId) {
+  const c = usageCache.get(machineId);
+  if (c && Date.now() - c.at < 60_000) return c.p;
+  const p = get(`/machines/${machineId}/usage`).catch((err) => ({ usage: { kind: 'error', message: err.message } }));
+  usageCache.set(machineId, { at: Date.now(), p });
+  return p;
+}
+
+// The 5-hour and 7-day quota under the context ring's menu.
+function quotaMenuNode() {
+  const mid = S.cur?.summary?.machineId;
+  if (!mid) return null;
+  const box = h('div', { class: 'menu-quota' }, h('div', { class: 'muted' }, '讀取方案用量…'));
+  fetchUsage(mid).then((data) => {
+    const u = data.usage;
+    const bars = u?.kind === 'ok' ? quotaBars(u.quota, ['limit5h', 'limit7d']) : [];
+    if (bars.length) return fill(box, ...bars);
+    const msg = u?.kind === 'error' ? (/no token|login/i.test(u.message || '') ? '這台電腦的 Kimi 沒有用 Kimi 帳號登入' : '讀不到方案用量') : '這個帳號沒有方案額度';
+    fill(box, h('div', { class: 'muted' }, msg));
+  });
+  return box;
+}
+
+async function accountDialog(machineId, rows = null) {
+  const m = machineById(machineId);
+  const body = h('div', { class: 'account' }, h('div', { class: 'dialog-title' }, rows ? '狀態' : '用量'), h('div', { class: 'muted' }, '讀取中…'));
+  const d = dialog(body);
+  usageCache.delete(machineId); // this dialog is where someone checks on purpose
+  const data = await fetchUsage(machineId);
+  const u = data.usage;
+  const quota = u?.kind === 'ok' ? u.quota : null;
+  const bars = quotaBars(quota);
   const x = quota?.extraUsage;
   const money = (c) => `${(c / 100).toFixed(2)} ${x?.currency || ''}`.trim();
   const info = [
@@ -1925,7 +1955,8 @@ function upsertSession(s) {
   if (S.cur?.id === s.id) {
     const was = S.cur.summary?.status;
     S.cur.summary = s;
-    if (was !== s.status) S.cur.transcript.setStatus(s.status, busy(s.status) && !busy(was) ? Date.now() : null);
+    const tps = s.meta?.tps || 0;
+    if (was !== s.status || tps !== (prev?.meta?.tps || 0)) S.cur.transcript.setStatus(s.status, busy(s.status) && !busy(was) ? Date.now() : null, tps);
     updateComposer();
     if (prev?.title !== s.title || prev?.cwd !== s.cwd) renderToolbar();
     if (was && busy(was) && !busy(s.status) && S.panel?.tab === 'changes') showChanges();

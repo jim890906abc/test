@@ -173,9 +173,10 @@ export class Transcript {
     return collectArtifacts(this.all());
   }
 
-  setStatus(status, since) {
+  setStatus(status, since, tps) {
     this.status = status;
     if (since) this.since = since;
+    if (tps !== undefined) this.tps = tps;
     this.renderWorking();
     // The last open thinking/tool rows reflect whether Kimi is still going.
     for (const id of this.order.slice(-6)) this.markDirty(id);
@@ -853,7 +854,15 @@ export class Transcript {
     fill(
       this.working,
       s === 'running'
-        ? h('div', { class: 'working-line' }, h('span', { class: 'pulse' }), h('span', null, 'Kimi 正在處理'), secs ? h('span', { class: 'muted' }, ` · ${secs}`) : null, h('span', { class: 'muted hint' }, ' · Esc 停止'))
+        ? h(
+            'div',
+            { class: 'working-line' },
+            h('span', { class: 'pulse' }),
+            h('span', null, 'Kimi 正在處理'),
+            secs ? h('span', { class: 'muted' }, ` · ${secs}`) : null,
+            this.tps ? h('span', { class: 'muted', title: '產生速度：這一輪生成的 token 數 ÷ 生成時間' }, ` · ${this.tps} tok/s`) : null,
+            h('span', { class: 'muted hint' }, ' · Esc 停止'),
+          )
         : h('div', { class: 'working-line' }, h('span', { class: 'om-badge om-badge--warning' }, '等你回應'), h('span', { class: 'muted' }, '在上面的卡片選擇怎麼做')),
     );
   }
