@@ -2029,9 +2029,59 @@ pre.tail {
   font-size: 12px;
 }
 .changes-sum {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
   font-size: 12px;
   font-weight: 600;
   margin: 0 0 var(--space-2);
+}
+.changes-sum .om-seg {
+  margin-left: auto;
+  font-weight: 500;
+}
+
+/* 變更 as a folder tree */
+.change-dir > summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 4px;
+  margin: 0 -4px;
+  border-radius: var(--radius-sm);
+  list-style: none;
+  cursor: default;
+  font-size: 12px;
+}
+.change-dir > summary::-webkit-details-marker {
+  display: none;
+}
+.change-dir > summary:hover {
+  background: var(--fill-hover);
+}
+.change-dir[open] > summary .chev {
+  transform: rotate(90deg);
+}
+.change-dir > summary .om-icon {
+  flex: none;
+  width: 13px;
+  height: 13px;
+  color: var(--ink-secondary);
+}
+.change-dir-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+}
+.change.in-tree {
+  margin-bottom: 0;
+}
+.change.in-tree > summary {
+  padding: 3px 4px;
+}
+.change.in-tree .diff {
+  margin-bottom: var(--space-2);
 }
 .change {
   margin-bottom: var(--space-2);

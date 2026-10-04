@@ -1291,21 +1291,117 @@ async function showChanges() {
     if (!files.length) return fill(body, h('div', { class: 'panel-empty' }, r.branch ? `${r.branch} 上沒有未提交的變更。` : '沒有未提交的變更。'));
     const added = files.reduce((n, f) => n + f.added, 0);
     const removed = files.reduce((n, f) => n + f.removed, 0);
+    const tree = changesTreeView();
+    const toggle = h(
+      'div',
+      { class: 'om-seg om-seg--sm', role: 'group', 'aria-label': '檢視方式' },
+      h('button', { class: 'om-seg__item', type: 'button', 'aria-pressed': String(!tree), onclick: () => setChangesTreeView(false) }, '清單'),
+      h('button', { class: 'om-seg__item', type: 'button', 'aria-pressed': String(tree), onclick: () => setChangesTreeView(true) }, '樹狀'),
+    );
     fill(
       body,
-      h('div', { class: 'changes-sum' }, `${files.length} 個檔案`, h('span', { class: 'plus' }, ` +${added}`), h('span', { class: 'minus' }, ` −${removed}`), r.branch ? h('span', { class: 'muted' }, ` · ${r.branch}`) : null),
-      ...files.map((f) => {
-        const d = h('details', { class: 'change', open: files.length <= 6 });
-        d.append(
-          h('summary', null, icon('chev', 'chev'), h('span', { class: 'change-path' }, f.path), f.status === 'added' ? h('span', { class: 'om-badge om-badge--success' }, '新增') : f.status === 'deleted' ? h('span', { class: 'om-badge om-badge--danger' }, '刪除') : null, h('span', { class: 'change-stat' }, h('span', { class: 'plus' }, `+${f.added}`), h('span', { class: 'minus' }, ` −${f.removed}`))),
-          renderHunks(f.lines),
-        );
-        return d;
-      }),
+      h('div', { class: 'changes-sum' }, `${files.length} 個檔案`, h('span', { class: 'plus' }, ` +${added}`), h('span', { class: 'minus' }, ` −${removed}`), r.branch ? h('span', { class: 'muted' }, ` · ${r.branch}`) : null, toggle),
+      tree ? changesTree(files) : h('div', { class: 'changes-flat' }, ...files.map((f) => changeDetails(f, files.length <= 6))),
     );
   } catch (err) {
     fill(body, h('div', { class: 'panel-empty' }, err.message));
   }
+}
+
+// One changed file, expandable to its diff.
+function changeDetails(f, open) {
+  const d = h('details', { class: 'change', open });
+  d.append(
+    h(
+      'summary',
+      null,
+      icon('chev', 'chev'),
+      h('span', { class: 'change-path' }, f.path),
+      f.status === 'added' ? h('span', { class: 'om-badge om-badge--success' }, '新增') : f.status === 'deleted' ? h('span', { class: 'om-badge om-badge--danger' }, '刪除') : null,
+      h('span', { class: 'change-stat' }, h('span', { class: 'plus' }, `+${f.added}`), h('span', { class: 'minus' }, ` −${f.removed}`)),
+    ),
+    renderHunks(f.lines),
+  );
+  return d;
+}
+
+const changesTreeView = () => {
+  try {
+    return localStorage.getItem('hubChangesTree') === '1';
+  } catch {
+    return false;
+  }
+};
+function setChangesTreeView(on) {
+  try {
+    localStorage.setItem('hubChangesTree', on ? '1' : '');
+  } catch {}
+  showChanges();
+}
+
+// The changed files as a folder tree: directories collapse, leaves are the
+// file rows (each expandable to its diff). Folders with a single child fold
+// into one row (a/b/c), like a file explorer.
+function changesTree(files) {
+  const root = { dirs: new Map(), files: [] };
+  for (const f of files) {
+    const parts = f.path.split('/');
+    const name = parts.pop();
+    let node = root;
+    for (const part of parts) {
+      if (!node.dirs.has(part)) node.dirs.set(part, { dirs: new Map(), files: [] });
+      node = node.dirs.get(part);
+    }
+    node.files.push({ ...f, name });
+  }
+  const wrap = h('div', { class: 'change-tree' });
+  const sumOf = (node) => {
+    let a = 0;
+    let r = 0;
+    for (const f of node.files) (a += f.added), (r += f.removed);
+    for (const [, c] of node.dirs) {
+      const s = sumOf(c);
+      a += s.a;
+      r += s.r;
+    }
+    return { a, r };
+  };
+  const build = (node, depth, into) => {
+    const dirs = [...node.dirs.entries()].sort((x, y) => x[0].localeCompare(y[0]));
+    for (let [label, child] of dirs) {
+      // Fold a chain of single-child directories into one row.
+      while (child.files.length === 0 && child.dirs.size === 1) {
+        const [cn, cc] = [...child.dirs.entries()][0];
+        label = `${label}/${cn}`;
+        child = cc;
+      }
+      const d = h('details', { class: 'change-dir', open: depth < 1 });
+      const s = sumOf(child);
+      d.append(
+        h(
+          'summary',
+          { style: { paddingLeft: `${depth * 14}px` } },
+          icon('chev', 'chev'),
+          icon('folder'),
+          h('span', { class: 'change-dir-name' }, label),
+          h('span', { class: 'change-stat' }, s.a ? h('span', { class: 'plus' }, `+${s.a}`) : null, s.r ? h('span', { class: 'minus' }, ` −${s.r}`) : null),
+        ),
+      );
+      const kids = h('div');
+      build(child, depth + 1, kids);
+      d.append(kids);
+      into.append(d);
+    }
+    for (const f of node.files.sort((x, y) => x.name.localeCompare(y.name))) {
+      const d = changeDetails(f, false);
+      d.classList.add('in-tree');
+      d.querySelector('.change-path').textContent = f.name;
+      d.querySelector('summary').style.paddingLeft = `${depth * 14}px`;
+      into.append(d);
+    }
+  };
+  build(root, 0, wrap);
+  return wrap;
 }
 
 // ------------------------------------------------------------- dialogs
