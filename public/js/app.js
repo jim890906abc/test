@@ -1180,12 +1180,34 @@ function showAgents(id) {
   closeAgentPanel();
   showPanel('agents');
   const steps = new Transcript({ cwd: S.cur.summary?.cwd, onRespond: respond, onImage: lightbox, onLink: openFileLink });
-  agentPanel = { id: pick, transcript: steps, list: h('div', { class: 'agent-list' }), summary: h('div', { class: 'agent-report' }), ids: new Set([pick]), sig: '' };
+  const section = (label, ...right) => h('div', { class: 'agent-sec' }, h('span', { class: 'agent-sec-label' }, label), h('span', { class: 'om-toolbar__spacer' }), ...right);
+  agentPanel = {
+    id: pick,
+    transcript: steps,
+    list: h('div', { class: 'agent-list' }),
+    summary: h('div', { class: 'agent-report-body' }),
+    count: h('span', { class: 'agent-sec-count' }),
+    stepsLabel: h('span', { class: 'agent-sec-sub' }),
+    ids: new Set([pick]),
+    sig: '',
+  };
   const evs = t.descendants(pick);
   for (const e of evs) agentPanel.ids.add(e.id);
   steps.load(evs.map((e) => ({ ...e, parent: e.parent === pick ? undefined : e.parent })));
   steps.setStatus(t.agentList().find((a) => a.id === pick)?.running ? 'running' : 'idle');
-  fill($panel, $grip, h('div', { class: 'panel-agents' }, panelHead(), agentPanel.list, steps.el, agentPanel.summary));
+  agentPanel.report = h('div', { class: 'agent-report' }, section('子代理回報'), agentPanel.summary);
+  fill(
+    $panel,
+    $grip,
+    h(
+      'div',
+      { class: 'panel-agents' },
+      panelHead(),
+      h('div', { class: 'agent-pane' }, section('子代理', agentPanel.count), agentPanel.list),
+      h('div', { class: 'agent-pane agent-steps' }, section('步驟', agentPanel.stepsLabel), steps.el),
+      agentPanel.report,
+    ),
+  );
   drawAgentList();
 }
 
@@ -1224,8 +1246,10 @@ function drawAgentList() {
   );
   const cur = all.find((a) => a.id === agentPanel.id);
   agentPanel.transcript.setStatus(cur?.running ? 'running' : 'idle');
-  fill(agentPanel.summary, cur?.summary ? [h('div', { class: 'agent-summary-label' }, '子代理回報'), renderMarkdown(cur.summary)] : null);
-  agentPanel.summary.hidden = !cur?.summary;
+  agentPanel.count.textContent = all.length > 1 ? `${all.length} 個` : '';
+  fill(agentPanel.stepsLabel, cur ? [cur.name ? `${cur.name} · ` : '', cur.description || '', cur.running ? h('span', { class: 'spinner' }) : null] : null);
+  fill(agentPanel.summary, cur?.summary ? renderMarkdown(cur.summary) : null);
+  agentPanel.report.hidden = !cur?.summary;
 }
 
 // New steps of the chosen subagent, as the conversation updates.

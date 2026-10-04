@@ -1927,15 +1927,60 @@ pre.tail {
   height: 100%;
   min-height: 0;
 }
-.agent-list {
+
+/* 子代理: three stacked sections, each under its own header */
+.agent-pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.agent-pane:first-of-type {
   flex: none;
-  max-height: 32%;
+  max-height: 34%;
+}
+.agent-steps {
+  flex: 1;
+}
+.agent-sec {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: none;
+  padding: 5px var(--space-4);
+  background: var(--window-raised);
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--ink-secondary);
+}
+.agent-sec-label {
+  flex: none;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--ink);
+}
+.agent-sec-count,
+.agent-sec-sub {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.agent-sec .spinner {
+  flex: none;
+}
+.agent-list {
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 2px;
   padding: var(--space-2);
-  border-bottom: 1px solid var(--line);
 }
 .agent-item {
   display: flex;
@@ -1956,7 +2001,7 @@ pre.tail {
   background: var(--fill-hover);
 }
 .agent-item.on {
-  background: var(--fill-selected, var(--fill-hover));
+  background: var(--fill-hover);
   box-shadow: inset 2px 0 0 var(--accent);
 }
 .agent-item > .om-icon {
@@ -1993,24 +2038,31 @@ pre.tail {
   color: var(--ink-secondary);
   font-variant-numeric: tabular-nums;
 }
-.panel-agents > .transcript {
+.panel-agents .transcript {
   flex: 1;
   min-height: 0;
   padding: var(--space-4) var(--space-4) var(--space-3);
 }
-.panel-agents > .transcript .column {
+.panel-agents .transcript .column {
   max-width: none;
 }
-.panel-agents > .transcript .working {
+.panel-agents .transcript .working {
   display: none;
 }
 .agent-report {
   flex: none;
-  max-height: 30%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  max-height: 34%;
+}
+.agent-report-body {
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding: var(--space-3) var(--space-4);
-  border-top: 1px solid var(--line);
   font-size: 13px;
+  line-height: 1.6;
 }
 .todo-sum {
   display: flex;
