@@ -1798,7 +1798,7 @@ pre.tail {
 
 .panel {
   position: relative;
-  width: var(--panel-w, min(46vw, 720px));
+  width: var(--panel-w, min(32vw, 620px));
   min-width: 0;
   min-height: 0;
   display: flex;
@@ -1935,7 +1935,7 @@ pre.tail {
 }
 .agent-top {
   flex: none;
-  height: var(--agent-list-h, 186px);
+  height: var(--agent-list-h, 230px);
 }
 /* the steps get whatever is left */
 .agent-steps {
@@ -2063,7 +2063,7 @@ pre.tail {
   display: flex;
   flex-direction: column;
   min-height: 0;
-  height: var(--agent-report-h, 200px);
+  height: var(--agent-report-h, 240px);
 }
 .agent-report-body {
   flex: 1;

@@ -934,29 +934,70 @@ async function sessionCommand(name, args) {
 
 // --------------------------------------------------------------- panel
 
+// Every draggable divider in one table: the CSS variable it drives, its
+// default and its bounds. What gets dragged is kept in one localStorage
+// entry holding only the dividers that were actually moved, so a new
+// version can change a default without touching anyone's own layout.
+const PANES = {
+  panelW: {
+    v: '--panel-w',
+    def: () => Math.min(window.innerWidth * 0.32, 620),
+    min: () => 320,
+    max: () => window.innerWidth - ($app.classList.contains('no-sidebar') ? 0 : $sidebar.offsetWidth) - 360,
+  },
+  agentListH: { v: '--agent-list-h', def: () => 230, min: () => 52, max: () => $panel.offsetHeight - rawPane('agentReportH') - 180 },
+  agentReportH: { v: '--agent-report-h', def: () => 240, min: () => 72, max: () => $panel.offsetHeight - rawPane('agentListH') - 180 },
+};
+
+function savedPanes() {
+  try {
+    return JSON.parse(localStorage.getItem('hubLayout') || '{}');
+  } catch {
+    return {};
+  }
+}
+// What was dragged, else the default. Raw, so bounds can use it without
+// asking each other in circles.
+const rawPane = (key) => Number(savedPanes()[key]) || PANES[key].def();
+function pane(key) {
+  const p = PANES[key];
+  const lo = p.min();
+  return Math.round(Math.min(Math.max(rawPane(key), lo), Math.max(lo, p.max())));
+}
+function applyPanes() {
+  for (const [key, p] of Object.entries(PANES)) $panel.style.setProperty(p.v, `${pane(key)}px`);
+}
+// A size in px, or null to go back to the default.
+function setPane(key, px) {
+  const p = PANES[key];
+  const next = { ...savedPanes() };
+  if (px == null) delete next[key];
+  else {
+    const lo = p.min();
+    next[key] = Math.round(Math.min(Math.max(px, lo), Math.max(lo, p.max())));
+  }
+  try {
+    localStorage.setItem('hubLayout', JSON.stringify(next));
+  } catch {}
+  applyPanes();
+}
+// Sizes saved by the versions before this table.
+try {
+  if (!localStorage.getItem('hubLayout')) {
+    const old = {};
+    const w = Number(localStorage.getItem('hubPanelW'));
+    if (w) old.panelW = w;
+    const agents = JSON.parse(localStorage.getItem('hubAgentPanes') || 'null');
+    if (agents?.list) old.agentListH = agents.list;
+    if (agents?.report) old.agentReportH = agents.report;
+    if (Object.keys(old).length) localStorage.setItem('hubLayout', JSON.stringify(old));
+  }
+} catch {}
+applyPanes();
+window.addEventListener('resize', applyPanes);
+
 // Drag the panel's left edge to share the width with the conversation.
 const $grip = h('div', { class: 'panel-grip', role: 'separator', 'aria-orientation': 'vertical', 'aria-label': '拖曳調整寬度', tabindex: '0', title: '拖曳調整寬度，按兩下還原' });
-function panelWidth(w) {
-  const side = $app.classList.contains('no-sidebar') ? 0 : $sidebar.offsetWidth;
-  const max = window.innerWidth - side - 360;
-  if (w == null) {
-    $panel.style.removeProperty('--panel-w');
-    try {
-      localStorage.removeItem('hubPanelW');
-    } catch {}
-    return;
-  }
-  w = Math.round(Math.max(320, Math.min(w, max)));
-  // On the panel itself: set on .app it would restyle the whole page.
-  $panel.style.setProperty('--panel-w', `${w}px`);
-  try {
-    localStorage.setItem('hubPanelW', String(w));
-  } catch {}
-}
-try {
-  const w = Number(localStorage.getItem('hubPanelW'));
-  if (w) $panel.style.setProperty('--panel-w', `${w}px`);
-} catch {}
 $grip.addEventListener('pointerdown', (e) => {
   e.preventDefault();
   $grip.setPointerCapture(e.pointerId);
@@ -965,7 +1006,7 @@ $grip.addEventListener('pointerdown', (e) => {
   let x = e.clientX;
   const move = (ev) => {
     x = ev.clientX;
-    raf ||= requestAnimationFrame(() => ((raf = 0), panelWidth(window.innerWidth - x)));
+    raf ||= requestAnimationFrame(() => ((raf = 0), setPane('panelW', window.innerWidth - x)));
   };
   const up = () => {
     $app.classList.remove('resizing');
@@ -977,11 +1018,11 @@ $grip.addEventListener('pointerdown', (e) => {
   $grip.addEventListener('pointerup', up);
   $grip.addEventListener('pointercancel', up);
 });
-$grip.addEventListener('dblclick', () => panelWidth(null));
+$grip.addEventListener('dblclick', () => setPane('panelW', null));
 $grip.addEventListener('keydown', (e) => {
   if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
   e.preventDefault();
-  panelWidth($panel.offsetWidth + (e.key === 'ArrowLeft' ? 32 : -32));
+  setPane('panelW', $panel.offsetWidth + (e.key === 'ArrowLeft' ? 32 : -32));
 });
 
 // A pane with nothing in it yet: the tabs stay, so the others are a click
@@ -1100,7 +1141,7 @@ function drawArtifactHead() {
       : null,
     h('button', { class: 'om-btn om-btn--toolbar', type: 'button', title: '重新載入', 'aria-label': '重新載入', onclick: () => syncArtifact(true, true) }, icon('refresh')),
     h('button', { class: 'om-btn om-btn--toolbar', type: 'button', title: '下載 HTML', 'aria-label': '下載 HTML', onclick: () => artifactView?.html && downloadHtml(artifactView.html, art.path) }, icon('download')),
-    h('button', { class: 'om-btn om-btn--toolbar wide-only', type: 'button', title: '放大', 'aria-label': '放大面板', onclick: () => panelWidth(window.innerWidth) }, icon('expand')),
+    h('button', { class: 'om-btn om-btn--toolbar wide-only', type: 'button', title: '放大', 'aria-label': '放大面板', onclick: () => setPane('panelW', window.innerWidth) }, icon('expand')),
   );
   const titles = h(
     'div',
@@ -1211,7 +1252,7 @@ function showAgents(id) {
   showPanel('agents');
   const steps = new Transcript({ cwd: S.cur.summary?.cwd, onRespond: respond, onImage: lightbox, onLink: openFileLink });
   const section = (label, ...right) => h('div', { class: 'agent-sec' }, h('span', { class: 'agent-sec-label' }, label), h('span', { class: 'om-toolbar__spacer' }), ...right);
-  applyAgentSizes();
+  applyPanes();
   agentPanel = {
     id: pick,
     transcript: steps,
@@ -1228,8 +1269,8 @@ function showAgents(id) {
   steps.setStatus(t.agentList().find((a) => a.id === pick)?.running ? 'running' : 'idle');
   const stepsBar = section('步驟', agentPanel.stepsLabel);
   const reportBar = section('子代理回報');
-  agentSplit(stepsBar, 'list');
-  agentSplit(reportBar, 'report');
+  agentSplit(stepsBar, 'agentListH', 1);
+  agentSplit(reportBar, 'agentReportH', -1);
   agentPanel.report = h('div', { class: 'agent-report' }, reportBar, agentPanel.summary);
   fill(
     $panel,
@@ -1249,30 +1290,9 @@ function showAgents(id) {
 // The 子代理 panes: the list is short (about three subagents) and the
 // steps take the rest. The 步驟 and 子代理回報 bars double as splitters,
 // so the shares can be dragged; double-click resets one.
-const AGENT_SIZES = { list: 186, report: 200 };
-const agentSizes = () => {
-  try {
-    return { ...AGENT_SIZES, ...JSON.parse(localStorage.getItem('hubAgentPanes') || '{}') };
-  } catch {
-    return { ...AGENT_SIZES };
-  }
-};
-function applyAgentSizes() {
-  const s = agentSizes();
-  $panel.style.setProperty('--agent-list-h', `${s.list}px`);
-  $panel.style.setProperty('--agent-report-h', `${s.report}px`);
-}
-function setAgentSize(which, px) {
-  const min = which === 'list' ? 52 : 72;
-  const other = which === 'list' ? agentSizes().report : agentSizes().list;
-  const max = Math.max(min, $panel.offsetHeight - other - 180);
-  const next = { ...agentSizes(), [which]: Math.round(Math.max(min, Math.min(px, max))) };
-  try {
-    localStorage.setItem('hubAgentPanes', JSON.stringify(next));
-  } catch {}
-  applyAgentSizes();
-}
-function agentSplit(bar, which) {
+// A section bar that doubles as a horizontal splitter for the pane above
+// it (`grow` 1) or below it (-1).
+function agentSplit(bar, key, grow) {
   bar.classList.add('agent-sec--grip');
   bar.title = '拖曳調整高度，按兩下還原';
   bar.addEventListener('pointerdown', (e) => {
@@ -1280,12 +1300,12 @@ function agentSplit(bar, which) {
     e.preventDefault();
     bar.setPointerCapture(e.pointerId);
     const startY = e.clientY;
-    const from = agentSizes()[which];
+    const from = pane(key);
     let raf = 0;
     let y = startY;
     const move = (ev) => {
       y = ev.clientY;
-      raf ||= requestAnimationFrame(() => ((raf = 0), setAgentSize(which, from + (which === 'list' ? y - startY : startY - y))));
+      raf ||= requestAnimationFrame(() => ((raf = 0), setPane(key, from + (y - startY) * grow)));
     };
     const up = () => {
       cancelAnimationFrame(raf);
@@ -1297,7 +1317,7 @@ function agentSplit(bar, which) {
     bar.addEventListener('pointerup', up);
     bar.addEventListener('pointercancel', up);
   });
-  bar.addEventListener('dblclick', () => setAgentSize(which, AGENT_SIZES[which]));
+  bar.addEventListener('dblclick', () => setPane(key, null));
 }
 
 // "K3-256k · 思考 最高": the model and thinking a subagent runs with.
