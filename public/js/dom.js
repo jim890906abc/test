@@ -89,6 +89,7 @@ const P = {
   link: '<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>',
   bell: '<path d="M6.5 16.5V11a5.5 5.5 0 0 1 11 0v5.5l1.5 2h-14z"/><path d="M10 20.5a2 2 0 0 0 4 0"/>',
   back: '<path d="m14.5 6-6 6 6 6"/>',
+  pause: '<path d="M9 6.5v11M15 6.5v11"/>',
 };
 
 export function icon(name, cls = '') {
@@ -118,6 +119,29 @@ export function dayGroup(ts) {
   if (ts >= start.getTime() - 86400000) return '昨天';
   if (ts >= start.getTime() - 6 * 86400000) return '過去 7 天';
   return '更早';
+}
+
+// Time left the way Kimi's own /usage counts it: days, hours and minutes
+// ("2 小時 13 分"), seconds only under a minute. Empty once it has passed.
+export function fmtCountdown(ms) {
+  const total = Math.floor(ms / 1000);
+  if (!(total > 0)) return '';
+  const parts = [];
+  const d = Math.floor(total / 86400);
+  const hr = Math.floor((total % 86400) / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  if (d) parts.push(`${d} 天`);
+  if (hr) parts.push(`${hr} 小時`);
+  if (m) parts.push(`${m} 分`);
+  if (!parts.length) parts.push(`${total % 60} 秒`);
+  return parts.join(' ');
+}
+
+// "15:30", or "10/8 15:30" when it is not today.
+export function clockTime(ts) {
+  const d = new Date(ts);
+  const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  return d.toDateString() === new Date().toDateString() ? hm : `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
 }
 
 export function fmtTokens(n) {

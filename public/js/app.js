@@ -1,10 +1,10 @@
 // Agent Hub — Kimi Code on all your machines, in one window.
-import { h, fill, icon, relTime, dayGroup, shortPath, baseName, copyText } from './dom.js';
+import { h, fill, icon, relTime, dayGroup, shortPath, baseName, copyText, clockTime, fmtCountdown } from './dom.js';
 import { get, post, put, del, connect, setToken } from './api.js';
 import { renderHunks, parseUnifiedDiff, renderMarkdown } from './markdown.js';
 import { openMenu, closeMenu, menuOpen, pointAnchor } from './menu.js';
 import { Transcript, todoList } from './transcript.js';
-import { Composer, PERMISSION_LABELS, EFFORT_LABELS } from './composer.js';
+import { Composer, PERMISSION_LABELS, EFFORT_LABELS, autoPauseStatus, whenText } from './composer.js';
 import { ArtifactView, downloadHtml, htmlTitle } from './artifacts.js';
 
 const S = {
@@ -696,6 +696,10 @@ async function openSession(id) {
     onFocusAgent: (aid) => showAgents(aid),
     onQuotaNode: quotaMenuNode,
     onOpenTodos: showTodos,
+    onAutoPause: autoPauseDialog,
+    onCancelAutoResume: cancelAutoResume,
+    onArmResume: () => armResumeAfterReset(),
+    onCancelScheduled: cancelScheduled,
   });
   composer.setKey(id);
   composer.update({ agents: [] });
@@ -773,6 +777,8 @@ function updateComposer() {
     terminal: meta.owner === 'tui',
     controllable: Boolean(meta.controllable),
     guess: Boolean(meta.guess),
+    autoPause: s.autoPause || null,
+    scheduled: s.scheduled || [],
   });
 }
 
@@ -803,6 +809,7 @@ function renderToolbar() {
         sub,
         m && !m.online ? h('span', { class: 'om-badge om-badge--danger' }, '電腦離線') : null,
         s.meta?.owner === 'tui' ? h('span', { class: 'om-badge', title: s.meta.guess ? '同一個資料夾有終端機的 Kimi 開著，可能正在用這個對話，這裡先只能看' : s.meta.controllable ? '在終端機的 Kimi 裡執行，可以從這裡操作' : '在終端機的 Kimi 裡執行，這裡只能看' }, s.meta.controllable ? '終端機' : '終端機 · 唯讀') : null,
+        autoPauseBadge(s),
       ),
     ),
     h('span', { class: 'om-toolbar__spacer' }),
@@ -820,6 +827,8 @@ function sessionMenu(anchor) {
       { label: '重新命名…', onSelect: renameSession },
       { label: '複製成新對話', hint: '/fork', onSelect: () => sessionCommand('fork', '') },
       { label: '壓縮對話', hint: '/compact', onSelect: () => sessionCommand('compact', '') },
+      { label: '自動暫停…', hint: s.autoPause?.enabled ? `${s.autoPause.threshold}%` : '關', onSelect: autoPauseDialog },
+      { label: '定時送出…', hint: s.scheduled?.length ? `${s.scheduled.length} 則` : '/later', onSelect: () => scheduleDialog() },
       { label: '複製資料夾路徑', onSelect: () => copyText(s.cwd || '').then(() => toast('已複製')) },
       { separator: true },
       { label: '刪除對話…', destructive: true, onSelect: () => deleteRow({ key: `${s.machineId}:${s.kimiSessionId}`, title: s.title }, s.machineId, s.kimiSessionId) },
@@ -907,6 +916,17 @@ async function sessionCommand(name, args) {
       return sendMessage({ text: INIT_PROMPT, images: [] });
     case 'usage':
       return accountDialog(s.machineId);
+    case 'autopause': {
+      const a = args.trim().toLowerCase().replace(/\s*%$/, '');
+      if (!a) return autoPauseDialog();
+      if (['off', '關', '關閉'].includes(a)) return setAutoPause({ enabled: false });
+      if (['on', '開', '開啟'].includes(a)) return setAutoPause({ enabled: true });
+      const n = Number(a);
+      if (Number.isInteger(n) && n >= 1 && n <= 100) return setAutoPause({ enabled: true, threshold: n });
+      return toast('用法：/autopause 90（用到 90% 暫停）、/autopause off，或只輸入 /autopause 打開設定', { kind: 'error' });
+    }
+    case 'later':
+      return laterCommand(args);
     case 'status': {
       const model = (meta.models || []).find((x) => x.id === meta.model);
       const ctx = meta.context;
@@ -1609,11 +1629,11 @@ const fmtK = (n) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 100_000 ? 0 : 1)}k` 
 // /usage and /status: the plan quota of the Kimi account on that machine,
 // plus (for /status) the conversation's own settings.
 const QUOTA_WINDOWS = { limit5h: '5 小時', limit7d: '7 天', monthTotal: '本月總額度', monthCode: '本月 Code 額度' };
+// To the minute, like Kimi's /usage ("2 小時 13 分後重置").
 const resetIn = (t) => {
   const ms = Date.parse(t) - Date.now();
-  if (!(ms > 0)) return '';
-  const hrs = ms / 3_600_000;
-  return hrs < 1 ? `${Math.ceil(ms / 60_000)} 分鐘後重置` : hrs < 48 ? `${Math.round(hrs)} 小時後重置` : `${Math.round(hrs / 24)} 天後重置`;
+  if (!Number.isFinite(ms)) return '';
+  return ms > 0 ? `${fmtCountdown(ms)}後重置` : '已重置';
 };
 
 // The plan's quota windows, as Kimi reports them. `only` picks which.
@@ -1682,6 +1702,282 @@ async function accountDialog(machineId, rows = null) {
     info.length ? h('dl', { class: 'kv' }, info.flatMap(([k, v]) => [h('dt', null, k), h('dd', null, v)])) : null,
     h('div', { class: 'dialog-actions' }, h('button', { class: 'om-btn om-btn--primary', type: 'button', onclick: () => d.close() }, '好')),
   );
+}
+
+// ----------------------------------------------------------- auto-pause
+
+// The hub watches the 5-hour quota and types 「優雅暫停」 / 「繼續」 itself;
+// these only turn it on and off and show what it is doing.
+function autoPauseBadge(s) {
+  const st = autoPauseStatus(s.autoPause);
+  if (!st) return null;
+  return h('button', { class: `om-badge ap-badge${st.tone ? ` om-badge--${st.tone}` : ''}`, type: 'button', title: st.detail, onclick: autoPauseDialog }, icon('pause'), st.label);
+}
+
+async function setAutoPause(change) {
+  const s = S.cur?.summary;
+  if (!s) return null;
+  try {
+    const r = await post(`/sessions/${s.id}/autopause`, change);
+    upsertSession(r);
+    if ('enabled' in change) toast(r.autoPause?.enabled ? `已開啟自動暫停：5 小時額度用到 ${r.autoPause.threshold}% 時送出「優雅暫停」` : '已關閉自動暫停');
+    return r;
+  } catch (err) {
+    fail(err);
+    return null;
+  }
+}
+
+async function cancelAutoResume() {
+  const s = S.cur?.summary;
+  const ap = s?.autoPause;
+  if (ap?.phase !== 'paused') return;
+  const text = ap.resumeText || '繼續';
+  const ok = await confirmDialog({
+    title: `不要在額度恢復後送出「${text}」？`,
+    body: ap.enabled ? '自動暫停會保持開啟，下一個 5 小時視窗照常運作。這個對話之後要繼續，請自己送出訊息。' : '這個對話之後要繼續，請自己送出訊息。',
+    action: '不要送出',
+  });
+  if (!ok) return;
+  try {
+    upsertSession(await post(`/sessions/${s.id}/autopause`, { cancelResume: true }));
+    toast(`已取消：額度恢復後不會送出「${text}」`);
+  } catch (err) {
+    fail(err);
+  }
+}
+
+// 「額度恢復後送出」: for a conversation already paused (you told Kimi to
+// stop). The hub reads the quota now to know which window to wait out.
+async function armResumeAfterReset(text = '繼續') {
+  const s = S.cur?.summary;
+  if (!s) return false;
+  if (busy(s.status) && !(await confirmDialog({ title: 'Kimi 還在工作', body: `要等它停下、而且 5 小時額度恢復後，再送出「${text}」嗎？`, action: '好' }))) return false;
+  try {
+    const r = await post(`/sessions/${s.id}/autopause`, { resumeAfterReset: true, text });
+    upsertSession(r);
+    const at = r.autoPause?.resetAt;
+    toast(`已設定：${at ? `約 ${whenText(at)}` : ''}5 小時額度恢復後送出「${text}」`);
+    return true;
+  } catch (err) {
+    fail(err);
+    return false;
+  }
+}
+
+// 定時送出 at a time (ms).
+async function scheduleMessage(text, at) {
+  const s = S.cur?.summary;
+  if (!s) return false;
+  try {
+    upsertSession(await post(`/sessions/${s.id}/schedule`, { text, at }));
+    toast(`已排定：${whenText(at)}送出「${text}」`);
+    return true;
+  } catch (err) {
+    fail(err);
+    return false;
+  }
+}
+
+async function cancelScheduled(itemId) {
+  const s = S.cur?.summary;
+  if (!s) return;
+  try {
+    upsertSession(await del(`/sessions/${s.id}/schedule/${encodeURIComponent(itemId)}`));
+    toast('已取消定時訊息');
+  } catch (err) {
+    fail(err);
+  }
+}
+
+// "15:30" → the next 15:30 (today, or tomorrow once it has passed).
+function nextClock(hhmm) {
+  const m = String(hhmm).match(/^(\d{1,2}):(\d{2})$/);
+  if (!m || +m[1] > 23 || +m[2] > 59) return null;
+  const d = new Date();
+  d.setHours(+m[1], +m[2], 0, 0);
+  if (d.getTime() <= Date.now()) d.setDate(d.getDate() + 1);
+  return d.getTime();
+}
+
+// /later 30 繼續 · /later 1.5h 繼續 · /later 15:30 繼續 · /later reset 繼續
+function laterCommand(args) {
+  const a = args.trim();
+  if (!a) return scheduleDialog();
+  const [, when, rest] = a.match(/^(\S+)\s*([\s\S]*)$/);
+  const text = rest.trim() || '繼續';
+  const w = when.toLowerCase();
+  if (['reset', '額度', '恢復'].includes(w)) return armResumeAfterReset(text);
+  let m;
+  let at = null;
+  if (/^\d{1,2}:\d{2}$/.test(w)) at = nextClock(w);
+  else if ((m = w.match(/^(\d+(?:\.\d+)?)(m|min|分|分鐘)?$/))) at = Date.now() + Math.round(parseFloat(m[1]) * 60_000);
+  else if ((m = w.match(/^(\d+(?:\.\d+)?)(h|hr|小時)$/))) at = Date.now() + Math.round(parseFloat(m[1]) * 3_600_000);
+  if (!at || at - Date.now() < 30_000) return toast('用法：/later 30 繼續（30 分鐘後）、/later 15:30 繼續、/later reset 繼續（5 小時額度恢復後）', { kind: 'error' });
+  return scheduleMessage(text, at);
+}
+
+// 定時送出: a message, and when — in some minutes, at a time, or once the
+// 5-hour quota is back. Lists what is already waiting.
+function scheduleDialog() {
+  const s = S.cur?.summary;
+  if (!s) return;
+  const sid = s.id;
+  const text = h('textarea', { class: 'om-input sched-text', rows: 2, 'aria-label': '要送出的訊息' }, '繼續');
+  const minutes = h('input', { class: 'om-input sched-num', type: 'number', min: '1', max: '43200', step: '1', inputmode: 'numeric', value: '30', 'aria-label': '幾分鐘後' });
+  const later = new Date(Date.now() + 3_600_000);
+  const clock = h('input', { class: 'om-input sched-clock', type: 'time', value: `${String(later.getHours()).padStart(2, '0')}:00`, 'aria-label': '送出時間' });
+  const preview = h('span', { class: 'om-field__help' });
+  const usageNote = h('p', { class: 'dialog-text muted' }, '讀取 5 小時額度…');
+  const err = h('div', { class: 'om-field__error', role: 'alert' });
+  const pending = h('div', { class: 'sched-pending' });
+  const modes = { minutes: '幾分鐘後', clock: '指定時間', reset: '5 小時額度恢復後' };
+  let mode = 'minutes';
+  const seg = h('div', { class: 'om-seg om-seg--sm', role: 'group', 'aria-label': '什麼時候送出' });
+  const panes = {
+    minutes: h('div', { class: 'sched-when' }, minutes, h('span', null, '分鐘後'), preview),
+    clock: h('div', { class: 'sched-when' }, clock, h('span', { class: 'om-field__help sched-clock-note' })),
+    reset: h('div', { class: 'sched-when sched-reset' }, usageNote),
+  };
+  const when = () => (mode === 'minutes' ? Date.now() + Math.round(Number(minutes.value)) * 60_000 : mode === 'clock' ? nextClock(clock.value) : null);
+  const drawWhen = () => {
+    fill(seg, ...Object.entries(modes).map(([k, label]) => h('button', { class: 'om-seg__item', type: 'button', 'aria-pressed': String(k === mode), onclick: () => ((mode = k), drawWhen()) }, label)));
+    for (const [k, el] of Object.entries(panes)) el.hidden = k !== mode;
+    const n = Number(minutes.value);
+    preview.textContent = Number.isInteger(n) && n >= 1 ? `${clockTime(Date.now() + n * 60_000)} 送出` : '';
+    const at = nextClock(clock.value);
+    panes.clock.lastChild.textContent = at ? `${new Date(at).toDateString() === new Date().toDateString() ? '今天' : '明天'} ${whenText(at)}` : '';
+    err.textContent = '';
+  };
+  minutes.addEventListener('input', drawWhen);
+  clock.addEventListener('input', drawWhen);
+
+  // What is waiting to go out in this conversation.
+  const drawPending = () => {
+    const cur = S.sessions.get(sid) || s;
+    const ap = autoPauseStatus(cur.autoPause);
+    const rows = [
+      ...(ap?.paused ? [h('div', { class: 'sched-item' }, icon('pause'), h('span', { class: 'sched-item-text' }, ap.detail), h('button', { class: 'om-btn om-btn--toolbar om-btn--sm', type: 'button', title: '不要送出', 'aria-label': '不要送出', onclick: cancelAutoResume }, icon('x')))] : []),
+      ...(cur.scheduled || []).map((q) => h('div', { class: `sched-item${q.gaveUp ? ' danger' : ''}` }, icon('clock'), h('span', { class: 'sched-item-text' }, `${q.at > Date.now() ? whenText(q.at) : ''}送出「${q.text}」`, q.error || q.wait ? h('span', { class: 'muted' }, ` · ${q.wait === 'offline' ? '電腦離線，連上後送出' : q.error}`) : null), h('button', { class: 'om-btn om-btn--toolbar om-btn--sm', type: 'button', title: '取消', 'aria-label': '取消這則定時訊息', onclick: () => cancelScheduled(q.id) }, icon('x')))),
+    ];
+    fill(pending, rows.length ? [h('div', { class: 'dialog-subtitle' }, '等著送出'), ...rows] : null);
+  };
+
+  const save = async (e) => {
+    e.preventDefault();
+    const msg = text.value.trim();
+    if (!msg) return (err.textContent = '要送出的訊息是空的');
+    let ok;
+    if (mode === 'reset') ok = await armResumeAfterReset(msg);
+    else {
+      const at = when();
+      if (!at || !Number.isFinite(at) || (mode === 'minutes' && !(Number.isInteger(Number(minutes.value)) && Number(minutes.value) >= 1))) return (err.textContent = mode === 'minutes' ? '分鐘數要是 1 以上的整數' : '請選一個時間');
+      ok = await scheduleMessage(msg, at);
+    }
+    if (ok) d.close();
+  };
+
+  const form = h(
+    'form',
+    { class: 'settings schedule', onsubmit: save },
+    h('div', { class: 'dialog-title' }, '定時送出'),
+    h('p', { class: 'dialog-text settings-lead' }, '到時候由中控台替你在這個對話送出訊息，關掉網頁也照常。Kimi 正在工作時，會排在這一輪之後。'),
+    h('label', { class: 'om-field' }, h('span', { class: 'om-field__label' }, '訊息'), text),
+    h('div', { class: 'om-field' }, h('span', { class: 'om-field__label' }, '什麼時候'), seg, ...Object.values(panes)),
+    err,
+    pending,
+    h('div', { class: 'dialog-actions' }, h('button', { class: 'om-btn', type: 'button', onclick: () => d.close() }, '取消'), h('button', { class: 'om-btn om-btn--primary', type: 'submit' }, '排定')),
+  );
+  const d = dialog(form, { onClose: () => S.scheduleDraw === drawPending && (S.scheduleDraw = null) });
+  S.scheduleDraw = drawPending;
+  drawWhen();
+  drawPending();
+  fetchUsage(s.machineId).then((data) => {
+    const u = data.usage;
+    const h5 = u?.kind === 'ok' ? u.quota?.usages?.limit5h : null;
+    fill(
+      usageNote,
+      h5
+        ? `目前 5 小時額度已用 ${Math.round(Math.min(1, h5.usedRatio) * 100)}%${h5.resetAt ? `，${resetIn(h5.resetAt)}` : ''}。等 Kimi 停下、而且額度確實恢復後才送出；這之前若有人又讓 Kimi 開始工作，就不送。`
+        : u?.kind === 'error'
+          ? `讀不到 5 小時額度（${u.message}），這個選項沒辦法用。`
+          : '這個帳號沒有 5 小時額度資訊，這個選項沒辦法用。',
+    );
+  });
+}
+
+function autoPauseDialog() {
+  const s = S.cur?.summary;
+  if (!s) return;
+  const sid = s.id;
+  const ap0 = s.autoPause || {};
+  const on = h('input', { class: 'om-switch', type: 'checkbox', checked: Boolean(ap0.enabled) });
+  const pct = h('input', { class: 'om-input ap-pct', type: 'number', min: '1', max: '100', step: '1', inputmode: 'numeric', value: String(ap0.threshold || 90), 'aria-label': '暫停門檻（%）' });
+  const err = h('div', { class: 'om-field__error', role: 'alert' });
+  const offHint = h('span', { class: 'om-field__help' }, '只對這個對話');
+  // Turning it off while paused also drops the 「繼續」 it is waiting to send.
+  on.addEventListener('change', () => {
+    const paused = S.sessions.get(sid)?.autoPause?.phase === 'paused';
+    offHint.textContent = !on.checked && paused ? '這個對話正在等額度恢復：關閉後就不會自動送出「繼續」' : '只對這個對話';
+    offHint.classList.toggle('warn', !on.checked && paused);
+  });
+  const usageBox = h('div', { class: 'quotas' }, h('div', { class: 'muted' }, '讀取方案用量…'));
+  const statusBox = h('div', { class: 'ap-status' });
+  const field = (label, control, help) => h('label', { class: 'om-field' }, h('span', { class: 'om-field__label' }, label), control, help ? h('span', { class: 'om-field__help' }, help) : null);
+
+  // What it is doing now, its problems and its recent actions. Redrawn as
+  // the conversation updates, without touching what is being edited above.
+  const drawStatus = () => {
+    const cur = S.sessions.get(sid) || s;
+    const ap = cur.autoPause || {};
+    const st = autoPauseStatus(ap);
+    const readOnly = cur.meta?.owner === 'tui' && !cur.meta?.controllable;
+    fill(
+      statusBox,
+      st ? h('div', { class: `ap-now${st.tone ? ` ${st.tone}` : ''}` }, icon('pause'), h('div', null, h('div', { class: 'ap-now-label' }, st.label), h('div', { class: 'ap-now-detail' }, st.detail)), st.paused ? h('button', { class: 'om-btn om-btn--sm', type: 'button', onclick: cancelAutoResume }, '取消繼續') : null) : null,
+      readOnly ? h('div', { class: 'callout small ap-warn' }, icon('terminal'), h('div', { class: 'callout-text' }, '這個對話正在終端機的 Kimi 裡執行（唯讀），中控台沒辦法替它送出訊息。改用 kimi-hub 啟動 Kimi，或在那個 Kimi 裡輸入 /web。')) : null,
+      ap.log?.length
+        ? [h('div', { class: 'dialog-subtitle' }, '最近紀錄'), h('ol', { class: 'ap-log' }, ...[...ap.log].reverse().map((l) => h('li', null, h('span', { class: 'ap-log-time' }, clockTime(l.ts)), h('span', null, l.text))))]
+        : null,
+    );
+  };
+
+  const save = async (e) => {
+    e.preventDefault();
+    const n = Number(pct.value);
+    if (!Number.isInteger(n) || n < 1 || n > 100) {
+      err.textContent = '門檻要是 1 到 100 之間的整數';
+      pct.focus();
+      return;
+    }
+    const r = await setAutoPause({ enabled: on.checked, threshold: n });
+    if (r) d.close();
+  };
+
+  const form = h(
+    'form',
+    { class: 'settings autopause', onsubmit: save },
+    h('div', { class: 'dialog-title' }, '自動暫停'),
+    h('p', { class: 'dialog-text settings-lead' }, '5 小時額度用到設定的比例時，在這個對話送出「優雅暫停」（插隊，Kimi 下一步就會讀到）；5 小時額度恢復後再送出「繼續」。只在 Kimi 工作時暫停，每個 5 小時視窗最多一次。由中控台執行，關掉網頁也照常運作。'),
+    h('label', { class: 'settings-switch' }, on, h('span', null, h('span', { class: 'om-field__label' }, '開啟自動暫停'), offHint)),
+    field('暫停門檻', h('div', { class: 'ap-pct-row' }, pct, h('span', null, '%')), '5 小時額度用到這個比例就暫停（1–100）'),
+    err,
+    h('div', { class: 'dialog-subtitle' }, '目前額度'),
+    usageBox,
+    statusBox,
+    h('div', { class: 'dialog-actions' }, h('button', { class: 'om-btn', type: 'button', onclick: () => d.close() }, '取消'), h('button', { class: 'om-btn om-btn--primary', type: 'submit' }, '儲存')),
+  );
+  const d = dialog(form, { onClose: () => S.autoPauseDraw === drawStatus && (S.autoPauseDraw = null) });
+  S.autoPauseDraw = drawStatus;
+  drawStatus();
+  usageCache.delete(s.machineId);
+  fetchUsage(s.machineId).then((data) => {
+    const u = data.usage;
+    const bars = u?.kind === 'ok' ? quotaBars(u.quota, ['limit5h', 'limit7d']) : [];
+    if (bars.length) return fill(usageBox, ...bars);
+    const msg = u?.kind === 'error' ? (/no token|login/i.test(u.message || '') ? '這台電腦的 Kimi 沒有用 Kimi 帳號登入，讀不到 5 小時額度，自動暫停沒辦法運作。在那台電腦執行 kimi login。' : `讀不到方案用量：${u.message}`) : '這個帳號沒有 5 小時額度資訊，自動暫停沒辦法運作。';
+    fill(usageBox, h('p', { class: 'dialog-text muted' }, msg));
+  });
 }
 
 async function openSettings() {
@@ -1978,7 +2274,13 @@ function upsertSession(s) {
     const tps = s.meta?.tps || 0;
     if (was !== s.status || tps !== (prev?.meta?.tps || 0)) S.cur.transcript.setStatus(s.status, busy(s.status) && !busy(was) ? Date.now() : null, tps);
     updateComposer();
-    if (prev?.title !== s.title || prev?.cwd !== s.cwd) renderToolbar();
+    const apChanged = JSON.stringify(prev?.autoPause || null) !== JSON.stringify(s.autoPause || null);
+    const schedChanged = JSON.stringify(prev?.scheduled || []) !== JSON.stringify(s.scheduled || []);
+    if (prev?.title !== s.title || prev?.cwd !== s.cwd || apChanged) renderToolbar();
+    if (apChanged || schedChanged) {
+      S.autoPauseDraw?.();
+      S.scheduleDraw?.();
+    }
     if (was && busy(was) && !busy(s.status) && S.panel?.tab === 'changes') showChanges();
   }
 }

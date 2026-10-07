@@ -267,9 +267,13 @@ class Mirror {
     this.session.state.syncedAt = now();
   }
 
-  remember(promptId) {
+  remember(promptId, note) {
     this.mine.add(promptId);
     this.session.state.mine = [...this.mine].slice(-50);
+    // What the hub said about a message it sent ("從 Artifact 送出", "自動暫停…"),
+    // kept so the note is still there when the conversation is rebuilt
+    // from Kimi's journal.
+    if (note) this.session.state.notes = Object.fromEntries([...Object.entries(this.session.state.notes || {}), [promptId, note]].slice(-50));
   }
 
   async loadModels() {
@@ -581,7 +585,10 @@ class Mirror {
   // A turn opens with a prompt. Prompts sent from the hub are already in the
   // transcript; queued ones join it now; anything else was typed in Kimi.
   showPrompt(promptId, text, images, extra = {}) {
-    if (this.batch) return text || images?.length ? this.ctx.emit({ type: 'user', text, images, promptId, source: this.mine.has(promptId) ? 'hub' : 'kimi', ...extra }) : null;
+    if (this.batch) {
+      const note = this.session.state.notes?.[promptId];
+      return text || images?.length ? this.ctx.emit({ type: 'user', text, images, promptId, source: this.mine.has(promptId) ? 'hub' : 'kimi', ...(note ? { note } : {}), ...extra }) : null;
+    }
     // Typed into a terminal Kimi from the hub: matched by text.
     const t = this.tuiPending?.findIndex((x) => x.text === text) ?? -1;
     if (t !== -1) {
@@ -852,6 +859,7 @@ class Mirror {
       if (busy) this.dequeue(item.promptId);
       throw err;
     }
+    return { ok: true };
   }
 
   // After a terminal turn, type the next held message into Kimi.
@@ -876,12 +884,14 @@ class Mirror {
     }
   }
 
+  // Resolves to { ok } — false (with the error, already shown in the
+  // conversation) when Kimi did not take the message.
   async send(text, images = [], { note, steer } = {}) {
     if (this.inTerminal()) return this.sendToTerminal(text, images, note, steer);
     await ensureServer(this.machineId);
     const ctx = this.ctx;
     const promptId = newPromptId();
-    this.remember(promptId);
+    this.remember(promptId, note);
     const thumbs = images.map((i) => i.thumb || `data:${i.mimeType};base64,${i.data}`);
     const busy = ['running', 'awaiting_permission'].includes(this.session.status);
     if (busy) this.meta({ queue: [...this.queue(), { promptId, text, images: thumbs, note }] });
@@ -898,10 +908,12 @@ class Mirror {
     try {
       const r = await post;
       if (r?.status === 'queued' && steer) await this.steer(promptId);
+      return { ok: true, promptId };
     } catch (err) {
       this.dequeue(promptId);
       ctx.emit({ type: 'error', text: err.message });
       if (!busy) ctx.setStatus('idle');
+      return { ok: false, error: err.message };
     } finally {
       this.inflight.delete(promptId);
     }
@@ -1129,8 +1141,11 @@ export async function createRemote({ machineId, cwd, nameHint }) {
 export async function send(session, text, { images = [], note, steer } = {}) {
   const m = mirrorFor(session);
   await m.ensureLive();
-  await m.send(text, images, { note, steer });
+  return m.send(text, images, { note, steer });
 }
+// Followed right now (subscribed to the machine and caught up), so the
+// hub's status for it is current.
+export const isLive = (session) => Boolean(mirrors.get(session.id)?.live);
 export const steerQueued = (session, promptId) => mirrorFor(session).steerQueued(promptId);
 // Take a conversation locked only because a terminal Kimi runs in its folder.
 export const unlock = (session) => machines.rpc(session.machineId, 'kimi.unlock', { sessionId: session.kimiSessionId });

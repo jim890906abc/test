@@ -224,8 +224,8 @@ export function rpc(machineId, op, args = {}, timeoutMs = 60_000) {
 }
 
 // Calls the Kimi Server API on a machine and unwraps its envelope.
-export async function kimiApi(machineId, method, p, body) {
-  const env = await rpc(machineId, 'kimi.request', { method, path: p, body });
+export async function kimiApi(machineId, method, p, body, timeoutMs) {
+  const env = await rpc(machineId, 'kimi.request', { method, path: p, body }, timeoutMs);
   if (env?.code !== 0) {
     const err = new Error(kimiErrorText(env));
     err.kimiCode = env?.code;

@@ -2839,3 +2839,181 @@ pre.tail {
 .queued .om-btn--sm:not(.om-btn--toolbar) {
   flex: none;
 }
+
+/* Auto-pause: the badge in the conversation's header, the row above the
+   composer while paused, and its dialog. */
+.ap-badge {
+  border: 0;
+  font-family: inherit;
+  cursor: pointer;
+  flex: none;
+}
+.ap-badge:hover {
+  filter: brightness(0.96);
+}
+.autopause-row > .om-icon {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  color: var(--warning);
+}
+.autopause-row.danger > .om-icon {
+  color: var(--danger);
+}
+.autopause-row .om-btn--sm {
+  flex: none;
+}
+.ap-pct-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.settings .ap-pct {
+  width: 96px;
+}
+.om-field__help.warn {
+  color: var(--warning);
+}
+.ap-status {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.ap-status:empty {
+  display: none;
+}
+.ap-status .dialog-subtitle {
+  margin: 0;
+}
+.ap-now {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  font-size: 12px;
+  line-height: 17px;
+}
+.ap-now > div {
+  flex: 1;
+  min-width: 0;
+}
+.ap-now > .om-icon {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  color: var(--ink-secondary);
+}
+.ap-now.warning > .om-icon {
+  color: var(--warning);
+}
+.ap-now.danger > .om-icon {
+  color: var(--danger);
+}
+.ap-now-label {
+  font-weight: 600;
+}
+.ap-now-detail {
+  color: var(--ink-secondary);
+  overflow-wrap: anywhere;
+}
+.ap-log {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 168px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  line-height: 17px;
+}
+.ap-log li {
+  display: flex;
+  gap: var(--space-3);
+}
+.ap-log-time {
+  flex: none;
+  color: var(--ink-secondary);
+  font-variant-numeric: tabular-nums;
+}
+.ap-warn {
+  background: var(--warning-soft);
+}
+
+/* 定時送出: its dialog, and its rows above the composer. */
+.sched-row > .om-icon {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  color: var(--ink-secondary);
+}
+.sched-row.danger > .om-icon {
+  color: var(--danger);
+}
+.schedule .sched-text {
+  width: 100%;
+  resize: vertical;
+  min-height: 44px;
+  font-family: inherit;
+}
+.schedule .om-seg {
+  align-self: flex-start;
+  flex-wrap: wrap;
+}
+.sched-when {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+.sched-when[hidden] {
+  display: none;
+}
+.schedule .sched-num {
+  width: 96px;
+}
+.schedule .sched-clock {
+  width: 128px;
+}
+.sched-reset .dialog-text {
+  margin: 0;
+}
+.sched-pending {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.sched-pending:empty {
+  display: none;
+}
+.sched-pending .dialog-subtitle {
+  margin: 0;
+}
+.sched-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 6px var(--space-2) 6px var(--space-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  font-size: 12px;
+  line-height: 17px;
+}
+.sched-item > .om-icon {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  color: var(--ink-secondary);
+}
+.sched-item.danger > .om-icon {
+  color: var(--danger);
+}
+.sched-item-text {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}

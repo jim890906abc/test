@@ -15,6 +15,11 @@ export function setBroadcast(fn) {
 
 const running = new Map(); // sessionId -> { ac }
 const pendingPermissions = new Map(); // `${sid}:${eventId}` -> resolve(decision)
+const statusListeners = new Set(); // (session) => void, on every status change
+
+export function onStatus(fn) {
+  statusListeners.add(fn);
+}
 
 export function summarize(s) {
   return {
@@ -30,6 +35,8 @@ export function summarize(s) {
     kimiSessionId: s.kimiSessionId,
     meta: s.meta,
     usage: s.usage,
+    autoPause: s.autoPause || null,
+    scheduled: s.scheduled || [],
     createdAt: s.createdAt,
     updatedAt: s.updatedAt,
   };
@@ -40,6 +47,13 @@ function setStatus(session, status) {
   session.status = status;
   store.saveSession(session);
   broadcast({ t: 'session', session: summarize(session) });
+  for (const fn of statusListeners) {
+    try {
+      fn(session);
+    } catch (err) {
+      console.error('[runner] status listener:', err);
+    }
+  }
 }
 
 // ----------------------------------------------------------- event helpers
@@ -412,6 +426,17 @@ export function startTurn(session, text, opts) {
   }
   if (running.has(session.id)) throw Object.assign(new Error('這個 session 正在執行中'), { status: 409 });
   runTurn(session, text, opts).catch((err) => console.error(`[runner] ${session.id}:`, err));
+}
+
+// A message the hub sends on its own (auto-pause). Unlike startTurn it
+// waits, and throws when the message did not get through.
+export async function deliver(session, text, opts = {}) {
+  const adapter = adapterFor(session);
+  if (!adapter?.live) throw new Error('這個對話不支援自動送出訊息');
+  const why = adapter.cannotSend?.(session);
+  if (why) throw new Error(why);
+  const r = await adapter.send(session, text, opts);
+  if (r?.ok === false) throw new Error(r.error || 'Kimi 沒有收到訊息');
 }
 
 export function isRunning(id) {

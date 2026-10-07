@@ -14,6 +14,8 @@ import { ADAPTERS, TYPE_LABELS } from './adapters/index.js';
 import { TEMPLATES } from './adapters/presets.js';
 import { disposeAll } from './adapters/acp.js';
 import * as machines from './machines.js';
+import { createAutoPause, activityOf, timings, isActive } from './autopause.js';
+import { createScheduler, scheduleTimings } from './schedule.js';
 
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -292,6 +294,33 @@ app.post('/api/sessions/:id/earlier', wrap(async (req) => {
   await ADAPTERS['kimi-remote'].loadEarlier(s);
 }));
 
+// 自動暫停: { enabled, threshold } turns it on or off and sets the share of
+// the 5-hour quota to pause at; { resumeAfterReset: true, text } sends `text`
+// (「繼續」) once the 5-hour quota has reset, for a conversation paused by
+// hand; { cancelResume: true } calls off the message waiting to go out.
+app.post('/api/sessions/:id/autopause', wrap(async (req) => {
+  const s = mustSession(req.params.id);
+  if (!s.kimiSessionId) throw Object.assign(new Error('只有 Kimi 對話可以自動暫停'), { status: 400 });
+  const { enabled, threshold, cancelResume, resumeAfterReset, text } = req.body || {};
+  if (cancelResume) autoPause.cancelResume(s);
+  else if (resumeAfterReset) await autoPause.armResume(s, { text });
+  else autoPause.configure(s, { enabled, threshold });
+  return runner.summarize(s);
+}));
+
+// 定時送出: { text, at } (ms) adds a message to send at that time.
+app.post('/api/sessions/:id/schedule', wrap((req) => {
+  const s = mustSession(req.params.id);
+  if (!s.kimiSessionId) throw Object.assign(new Error('只有 Kimi 對話可以定時送出'), { status: 400 });
+  scheduler.add(s, req.body || {});
+  return runner.summarize(s);
+}));
+app.delete('/api/sessions/:id/schedule/:item', wrap((req) => {
+  const s = mustSession(req.params.id);
+  scheduler.cancel(s, req.params.item);
+  return runner.summarize(s);
+}));
+
 // 插隊: slip a queued message into the running turn (Kimi's Ctrl-S).
 app.post('/api/sessions/:id/queue/:promptId/steer', wrap(async (req) => {
   const s = mustSession(req.params.id);
@@ -443,6 +472,43 @@ function broadcast(msg) {
 runner.setBroadcast(broadcast);
 machines.setBroadcast(broadcast);
 runner.restoreLiveSessions();
+
+// Auto-pause and 定時送出 run here on the hub, whether or not a browser is open.
+const persist = (s, { immediate }) => {
+  if (store.getSession(s.id) !== s) return; // deleted meanwhile
+  store.saveSession(s, { immediate });
+  broadcast({ t: 'session', session: runner.summarize(s) });
+};
+const autoPause = createAutoPause({
+  sessions: () => store.listSessions().filter((s) => s.kimiSessionId && isActive(s.autoPause)),
+  activity: (s) => activityOf(s, machines.getMachine(s.machineId), kimiRemote.isLive(s)),
+  readUsage: async (mid) => {
+    await kimiRemote.ensureServer(mid);
+    return machines.kimiApi(mid, 'GET', '/api/v1/oauth/usage', undefined, 20_000);
+  },
+  send: (s, text, opts) => runner.deliver(s, text, opts),
+  cannotSend: (s) => kimiRemote.cannotSend(s),
+  changed: persist,
+  info: (s, text) => runner.liveContext(s).emit({ type: 'info', text }),
+  timings: timings(Number(process.env.AGENT_HUB_AUTOPAUSE_SCALE) || 1),
+});
+// Status changes are seen as they happen, not only at the next check.
+runner.onStatus((s) => isActive(s.autoPause) && autoPause.observe(s));
+machines.onSessionChange((mid, entry) => {
+  const s = store.getSession(kimiRemote.findByKimi(mid, entry.id));
+  if (isActive(s?.autoPause)) autoPause.observe(s);
+});
+autoPause.start();
+const scheduler = createScheduler({
+  sessions: () => store.listSessions().filter((s) => s.kimiSessionId && s.scheduled?.length),
+  online: (s) => activityOf(s, machines.getMachine(s.machineId), kimiRemote.isLive(s)).online,
+  send: (s, text, opts) => runner.deliver(s, text, opts),
+  cannotSend: (s) => kimiRemote.cannotSend(s),
+  changed: persist,
+  newId: () => store.newId('q_'),
+  timings: scheduleTimings(Number(process.env.AGENT_HUB_AUTOPAUSE_SCALE) || 1),
+});
+scheduler.start();
 
 setInterval(() => {
   for (const ws of [...wss.clients, ...bridgeWss.clients]) {

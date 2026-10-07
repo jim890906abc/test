@@ -1,7 +1,7 @@
 // The message box: auto-growing input, / commands, images, and the
 // model / thinking / permission controls. Used on the home screen (new
 // conversation) and under every conversation.
-import { h, fill, icon, fmtTokens } from './dom.js';
+import { h, fill, icon, fmtTokens, clockTime, fmtCountdown } from './dom.js';
 import { openMenu, closeMenu, place } from './menu.js';
 import { todoList } from './transcript.js';
 
@@ -34,6 +34,8 @@ export const COMMANDS = [
   { name: 'copy', description: '複製 Kimi 最後一則回覆' },
   { name: 'usage', description: '方案用量：5 小時、7 天與本月額度' },
   { name: 'status', description: '目前的模型、權限、context、帳號與電腦' },
+  { name: 'autopause', description: '自動暫停：5 小時額度用到設定的 % 送出「優雅暫停」，恢復後送出「繼續」', args: true, hint: '[% | off]' },
+  { name: 'later', description: '定時送出：幾分鐘後、指定時間，或 5 小時額度恢復後送出訊息', args: true, hint: '[30 | 15:30 | reset] [訊息]' },
 ];
 const HOME_COMMANDS = ['model', 'effort', 'plan', 'permission', 'yolo', 'auto', 'manual', 'usage', 'status'];
 // A Kimi running in a terminal runs its own slash commands; these are the
@@ -54,7 +56,43 @@ const TERMINAL_COMMANDS = [
   { name: 'fork', description: '複製這個對話成新的對話' },
   { name: 'title', description: '修改對話標題', args: true, hint: '<標題>' },
   { name: 'copy', description: '複製 Kimi 最後一則回覆' },
+  { name: 'autopause', description: '自動暫停：5 小時額度用到設定的 % 送出「優雅暫停」，恢復後送出「繼續」', args: true, hint: '[% | off]' },
+  { name: 'later', description: '定時送出：幾分鐘後、指定時間，或 5 小時額度恢復後送出訊息', args: true, hint: '[30 | 15:30 | reset] [訊息]' },
 ];
+
+// "15:42（2 小時 13 分後）", or just the time once it has passed.
+export function whenText(ts) {
+  const left = fmtCountdown(ts - Date.now());
+  return left ? `${clockTime(ts)}（${left}後）` : clockTime(ts);
+}
+
+// What auto-pause is doing for a conversation: a short label (badge) and a
+// sentence (tray, dialog). Null when it is off.
+// Also covers 「額度恢復後送出」 set by hand (auto-pause itself may be off).
+export function autoPauseStatus(ap) {
+  if (!ap?.enabled && ap?.phase !== 'paused') return null;
+  const w = ap.wait || {};
+  const at = whenText;
+  const text = ap.resumeText || '繼續';
+  const resume = (until) => (until ? `${at(until)}額度恢復後送出「${text}」` : `額度恢復後送出「${text}」`);
+  if (ap.phase === 'paused') {
+    const manual = ap.reason === 'manual';
+    let detail;
+    if (ap.error) detail = `${ap.error}（會再試）`;
+    else if (w.kind === 'offline') detail = '電腦離線，連上後繼續';
+    else if (w.kind === 'stopping') detail = `等 Kimi ${manual ? '' : '收尾'}停下，之後${resume(ap.resetAt)}`;
+    else if (w.kind === 'usage') detail = `5 小時額度還沒恢復（已用 ${Math.round(w.used * 100)}%）${w.until ? `，${at(w.until)}重置後再看` : '，稍後再看'}`;
+    else if (w.kind === 'confirm') detail = `重置時間到了，確認 5 小時額度恢復後送出「${text}」`;
+    else if (w.kind === 'week') detail = `7 天額度已用完，${w.until ? at(w.until) : ''}重置後才送出「${text}」`;
+    else detail = resume(ap.resetAt);
+    return { label: manual ? '等額度恢復' : '已自動暫停', detail, tone: ap.error ? 'danger' : 'warning', paused: true, text };
+  }
+  const label = `自動暫停 ${ap.threshold}%`;
+  if (ap.error) return { label, detail: ap.error, tone: 'danger' };
+  if (w.kind === 'offline') return { label, detail: '電腦離線，連上後繼續監看', tone: '' };
+  if (w.kind === 'quiet') return { label, detail: `這個 5 小時視窗已經暫停過，${at(w.until)}重置後重新監看`, tone: '' };
+  return { label, detail: `5 小時額度用到 ${ap.threshold}% 時送出「優雅暫停」`, tone: '' };
+}
 
 export class Composer {
   // opts: { home, placeholder, onSend({ text, images }), onCommand(name, args),
@@ -75,6 +113,10 @@ export class Composer {
     this.slash = null;
     this.el = h('div', { class: `composer${opts.home ? ' home' : ''}` }, this.tray, this.box);
     this.bind();
+    // Countdowns in the tray ("12 分後") keep up with the clock.
+    setInterval(() => {
+      if (this.el.isConnected && (this.state.scheduled?.length || this.state.autoPause?.phase === 'paused')) this.renderTray();
+    }, 20_000);
   }
 
   bind() {
@@ -251,7 +293,8 @@ export class Composer {
     const s = this.state;
     const busy = s.running || s.awaiting;
     const ctx = s.context;
-    const ring = ctx?.size ? contextRing(ctx, () => this.opts.onCommand('compact', ''), this.opts.onQuotaNode) : null;
+    const ap = this.opts.onAutoPause ? { state: s.autoPause, open: this.opts.onAutoPause, arm: this.opts.onArmResume } : null;
+    const ring = ctx?.size ? contextRing(ctx, () => this.opts.onCommand('compact', ''), this.opts.onQuotaNode, ap) : null;
     const stop = busy && !this.hasContent();
     fill(
       this.right,
@@ -271,6 +314,35 @@ export class Composer {
     const todos = s.todos || [];
     const open = todos.filter((t) => t.status !== 'done' && t.status !== 'completed');
     const items = [];
+    // Auto-pause, while it has paused the conversation or has a problem.
+    const ap = autoPauseStatus(s.autoPause);
+    if (ap && (ap.paused || ap.tone === 'danger')) {
+      items.push(
+        h(
+          'div',
+          { class: `queued autopause-row${ap.tone === 'danger' ? ' danger' : ''}` },
+          icon('pause'),
+          h('span', { class: 'queued-label' }, ap.label),
+          h('span', { class: 'queued-text', title: ap.detail }, ap.detail),
+          h('button', { class: 'om-btn om-btn--sm', type: 'button', title: '狀態、設定與紀錄', onclick: () => this.opts.onAutoPause?.() }, '詳情'),
+          ap.paused ? h('button', { class: 'om-btn om-btn--sm', type: 'button', title: `這次不自動送出「${ap.text}」`, onclick: () => this.opts.onCancelAutoResume?.() }, '取消') : null,
+        ),
+      );
+    }
+    // 定時送出, until they have gone out.
+    for (const q of s.scheduled || []) {
+      const note = q.gaveUp ? q.error : q.wait === 'offline' ? '電腦離線，連上後送出' : q.error;
+      items.push(
+        h(
+          'div',
+          { class: `queued sched-row${q.gaveUp ? ' danger' : ''}` },
+          icon('clock'),
+          h('span', { class: 'queued-label' }, q.gaveUp ? '沒送出' : '定時'),
+          h('span', { class: 'queued-text', title: [q.text, note].filter(Boolean).join('\n') }, `${q.at > Date.now() ? whenText(q.at) : '正在'}送出「${q.text}」`, note ? h('span', { class: 'muted' }, ` · ${note}`) : null),
+          h('button', { class: 'om-btn om-btn--toolbar om-btn--sm', type: 'button', title: '取消這則定時訊息', 'aria-label': '取消這則定時訊息', onclick: () => this.opts.onCancelScheduled?.(q.id) }, icon('x')),
+        ),
+      );
+    }
     for (const q of queue) {
       items.push(
         h(
@@ -517,7 +589,7 @@ async function readImage(file) {
   return { mimeType, data, thumb, name: file.name };
 }
 
-function contextRing(ctx, onCompact, quotaNode) {
+function contextRing(ctx, onCompact, quotaNode, autoPause) {
   const pct = Math.min(1, ctx.used / ctx.size);
   const r = 7;
   const c = 2 * Math.PI * r;
@@ -538,6 +610,15 @@ function contextRing(ctx, onCompact, quotaNode) {
           { section: 'Context' },
           { node: h('div', { class: 'menu-quota' }, h('div', { class: 'quota' }, h('div', { class: 'quota-head' }, h('span', null, `${fmtTokens(ctx.used)} / ${fmtTokens(ctx.size)}`), h('span', { class: 'muted' }, `已用 ${Math.round(pct * 100)}%`)), h('div', { class: `quota-bar${level ? ` ${level}` : ''}` }, h('span', { style: { width: `${Math.round(pct * 100)}%` } })))) },
           ...(quota ? [{ separator: true }, { section: '方案用量' }, { node: quota }] : []),
+          ...(autoPause
+            ? [
+                { label: '自動暫停…', hint: autoPause.state?.enabled ? `${autoPause.state.threshold}%` : '關', onSelect: autoPause.open },
+                // Already paused (by hand): just 「繼續」 once the quota is back.
+                autoPause.state?.phase === 'paused'
+                  ? { label: `額度恢復後送出「${autoPause.state.resumeText || '繼續'}」`, hint: '已設定', onSelect: autoPause.open }
+                  : { label: '額度恢復後送出「繼續」', description: '你已經讓 Kimi 停下時用', onSelect: () => autoPause.arm?.() },
+              ]
+            : []),
           { separator: true },
           { label: '壓縮對話', hint: '/compact', onSelect: onCompact },
         ],

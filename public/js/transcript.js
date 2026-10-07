@@ -383,7 +383,7 @@ export class Transcript {
   renderUser(node) {
     const ev = node.ev;
     const images = (ev.images || []).map((src) => (src ? h('img', { class: 'user-img', src, alt: '附加的圖片', loading: 'lazy', onclick: () => this.opts.onImage?.(src) }) : h('span', { class: 'user-img placeholder' }, icon('image'), '圖片')));
-    const note = ev.steered ? '在 Kimi 工作時插入' : ev.note;
+    const note = [ev.note, ev.steered ? '在 Kimi 工作時插入' : null].filter(Boolean).join(' · ');
     fill(
       node.el,
       h('div', { class: 'bubble' }, images.length ? h('div', { class: 'user-imgs' }, images) : null, ev.text ? h('div', { class: 'user-text' }, ev.text) : null),
