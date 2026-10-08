@@ -1712,8 +1712,10 @@ function quotaBars(quota, only) {
       return h(
         'div',
         { class: 'quota', title: why },
-        h('div', { class: 'quota-head' }, h('span', null, QUOTA_WINDOWS[k] || k), h('span', { class: 'muted' }, `已用 ${pct}%${v.counted ? '（依次數）' : ''}${v.resetAt ? ` · ${resetIn(v.resetAt)}` : ''}`)),
+        h('div', { class: 'quota-head' }, h('span', null, QUOTA_WINDOWS[k] || k), h('span', { class: 'muted' }, `已用 ${pct}%`)),
         h('div', { class: `quota-bar${pct >= 90 ? ' danger' : pct >= 75 ? ' warning' : ''}` }, h('span', { style: { width: `${pct}%` } })),
+        // A line of its own: squeezed next to the share, it broke apart.
+        v.resetAt ? h('div', { class: 'quota-reset muted' }, resetIn(v.resetAt)) : null,
       );
     });
 }
@@ -1757,7 +1759,7 @@ async function accountDialog(machineId, rows = null) {
   // Kimi's ratios are known to stick at 0 (MoonshotAI/kimi-code#3817,
   // #3908, #4133): say what is shown instead, or where to check.
   const note = wins.some((v) => v.counted)
-    ? '標「依次數」的：Kimi 回報的百分比和同一份回應裡的已用次數對不上（官方已知的問題，常卡在 0%；Kimi 終端機的 /usage 和網頁版顯示的就是那個百分比），這裡以次數為準。'
+    ? 'Kimi 回報的百分比和同一份回應裡的已用次數對不上（官方已知的問題，常卡在 0%；Kimi 終端機的 /usage 和網頁版顯示的就是那個百分比），這裡以次數為準。'
     : wins.length && !u?.counts && wins.every((v) => v.usedRatio === 0)
       ? '如果這段時間確實有在用、這裡卻是 0%：這是 Kimi 官方已知的問題（回報的百分比卡在 0%），Kimi 這次也沒有附上次數可以換算，請以 Kimi 網站會員頁的數字為準。'
       : null;

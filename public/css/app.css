@@ -2285,6 +2285,10 @@ pre.tail {
 .quota-head > :last-child {
   text-align: right;
 }
+.quota-reset {
+  margin-top: 4px;
+  font-size: 12px;
+}
 .quota-note {
   margin: var(--space-3) 0 0;
   font-size: 12px;
