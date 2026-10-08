@@ -51,6 +51,9 @@ function fakeMachine(key) {
     steers: [], // prompt ids
     frames: [], // everything sent, for kimi.history
     win: { used: 0.5, resetAt: Date.now() + 3600_000, next: 0.05 },
+    // Kimi's ratios stuck at 0 (MoonshotAI/kimi-code#3908): Kimi says 0%;
+    // the counts sent along with them say how much is used.
+    ratioStuck: false,
   };
   const ws = new WebSocket(`ws://127.0.0.1:${PORT}/bridge?key=${encodeURIComponent(key)}`);
   const send = (m) => ws.send(JSON.stringify(m));
@@ -78,7 +81,17 @@ function fakeMachine(key) {
   const usage = () => {
     if (Date.now() >= k.win.resetAt) k.win = { used: k.win.next, resetAt: Date.now() + 5 * 3600_000, next: 0.05 };
     const iso = (t) => new Date(t).toISOString();
-    return { kind: 'ok', quota: { usages: { limit5h: { usedRatio: k.win.used, resetAt: iso(k.win.resetAt) }, limit7d: { usedRatio: 0.2, resetAt: iso(Date.now() + 90 * 3600_000) } }, extraUsage: null } };
+    return { kind: 'ok', quota: { usages: { limit5h: { usedRatio: k.ratioStuck ? 0 : k.win.used, resetAt: iso(k.win.resetAt) }, limit7d: { usedRatio: k.ratioStuck ? 0 : 0.2, resetAt: iso(Date.now() + 90 * 3600_000) } }, extraUsage: null } };
+  };
+  // The whole /usages answer, as the bridge reads it.
+  const answer = () => {
+    const iso = (t) => new Date(t).toISOString();
+    const used = Math.round(k.win.used * 100);
+    return {
+      usage: { limit: '100', used: '20', remaining: '80', resetTime: iso(Date.now() + 90 * 3600_000) },
+      limits: [{ window: { duration: 300, timeUnit: 'TIME_UNIT_MINUTE' }, detail: { limit: '100', used: String(used), remaining: String(100 - used), resetTime: iso(k.win.resetAt) } }],
+      usages: { limit_5h: { used_ratio: 0, reset_time: iso(k.win.resetAt) }, limit_7d: { used_ratio: 0, reset_time: iso(Date.now() + 90 * 3600_000) } },
+    };
   };
   const info = () => ({ id: KID, title: '大工程', metadata: { cwd: '/tmp/project' }, busy: k.busy, pending_interaction: 'none', last_turn_reason: 'completed', owner: null, controllable: null });
   const request = (method, p, body) => {
@@ -125,6 +138,9 @@ function fakeMachine(key) {
         break;
       case 'kimi.request':
         out = request(a.method, a.path, a.body);
+        break;
+      case 'kimi.usage':
+        out = k.ratioStuck ? { ok: true, payload: answer() } : { ok: false };
         break;
       default:
         out = { ok: true };
@@ -291,4 +307,39 @@ test('額度恢復後送出, set by hand after pausing Kimi yourself; 定時送�
   assert.equal(done.events.find((e) => e.type === 'user' && e.text === '定時測試').note, '定時送出');
   assert.equal(bridge.prompts.filter((x) => x.text === '定時測試').length, 1);
   await finishTurn();
+});
+
+test('Kimi says 0% while the counts sent along say 85%: the counts are shown, and pause', async () => {
+  const s = await api('POST', `/machines/${MID}/kimi/${KID}/attach`);
+  const session = () => api('GET', `/sessions/${s.id}`);
+  await until(async () => (await session()).status === 'idle', 5000, 'idle');
+  bridge.ratioStuck = true;
+  bridge.win = { used: 0.5, resetAt: Date.now() + 3600_000, next: 0.05 };
+
+  // The 用量 menu: from the counts, saying so.
+  const { usage } = await api('GET', `/machines/${MID}/usage`);
+  assert.equal(usage.counts, true);
+  assert.equal(usage.quota.usages.limit5h.usedRatio, 0.5);
+  assert.deepEqual(usage.quota.usages.limit5h.counted, { used: 50, limit: 100 });
+  assert.equal(usage.quota.usages.limit5h.reported, 0);
+  assert.equal(usage.quota.usages.limit7d.usedRatio, 0.2);
+
+  // Auto-pause goes by them too.
+  const before = bridge.prompts.length;
+  const pauses = (x) => x.events.filter((e) => e.type === 'user' && e.text === '優雅暫停');
+  const earlier = pauses(await session()).length; // from the first test
+  await api('POST', `/sessions/${s.id}/autopause`, { enabled: true, threshold: 80 });
+  bridge.startTurn('接著做大工程');
+  await until(async () => (await session()).status === 'running', 5000, 'running');
+  await sleep(2000);
+  assert.equal(bridge.prompts.length, before, 'under the mark');
+  bridge.win = { used: 0.85, resetAt: Date.now() + 3600_000, next: 0.05 };
+  await until(async () => bridge.prompts.slice(before).find((x) => x.text === '優雅暫停'), 10000, '優雅暫停');
+  const cur = await until(async () => {
+    const x = await session();
+    return x.autoPause.phase === 'paused' && pauses(x).length > earlier && x;
+  }, 5000, 'paused, shown in the conversation');
+  assert.match(pauses(cur).at(-1).note, /已用 85%（門檻 80%）/);
+  bridge.endTurn();
+  bridge.ratioStuck = false;
 });

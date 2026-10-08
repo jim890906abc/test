@@ -2278,6 +2278,18 @@ pre.tail {
   font-size: 13px;
   margin-bottom: 6px;
 }
+.quota-head > :first-child {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.quota-head > :last-child {
+  text-align: right;
+}
+.quota-note {
+  margin: var(--space-3) 0 0;
+  font-size: 12px;
+  line-height: 17px;
+}
 .quota-bar {
   height: 8px;
   border-radius: 4px;

@@ -1705,10 +1705,14 @@ function quotaBars(quota, only) {
     .sort(([a], [b]) => (only ? only.indexOf(a) - only.indexOf(b) : 0))
     .map(([k, v]) => {
       const pct = Math.round(Math.min(1, v.usedRatio) * 100);
+      // Corrected by the hub from the counts Kimi sent along (server/quota.js).
+      const why = v.counted
+        ? `Kimi 回報的百分比是 ${v.reported == null ? '（沒有）' : `${Math.round(v.reported * 100)}%`}，同一份回應裡的次數卻是已用 ${v.counted.used} / ${v.counted.limit}：這是 Kimi 官方已知的問題，這裡以次數為準`
+        : undefined;
       return h(
         'div',
-        { class: 'quota' },
-        h('div', { class: 'quota-head' }, h('span', null, QUOTA_WINDOWS[k] || k), h('span', { class: 'muted' }, `已用 ${pct}%${v.resetAt ? ` · ${resetIn(v.resetAt)}` : ''}`)),
+        { class: 'quota', title: why },
+        h('div', { class: 'quota-head' }, h('span', null, QUOTA_WINDOWS[k] || k), h('span', { class: 'muted' }, `已用 ${pct}%${v.counted ? '（依次數）' : ''}${v.resetAt ? ` · ${resetIn(v.resetAt)}` : ''}`)),
         h('div', { class: `quota-bar${pct >= 90 ? ' danger' : pct >= 75 ? ' warning' : ''}` }, h('span', { style: { width: `${pct}%` } })),
       );
     });
@@ -1749,6 +1753,14 @@ async function accountDialog(machineId, rows = null) {
   const u = data.usage;
   const quota = u?.kind === 'ok' ? u.quota : null;
   const bars = quotaBars(quota);
+  const wins = Object.values(quota?.usages || {}).filter((v) => v && typeof v.usedRatio === 'number');
+  // Kimi's ratios are known to stick at 0 (MoonshotAI/kimi-code#3817,
+  // #3908, #4133): say what is shown instead, or where to check.
+  const note = wins.some((v) => v.counted)
+    ? '標「依次數」的：Kimi 回報的百分比和同一份回應裡的已用次數對不上（官方已知的問題，常卡在 0%；Kimi 終端機的 /usage 和網頁版顯示的就是那個百分比），這裡以次數為準。'
+    : wins.length && !u?.counts && wins.every((v) => v.usedRatio === 0)
+      ? '如果這段時間確實有在用、這裡卻是 0%：這是 Kimi 官方已知的問題（回報的百分比卡在 0%），Kimi 這次也沒有附上次數可以換算，請以 Kimi 網站會員頁的數字為準。'
+      : null;
   const x = quota?.extraUsage;
   const money = (c) => `${(c / 100).toFixed(2)} ${x?.currency || ''}`.trim();
   const info = [
@@ -1761,6 +1773,7 @@ async function accountDialog(machineId, rows = null) {
     body,
     h('div', { class: 'dialog-title' }, rows ? '狀態' : '用量'),
     bars.length ? h('div', { class: 'quotas' }, bars) : h('p', { class: 'dialog-text muted' }, u?.kind === 'error' ? (/no token|login/i.test(u.message || '') ? '這台電腦的 Kimi 沒有用 Kimi 帳號登入，看不到方案用量。在那台電腦執行 kimi login。' : `讀不到方案用量：${u.message}`) : '這個帳號沒有方案額度資訊（例如用 API key 而不是 Kimi 帳號登入）。'),
+    note ? h('p', { class: 'quota-note muted' }, note) : null,
     info.length ? h('dl', { class: 'kv' }, info.flatMap(([k, v]) => [h('dt', null, k), h('dd', null, v)])) : null,
     h('div', { class: 'dialog-actions' }, h('button', { class: 'om-btn om-btn--primary', type: 'button', onclick: () => d.close() }, '好')),
   );

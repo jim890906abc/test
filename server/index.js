@@ -16,6 +16,7 @@ import { disposeAll } from './adapters/acp.js';
 import * as machines from './machines.js';
 import { createAutoPause, activityOf, timings, isActive } from './autopause.js';
 import { createScheduler, scheduleTimings } from './schedule.js';
+import { mergeQuota, countsOf } from './quota.js';
 
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -389,17 +390,38 @@ app.get('/api/machines', wrap(() => machines.listMachines()));
 app.delete('/api/machines/:id', wrap((req) => machines.removeMachine(req.params.id)));
 app.post('/api/machines/:id/refresh', wrap((req) => machines.rpc(req.params.id, 'kimi.status')));
 app.post('/api/machines/:id/kimi/start', wrap((req) => machines.rpc(req.params.id, 'kimi.start', {}, 40_000)));
-// Models the machine's Kimi offers, for the new-conversation screen.
 // The Kimi account's plan quota and who is logged in on that machine.
 app.get('/api/machines/:id/usage', wrap(async (req) => {
   await kimiRemote.ensureServer(req.params.id);
   const [usage, user] = await Promise.all([
-    machines.kimiApi(req.params.id, 'GET', '/api/v1/oauth/usage').catch((err) => ({ kind: 'error', message: err.message })),
+    readQuota(req.params.id, { shared: true }).catch((err) => ({ kind: 'error', message: err.message })),
     machines.kimiApi(req.params.id, 'GET', '/api/v1/oauth/userinfo').catch(() => null),
   ]);
   return { usage, user: user?.kind === 'ok' ? user.userInfo : null };
 }));
 
+// The plan quota as Kimi reads it, with the counts of the same answer folded
+// in (server/quota.js). Pages asking at once share one reading (`shared`);
+// auto-pause always reads anew, so a reading is never older than its ask.
+const quotaReads = new Map();
+function readQuota(mid, { shared = false } = {}) {
+  if (shared && quotaReads.has(mid)) return quotaReads.get(mid);
+  const p = (async () => {
+    await kimiRemote.ensureServer(mid);
+    const usage = await machines.kimiApi(mid, 'GET', '/api/v1/oauth/usage', undefined, 20_000);
+    if (usage?.kind !== 'ok' || !usage.quota) return usage;
+    const u = usage.quota.usages || {};
+    const expect = Object.fromEntries(['limit5h', 'limit7d'].filter((k) => u[k]?.resetAt).map((k) => [k, u[k].resetAt]));
+    // A bridge older than this does not know it: Kimi's reading as it is.
+    const raw = await machines.rpc(mid, 'kimi.usage', { expect }, 15_000).catch(() => null);
+    const counts = raw?.ok && Object.keys(countsOf(raw.payload)).length > 0;
+    return { ...usage, quota: counts ? mergeQuota(usage.quota, raw.payload) : usage.quota, counts };
+  })().finally(() => quotaReads.get(mid) === p && quotaReads.delete(mid));
+  quotaReads.set(mid, p);
+  return p;
+}
+
+// Models the machine's Kimi offers, for the new-conversation screen.
 app.get('/api/machines/:id/models', wrap(async (req) => {
   if (!machines.getMachine(req.params.id)?.kimi?.server) return { defaultModel: '', models: [] };
   return kimiRemote.modelsFor(req.params.id);
@@ -582,10 +604,7 @@ const persist = (s, { immediate }) => {
 const autoPause = createAutoPause({
   sessions: () => store.listSessions().filter((s) => s.kimiSessionId && isActive(s.autoPause)),
   activity: (s) => activityOf(s, machines.getMachine(s.machineId), kimiRemote.isLive(s)),
-  readUsage: async (mid) => {
-    await kimiRemote.ensureServer(mid);
-    return machines.kimiApi(mid, 'GET', '/api/v1/oauth/usage', undefined, 20_000);
-  },
+  readUsage: (mid) => readQuota(mid),
   send: (s, text, opts) => runner.deliver(s, text, opts),
   cannotSend: (s) => kimiRemote.cannotSend(s),
   changed: persist,

@@ -317,7 +317,8 @@ function installSelf() {
 // shuts the server down is refused here, whatever the hub asks for.
 const ALLOW = [
   ['GET', /^\/api\/v1\/(meta|auth|models|healthz|config)$/],
-  ['GET', /^\/api\/v1\/oauth\/(usage|userinfo)$/],
+  ['GET', /^\/api\/v1\/oauth\/(usage|userinfo|region)$/],
+  ['GET', /^\/api\/v1\/providers$/],
   ['GET', /^\/api\/v1\/fs:(browse|home)(\?.*)?$/],
   ['GET', /^\/api\/v1\/sessions(\?.*)?$/],
   ['GET', /^\/api\/v1\/workspaces\/[\w.-]+\/skills$/],
@@ -545,6 +546,87 @@ const server = {
       if (exited !== null && i > 4) throw new Error(`kimi web 啟動後馬上結束了（代碼 ${exited}）。在這台電腦執行 kimi web 看看錯誤訊息，也確認已經 kimi login`);
     }
     throw new Error('Kimi 伺服器沒有在 20 秒內啟動');
+  },
+};
+
+// --------------------------------------------------------- plan quota
+// Kimi's /usages answer carries the plan quota twice: as ratios
+// (usages.limit_5h.used_ratio …), which is all Kimi Code reads and shows,
+// and as counts (usage for the week, limits[] for the 5-hour window). The
+// ratios have been seen stuck at 0 while the counts, and the 403 "limit
+// reached", say otherwise (MoonshotAI/kimi-code#3817, #3908, #3951, #4133).
+// So the hub asks for the whole answer: the same request Kimi makes, with
+// the login Kimi saved, to the address Kimi uses. Read only: the login is
+// never refreshed or written here (Kimi refreshes it when the hub asks it
+// for usage first), and it goes nowhere but Kimi's own servers.
+const REGIONS = {
+  'mainland-cn': ['https://auth.kimi.com', 'https://api.kimi.com/coding/v1'],
+  global: ['https://auth.kimi.ai', 'https://api.kimi.ai/coding/v1'],
+};
+const trimUrl = (u) => String(u || '').trim().replace(/\/+$/, '');
+
+const quota = {
+  // Where Kimi keeps the login for a sign-in host and API address (its
+  // resolveKimiCodeOAuthKey).
+  slotOf(host, base) {
+    if (host === REGIONS['mainland-cn'][0] && base === REGIONS['mainland-cn'][1]) return 'kimi-code';
+    return `kimi-code-env-${crypto.createHash('sha256').update(JSON.stringify({ oauthHost: host, baseUrl: base })).digest('hex').slice(0, 16)}`;
+  },
+
+  token(slot) {
+    try {
+      const t = JSON.parse(fs.readFileSync(path.join(KIMI_HOME, 'credentials', `${slot}.json`), 'utf8'));
+      const at = typeof t?.access_token === 'string' ? t.access_token : '';
+      // An expired one is a login Kimi no longer uses (it just refreshed the
+      // one it does).
+      if (!at || (typeof t.expires_at === 'number' && t.expires_at > 0 && t.expires_at < Date.now() / 1000 + 30)) return null;
+      return at;
+    } catch {
+      return null;
+    }
+  },
+
+  // The (login, address) pairs to try: Kimi's own first.
+  async candidates() {
+    const data = async (p) => (await server.request('GET', p).catch(() => null))?.data;
+    const [region, providers] = await Promise.all([data('/api/v1/oauth/region'), data('/api/v1/providers')]);
+    const [rHost, rBase] = REGIONS[region?.region] || REGIONS['mainland-cn'];
+    const envHost = trimUrl(process.env.KIMI_CODE_OAUTH_HOST || process.env.KIMI_OAUTH_HOST);
+    const envBase = trimUrl(process.env.KIMI_CODE_BASE_URL);
+    const configured = trimUrl((providers?.items || []).find((p) => p.id === 'managed:kimi-code')?.base_url);
+    const base = envBase || configured || rBase;
+    const pairs = [[envHost || (base === REGIONS.global[1] ? REGIONS.global[0] : rHost), base], REGIONS['mainland-cn'], REGIONS.global];
+    const out = [];
+    pairs.forEach(([host, b], i) => {
+      // The login is only ever sent to an address Kimi itself uses, over
+      // https (or to this computer).
+      if (!/^https:\/\//.test(b) && !/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//.test(b)) return;
+      const slot = this.slotOf(host, b);
+      if (!out.some((c) => c.slot === slot && c.base === b)) out.push({ slot, base: b, own: i === 0 });
+    });
+    return out;
+  },
+
+  // `expect`: the reset times Kimi itself just reported, by window. An
+  // answer counts only if it is about the same windows (the same account),
+  // or, with nothing to compare, if it came from Kimi's own login.
+  async read({ expect = {} } = {}) {
+    const want = Object.entries(expect).filter(([, v]) => typeof v === 'string' && Number.isFinite(Date.parse(v)));
+    const KEYS = { limit5h: 'limit_5h', limit7d: 'limit_7d' };
+    const same = (j) => want.every(([k, v]) => Math.abs(Date.parse(j?.usages?.[KEYS[k] || k]?.reset_time) - Date.parse(v)) <= 5000);
+    for (const c of await this.candidates()) {
+      if (!want.length && !c.own) continue;
+      const token = this.token(c.slot);
+      if (!token) continue;
+      try {
+        const res = await fetch(`${c.base}/usages`, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }, signal: AbortSignal.timeout(6000) });
+        if (!res.ok) continue;
+        const j = await res.json();
+        if (!same(j)) continue;
+        return { ok: true, payload: { usage: j?.usage ?? null, limits: Array.isArray(j?.limits) ? j.limits : null, usages: j?.usages ?? null } };
+      } catch {}
+    }
+    return { ok: false };
   },
 };
 
@@ -1393,6 +1475,8 @@ const hub = {
         return this.status();
       case 'kimi.request':
         return server.request(String(args.method || 'GET').toUpperCase(), String(args.path || ''), args.body);
+      case 'kimi.usage':
+        return quota.read({ expect: args.expect && typeof args.expect === 'object' ? args.expect : {} });
       case 'kimi.subscribe':
         server.subscribe(args.sessionIds || []);
         for (const id of args.sessionIds || []) {
