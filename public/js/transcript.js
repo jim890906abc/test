@@ -1,7 +1,11 @@
 // The conversation view. Events arrive one at a time (event / patch / delta)
 // and each maps to one DOM node that is re-rendered in place, at most once
 // per animation frame, so long conversations stay fast while streaming.
-// Subagent events carry `parent` and render inside their Agent card.
+// Subagent events carry `parent` and render inside their Agent card; while
+// that card is closed they are not rendered at all (only its summary line
+// is), and catch up when it is opened. Nothing here walks the whole
+// conversation per update: children and the newest row of each parent are
+// indexed as events arrive.
 import { h, fill, icon, fmtDuration } from './dom.js';
 import { markdownInto, renderMarkdown, renderLineDiff, diffStats } from './markdown.js';
 import { artifactOf, collectArtifacts, artifactCard } from './artifacts.js';
@@ -47,11 +51,17 @@ export const TOOLS = {
 };
 
 const ACTIVE = ['pending', 'running', 'awaiting'];
+// Rows drawn right away when a conversation opens; the rest follow.
+const NOW = 150;
 // Look-around tools: a run of them folds into one line, like Claude Code.
 const LOOK = /^(Read|ReadFile|ReadMediaFile|Glob|Grep|FetchURL|WebFetch|WebSearch|SearchWeb)$/;
 const lineCount = (t) => (t ? String(t).replace(/\n+$/, '').split('\n').length : 0);
 const isAgent = (ev) => Boolean(ev.subagent) || /^(Agent|AgentSwarm|Task)$/.test(ev.name);
 const isTodo = (ev) => /^(TodoList|TodoWrite|SetTodoList)$/.test(ev.name);
+const agentRunning = (ev) => {
+  const sub = ev.subagent || {};
+  return sub.status === 'running' || (!sub.status && ACTIVE.includes(ev.status));
+};
 
 export class Transcript {
   // opts: { cwd, onRespond(ev, optionId, extra), onOpenArtifact(path, versionId), onCopy }
@@ -69,6 +79,9 @@ export class Transcript {
     this.pinBar = h('div', { class: 'prompt-pin-bar', hidden: true }, this.pin);
     this.users = []; // top-level user message ids, in order
     this.agentIds = []; // top-level subagent calls
+    this.kids = new Map(); // parent id -> ids of its direct children, in order
+    this.lastOf = new Map(); // parent id ('' for the top) -> its newest child
+    this.deferred = new Set(); // dirty, but inside a closed subagent card
     this.el = h('div', { class: 'transcript', tabindex: '-1' }, this.pinBar, this.column, this.working, this.jumpBar);
     this.events = new Map();
     this.order = [];
@@ -97,14 +110,18 @@ export class Transcript {
       if (!a || !this.column.contains(a) || e.metaKey || e.ctrlKey) return;
       if (this.opts.onLink?.(a.getAttribute('href'))) e.preventDefault();
     });
-    // The column can still settle after a render (an image loads, a tool's
-    // output arrives): stay pinned to the end while following it.
+    // Following the end is done here, after the browser has laid the page
+    // out anyway, rather than right after each change: reading the height
+    // then would make it lay out the whole conversation an extra time per
+    // frame. Covers the column growing and the view itself resizing.
     this.resize = new ResizeObserver(() => this.stick && this.scrollToEnd());
     this.resize.observe(this.column);
+    this.resize.observe(this.el);
   }
 
   destroy() {
     cancelAnimationFrame(this.raf);
+    clearTimeout(this.backlogTimer);
     clearInterval(this.tick);
     this.resize.disconnect();
   }
@@ -117,11 +134,40 @@ export class Transcript {
     this.groupOf.clear();
     this.users = [];
     this.agentIds = [];
+    this.kids.clear();
+    this.lastOf.clear();
+    this.deferred.clear();
     this.pinBar.hidden = true;
     this.column.replaceChildren();
+    clearTimeout(this.backlogTimer);
     for (const ev of events) this.add(ev, true);
+    // The newest part (what is on screen, at the bottom) is drawn now; the
+    // rest after it, a slice at a time, so a long conversation shows at once
+    // and stays responsive while the older part fills in.
+    const all = [...this.dirty];
+    const keep = new Set(all.slice(-NOW));
+    this.backlog = all.filter((id) => !keep.has(id));
+    this.dirty = keep;
+    for (const id of keep) {
+      const p = this.events.get(id)?.parent;
+      if (p) keep.add(p); // a card shows its latest step
+    }
     this.flush();
     this.scrollToEnd();
+    if (this.backlog.length) this.backlogTimer = setTimeout(() => this.drawBacklog(), 0);
+  }
+
+  drawBacklog() {
+    const end = performance.now() + 10;
+    while (this.backlog.length && performance.now() < end) {
+      const id = this.backlog.pop(); // newest first: nearest to the view
+      const node = this.nodes.get(id);
+      if (!node) continue;
+      if (this.insideClosed(node.ev)) this.deferred.add(id);
+      else this.render(node);
+    }
+    if (this.stick) this.scrollToEnd();
+    if (this.backlog.length) this.backlogTimer = setTimeout(() => this.drawBacklog(), 0);
   }
 
   add(ev, batch = false) {
@@ -131,6 +177,12 @@ export class Transcript {
     this.grew = true;
     if (ev.type === 'user' && !ev.parent) this.users.push(ev.id);
     if (ev.type === 'tool_use' && !ev.parent && isAgent(ev)) this.agentIds.push(ev.id);
+    if (ev.parent) {
+      const list = this.kids.get(ev.parent);
+      if (list) list.push(ev.id);
+      else this.kids.set(ev.parent, [ev.id]);
+    }
+    this.lastOf.set(ev.parent || '', ev.id);
     const node = this.makeNode(ev);
     this.nodes.set(ev.id, node);
     this.mount(node);
@@ -192,7 +244,9 @@ export class Transcript {
     this.dirty.clear();
     for (const id of ids) {
       const node = this.nodes.get(id);
-      if (node) this.render(node);
+      if (!node) continue;
+      if (this.insideClosed(node.ev)) this.deferred.add(id);
+      else this.render(node);
     }
     for (const g of this.dirtyGroups) this.renderGroup(g);
     this.dirtyGroups.clear();
@@ -200,8 +254,7 @@ export class Transcript {
       this.artifactsChanged = false;
       this.opts.onArtifacts?.(this.artifacts());
     }
-    if (this.stick) this.scrollToEnd();
-    else if (this.grew) this.jump.classList.add('new');
+    if (!this.stick && this.grew) this.jump.classList.add('new');
     this.grew = false;
     this.opts.onFlush?.(ids);
   }
@@ -216,34 +269,60 @@ export class Transcript {
     return this.agentList(true);
   }
 
+  // How many are still working, without looking at their steps.
+  runningCount() {
+    let n = 0;
+    for (const id of this.agentIds) if (this.events.has(id) && agentRunning(this.events.get(id))) n++;
+    return n;
+  }
+
+  // Inside a subagent card that is closed (at any depth): not on screen.
+  insideClosed(ev) {
+    let p = ev.parent;
+    while (p) {
+      const pe = this.events.get(p);
+      if (!pe) return false;
+      if (isAgent(pe) && !this.agentOpen(pe)) return true;
+      p = pe.parent;
+    }
+    return false;
+  }
+
+  // Subagent cards start closed, but open by themselves while one of their
+  // steps waits for you (an approval or a question).
+  agentOpen(ev) {
+    return this.expanded(ev, this.childrenOf(ev.id).some((k) => k.permission && !k.permission.chosen));
+  }
+
+  // A card was opened: what changed inside it while closed is drawn now.
+  reveal() {
+    for (const id of this.deferred) {
+      const ev = this.events.get(id);
+      if (ev && !this.insideClosed(ev)) {
+        this.deferred.delete(id);
+        this.markDirty(id);
+      }
+    }
+  }
+
   // Every subagent this conversation started (newest last), or only the
   // ones still working.
   agentList(onlyRunning = false) {
-    const isRunning = (ev) => {
-      const sub = ev.subagent || {};
-      return sub.status === 'running' || (!sub.status && ACTIVE.includes(ev.status));
-    };
-    const ids = this.agentIds.filter((id) => this.events.has(id) && (!onlyRunning || isRunning(this.events.get(id))));
-    if (!ids.length) return [];
-    // One pass for every agent's direct steps.
-    const kidsOf = new Map(ids.map((id) => [id, []]));
-    for (const k of this.order) {
-      const e = this.events.get(k);
-      if (e.parent && kidsOf.has(e.parent)) kidsOf.get(e.parent).push(e);
-    }
+    const ids = this.agentIds.filter((id) => this.events.has(id) && (!onlyRunning || agentRunning(this.events.get(id))));
     const out = [];
     for (const id of ids) {
       const ev = this.events.get(id);
       const sub = ev.subagent || {};
-      const running = isRunning(ev);
+      const running = agentRunning(ev);
       const failed = sub.status === 'error' || ev.status === 'error';
-      const kids = kidsOf.get(id);
+      const kids = this.childrenOf(id);
       const last = [...kids].reverse().find((k) => k.type === 'tool_use' || (k.type === 'text' && k.text?.trim()));
       const activity = !last ? '' : last.type === 'tool_use' ? `${(TOOLS[last.name] || [null, last.name])[1]} ${last.title || ''}`.trim() : last.text.trim().split('\n').pop();
       out.push({
         id,
         name: sub.name && !['subagent', 'btw'].includes(sub.name) ? sub.name : '',
-        description: sub.description || ev.input?.description || ev.title || '',
+        // Without a description, the first line of the task it was given.
+        description: sub.description || ev.input?.description || ev.title || String(ev.input?.prompt || '').trim().split('\n')[0].slice(0, 120),
         activity: activity.slice(0, 120),
         steps: kids.filter((k) => k.type === 'tool_use').length,
         background: Boolean(sub.background),
@@ -256,6 +335,10 @@ export class Transcript {
       });
     }
     return out;
+  }
+
+  childrenOf(id) {
+    return (this.kids.get(id) || []).map((k) => this.events.get(k)).filter(Boolean);
   }
 
   // Everything a subagent did (its nested subagents included), oldest first.
@@ -279,6 +362,7 @@ export class Transcript {
     this.open.add(id);
     this.shut.delete(id);
     this.markDirty(id);
+    this.reveal();
     this.stick = false;
     node.el.scrollIntoView({ block: 'start', behavior: 'smooth' });
   }
@@ -358,11 +442,20 @@ export class Transcript {
     switch (ev.type) {
       case 'user':
         return this.renderUser(node);
-      case 'text':
+      case 'text': {
         if (!node.md) node.el.append((node.md = h('div', { class: 'md' })));
+        // A long reply still being written is parsed again at most about
+        // eight times a second, not on every frame.
+        const t = performance.now();
+        if (ev.text?.length > 3000 && this.isLive(ev) && t - (node.mdAt || 0) < 120) {
+          node.mdTimer ??= setTimeout(() => ((node.mdTimer = null), this.markDirty(ev.id)), 120);
+          return;
+        }
+        node.mdAt = t;
         markdownInto(node.md, ev.text);
         node.el.hidden = !ev.text?.trim();
         return;
+      }
       case 'thinking':
         return this.renderThinking(node);
       case 'tool_use':
@@ -410,9 +503,7 @@ export class Transcript {
 
   // The newest unfinished row while Kimi is working.
   isLive(ev) {
-    if (this.status !== 'running') return false;
-    const siblings = this.order.filter((id) => (this.events.get(id).parent || null) === (ev.parent || null));
-    return siblings.at(-1) === ev.id;
+    return this.status === 'running' && this.lastOf.get(ev.parent || '') === ev.id;
   }
 
   toggle(id, wasOpen) {
@@ -420,6 +511,7 @@ export class Transcript {
     else (this.open.add(id), this.shut.delete(id));
     if (id.startsWith('g:')) this.markDirty(id.slice(2));
     else this.markDirty(id);
+    if (!wasOpen) this.reveal();
   }
 
   expanded(ev, byDefault) {
@@ -495,24 +587,32 @@ export class Transcript {
     const art = artifactOf(ev);
     node.el.className = `ev ev-tool_use tool status-${ev.status}${waiting ? ' waiting' : ''}${isAgent(ev) ? ' agent' : ''}${ev.parent ? ' nested' : ''}`;
 
+    // Drawn some other way: the cached row below no longer stands.
+    if ((art && !waiting) || (isTodo(ev) && (ev.todos || ev.input?.todos)) || isAgent(ev)) node.headOf = null;
     if (art && !waiting) return this.renderArtifactTool(node, art);
     if (isTodo(ev) && (ev.todos || ev.input?.todos)) return this.renderTodos(node);
     if (isAgent(ev)) return this.renderAgent(node, ic, verb);
+    node.headKey = null;
 
     const open = waiting || this.expanded(ev, ['Edit', 'MultiEdit', 'StrReplaceFile'].includes(ev.name) || ev.status === 'error');
-    fill(
-      node.head,
-      h(
-        'button',
-        { class: 'tool-row', type: 'button', 'aria-expanded': String(open), onclick: () => !waiting && this.toggle(ev.id, open) },
-        h('span', { class: 'tool-icon' }, icon(ic)),
-        h('span', { class: 'tool-verb' }, verb),
-        h('span', { class: 'tool-target' }, this.target(ev)),
-        this.meta(ev),
-        this.statusMark(ev),
-        waiting ? null : icon('chev', 'chev'),
-      ),
-    );
+    // The row itself changes far less often than the output under it.
+    const head = node.headOf;
+    if (!head || head.input !== ev.input || head.status !== ev.status || head.title !== ev.title || head.open !== open || head.waiting !== waiting || head.permission !== ev.permission || head.args !== Boolean(ev.argsText) || head.name !== ev.name) {
+      node.headOf = { input: ev.input, status: ev.status, title: ev.title, open, waiting, permission: ev.permission, args: Boolean(ev.argsText), name: ev.name };
+      fill(
+        node.head,
+        h(
+          'button',
+          { class: 'tool-row', type: 'button', 'aria-expanded': String(open), onclick: () => !waiting && this.toggle(ev.id, open) },
+          h('span', { class: 'tool-icon' }, icon(ic)),
+          h('span', { class: 'tool-verb' }, verb),
+          h('span', { class: 'tool-target' }, this.target(ev)),
+          this.meta(ev),
+          this.statusMark(ev),
+          waiting ? null : icon('chev', 'chev'),
+        ),
+      );
+    }
     fill(node.body, ...(open ? this.toolBody(ev) : this.peek(ev)));
     if (waiting) node.body.append(this.permissionUI(ev));
     else if (ev.permission?.chosen && !/^approved/.test(ev.permission.chosen)) node.body.append(this.permissionResult(ev));
@@ -634,14 +734,22 @@ export class Transcript {
     const ev = node.ev;
     const sub = ev.subagent || {};
     const input = ev.input || {};
-    const kids = this.order.filter((id) => this.events.get(id).parent === ev.id).map((id) => this.events.get(id));
-    const running = sub.status === 'running' || (!sub.status && ACTIVE.includes(ev.status));
-    const open = this.expanded(ev, false);
+    const kids = this.childrenOf(ev.id);
+    const running = agentRunning(ev);
+    const open = this.agentOpen(ev);
     const steps = kids.filter((k) => k.type === 'tool_use').length;
     const last = [...kids].reverse().find((k) => k.type === 'tool_use' || (k.type === 'text' && k.text?.trim()));
     let activity = '';
     if (running && last) activity = last.type === 'tool_use' ? `${(TOOLS[last.name] || [null, last.name])[1]} ${last.title || ''}` : last.text.trim().split('\n').pop();
     const label = ev.name === 'btw' ? verb : `${verb}${sub.name && sub.name !== 'subagent' && sub.name !== 'btw' ? ` · ${sub.name}` : ''}`;
+    const summary = sub.summary;
+    // Redrawn only when something on it changed: a working subagent touches
+    // its card many times a second, and a rebuilt spinner starts over.
+    const headKey = [label, sub.description || input.description || ev.title || '', steps, Boolean(sub.background), running, sub.status, ev.status, open].join('\u0001');
+    const bodyKey = [open, running, activity, summary, sub.error].join('\u0001');
+    const same = node.headKey === headKey && node.bodyKey === bodyKey && !(ev.permission && !ev.permission.chosen);
+    node.children.hidden = !open;
+    if (same) return;
     const statusEl = running
       ? h('span', { class: 'spinner' })
       : sub.status === 'error' || ev.status === 'error'
@@ -649,28 +757,30 @@ export class Transcript {
         : sub.status === 'cancelled' || ev.status === 'interrupted'
           ? h('span', { class: 'mark-text' }, '已中斷')
           : null;
-    fill(
-      node.head,
-      h(
-        'button',
-        { class: 'tool-row', type: 'button', 'aria-expanded': String(open), onclick: () => this.toggle(ev.id, open) },
-        h('span', { class: 'tool-icon' }, icon(ic)),
-        h('span', { class: 'tool-verb' }, label),
-        h('span', { class: 'tool-target' }, sub.description || input.description || ev.title || ''),
-        steps ? h('span', { class: 'tool-meta' }, `${steps} 個步驟`) : null,
-        sub.background ? h('span', { class: 'om-badge' }, '背景') : null,
-        statusEl,
-        icon('chev', 'chev'),
-      ),
-    );
-    const summary = sub.summary;
+    if (node.headKey !== headKey) {
+      node.headKey = headKey;
+      fill(
+        node.head,
+        h(
+          'button',
+          { class: 'tool-row', type: 'button', 'aria-expanded': String(open), onclick: () => this.toggle(ev.id, open) },
+          h('span', { class: 'tool-icon' }, icon(ic)),
+          h('span', { class: 'tool-verb' }, label),
+          h('span', { class: 'tool-target' }, sub.description || input.description || ev.title || ''),
+          steps ? h('span', { class: 'tool-meta' }, `${steps} 個步驟`) : null,
+          sub.background ? h('span', { class: 'om-badge' }, '背景') : null,
+          statusEl,
+          icon('chev', 'chev'),
+        ),
+      );
+    }
+    node.bodyKey = bodyKey;
     fill(
       node.body,
       !open && running && activity ? h('div', { class: 'agent-activity' }, activity) : null,
       !open && !running && summary ? h('div', { class: 'agent-summary clamp' }, summary) : null,
       sub.error ? h('div', { class: 'callout danger small' }, icon('alert'), h('div', { class: 'callout-text' }, sub.error)) : null,
     );
-    node.children.hidden = !open;
     if (open && summary && !running) {
       node.summary ??= h('div', { class: 'agent-summary' });
       fill(node.summary, h('div', { class: 'agent-summary-label' }, '子代理回報'), renderMarkdown(summary));
@@ -843,24 +953,27 @@ export class Transcript {
     const s = this.status;
     if (s !== 'running' && s !== 'awaiting_permission') {
       this.working.hidden = true;
+      this.workingKind = null;
       return;
     }
     this.working.hidden = false;
     const secs = this.since ? fmtDuration(Date.now() - this.since) : '';
-    fill(
-      this.working,
-      s === 'running'
-        ? h(
-            'div',
-            { class: 'working-line' },
-            h('span', { class: 'pulse' }),
-            h('span', null, 'Kimi 正在處理'),
-            secs ? h('span', { class: 'muted' }, ` · ${secs}`) : null,
-            this.tps ? h('span', { class: 'muted', title: '產生速度：這一輪生成的 token 數 ÷ 生成時間' }, ` · ${this.tps} tok/s`) : null,
-            h('span', { class: 'muted hint' }, ' · Esc 停止'),
-          )
-        : h('div', { class: 'working-line' }, h('span', { class: 'om-badge om-badge--warning' }, '等你回應'), h('span', { class: 'muted' }, '在上面的卡片選擇怎麼做')),
-    );
+    if (s === 'running') {
+      // Built once; the clock and the speed are updated in place, so the
+      // pulse keeps its rhythm.
+      if (this.workingKind !== 'running') {
+        this.workingKind = 'running';
+        this.secsEl = h('span', { class: 'muted' });
+        this.tpsEl = h('span', { class: 'muted', title: '產生速度：這一輪生成的 token 數 ÷ 生成時間' });
+        fill(this.working, h('div', { class: 'working-line' }, h('span', { class: 'pulse' }), h('span', null, 'Kimi 正在處理'), this.secsEl, this.tpsEl, h('span', { class: 'muted hint' }, ' · Esc 停止')));
+      }
+      this.secsEl.textContent = secs ? ` · ${secs}` : '';
+      this.tpsEl.textContent = this.tps ? ` · ${this.tps} tok/s` : '';
+      return;
+    }
+    if (this.workingKind === 'waiting') return;
+    this.workingKind = 'waiting';
+    fill(this.working, h('div', { class: 'working-line' }, h('span', { class: 'om-badge om-badge--warning' }, '等你回應'), h('span', { class: 'muted' }, '在上面的卡片選擇怎麼做')));
   }
 }
 

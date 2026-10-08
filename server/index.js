@@ -229,11 +229,20 @@ app.post('/api/sessions', wrap(async (req) => {
   return runner.summarize(s);
 }));
 
-app.get('/api/sessions/:id', wrap((req) => {
-  const s = mustSession(req.params.id);
-  if (s.kimiSessionId) kimiRemote.view(s);
-  return { ...runner.summarize(s), seq: s.seq || 0, events: s.events, allowedTools: s.allowedTools };
-}));
+// A conversation with all its events, as of `seq`. Taken in one go (the
+// events are copied, which is quick) and written out in slices, so a big
+// one does not hold up the live stream.
+const snapshotOf = (s) => ({ ...runner.summarize(s), seq: s.seq || 0, allowedTools: s.allowedTools, events: s.events.map((e) => ({ ...e })) });
+
+app.get('/api/sessions/:id', async (req, res) => {
+  try {
+    const s = mustSession(req.params.id);
+    if (s.kimiSessionId) kimiRemote.view(s);
+    res.type('json').send(await store.jsonInSlices(snapshotOf(s), 'events'));
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message || String(err) });
+  }
+});
 
 // The page pings while a conversation is open, so it stays followed.
 app.post('/api/sessions/:id/viewing', wrap((req) => {
@@ -459,15 +468,101 @@ server.on('upgrade', (req, socket, head) => {
   wss.handleUpgrade(req, socket, head, (ws) => {
     ws.isAlive = true;
     ws.on('pong', () => (ws.isAlive = true));
+    ws.on('message', (data) => {
+      let m;
+      try {
+        m = JSON.parse(data);
+      } catch {
+        return;
+      }
+      if (m.t === 'watch') watch(ws, typeof m.sid === 'string' ? m.sid : null).catch((err) => console.warn('[ws] watch:', err.message));
+    });
     ws.send(JSON.stringify({ t: 'hello' }));
   });
 });
 
-// Each delta is pushed immediately — no batching — so the browser sees the
-// agent's output with only local-pipe latency.
+// The live stream. A page says which conversation it shows ({ t: 'watch',
+// sid }); from then on it gets that conversation's events only, starting
+// with a snapshot sent down the same socket, so nothing can fall between
+// the snapshot and the stream. Messages are sent in bundles, at most one
+// per frame (16 ms). A page that is not keeping up (a slow phone link) is
+// sent no more of the stream until it has caught up, then a fresh
+// snapshot. Pages that never said what they show (an older page still
+// open) get everything, one message at a time, as before.
+const STREAM = new Set(['event', 'patch', 'delta', 'reset']);
+const BUNDLE_MS = 16;
+const BEHIND = 4 * 1024 * 1024; // bytes still waiting to go out, beyond a snapshot
+const CAUGHT_UP = 256 * 1024;
+
+function queue(ws, data) {
+  ws.out.push(data);
+  if (!ws.timer && !ws.holding) ws.timer = setTimeout(() => flushOut(ws), BUNDLE_MS);
+}
+
+function flushOut(ws) {
+  ws.timer = null;
+  if (ws.readyState !== 1 || ws.holding || !ws.out.length) return;
+  const out = ws.out;
+  ws.out = [];
+  const lag = ws.bufferedAmount; // not yet out from earlier sends
+  ws.send(out.length === 1 ? out[0] : `{"t":"batch","items":[${out.join(',')}]}`);
+  // A snapshot takes a while to go out on a slow link: measure falling
+  // behind from what was left right after it, as that drains.
+  if (ws.sentSnapshot) {
+    ws.sentSnapshot = false;
+    ws.base = ws.bufferedAmount;
+  } else {
+    ws.base = Math.min(ws.base || 0, lag);
+    if (lag > ws.base + BEHIND) ws.behind = true;
+  }
+}
+
+async function watch(ws, sid) {
+  ws.watch = sid;
+  ws.out ??= [];
+  ws.behind = false;
+  const token = (ws.watchToken = (ws.watchToken || 0) + 1);
+  if (!sid) return;
+  const s = store.getSession(sid);
+  if (!s) return queue(ws, JSON.stringify({ t: 'snapshot', sid, error: '找不到 session' }));
+  if (s.kimiSessionId) kimiRemote.view(s);
+  // Taken now, in order with the stream: what happens while it is being
+  // written out is queued behind it.
+  const snap = snapshotOf(s);
+  ws.holding = (ws.holding || 0) + 1;
+  try {
+    const body = await store.jsonInSlices(snap, 'events');
+    // Only the newest watch counts (pages switch, resync).
+    if (ws.watchToken === token) {
+      ws.out.unshift(`{"t":"snapshot","sid":${JSON.stringify(sid)},"session":${body}}`);
+      ws.sentSnapshot = true;
+    }
+  } finally {
+    ws.holding--;
+  }
+  if (!ws.holding) flushOut(ws);
+}
+
 function broadcast(msg) {
   const data = JSON.stringify(msg);
-  for (const ws of wss.clients) if (ws.readyState === 1) ws.send(data);
+  const sid = STREAM.has(msg.t) ? msg.sid : null;
+  for (const ws of wss.clients) {
+    if (ws.readyState !== 1) continue;
+    if (ws.watch === undefined) {
+      ws.send(data);
+      continue;
+    }
+    if (sid) {
+      if (ws.watch !== sid) continue;
+      if (ws.behind) {
+        if (ws.bufferedAmount > CAUGHT_UP) continue;
+        // Caught up: start it over from a snapshot.
+        watch(ws, sid).catch(() => {});
+        continue;
+      }
+    }
+    queue(ws, data);
+  }
 }
 runner.setBroadcast(broadcast);
 machines.setBroadcast(broadcast);

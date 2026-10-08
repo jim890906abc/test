@@ -359,7 +359,7 @@ export class Composer {
     // conversation, for as long as they are unfinished. Subagents only as
     // a count: who they are and what each is doing is in the 子代理 pane,
     // which this row opens.
-    const working = (s.agents || []).length;
+    const working = s.agentsWorking || 0;
     if (working) {
       items.push(
         h(

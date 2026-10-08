@@ -39,10 +39,17 @@ export const patch = (p, b) => api('PATCH', p, b);
 export const del = (p) => api('DELETE', p);
 
 // Persistent socket with backoff. onStatus(true|false) reports connectivity;
-// callers resync state after a reconnect.
+// callers resync state after a reconnect (and say again what they watch:
+// the server starts each connection knowing nothing). Returns { send },
+// which drops what is sent while disconnected.
 export function connect(onMessage, onStatus) {
   let delay = 500;
   let ws;
+  const socket = {
+    send(msg) {
+      if (ws?.readyState === 1) ws.send(JSON.stringify(msg));
+    },
+  };
   const open = () => {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
     ws = new WebSocket(`${proto}://${location.host}/ws${token ? `?token=${encodeURIComponent(token)}` : ''}`);
@@ -64,4 +71,5 @@ export function connect(onMessage, onStatus) {
     };
   };
   open();
+  return socket;
 }

@@ -482,6 +482,13 @@ kbd {
 .ev {
   min-width: 0;
 }
+/* Rows scrolled out of view are skipped when the page is laid out and
+   painted (sized as they last were), so a long conversation costs about
+   as much per frame as the part on screen. */
+.column > .ev {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 72px;
+}
 /* The question on screen, pinned at the top once scrolled past */
 .prompt-pin-bar {
   position: sticky;
@@ -1926,13 +1933,17 @@ pre.tail {
   min-height: 0;
 }
 .agent-top {
-  flex: none;
+  flex: 0 1 auto;
+  min-height: 28px;
+  overflow: hidden;
   height: var(--agent-list-h, 230px);
 }
-/* the steps get whatever is left */
+/* the steps get whatever is left; each section can be dragged down to
+   just its header */
 .agent-steps {
-  flex: 1;
-  min-height: 120px;
+  flex: 1 1 0;
+  min-height: 28px;
+  overflow: hidden;
 }
 .agent-sec {
   display: flex;
@@ -2051,10 +2062,11 @@ pre.tail {
   display: none;
 }
 .agent-report {
-  flex: none;
+  flex: 0 1 auto;
   display: flex;
   flex-direction: column;
-  min-height: 0;
+  min-height: 28px;
+  overflow: hidden;
   height: var(--agent-report-h, 240px);
 }
 .agent-report-body {

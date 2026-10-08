@@ -632,6 +632,16 @@ async function startSession({ text, images }) {
 let composer = null;
 let artifactView = null;
 
+// The conversation on screen is followed over the socket: { t: 'watch' }
+// brings a snapshot of it, then its events, in order on the same socket.
+// Asking again (a gap, a reset, a reconnect) starts over from a snapshot;
+// until it arrives, events are left alone (the snapshot has them).
+let socket = null;
+function watchCurrent() {
+  if (S.cur) S.cur.syncing = true;
+  socket?.send({ t: 'watch', sid: S.cur?.id || null });
+}
+
 function leaveSession() {
   if (!S.cur) return;
   if (['agents', 'todos'].includes(S.panel?.tab)) hidePanel();
@@ -641,6 +651,7 @@ function leaveSession() {
   S.artifacts = [];
   artifactView?.destroy();
   artifactView = null;
+  watchCurrent();
 }
 
 async function openSession(id) {
@@ -649,7 +660,7 @@ async function openSession(id) {
   S.route = `s:${id}`;
   if (S.panel?.tab === 'artifact') hidePanel();
   const summary = S.sessions.get(id);
-  const cur = { id, summary, seq: 0, transcript: null, loading: true };
+  const cur = { id, summary, seq: 0, transcript: null, loading: true, syncing: true };
   S.cur = cur;
   // Keeps the conversation followed on the machine while it is open.
   cur.ping = setInterval(() => document.visibilityState === 'visible' && post(`/sessions/${id}/viewing`).catch(() => {}), 60_000);
@@ -676,12 +687,11 @@ async function openSession(id) {
     onFlush: (ids) => {
       if (S.cur !== cur || !composer) return;
       syncAgentPanel(ids);
-      const agents = cur.transcript.runningAgents();
       // The tray shows only how many: redraw when that changes.
-      const sig = String(agents.length);
-      if (sig === cur.agentSig) return;
-      cur.agentSig = sig;
-      composer.update({ agents });
+      const n = cur.transcript.runningCount();
+      if (n === cur.agentsWorking) return;
+      cur.agentsWorking = n;
+      composer.update({ agentsWorking: n });
     },
   });
   composer ??= new Composer({
@@ -703,20 +713,26 @@ async function openSession(id) {
     onCancelScheduled: cancelScheduled,
   });
   composer.setKey(id);
-  composer.update({ agents: [] });
+  composer.update({ agentsWorking: 0 });
+  cur.composerSig = '';
   fill($view, h('div', { class: 'session' }, cur.transcript.el, h('div', { class: 'composer-dock' }, composer.el)));
   renderToolbar();
   renderSidebar();
-  try {
-    const full = await get(`/sessions/${id}`);
-    if (S.cur !== cur) return;
-    applySnapshot(full);
-  } catch (err) {
-    if (S.cur !== cur) return;
-    if (err.status === 404) return go('#/');
-    fill($view, h('div', { class: 'loading' }, err.message));
-  }
+  watchCurrent();
   composer.focus();
+  // No socket yet (it is still connecting, or down): over HTTP after a
+  // moment, so the conversation shows anyway.
+  setTimeout(async () => {
+    if (S.cur !== cur || !cur.loading || S.socketOpen) return;
+    try {
+      const full = await get(`/sessions/${id}`);
+      if (S.cur === cur && cur.loading) applySnapshot(full);
+    } catch (err) {
+      if (S.cur !== cur) return;
+      if (err.status === 404) return go('#/');
+      fill($view, h('div', { class: 'loading' }, err.message));
+    }
+  }, S.socketOpen ? 0 : 2500);
 }
 
 function applySnapshot(full) {
@@ -724,10 +740,11 @@ function applySnapshot(full) {
   const { events, seq, ...summary } = full;
   cur.summary = summary;
   cur.seq = seq;
-  cur.loading = false;
+  cur.loading = true; // pages already there are not "new" while it loads
   S.sessions.set(summary.id, summary);
   cur.transcript.opts.cwd = summary.cwd;
   cur.transcript.load(events);
+  cur.loading = false;
   cur.transcript.setStatus(summary.status, busy(summary.status) ? lastUserTs(events) : null, summary.meta?.tps || 0);
   S.artifacts = withOpened(cur.transcript.artifacts());
   cur.knownArtifacts = new Set(S.artifacts.map((a) => a.path));
@@ -745,15 +762,6 @@ function lastUserTs(events) {
   return [...events].reverse().find((e) => e.type === 'user')?.ts || Date.now();
 }
 
-async function resync() {
-  if (!S.cur) return;
-  const cur = S.cur;
-  try {
-    const full = await get(`/sessions/${cur.id}`);
-    if (S.cur === cur) applySnapshot(full);
-  } catch {}
-}
-
 function updateComposer() {
   const s = S.cur?.summary;
   if (!s || !composer) return;
@@ -762,7 +770,7 @@ function updateComposer() {
     drawTodos();
   }
   const meta = s.meta || {};
-  composer.update({
+  const state = {
     running: s.status === 'running',
     awaiting: s.status === 'awaiting_permission',
     queue: meta.queue || [],
@@ -780,7 +788,13 @@ function updateComposer() {
     guess: Boolean(meta.guess),
     autoPause: s.autoPause || null,
     scheduled: s.scheduled || [],
-  });
+  };
+  // Summaries arrive many times a second while Kimi works (speed, context);
+  // redraw the controls only when something they show changed.
+  const sig = JSON.stringify(state);
+  if (S.cur.composerSig === sig) return;
+  S.cur.composerSig = sig;
+  composer.update(state);
 }
 
 function sidebarToggle() {
@@ -966,8 +980,21 @@ const PANES = {
     min: () => 320,
     max: () => window.innerWidth - ($app.classList.contains('no-sidebar') ? 0 : $sidebar.offsetWidth) - 360,
   },
-  agentListH: { v: '--agent-list-h', def: () => 230, min: () => 52, max: () => $panel.offsetHeight - rawPane('agentReportH') - 180 },
-  agentReportH: { v: '--agent-report-h', def: () => 240, min: () => 72, max: () => $panel.offsetHeight - rawPane('agentListH') - 180 },
+  // 子代理: the list and the report can each go from just their header to
+  // everything the steps leave (down to the steps' own header).
+  agentListH: { v: '--agent-list-h', def: () => 230, min: () => agentBar(), max: () => agentRoom() - agentBar() - reportShown() },
+  agentReportH: { v: '--agent-report-h', def: () => 240, min: () => agentBar(), max: () => agentRoom() - agentBar() - Math.min(rawPane('agentListH'), agentRoom()) },
+};
+// The 子代理 pane's height below its tabs, and one section header's.
+const agentPane = () => $panel.querySelector('.panel-agents');
+const agentBar = () => agentPane()?.querySelector('.agent-sec')?.offsetHeight || 28;
+function agentRoom() {
+  const el = agentPane();
+  return el ? el.clientHeight - (el.querySelector('.panel-head')?.offsetHeight || 48) : $panel.offsetHeight - 48;
+}
+const reportShown = () => {
+  const r = agentPane()?.querySelector('.agent-report');
+  return r && !r.hidden ? Math.min(rawPane('agentReportH'), agentRoom()) : 0;
 };
 
 function savedPanes() {
@@ -1060,7 +1087,7 @@ function emptyPane(tab, text) {
 // useful right now. Every available pane shows as a tab in the head.
 function openPanel() {
   if (S.artifacts.length) return showArtifact();
-  if (S.cur?.transcript?.runningAgents().length) return showAgents();
+  if (S.cur?.transcript?.runningCount()) return showAgents();
   if (S.cur?.summary?.meta?.todos?.length) return showTodos();
   return showChanges();
 }
@@ -1349,38 +1376,57 @@ function agentModel(a) {
   return [m, e].filter(Boolean).join(' · ');
 }
 
+// Rows are built once per subagent and then only have their text updated
+// (the list is drawn several times a second while they work); rebuilding
+// them would also restart their spinners.
 function drawAgentList() {
   if (!agentPanel || !S.cur) return;
   const all = S.cur.transcript.agentList();
-  const sig = JSON.stringify([agentPanel.id, all]);
-  if (sig === agentPanel.sig) return;
-  agentPanel.sig = sig;
   const status = (a) => (a.running ? h('span', { class: 'spinner', 'aria-label': '執行中' }) : a.failed ? h('span', { class: 'om-badge om-badge--danger' }, '失敗') : a.stopped ? h('span', { class: 'om-badge' }, '已中斷') : h('span', { class: 'om-badge om-badge--success' }, '完成'));
-  fill(
-    agentPanel.list,
-    ...[...all].reverse().map((a) =>
-      h(
+  const rows = (agentPanel.rows ??= new Map());
+  const els = [...all].reverse().map((a) => {
+    const shape = JSON.stringify([a.id === agentPanel.id, a.name, a.background, agentModel(a), a.running, a.failed, a.stopped]);
+    let r = rows.get(a.id);
+    if (r?.shape !== shape) {
+      const desc = h('span', { class: 'agent-item-desc' });
+      const meta = h('span', { class: 'agent-item-meta' });
+      const el = h(
         'button',
         { class: `agent-item${a.id === agentPanel.id ? ' on' : ''}`, type: 'button', onclick: () => a.id !== agentPanel.id && showAgents(a.id) },
         icon('agents'),
-        h(
-          'span',
-          { class: 'agent-item-text' },
-          h('span', { class: 'agent-item-name' }, a.name ? `子代理 · ${a.name}` : '子代理', a.background ? h('span', { class: 'om-badge' }, '背景') : null, agentModel(a) ? h('span', { class: 'agent-item-model' }, agentModel(a)) : null),
-          h('span', { class: 'agent-item-desc' }, a.running && a.activity ? `${a.description} · ${a.activity}` : a.description),
-        ),
-        a.steps ? h('span', { class: 'agent-item-meta' }, `${a.steps} 步`) : null,
+        h('span', { class: 'agent-item-text' }, h('span', { class: 'agent-item-name' }, a.name ? `子代理 · ${a.name}` : '子代理', a.background ? h('span', { class: 'om-badge' }, '背景') : null, agentModel(a) ? h('span', { class: 'agent-item-model' }, agentModel(a)) : null), desc),
+        meta,
         status(a),
-      ),
-    ),
-  );
+      );
+      r = { shape, el, desc, meta };
+      rows.set(a.id, r);
+    }
+    const d = a.running && a.activity ? `${a.description} · ${a.activity}` : a.description;
+    if (r.desc.textContent !== d) r.desc.textContent = d;
+    const m = a.steps ? `${a.steps} 步` : '';
+    if (r.meta.textContent !== m) r.meta.textContent = m;
+    r.meta.hidden = !a.steps;
+    return r.el;
+  });
+  const list = agentPanel.list;
+  if (els.length !== list.children.length || els.some((el, i) => list.children[i] !== el)) list.replaceChildren(...els);
   const cur = all.find((a) => a.id === agentPanel.id);
   agentPanel.transcript.setStatus(cur?.running ? 'running' : 'idle');
   const working = all.filter((a) => a.running).length;
   agentPanel.count.textContent = [all.length > 1 ? `${all.length} 個` : '', working ? `${working} 個在工作` : ''].filter(Boolean).join(' · ');
-  fill(agentPanel.stepsLabel, cur ? [cur.name ? `${cur.name} · ` : '', cur.description || '', cur.running ? h('span', { class: 'spinner' }) : null] : null);
-  fill(agentPanel.summary, cur?.summary ? renderMarkdown(cur.summary) : null);
-  agentPanel.report.hidden = !cur?.summary;
+  const label = cur ? JSON.stringify([cur.name, cur.description, cur.running]) : '';
+  if (agentPanel.labelKey !== label) {
+    agentPanel.labelKey = label;
+    fill(agentPanel.stepsLabel, cur ? [cur.name ? `${cur.name} · ` : '', cur.description || '', cur.running ? h('span', { class: 'spinner' }) : null] : null);
+  }
+  if (agentPanel.summaryText !== (cur?.summary || '')) {
+    agentPanel.summaryText = cur?.summary || '';
+    fill(agentPanel.summary, cur?.summary ? renderMarkdown(cur.summary) : null);
+  }
+  if (agentPanel.report.hidden !== !cur?.summary) {
+    agentPanel.report.hidden = !cur?.summary;
+    applyPanes(); // the list may now have more room, or less
+  }
 }
 
 // New steps of the chosen subagent, as the conversation updates.
@@ -1393,7 +1439,11 @@ function syncAgentPanel(ids) {
     agentPanel.ids.add(id);
     agentPanel.transcript.add({ ...e, parent: e.parent === agentPanel.id ? undefined : e.parent });
   }
-  drawAgentList();
+  // The list (each one's latest step) a few times a second is plenty.
+  agentPanel.listTimer ??= setTimeout(() => {
+    if (agentPanel) agentPanel.listTimer = null;
+    drawAgentList();
+  }, 200);
 }
 
 // 待辦 tab: the conversation's whole todo list.
@@ -2295,13 +2345,25 @@ function onMessage(m) {
       S.sessions.delete(m.sid);
       if (S.cur?.id === m.sid) go('#/');
       return renderSidebar();
+    case 'batch':
+      for (const x of m.items) onMessage(x);
+      return;
+    case 'snapshot': {
+      const cur = S.cur;
+      if (!cur || cur.id !== m.sid) return;
+      if (m.error) return cur.loading ? go('#/') : undefined;
+      cur.syncing = false;
+      return applySnapshot(m.session);
+    }
     case 'event':
     case 'patch':
     case 'delta':
     case 'reset': {
       const cur = S.cur;
-      if (!cur || cur.id !== m.sid || cur.loading) return;
-      if (m.t === 'reset' || m.seq !== cur.seq + 1) return resync();
+      if (!cur || cur.id !== m.sid || cur.syncing) return;
+      if (m.t === 'reset') return watchCurrent();
+      if (m.seq <= cur.seq) return; // already in the snapshot
+      if (m.seq !== cur.seq + 1) return watchCurrent();
       cur.seq = m.seq;
       const t = cur.transcript;
       if (m.t === 'event') t.add(m.ev);
@@ -2365,11 +2427,13 @@ async function start() {
     return;
   }
   await Promise.all([loadMachines(), loadSessions()]).catch(fail);
-  connect(onMessage, (ok) => {
+  socket = connect(onMessage, (ok) => {
     const was = S.online;
     S.online = ok;
+    S.socketOpen = ok;
     drawFoot();
-    if (ok && !was) Promise.all([loadMachines(), loadSessions()]).then(resync).catch(() => {});
+    if (ok) watchCurrent();
+    if (ok && !was) Promise.all([loadMachines(), loadSessions()]).catch(() => {});
   });
   route();
 }

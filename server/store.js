@@ -1,5 +1,7 @@
 // Persistence for agents and sessions. Everything lives as JSON under DATA_DIR
-// so the hub needs no database; writes are debounced per session.
+// so the hub needs no database. Session writes are debounced, and made in
+// slices that give way to everything else: a big conversation (megabytes of
+// events) written in one go would hold up the live stream each time.
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -81,9 +83,13 @@ export function deleteAgent(id) {
 
 const sessions = new Map();
 const saveTimers = new Map();
+const saving = new Map(); // id -> { again }: a write in progress
+const SAVE_DELAY = 1500;
 
 export function loadSessions() {
   for (const file of fs.readdirSync(SESSIONS_DIR)) {
+    // Left by a write the hub was stopped in the middle of.
+    if (file.endsWith('.tmp')) fs.rmSync(path.join(SESSIONS_DIR, file), { force: true });
     if (!file.endsWith('.json')) continue;
     try {
       const s = JSON.parse(fs.readFileSync(path.join(SESSIONS_DIR, file), 'utf8'));
@@ -128,34 +134,85 @@ export function createSession(fields) {
   return session;
 }
 
+// `immediate` starts the write now instead of after the debounce.
 export function saveSession(session, { immediate = false } = {}) {
   session.updatedAt = Date.now();
   if (immediate) return saveSessionNow(session);
   if (saveTimers.has(session.id)) return;
   saveTimers.set(
     session.id,
-    setTimeout(() => saveSessionNow(session), 400),
+    setTimeout(() => saveSessionNow(session), SAVE_DELAY),
   );
 }
+
+const sessionFile = (id) => path.join(SESSIONS_DIR, `${id}.json`);
 
 function saveSessionNow(session) {
   clearTimeout(saveTimers.get(session.id));
   saveTimers.delete(session.id);
   if (!sessions.has(session.id)) return;
-  writeJsonAtomic(path.join(SESSIONS_DIR, `${session.id}.json`), session);
+  // One write at a time per session; changes made meanwhile get the next.
+  const busy = saving.get(session.id);
+  if (busy) return void (busy.again = true);
+  const job = { again: false };
+  saving.set(session.id, job);
+  writeSession(session)
+    .catch((err) => console.warn(`[store] saving ${session.id}: ${err.message}`))
+    .finally(() => {
+      saving.delete(session.id);
+      if (job.again) saveSessionNow(session);
+    });
+}
+
+async function writeSession(session) {
+  const text = await jsonInSlices(session, 'events');
+  if (!sessions.has(session.id)) return;
+  const file = sessionFile(session.id);
+  const tmp = `${file}.${process.pid}.w.tmp`;
+  await fs.promises.writeFile(tmp, text);
+  // Deleted while it was being written: do not bring it back.
+  if (!sessions.has(session.id)) return fs.promises.rm(tmp, { force: true });
+  fs.renameSync(tmp, file);
+}
+
+// JSON of `obj` without holding the event loop: the list under `key`
+// (nearly all of a session) goes in slices, with a pause after each. Items
+// changed while it runs may be caught before or after the change; each is
+// whole either way.
+export async function jsonInSlices(obj, key, slice = 200) {
+  const list = obj[key] || [];
+  const n = list.length;
+  const { [key]: _, ...rest } = obj;
+  const head = JSON.stringify(rest);
+  const parts = [head === '{}' ? '{' : `${head.slice(0, -1)},`, `${JSON.stringify(key)}:[`];
+  for (let i = 0; i < n; i += slice) {
+    if (i) {
+      parts.push(',');
+      await new Promise((r) => setImmediate(r));
+    }
+    parts.push(list.slice(i, Math.min(i + slice, n)).map((x) => JSON.stringify(x)).join(','));
+  }
+  parts.push(']}');
+  return parts.join('');
 }
 
 export function deleteSession(id) {
   clearTimeout(saveTimers.get(id));
   saveTimers.delete(id);
   sessions.delete(id);
-  fs.rmSync(path.join(SESSIONS_DIR, `${id}.json`), { force: true });
+  fs.rmSync(sessionFile(id), { force: true });
 }
 
+// On shutdown: everything not yet on disk, written right away.
 export function flushAll() {
-  for (const id of [...saveTimers.keys()]) {
+  for (const id of new Set([...saveTimers.keys(), ...saving.keys()])) {
+    clearTimeout(saveTimers.get(id));
+    saveTimers.delete(id);
     const s = sessions.get(id);
-    if (s) saveSessionNow(s);
+    if (!s) continue;
+    const tmp = `${sessionFile(id)}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(s));
+    fs.renameSync(tmp, sessionFile(id));
   }
 }
 

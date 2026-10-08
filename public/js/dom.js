@@ -92,10 +92,18 @@ const P = {
   pause: '<path d="M9 6.5v11M15 6.5v11"/>',
 };
 
+// Parsed once per icon, then copied: rows are redrawn many times a second
+// while Kimi works.
+const iconCache = new Map();
 export function icon(name, cls = '') {
-  const span = document.createElement('span');
-  span.innerHTML = `<svg class="om-icon ${cls}" viewBox="0 0 24 24" aria-hidden="true">${P[name] || ''}</svg>`;
-  return span.firstChild;
+  const key = `${name} ${cls}`;
+  let svg = iconCache.get(key);
+  if (!svg) {
+    const span = document.createElement('span');
+    span.innerHTML = `<svg class="om-icon ${cls}" viewBox="0 0 24 24" aria-hidden="true">${P[name] || ''}</svg>`;
+    iconCache.set(key, (svg = span.firstChild));
+  }
+  return svg.cloneNode(true);
 }
 
 export function esc(s) {

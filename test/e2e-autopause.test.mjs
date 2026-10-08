@@ -175,9 +175,8 @@ test('auto-pause: 「優雅暫停」 at the mark, 「繼續」 after the 5-hour 
   const on = await api('POST', `/sessions/${s.id}/autopause`, { enabled: true, threshold: 80 });
   assert.equal(on.autoPause.enabled, true);
   assert.equal(on.autoPause.threshold, 80);
-  // Kept with the conversation on disk.
-  const file = JSON.parse(fs.readFileSync(path.join(TMP, 'data', 'sessions', `${s.id}.json`), 'utf8'));
-  assert.equal(file.autoPause.enabled, true);
+  // Kept with the conversation on disk (written in the background).
+  await until(async () => JSON.parse(fs.readFileSync(path.join(TMP, 'data', 'sessions', `${s.id}.json`), 'utf8')).autoPause?.enabled, 5000, 'saved');
 
   // Kimi works under the mark: nothing.
   bridge.startTurn('做一個大工程');
