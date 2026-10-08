@@ -41,6 +41,11 @@ const BRIDGE_KEY = process.env.AGENT_HUB_BRIDGE_KEY || SECRETS.bridgeKey;
 
 store.loadAgents();
 store.loadSessions();
+// New conversations think as hard as the model allows, unless 設定 says
+// otherwise (set once; K3-256k as the model is set when a machine lists it).
+store.migrateSettings('effort-max', (d) => {
+  if (!d.effort) d.effort = 'max';
+});
 
 const app = express();
 app.use(express.json({ limit: '25mb' }));
@@ -91,7 +96,7 @@ const EDITABLE = ['name', 'enabled', 'color', 'command', 'args', 'env', 'login',
 
 // ------------------------------------------------------------------ meta
 
-const { readSettings, SETTINGS_FILE } = store;
+const { readSettings } = store;
 
 app.get('/api/config', wrap(() => ({
   version: '0.3.0',
@@ -111,7 +116,7 @@ app.put('/api/settings', wrap((req) => {
     planMode: Boolean(d.planMode),
   };
   const settings = { ...readSettings(), defaults };
-  fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2));
+  store.writeSettings(settings);
   return settings;
 }));
 

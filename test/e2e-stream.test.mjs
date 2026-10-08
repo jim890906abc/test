@@ -52,7 +52,10 @@ function fakeMachine(key) {
     let out = { ok: true };
     if (m.op === 'kimi.info') out = info;
     else if (m.op === 'kimi.history') out = { frames: [], more: false, before: 0, info };
-    else if (m.op === 'kimi.request') out = { code: 0, data: a.path === '/api/v1/models' ? { items: [] } : {} };
+    else if (m.op === 'kimi.request') {
+      const models = { items: [{ model: 'kimi/k2', display_name: 'K2', support_efforts: ['low', 'high'] }, { model: 'kimi/k3-256k', display_name: 'K3-256k', capabilities: ['always_thinking'], support_efforts: ['low', 'high', 'max'], default_effort: 'high', max_context_size: 262144 }] };
+      out = { code: 0, data: a.path === '/api/v1/models' ? models : a.path === '/api/v1/config' ? { default_model: 'kimi/k2' } : {} };
+    }
     send({ t: 'res', id: m.id, ok: true, data: out });
   });
   const frame = (type, payload) => send({ t: 'kimi.event', frame: { type, session_id: KID, payload: { agentId: 'main', ...payload, sessionId: KID } } });
@@ -175,4 +178,33 @@ test('watching a conversation that does not exist says so; switching to another 
   await sleep(300);
   assert.equal(p.got.slice(before).filter((m) => ['event', 'patch', 'delta'].includes(m.t)).length, 0);
   p.ws.close();
+});
+
+test('a thinking change during a turn shows as for the next turn; 設定 starts at K3-256k, 最高', async () => {
+  // Defaults, set once: 最高 at start, K3-256k once a machine lists it.
+  await api('GET', '/machines/m_s/models');
+  const cfg = await api('GET', '/config');
+  assert.equal(cfg.settings.defaults.effort, 'max');
+  assert.equal(cfg.settings.defaults.model, 'kimi/k3-256k');
+  assert.deepEqual(cfg.settings.migrated.sort(), ['effort-max', 'model-k3-256k']);
+
+  machine.frame('agent.status.updated', { model: 'kimi/k3-256k', thinkingEffort: 'high' });
+  machine.frame('turn.started', { turnId: 't3', promptId: 'p3', origin: { kind: 'user' }, prompt: '長任務' });
+  machine.frame('event.session.work_changed', { busy: true, pending_interaction: 'none' });
+  await until(async () => (await api('GET', `/sessions/${sid}`)).meta.turnEffort === 'high', 5000, 'turn started on high');
+  // Changed to max while it runs (from the hub, Kimi's UI or the terminal).
+  machine.frame('agent.status.updated', { thinkingEffort: 'max' });
+  const during = await until(async () => {
+    const x = await api('GET', `/sessions/${sid}`);
+    return x.meta.effort === 'max' && x;
+  }, 5000, 'max set');
+  assert.equal(during.meta.turnEffort, 'high', 'this turn is still on high');
+  machine.frame('turn.ended', { turnId: 't3', reason: 'completed' });
+  machine.frame('event.session.work_changed', { busy: false, pending_interaction: 'none', last_turn_reason: 'completed' });
+  const after = await until(async () => {
+    const x = await api('GET', `/sessions/${sid}`);
+    return x.status === 'idle' && x;
+  }, 5000, 'turn over');
+  assert.equal(after.meta.turnEffort, null);
+  assert.equal(after.meta.effort, 'max');
 });

@@ -612,7 +612,10 @@ async function startSession({ text, images }) {
   const cwd = S.home.cwdByMachine?.[m.id] || undefined;
   const mm = machineModels.get(m.id);
   const model = S.home.model && mm?.models?.some((x) => x.id === S.home.model) ? S.home.model : undefined;
-  const effort = model ? S.home.effort : undefined;
+  // The thinking chosen (or from 設定), when the model that will be used
+  // (the one picked, or Kimi's default) offers it.
+  const used = mm?.models?.find((x) => x.id === (model || mm.defaultModel));
+  const effort = S.home.effort && used?.efforts?.includes(S.home.effort) ? S.home.effort : undefined;
   homeComposer.el.classList.add('sending');
   try {
     const s = await post('/sessions', { machineId: m.id, cwd, prompt: text, images, model, effort, permission: S.home.permission, planMode: S.home.planMode || undefined });
@@ -781,6 +784,8 @@ function updateComposer() {
     effort: meta.effort,
     permission: meta.permission,
     planMode: meta.planMode,
+    turnModel: meta.turnModel,
+    turnEffort: meta.turnEffort,
     context: meta.context,
     skills: meta.skills || [],
     terminal: meta.owner === 'tui',
@@ -884,6 +889,11 @@ async function configure(change) {
   if (!s) return;
   try {
     await post(`/sessions/${s.id}/config`, change);
+    // Kimi keeps the turn it is in on what it started with.
+    if (busy(s.status) && (change.model || change.effort)) {
+      const what = change.effort ? `思考強度改成「${EFFORT_LABELS[change.effort] || change.effort}」` : '模型已切換';
+      toast(`${what}，從下一輪開始生效：Kimi 每一輪開始時就固定模型和思考強度，正在進行的這一輪不變`);
+    }
   } catch (err) {
     fail(err);
   }
@@ -2036,13 +2046,15 @@ async function openSettings() {
   const m = homeMachine();
   if (m) await loadMachineModels(m);
   const models = (m && machineModels.get(m.id)?.models) || [];
+  const kimiDefault = (m && machineModels.get(m.id)?.defaultModel) || '';
   const d0 = defaults();
   const form = h('form', { class: 'settings' });
   const modelSel = h('select', { class: 'om-input', name: 'model' }, h('option', { value: '' }, 'Kimi 的預設模型'), ...models.map((x) => h('option', { value: x.id, selected: x.id === d0.model }, x.name || x.id)));
   if (d0.model && !models.some((x) => x.id === d0.model)) modelSel.append(h('option', { value: d0.model, selected: true }, d0.model));
   const effortSel = h('select', { class: 'om-input', name: 'effort' });
   const fillEfforts = () => {
-    const mod = models.find((x) => x.id === modelSel.value);
+    // Kimi's default model has thinking choices too.
+    const mod = models.find((x) => x.id === (modelSel.value || kimiDefault));
     const list = mod?.efforts || [];
     const cur = effortSel.value || d0.effort;
     fill(effortSel, h('option', { value: '' }, '模型預設'), ...list.map((e) => h('option', { value: e, selected: e === cur }, `${EFFORT_LABELS[e] || e}${e === mod.defaultEffort ? '（模型預設）' : ''}`)));

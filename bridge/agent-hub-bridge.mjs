@@ -571,6 +571,9 @@ const KEEP = new Set([
   'subagent.suspended',
   'token_counting.turn_recorded',
   'profile.bind',
+  // A model or thinking change (/model, /effort, the hub's controls) is
+  // recorded as config.update, not as a new profile.bind.
+  'config.update',
   'permission.set_mode',
   'plan_mode.set',
   'tools.update_store',
@@ -673,6 +676,11 @@ function translate(rec, sid, fileAgent = 'main') {
     case 'profile.bind':
       // Subagents bind their own model and thinking too.
       return [f('agent.status.updated', { model: rec.modelAlias, thinkingEffort: rec.thinkingEffort })];
+    case 'config.update': {
+      const effort = rec.thinkingEffort ?? rec.thinkingLevel;
+      if (rec.modelAlias === undefined && effort === undefined) return [];
+      return [f('agent.status.updated', { model: rec.modelAlias, thinkingEffort: effort })];
+    }
     case 'permission.set_mode':
       return a === 'main' ? [f('agent.status.updated', { permission: rec.mode })] : [];
     case 'tools.update_store':
@@ -846,6 +854,9 @@ class DiskSession {
         break;
       case 'profile.bind':
         if (main) (s.model = rec.modelAlias || s.model), (s.effort = rec.thinkingEffort || s.effort);
+        break;
+      case 'config.update':
+        if (main) (s.model = rec.modelAlias || s.model), (s.effort = rec.thinkingEffort || rec.thinkingLevel || s.effort);
         break;
       case 'permission.set_mode':
         if (main) s.permission = rec.mode || s.permission;

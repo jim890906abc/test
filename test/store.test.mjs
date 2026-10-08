@@ -62,3 +62,17 @@ test('a write left half-done by a stop is cleaned up at the next start', () => {
   store.loadSessions();
   assert.equal(fs.existsSync(path.join(TMP, 'sessions', 's_dead.json.123.w.tmp')), false);
 });
+
+test('a change to the defaults is made once; one that cannot be made yet is tried again', () => {
+  store.writeSettings({ defaults: { permission: 'auto' } });
+  assert.equal(store.migrateSettings('a', (d) => void (d.effort = 'max')), true);
+  assert.deepEqual(store.readSettings().defaults, { permission: 'auto', effort: 'max' });
+  // Chosen differently afterwards: stays.
+  store.writeSettings({ ...store.readSettings(), defaults: { effort: 'high' } });
+  assert.equal(store.migrateSettings('a', (d) => void (d.effort = 'max')), false);
+  assert.equal(store.readSettings().defaults.effort, 'high');
+  assert.equal(store.migrateSettings('b', () => false), false);
+  assert.ok(!store.readSettings().migrated.includes('b'));
+  assert.equal(store.migrateSettings('b', (d) => void (d.model = 'k3')), true);
+  assert.equal(store.readSettings().defaults.model, 'k3');
+});

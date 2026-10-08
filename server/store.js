@@ -226,3 +226,19 @@ export function readSettings() {
     return { defaults: {} };
   }
 }
+export function writeSettings(settings) {
+  writeJsonAtomic(SETTINGS_FILE, settings);
+}
+
+// A change to the defaults made once, by name: what is chosen in 設定
+// afterwards stays. `change(defaults)` returns false when it cannot be made
+// yet (it is tried again later).
+export function migrateSettings(name, change) {
+  const st = readSettings();
+  if ((st.migrated || []).includes(name)) return false;
+  st.defaults = { ...(st.defaults || {}) };
+  if (change(st.defaults) === false) return false;
+  st.migrated = [...(st.migrated || []), name];
+  writeSettings(st);
+  return true;
+}

@@ -56,6 +56,12 @@ async function machineModels(machineId) {
   ]);
   const v = { at: Date.now(), defaultModel: config.default_model || '', models: (list.items || []).map(modelInfo) };
   modelCache.set(machineId, v);
+  // K3-256k is the default model in 設定 unless one was chosen (once).
+  store.migrateSettings('model-k3-256k', (d) => {
+    const k3 = v.models.find((m) => /k3[-_ ]?256k/i.test(`${m.id} ${m.name}`));
+    if (!k3) return false;
+    if (!d.model) d.model = k3.id;
+  });
   return v;
 }
 export const modelsFor = (machineId) => machineModels(machineId).then(({ models, defaultModel }) => ({ models, defaultModel }));
@@ -627,6 +633,9 @@ class Mirror {
         if (!main) return;
         this.closeBlock();
         this.turn = { started: now(), input: 0, output: 0, id: p.turnId };
+        // Kimi fixes the model and thinking for the whole turn when it
+        // starts: a change made during it applies from the next one.
+        this.meta({ turnModel: this.session.meta?.model || '', turnEffort: this.session.meta?.effort || '' });
         const kind = p.origin?.kind;
         const text = promptLabel(p);
         if (text != null) this.showPrompt(p.promptId, text, contentImages(p.promptAttachments));
@@ -813,6 +822,7 @@ class Mirror {
       error: p.reason === 'failed',
     });
     this.turn = null;
+    this.meta({ turnModel: null, turnEffort: null });
     for (const [key, ev] of this.tools) if (!lives(ev)) this.tools.delete(key);
     if (!this.batch && this.inTerminal()) setTimeout(() => this.flushTerminalQueue(), 400);
   }
@@ -995,10 +1005,11 @@ class Mirror {
   async configure({ model, effort, permission, planMode }) {
     if (this.inTerminal()) {
       // Kimi's own slash commands; /model and /yolo /auto open a picker that
-      // is confirmed with Enter.
+      // is confirmed with Enter. The model first: a new model may not keep
+      // the thinking set before it.
+      if (typeof model === 'string' && model) await this.tui({ action: 'command', text: `/model ${model}`, confirm: true });
       if (typeof effort === 'string') await this.tui({ action: 'command', text: `/effort ${effort}` });
       if (typeof planMode === 'boolean') await this.tui({ action: 'command', text: `/plan ${planMode ? 'on' : 'off'}` });
-      if (typeof model === 'string' && model) await this.tui({ action: 'command', text: `/model ${model}`, confirm: true });
       if (permission === 'yolo' || permission === 'auto') await this.tui({ action: 'command', text: `/${permission}`, confirm: true });
       else if (permission) throw Object.assign(new Error('要改回「每次詢問」，請在終端機的 Kimi 裡輸入 /permission'), { status: 400 });
       // Kimi journals these with its next turn; show them now.

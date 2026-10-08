@@ -229,6 +229,13 @@ export class Composer {
       h('button', { class: `chip${active ? ' active' : ''}`, type: 'button', title: title || '', 'aria-haspopup': 'menu', dataset: { control }, onclick: (e) => onclick(e.currentTarget) }, iconName ? icon(iconName) : null, h('span', null, label), icon('down', 'caret'));
     const model = this.currentModel();
     const efforts = model?.efforts || [];
+    // Kimi fixes the model and thinking when a turn starts: changed during
+    // it, they say so, until the next turn picks them up.
+    const working = s.running || s.awaiting;
+    const nameOf = (id) => (s.models || []).find((m) => m.id === id)?.name || id;
+    const nextModel = working && s.turnModel && s.model && s.turnModel !== s.model;
+    const nextEffort = working && s.turnEffort && s.effort && s.turnEffort !== s.effort;
+    const effortName = (e) => EFFORT_LABELS[e] || e;
     fill(
       this.left,
       s.terminal ? null : h('button', { class: 'chip icon-only', type: 'button', title: '加入圖片', 'aria-label': '加入圖片', onclick: () => this.file.click() }, icon('attach')),
@@ -236,8 +243,18 @@ export class Composer {
       this.opts.home ? chip(s.machineName || '選擇電腦', (b) => this.opts.onPickMachine(b), { iconName: 'computer', title: '要在哪一台電腦上執行', control: 'machine' }) : null,
       this.opts.home ? chip(s.folderName || '選擇資料夾', (b) => this.opts.onPickFolder(b), { iconName: 'folder', title: '工作資料夾', control: 'folder' }) : null,
       chip(s.planMode ? '計畫模式' : PERMISSION_LABELS[s.permission] || PERMISSION_LABELS.manual, (b) => this.permissionMenu(b), { iconName: s.planMode ? 'map' : 'shield', title: '權限模式', active: s.planMode, control: 'permission' }),
-      s.models?.length ? chip(model?.name || 'Kimi 預設模型', (b) => this.modelMenu(b), { title: '模型', control: 'model' }) : null,
-      efforts.length > 1 ? chip(`思考 ${EFFORT_LABELS[s.effort] || s.effort || EFFORT_LABELS[model.defaultEffort] || '預設'}`, (b) => this.effortMenu(b), { title: '思考強度', control: 'effort' }) : null,
+      s.models?.length
+        ? chip(`${model?.name || 'Kimi 預設模型'}${nextModel ? '（下一輪）' : ''}`, (b) => this.modelMenu(b), {
+            title: nextModel ? `這一輪是用「${nameOf(s.turnModel)}」開始的。Kimi 每一輪開始時就固定模型，「${nameOf(s.model)}」從下一輪起使用` : '模型',
+            control: 'model',
+          })
+        : null,
+      efforts.length > 1
+        ? chip(`思考 ${EFFORT_LABELS[s.effort] || s.effort || EFFORT_LABELS[model.defaultEffort] || '預設'}${nextEffort ? '（下一輪）' : ''}`, (b) => this.effortMenu(b), {
+            title: nextEffort ? `這一輪是用「${effortName(s.turnEffort)}」開始的。Kimi 每一輪開始時就固定思考強度，「${effortName(s.effort)}」從下一輪起使用` : '思考強度',
+            control: 'effort',
+          })
+        : null,
     );
   }
 
@@ -266,7 +283,10 @@ export class Composer {
     const cur = s.model || s.defaultModel;
     openMenu(
       anchor,
-      (s.models || []).map((m) => ({ label: m.name, description: m.id !== m.name ? m.id : null, checked: m.id === cur, onSelect: () => this.opts.onConfig({ model: m.id }) })),
+      [
+        ...(s.running || s.awaiting ? [{ section: '模型 · 從下一輪起使用' }] : []),
+        ...(s.models || []).map((m) => ({ label: m.name, description: m.id !== m.name ? m.id : null, checked: m.id === cur, onSelect: () => this.opts.onConfig({ model: m.id }) })),
+      ],
       { width: 260 },
     );
   }
@@ -278,7 +298,7 @@ export class Composer {
     const cur = s.effort || model.defaultEffort;
     openMenu(
       anchor,
-      [{ section: '思考強度' }, ...model.efforts.map((e) => ({ label: EFFORT_LABELS[e] || e, hint: e === model.defaultEffort ? '預設' : '', checked: e === cur, onSelect: () => this.opts.onConfig({ effort: e }) }))],
+      [{ section: s.running || s.awaiting ? '思考強度 · 從下一輪起使用' : '思考強度' }, ...model.efforts.map((e) => ({ label: EFFORT_LABELS[e] || e, hint: e === model.defaultEffort ? '預設' : '', checked: e === cur, onSelect: () => this.opts.onConfig({ effort: e }) }))],
       { width: 200 },
     );
   }
