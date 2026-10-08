@@ -356,18 +356,20 @@ export class Composer {
       );
     }
     // Subagents at work and the todo list stay here, under the
-    // conversation, for as long as they are unfinished.
-    for (const a of s.agents || []) {
+    // conversation, for as long as they are unfinished. Subagents only as
+    // a count: who they are and what each is doing is in the 子代理 pane,
+    // which this row opens.
+    const working = (s.agents || []).length;
+    if (working) {
       items.push(
         h(
           'button',
-          { class: 'agent-tray', type: 'button', title: '看這個子代理在做什麼', onclick: () => this.opts.onFocusAgent?.(a.id) },
+          { class: 'agent-tray', type: 'button', title: '在側邊面板看每個子代理在做什麼', onclick: () => this.opts.onFocusAgent?.() },
           icon('agents'),
-          h('span', { class: 'agent-tray-name' }, a.name ? `子代理 · ${a.name}` : '子代理'),
-          h('span', { class: 'agent-tray-desc' }, a.description, a.activity ? h('span', { class: 'agent-tray-now' }, ` · ${a.activity}`) : null),
-          a.steps ? h('span', { class: 'agent-tray-meta' }, `${a.steps} 個步驟`) : null,
-          a.background ? h('span', { class: 'om-badge' }, '背景') : null,
+          h('span', { class: 'agent-tray-name' }, '子代理'),
+          h('span', { class: 'agent-tray-desc' }, `${working} 個在工作`),
           h('span', { class: 'spinner', 'aria-label': '執行中' }),
+          icon('chev', 'caret'),
         ),
       );
     }

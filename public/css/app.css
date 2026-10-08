@@ -1636,14 +1636,6 @@ pre.tail {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.agent-tray-now,
-.agent-tray-meta {
-  color: var(--ink-secondary);
-}
-.agent-tray-meta {
-  flex: none;
-  font-variant-numeric: tabular-nums;
-}
 .todo-tray {
   background: var(--window-raised);
   border: 1px solid var(--line);

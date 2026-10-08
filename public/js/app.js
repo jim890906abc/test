@@ -677,7 +677,8 @@ async function openSession(id) {
       if (S.cur !== cur || !composer) return;
       syncAgentPanel(ids);
       const agents = cur.transcript.runningAgents();
-      const sig = JSON.stringify(agents);
+      // The tray shows only how many: redraw when that changes.
+      const sig = String(agents.length);
       if (sig === cur.agentSig) return;
       cur.agentSig = sig;
       composer.update({ agents });
@@ -1375,7 +1376,8 @@ function drawAgentList() {
   );
   const cur = all.find((a) => a.id === agentPanel.id);
   agentPanel.transcript.setStatus(cur?.running ? 'running' : 'idle');
-  agentPanel.count.textContent = all.length > 1 ? `${all.length} 個` : '';
+  const working = all.filter((a) => a.running).length;
+  agentPanel.count.textContent = [all.length > 1 ? `${all.length} 個` : '', working ? `${working} 個在工作` : ''].filter(Boolean).join(' · ');
   fill(agentPanel.stepsLabel, cur ? [cur.name ? `${cur.name} · ` : '', cur.description || '', cur.running ? h('span', { class: 'spinner' }) : null] : null);
   fill(agentPanel.summary, cur?.summary ? renderMarkdown(cur.summary) : null);
   agentPanel.report.hidden = !cur?.summary;
