@@ -437,6 +437,7 @@ export async function deliver(session, text, opts = {}) {
   if (why) throw new Error(why);
   const r = await adapter.send(session, text, opts);
   if (r?.ok === false) throw new Error(r.error || 'Kimi 沒有收到訊息');
+  return r;
 }
 
 export function isRunning(id) {

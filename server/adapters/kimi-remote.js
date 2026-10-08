@@ -29,6 +29,8 @@ const HISTORY_TURNS = 10;
 // machine after this long; opening it again catches up from Kimi's journal.
 const IDLE_FOLLOW_MS = 15 * 60_000;
 const MAX_IMAGE_URL = 600_000; // history images larger than this become a placeholder
+// How often a message waiting to cut in (插隊) is offered to Kimi again.
+const CUT_IN_RETRY_MS = 2000;
 
 export function available(agent) {
   const m = machines.getMachine(agent.machineId);
@@ -217,6 +219,8 @@ class Mirror {
     await Promise.all([this.loadModels(), this.loadSkills(info?.workspace_id)].map((p) => p.catch(() => {})));
     this.touch();
     this.live = true;
+    // Waiting to cut in from before (the hub restarted meanwhile).
+    if (this.queue().some((q) => q.cutIn && !q.steered)) this.retryCutIns();
     await this.applyDefaults();
   }
 
@@ -631,6 +635,8 @@ class Mirror {
     switch (type) {
       case 'turn.started': {
         if (!main) return;
+        // A new turn may be one Kimi lets a waiting message into.
+        if (!this.batch && this.cutInTimer) setTimeout(() => this.tryCutIns(), 300);
         this.closeBlock();
         this.turn = { started: now(), input: 0, output: 0, id: p.turnId };
         // Kimi fixes the model and thinking for the whole turn when it
@@ -883,11 +889,12 @@ class Mirror {
   async steerQueued(promptId) {
     const q = this.queue().find((x) => x.promptId === promptId);
     if (!q || q.steered) return;
-    this.meta({ queue: this.queue().map((x) => (x === q ? { ...x, steered: true } : x)) });
     if (q.terminal) {
+      this.markQueued(promptId, { steered: true });
       const busy = ['running', 'awaiting_permission'].includes(this.session.status);
       await this.tui({ action: 'send', text: q.text, mode: busy ? 'steer' : 'enter' });
     } else {
+      this.markQueued(promptId, { cutIn: true });
       const post = this.inflight?.get(promptId);
       if (post && (await post.catch(() => null))?.status !== 'queued') return;
       await this.steer(promptId);
@@ -904,7 +911,7 @@ class Mirror {
     this.remember(promptId, note);
     const thumbs = images.map((i) => i.thumb || `data:${i.mimeType};base64,${i.data}`);
     const busy = ['running', 'awaiting_permission'].includes(this.session.status);
-    if (busy) this.meta({ queue: [...this.queue(), { promptId, text, images: thumbs, note }] });
+    if (busy) this.meta({ queue: [...this.queue(), { promptId, text, images: thumbs, note, ...(steer ? { cutIn: true } : {}) }] });
     else {
       ctx.emit({ type: 'user', text, images: thumbs, promptId, source: 'hub', note });
       ctx.setStatus('running');
@@ -929,11 +936,48 @@ class Mirror {
     }
   }
 
+  // Kimi takes a message into the running turn only when a message started
+  // that turn; a turn it started itself (to go on after a background
+  // subagent finished, say) refuses it. So a message asked to cut in waits
+  // as `cutIn` and is offered again every few seconds and whenever a turn
+  // starts, until Kimi takes it, it starts as a turn of its own (at the
+  // latest when this turn ends), or it is cancelled. Nothing is stopped.
   async steer(promptId) {
     try {
       await this.api('POST', this.path(`/prompts/${promptId}:steer`), {});
+      this.markQueued(promptId, { steered: true, cutIn: false });
+      return true;
     } catch {
-      // Already started as its own turn; nothing to do.
+      this.markQueued(promptId, { cutIn: true });
+      this.retryCutIns();
+      return false;
+    }
+  }
+
+  markQueued(promptId, fields) {
+    if (this.queue().some((q) => q.promptId === promptId)) this.meta({ queue: this.queue().map((q) => (q.promptId === promptId ? { ...q, ...fields } : q)) });
+  }
+
+  retryCutIns() {
+    if (this.cutInTimer) return;
+    this.cutInTimer = setInterval(() => this.tryCutIns(), CUT_IN_RETRY_MS);
+    this.cutInTimer.unref?.();
+  }
+
+  async tryCutIns() {
+    const waiting = this.queue().filter((q) => q.cutIn && !q.steered && !q.terminal);
+    // Kimi starts a waiting message itself once it stops.
+    if (!waiting.length || !['running', 'awaiting_permission'].includes(this.session.status)) {
+      clearInterval(this.cutInTimer);
+      this.cutInTimer = null;
+      return;
+    }
+    if (this.cuttingIn) return;
+    this.cuttingIn = true;
+    try {
+      for (const q of waiting) if (!this.inflight?.has(q.promptId)) await this.steer(q.promptId);
+    } finally {
+      this.cuttingIn = false;
     }
   }
 
@@ -1192,6 +1236,7 @@ machines.onSessionChange((machineId, entry) => {
 });
 
 export function dispose(session) {
+  clearInterval(mirrors.get(session.id)?.cutInTimer);
   mirrors.delete(session.id);
   byKimi.delete(`${session.machineId}:${session.kimiSessionId}`);
   machines.rpc(session.machineId, 'kimi.unsubscribe', { sessionIds: [session.kimiSessionId] }).catch(() => {});

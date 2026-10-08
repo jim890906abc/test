@@ -69,7 +69,9 @@ export function whenText(ts) {
 // What auto-pause is doing for a conversation: a short label (badge) and a
 // sentence (tray, dialog). Null when it is off.
 // Also covers 「額度恢復後送出」 set by hand (auto-pause itself may be off).
-export function autoPauseStatus(ap) {
+// `queue`: the conversation's waiting messages, to tell whether 「優雅暫停」
+// is still waiting to cut in.
+export function autoPauseStatus(ap, queue = []) {
   if (!ap?.enabled && ap?.phase !== 'paused') return null;
   const w = ap.wait || {};
   const at = whenText;
@@ -80,6 +82,7 @@ export function autoPauseStatus(ap) {
     let detail;
     if (ap.error) detail = `${ap.error}（會再試）`;
     else if (w.kind === 'offline') detail = '電腦離線，連上後繼續';
+    else if (w.kind === 'stopping' && !manual && (queue || []).some((q) => q.promptId === ap.pausePrompt && !q.steered)) detail = `「優雅暫停」等待插隊（${CUT_IN_WHY}），之後${resume(ap.resetAt)}`;
     else if (w.kind === 'stopping') detail = `等 Kimi ${manual ? '' : '收尾'}停下，之後${resume(ap.resetAt)}`;
     else if (w.kind === 'usage') detail = `5 小時額度還沒恢復（已用 ${Math.round(w.used * 100)}%）${w.until ? `，${at(w.until)}重置後再看` : '，稍後再看'}`;
     else if (w.kind === 'confirm') detail = `重置時間到了，確認 5 小時額度恢復後送出「${text}」`;
@@ -93,6 +96,8 @@ export function autoPauseStatus(ap) {
   if (w.kind === 'quiet') return { label, detail: `這個 5 小時視窗已經暫停過，${at(w.until)}重置後重新監看`, tone: '' };
   return { label, detail: `5 小時額度用到 ${ap.threshold}% 時送出「優雅暫停」`, tone: '' };
 }
+
+const CUT_IN_WHY = 'Kimi 正在跑它自己開的這一輪，例如處理背景子代理的結果，這種回合 Kimi 不收插隊；每 2 秒再試一次，最晚這一輪結束時第一個讀到';
 
 export class Composer {
   // opts: { home, placeholder, onSend({ text, images }), onCommand(name, args),
@@ -335,7 +340,7 @@ export class Composer {
     const open = todos.filter((t) => t.status !== 'done' && t.status !== 'completed');
     const items = [];
     // Auto-pause, while it has paused the conversation or has a problem.
-    const ap = autoPauseStatus(s.autoPause);
+    const ap = autoPauseStatus(s.autoPause, queue);
     if (ap && (ap.paused || ap.tone === 'danger')) {
       items.push(
         h(
@@ -368,9 +373,9 @@ export class Composer {
         h(
           'div',
           { class: 'queued' },
-          h('span', { class: 'queued-label' }, q.steered ? '下一步插入' : '排隊中'),
+          h('span', { class: 'queued-label', title: q.cutIn && !q.steered ? CUT_IN_WHY : undefined }, q.steered ? '下一步插入' : q.cutIn ? '等待插隊' : '排隊中'),
           h('span', { class: 'queued-text' }, q.text || (q.images?.length ? `${q.images.length} 張圖片` : '')),
-          !q.steered && !q.foreign ? h('button', { class: 'om-btn om-btn--sm', type: 'button', title: '讓 Kimi 在下一步就讀到這則訊息，不會中斷它', onclick: () => this.opts.onSteerQueued(q.promptId) }, '插隊') : null,
+          !q.steered && !q.cutIn && !q.foreign ? h('button', { class: 'om-btn om-btn--sm', type: 'button', title: '讓 Kimi 在下一步就讀到這則訊息，不會中斷它', onclick: () => this.opts.onSteerQueued(q.promptId) }, '插隊') : null,
           q.foreign ? null : h('button', { class: 'om-btn om-btn--toolbar om-btn--sm', type: 'button', title: '取消這則訊息', 'aria-label': '取消這則訊息', onclick: () => this.opts.onCancelQueued(q.promptId) }, icon('x')),
         ),
       );

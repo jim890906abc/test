@@ -1786,7 +1786,7 @@ async function accountDialog(machineId, rows = null) {
 // The hub watches the 5-hour quota and types 「優雅暫停」 / 「繼續」 itself;
 // these only turn it on and off and show what it is doing.
 function autoPauseBadge(s) {
-  const st = autoPauseStatus(s.autoPause);
+  const st = autoPauseStatus(s.autoPause, s.meta?.queue);
   if (!st) return null;
   return h('button', { class: `om-badge ap-badge${st.tone ? ` om-badge--${st.tone}` : ''}`, type: 'button', title: st.detail, onclick: autoPauseDialog }, icon('pause'), st.label);
 }
@@ -1932,7 +1932,7 @@ function scheduleDialog() {
   // What is waiting to go out in this conversation.
   const drawPending = () => {
     const cur = S.sessions.get(sid) || s;
-    const ap = autoPauseStatus(cur.autoPause);
+    const ap = autoPauseStatus(cur.autoPause, cur.meta?.queue);
     const rows = [
       ...(ap?.paused ? [h('div', { class: 'sched-item' }, icon('pause'), h('span', { class: 'sched-item-text' }, ap.detail), h('button', { class: 'om-btn om-btn--toolbar om-btn--sm', type: 'button', title: '不要送出', 'aria-label': '不要送出', onclick: cancelAutoResume }, icon('x')))] : []),
       ...(cur.scheduled || []).map((q) => h('div', { class: `sched-item${q.gaveUp ? ' danger' : ''}` }, icon('clock'), h('span', { class: 'sched-item-text' }, `${q.at > Date.now() ? whenText(q.at) : ''}送出「${q.text}」`, q.error || q.wait ? h('span', { class: 'muted' }, ` · ${q.wait === 'offline' ? '電腦離線，連上後送出' : q.error}`) : null), h('button', { class: 'om-btn om-btn--toolbar om-btn--sm', type: 'button', title: '取消', 'aria-label': '取消這則定時訊息', onclick: () => cancelScheduled(q.id) }, icon('x')))),
@@ -2007,7 +2007,7 @@ function autoPauseDialog() {
   const drawStatus = () => {
     const cur = S.sessions.get(sid) || s;
     const ap = cur.autoPause || {};
-    const st = autoPauseStatus(ap);
+    const st = autoPauseStatus(ap, cur.meta?.queue);
     const readOnly = cur.meta?.owner === 'tui' && !cur.meta?.controllable;
     fill(
       statusBox,

@@ -54,6 +54,11 @@ function fakeMachine(key) {
     // Kimi's ratios stuck at 0 (MoonshotAI/kimi-code#3908): Kimi says 0%;
     // the counts sent along with them say how much is used.
     ratioStuck: false,
+    // Kimi refusing to take a message into the running turn (one it started
+    // itself, after a background subagent finished).
+    refuseSteer: false,
+    refused: [], // prompt ids
+    aborts: 0,
   };
   const ws = new WebSocket(`ws://127.0.0.1:${PORT}/bridge?key=${encodeURIComponent(key)}`);
   const send = (m) => ws.send(JSON.stringify(m));
@@ -108,6 +113,11 @@ function fakeMachine(key) {
       return ok({ prompt_id: body.prompt_id, status: 'started' });
     }
     const steer = p.match(/\/prompts\/([\w-]+):steer$/);
+    if (method === 'POST' && steer && k.refuseSteer) {
+      k.refused.push(steer[1]);
+      return { code: 40400, msg: 'no active prompt to steer into', data: null };
+    }
+    if (method === 'POST' && /:abort$/.test(p)) k.aborts++;
     if (method === 'POST' && steer) {
       k.steers.push(steer[1]);
       const q = k.prompts.find((x) => x.promptId === steer[1]);
@@ -342,4 +352,51 @@ test('Kimi says 0% while the counts sent along say 85%: the counts are shown, an
   assert.match(pauses(cur).at(-1).note, /已用 85%（門檻 80%）/);
   bridge.endTurn();
   bridge.ratioStuck = false;
+});
+
+test('「優雅暫停」 into a turn Kimi will not take it into yet: offered again until it does, nothing stopped', async () => {
+  const s = await api('POST', `/machines/${MID}/kimi/${KID}/attach`);
+  const session = () => api('GET', `/sessions/${s.id}`);
+  await until(async () => (await session()).status === 'idle', 5000, 'idle');
+  await api('POST', `/sessions/${s.id}/autopause`, { enabled: false });
+  await api('POST', `/sessions/${s.id}/autopause`, { enabled: true, threshold: 80 });
+  bridge.win = { used: 0.5, resetAt: Date.now() + 3600_000, next: 0.05 };
+  bridge.refuseSteer = true;
+  const before = bridge.prompts.length;
+  const aborts = bridge.aborts;
+
+  // Kimi goes on by itself (a background subagent finished); then the mark.
+  bridge.startTurn('（背景工作結束）');
+  await until(async () => (await session()).status === 'running', 5000, 'running');
+  bridge.win = { used: 0.85, resetAt: Date.now() + 3600_000, next: 0.05 };
+  const pause = await until(async () => bridge.prompts.slice(before).find((x) => x.text === '優雅暫停'), 10000, '優雅暫停');
+  // Refused: it waits as 等待插隊, and says so.
+  let cur = await until(async () => {
+    const x = await session();
+    return x.meta.queue.find((q) => q.promptId === pause.promptId && q.cutIn && !q.steered) && x.autoPause.phase === 'paused' && x;
+  }, 5000, 'waiting to cut in');
+  assert.equal(cur.autoPause.pausePrompt, pause.promptId);
+  // Offered again, every couple of seconds; Kimi's turn is not stopped.
+  const n = bridge.refused.filter((id) => id === pause.promptId).length;
+  assert.ok(n >= 1);
+  await sleep(4500);
+  assert.ok(bridge.refused.filter((id) => id === pause.promptId).length >= n + 2, 'tried again');
+  assert.equal(bridge.aborts, aborts, 'nothing stopped');
+  assert.equal(bridge.prompts.filter((x) => x.text === '優雅暫停').length - bridge.prompts.slice(0, before).filter((x) => x.text === '優雅暫停').length, 1, 'sent once');
+
+  // Kimi takes it as soon as it can.
+  bridge.refuseSteer = false;
+  await until(async () => bridge.steers.includes(pause.promptId), 5000, 'steered');
+  cur = await until(async () => {
+    const x = await session();
+    return !x.meta.queue.some((q) => q.promptId === pause.promptId) && x;
+  }, 5000, 'out of the queue');
+  const bubble = cur.events.filter((e) => e.type === 'user' && e.text === '優雅暫停').at(-1);
+  assert.equal(bubble.steered, true);
+  // No more offers once taken.
+  const after = bridge.steers.length + bridge.refused.length;
+  await sleep(2500);
+  assert.equal(bridge.steers.length + bridge.refused.length, after);
+  bridge.endTurn();
+  await api('POST', `/sessions/${s.id}/autopause`, { enabled: false });
 });

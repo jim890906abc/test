@@ -210,8 +210,9 @@ export function createAutoPause(deps) {
   async function pause(s, r) {
     const a = s.autoPause;
     sending.add(s.id);
+    let sent;
     try {
-      await deps.send(s, PAUSE_TEXT, { steer: true, note: `自動暫停：5 小時額度已用 ${pct(r.h5.used)}%（門檻 ${a.threshold}%）` });
+      sent = await deps.send(s, PAUSE_TEXT, { steer: true, note: `自動暫停：5 小時額度已用 ${pct(r.h5.used)}%（門檻 ${a.threshold}%）` });
     } catch (err) {
       return failed(s, 'pause', PAUSE_TEXT, err);
     } finally {
@@ -221,7 +222,8 @@ export function createAutoPause(deps) {
     log(s, `5 小時額度已用 ${pct(r.h5.used)}%，送出「${PAUSE_TEXT}」`);
     // Turned off while the message was on its way: nothing to resume.
     if (a.enabled) {
-      Object.assign(a, { phase: 'paused', reason: 'sent', pausedAt: t, pausedUsed: r.h5.used, resetAt: r.h5.resetAt, quietUntil: r.h5.resetAt || t + T.window, settled: false, sentAt: t, lastSent: 'pause', failures: 0, retryAt: 0, error: null, wait: { kind: 'stopping' } });
+      // pausePrompt: which message in the queue it is, while it waits to cut in.
+      Object.assign(a, { phase: 'paused', reason: 'sent', pausedAt: t, pausedUsed: r.h5.used, resetAt: r.h5.resetAt, quietUntil: r.h5.resetAt || t + T.window, settled: false, sentAt: t, lastSent: 'pause', pausePrompt: sent?.promptId || null, failures: 0, retryAt: 0, error: null, wait: { kind: 'stopping' } });
     }
     changed(s, true);
   }
