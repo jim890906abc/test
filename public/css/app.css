@@ -461,7 +461,9 @@ kbd {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  overflow-anchor: none;
+  /* Rows above changing height (drawn for the first time as you scroll up,
+     a card opening) leave what is on screen where it is. */
+  overflow-anchor: auto;
   --tpad: var(--space-6);
   padding: var(--tpad) var(--space-5) var(--space-3);
   outline: none;

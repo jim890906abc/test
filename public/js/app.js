@@ -869,6 +869,8 @@ async function renameSession() {
 async function sendMessage({ text, images, steer }, from) {
   const s = S.cur?.summary;
   if (!s) return;
+  // What you send is what you want to see: back to the newest message.
+  if (!from) S.cur.transcript.toEnd();
   try {
     await post(`/sessions/${s.id}/messages`, { text, images, from, steer: Boolean(steer) });
   } catch (err) {

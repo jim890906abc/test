@@ -58,6 +58,18 @@ const LOOK = /^(Read|ReadFile|ReadMediaFile|Glob|Grep|FetchURL|WebFetch|WebSearc
 const lineCount = (t) => (t ? String(t).replace(/\n+$/, '').split('\n').length : 0);
 const isAgent = (ev) => Boolean(ev.subagent) || /^(Agent|AgentSwarm|Task)$/.test(ev.name);
 const isTodo = (ev) => /^(TodoList|TodoWrite|SetTodoList)$/.test(ev.name);
+// Following the newest message: back on when you reach the end by
+// scrolling down (within this many pixels), off as soon as you scroll up.
+const STICK_PX = 32;
+// After you scroll up, reaching the end again within this long does not
+// count: the end moves while Kimi writes.
+const UP_GRACE_MS = 600;
+// Browsers keep what is on screen in place when rows above change height
+// (scroll anchoring); where one does not, the transcript does it itself.
+const NATIVE_ANCHOR = typeof CSS !== 'undefined' && CSS.supports?.('overflow-anchor', 'auto');
+
+const sameValue = (a, b) => a === b || (a !== null && b !== null && typeof a === 'object' && typeof b === 'object' && JSON.stringify(a) === JSON.stringify(b));
+
 const agentRunning = (ev) => {
   const sub = ev.subagent || {};
   return sub.status === 'running' || (!sub.status && ACTIVE.includes(ev.status));
@@ -96,11 +108,69 @@ export class Transcript {
     this.stick = true;
     this.raf = 0;
     this.status = 'idle';
+    // Whether to follow the newest message is decided by what you do, not
+    // by where the view happens to be: text arriving between two scroll
+    // events, or the area under the conversation changing size, must never
+    // count as you scrolling away — and a small scroll up (a trackpad sends
+    // a few pixels at a time) must count at once, before the next bit of
+    // text pulls the view back down.
+    this.upAt = 0;
+    this.downAt = 0;
+    this.lastTop = 0;
+    this.lastHeight = 0;
+    this.lastClient = 0;
+    const up = () => {
+      this.upAt = performance.now();
+      this.setStick(false);
+    };
+    const down = () => (this.downAt = performance.now());
+    this.el.addEventListener(
+      'wheel',
+      (e) => {
+        // Scrolling a box of its own inside (a long command's output) is not
+        // scrolling the conversation.
+        if (this.innerScroller(e.target, e.deltaY)) return;
+        if (e.deltaY < 0) up();
+        else if (e.deltaY > 0) down();
+      },
+      { passive: true },
+    );
+    let touchY = null;
+    this.el.addEventListener('touchstart', (e) => (touchY = e.touches[0]?.clientY ?? null), { passive: true });
+    this.el.addEventListener(
+      'touchmove',
+      (e) => {
+        const y = e.touches[0]?.clientY;
+        if (y == null || touchY == null) return;
+        if (y > touchY + 2) up(); // finger down: the view goes up
+        else if (y < touchY - 2) down();
+        touchY = y;
+      },
+      { passive: true },
+    );
+    this.el.addEventListener('keydown', (e) => {
+      if (e.target.closest?.('input, textarea, select, [contenteditable]')) return;
+      if (['ArrowUp', 'PageUp', 'Home'].includes(e.key) || (e.key === ' ' && e.shiftKey)) up();
+      else if (['ArrowDown', 'PageDown', 'End', ' '].includes(e.key)) down();
+    });
     this.el.addEventListener('scroll', () => {
-      const atEnd = this.el.scrollHeight - this.el.scrollTop - this.el.clientHeight < 80;
-      this.stick = atEnd;
-      this.jumpBar.hidden = this.stick;
-      if (this.stick) this.jump.classList.remove('new');
+      const top = this.el.scrollTop;
+      const height = this.el.scrollHeight;
+      const client = this.el.clientHeight;
+      const fromEnd = height - top - client;
+      // The view only moves up by itself when the end comes closer (the
+      // conversation got shorter, or the view taller). Moving up otherwise
+      // is you: a finger, the scrollbar, a key, finding text.
+      const nearer = height < this.lastHeight - 1 || client > this.lastClient + 1;
+      if (top < this.lastTop - 1 && !nearer) up();
+      else if (fromEnd <= STICK_PX) {
+        // At the end: following again, unless you have just scrolled up.
+        if (!this.stick && (this.downAt > this.upAt || performance.now() - this.upAt > UP_GRACE_MS)) this.setStick(true);
+      }
+      this.lastTop = top;
+      this.lastHeight = height;
+      this.lastClient = client;
+      if (!this.stick && !NATIVE_ANCHOR) this.pickAnchor();
       this.pinRaf ||= requestAnimationFrame(() => ((this.pinRaf = 0), this.updatePin()));
     });
     this.tick = setInterval(() => this.renderWorking(), 1000);
@@ -115,8 +185,9 @@ export class Transcript {
     // out anyway, rather than right after each change: reading the height
     // then would make it lay out the whole conversation an extra time per
     // frame. Covers the column growing and the view itself resizing.
-    this.resize = new ResizeObserver(() => this.stick && this.scrollToEnd());
+    this.resize = new ResizeObserver(() => (this.stick ? this.scrollToEnd() : NATIVE_ANCHOR || this.keepAnchor()));
     this.resize.observe(this.column);
+    this.resize.observe(this.working);
     this.resize.observe(this.el);
   }
 
@@ -127,7 +198,25 @@ export class Transcript {
     this.resize.disconnect();
   }
 
+  // A conversation's events, all at once: when it opens, and again whenever
+  // the page takes a fresh copy (reconnecting, having fallen behind). A
+  // fresh copy of what is already shown only updates what changed, so the
+  // view stays as it is; one that does not line up is drawn anew, back at
+  // the same place if you had scrolled up.
   load(events) {
+    if (this.order.length && this.order.length <= events.length && this.order.every((id, i) => events[i].id === id)) {
+      for (let i = 0; i < this.order.length; i++) {
+        const old = this.events.get(this.order[i]);
+        const ev = events[i];
+        const changed = {};
+        for (const k of Object.keys(ev)) if (!sameValue(old[k], ev[k])) changed[k] = ev[k];
+        for (const k of Object.keys(old)) if (!(k in ev)) changed[k] = undefined;
+        if (Object.keys(changed).length) this.patch(ev.id, changed);
+      }
+      for (const ev of events.slice(this.order.length)) this.add(ev);
+      return;
+    }
+    const at = this.order.length && !this.stick ? this.viewSpot() : null;
     this.events.clear();
     this.order = [];
     this.nodes.clear();
@@ -148,6 +237,9 @@ export class Transcript {
     // and stays responsive while the older part fills in.
     const all = [...this.dirty];
     const keep = new Set(all.slice(-NOW));
+    // Where you were reading is drawn now too.
+    const i = at?.id ? all.indexOf(at.id) : -1;
+    if (i !== -1) for (const id of all.slice(Math.max(0, i - NOW / 2), i + NOW / 2)) keep.add(id);
     this.backlog = all.filter((id) => !keep.has(id));
     this.dirty = keep;
     for (const id of keep) {
@@ -155,8 +247,26 @@ export class Transcript {
       if (p) keep.add(p); // a card shows its latest step
     }
     this.flush();
-    this.scrollToEnd();
+    if (at) this.backTo(at);
+    else this.scrollToEnd();
     if (this.backlog.length) this.backlogTimer = setTimeout(() => this.drawBacklog(), 0);
+  }
+
+  // The row at the top of the view and how far from the end it is.
+  viewSpot() {
+    this.pickAnchor();
+    const a = this.anchor;
+    return { id: a?.el.dataset.id || null, y: a?.y || 0, fromEnd: this.el.scrollHeight - this.el.scrollTop - this.el.clientHeight };
+  }
+
+  backTo(at) {
+    const el = at.id && this.nodes.get(at.id)?.el;
+    if (el?.isConnected) this.el.scrollTop += el.getBoundingClientRect().top - this.el.getBoundingClientRect().top - at.y;
+    else this.el.scrollTop = this.el.scrollHeight - this.el.clientHeight - at.fromEnd;
+    this.lastTop = this.el.scrollTop;
+    this.lastHeight = this.el.scrollHeight;
+    this.lastClient = this.el.clientHeight;
+    this.pickAnchor();
   }
 
   drawBacklog() {
@@ -264,6 +374,58 @@ export class Transcript {
 
   scrollToEnd() {
     this.el.scrollTop = this.el.scrollHeight;
+    this.lastTop = this.el.scrollTop;
+    this.lastHeight = this.el.scrollHeight;
+    this.lastClient = this.el.clientHeight;
+  }
+
+  // A box inside the conversation that scrolls by itself and still can in
+  // this direction.
+  innerScroller(target, dy) {
+    for (let n = target; n && n !== this.el; n = n.parentElement) {
+      if (n.scrollHeight <= n.clientHeight + 1) continue;
+      const oy = getComputedStyle(n).overflowY;
+      if (oy !== 'auto' && oy !== 'scroll') continue;
+      if (dy < 0 ? n.scrollTop > 0 : n.scrollTop + n.clientHeight < n.scrollHeight - 1) return n;
+    }
+    return null;
+  }
+
+  setStick(on) {
+    if (this.stick === on) return;
+    this.stick = on;
+    this.jumpBar.hidden = on;
+    if (on) this.jump.classList.remove('new');
+    else if (!NATIVE_ANCHOR) this.pickAnchor();
+  }
+
+  // Where the browser does not keep what is on screen in place itself: the
+  // first row reaching into view, and where it is, so that rows above
+  // changing height (drawn for the first time, a card opening) can be made
+  // up for.
+  pickAnchor() {
+    const rows = this.column.children;
+    const top = this.el.getBoundingClientRect().top;
+    let lo = 0;
+    let hi = rows.length - 1;
+    let found = null;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const r = rows[mid].getBoundingClientRect();
+      if (r.bottom > top) (found = rows[mid]), (hi = mid - 1);
+      else lo = mid + 1;
+    }
+    this.anchor = found ? { el: found, y: found.getBoundingClientRect().top - top } : null;
+  }
+
+  keepAnchor() {
+    const a = this.anchor;
+    if (!a?.el.isConnected) return this.pickAnchor();
+    const shift = a.el.getBoundingClientRect().top - this.el.getBoundingClientRect().top - a.y;
+    if (Math.abs(shift) >= 1) {
+      this.el.scrollTop += shift;
+      this.lastTop = this.el.scrollTop;
+    }
   }
 
   // Subagents still working (background ones included), for the tray
@@ -377,7 +539,8 @@ export class Transcript {
     this.shut.delete(id);
     this.markDirty(id);
     this.reveal();
-    this.stick = false;
+    this.upAt = performance.now();
+    this.setStick(false);
     node.el.scrollIntoView({ block: 'start', behavior: 'smooth' });
   }
 
@@ -406,15 +569,15 @@ export class Transcript {
   toPrompt() {
     const el = this.pinned && this.nodes.get(this.pinned)?.el;
     if (!el) return;
-    this.stick = false;
+    this.upAt = performance.now();
+    this.setStick(false);
     const y = el.getBoundingClientRect().top - this.el.getBoundingClientRect().top + this.el.scrollTop - this.pin.offsetHeight - 12;
     this.el.scrollTo({ top: Math.max(0, y) });
   }
 
   toEnd() {
-    this.stick = true;
-    this.jumpBar.hidden = true;
-    this.jump.classList.remove('new');
+    this.downAt = performance.now();
+    this.setStick(true);
     this.scrollToEnd();
   }
 
