@@ -59,6 +59,12 @@ function fakeMachine(key) {
     refuseSteer: false,
     refused: [], // prompt ids
     aborts: 0,
+    // Kimi taking a message in but reading it only at its next step, which
+    // waits for work in the foreground (until that is moved aside).
+    holdSteer: false,
+    held: [], // prompt ids taken in, not read yet
+    tasks: [], // what GET …/tasks lists
+    detached: [], // task ids moved to the background
   };
   const ws = new WebSocket(`ws://127.0.0.1:${PORT}/bridge?key=${encodeURIComponent(key)}`);
   const send = (m) => ws.send(JSON.stringify(m));
@@ -118,6 +124,23 @@ function fakeMachine(key) {
       return { code: 40400, msg: 'no active prompt to steer into', data: null };
     }
     if (method === 'POST' && /:abort$/.test(p)) k.aborts++;
+    if (p === `/api/v1/sessions/${KID}/tasks`) return ok({ items: k.tasks });
+    const detach = p.match(/\/tasks\/([\w-]+):detach$/);
+    if (method === 'POST' && detach) {
+      k.detached.push(detach[1]);
+      // The step is over: what was taken in is read now.
+      for (const id of k.held.splice(0)) {
+        const q = k.prompts.find((x) => x.promptId === id);
+        setTimeout(() => frame('turn.steer', { turnId: `t${k.turn}`, input: [{ type: 'text', text: q?.text || '' }], promptIds: [id] }), 20);
+      }
+      return ok({ id: detach[1] });
+    }
+    if (method === 'POST' && steer && k.holdSteer) {
+      k.steers.push(steer[1]);
+      k.held.push(steer[1]);
+      setTimeout(() => frame('prompt.steered', { promptIds: [steer[1]] }), 10);
+      return ok({ steered: true, prompt_ids: [steer[1]] });
+    }
     if (method === 'POST' && steer) {
       k.steers.push(steer[1]);
       const q = k.prompts.find((x) => x.promptId === steer[1]);
@@ -160,6 +183,7 @@ function fakeMachine(key) {
   k.ready = new Promise((r) => ws.on('open', r));
   k.close = () => ws.close();
   k.texts = () => k.prompts.map((x) => x.text);
+  k.frame = frame;
   return k;
 }
 
@@ -397,6 +421,51 @@ test('「優雅暫停」 into a turn Kimi will not take it into yet: offered aga
   const after = bridge.steers.length + bridge.refused.length;
   await sleep(2500);
   assert.equal(bridge.steers.length + bridge.refused.length, after);
+  bridge.endTurn();
+  await api('POST', `/sessions/${s.id}/autopause`, { enabled: false });
+});
+
+test('「優雅暫停」 taken in while Kimi waits on a foreground subagent: that subagent is moved to the background (Ctrl+B) so it is read now', async () => {
+  const s = await api('POST', `/machines/${MID}/kimi/${KID}/attach`);
+  const session = () => api('GET', `/sessions/${s.id}`);
+  await until(async () => (await session()).status === 'idle', 5000, 'idle');
+  await api('POST', `/sessions/${s.id}/autopause`, { enabled: false });
+  await api('POST', `/sessions/${s.id}/autopause`, { enabled: true, threshold: 80 });
+  bridge.win = { used: 0.5, resetAt: Date.now() + 3600_000, next: 0.05 };
+  bridge.holdSteer = true;
+  const before = bridge.prompts.length;
+  const aborts = bridge.aborts;
+
+  // A turn waiting on a subagent in the foreground; another one already in
+  // the background; and a subagent's own foreground child, not ours.
+  bridge.startTurn('整合並跑全量測試');
+  await until(async () => (await session()).status === 'running', 5000, 'running');
+  bridge.frame('tool.call.started', { turnId: `t${bridge.turn}`, toolCallId: 'call_fg', name: 'Agent', args: { description: '跑全量測試', prompt: '跑全量測試' } });
+  bridge.frame('tool.call.started', { turnId: `t${bridge.turn}`, toolCallId: 'call_bg', name: 'Agent', args: { description: '整理文件', prompt: '整理文件', run_in_background: true } });
+  bridge.tasks = [
+    { id: 'agent-fg1', kind: 'agent', status: 'running', run_in_background: false, parent_tool_call_id: 'call_fg' },
+    { id: 'agent-bg1', kind: 'agent', status: 'running', run_in_background: true, parent_tool_call_id: 'call_bg' },
+    { id: 'agent-sub1', kind: 'agent', status: 'running', run_in_background: false, parent_tool_call_id: 'call_inside_a_subagent' },
+  ];
+  await sleep(300);
+
+  bridge.win = { used: 0.85, resetAt: Date.now() + 3600_000, next: 0.05 };
+  const pause = await until(async () => bridge.prompts.slice(before).find((x) => x.text === '優雅暫停'), 10000, '優雅暫停');
+  await until(async () => bridge.steers.includes(pause.promptId), 5000, 'taken in');
+  // Unread for a while: only our foreground subagent goes to the background.
+  await until(async () => bridge.detached.length > 0, 8000, 'moved to the background');
+  assert.deepEqual(bridge.detached, ['agent-fg1']);
+  const cur = await until(async () => {
+    const x = await session();
+    return !x.meta.queue.some((q) => q.promptId === pause.promptId) && x;
+  }, 5000, 'read');
+  assert.equal(cur.events.filter((e) => e.type === 'user' && e.text === '優雅暫停').at(-1).steered, true);
+  assert.ok(cur.events.some((e) => e.type === 'info' && /移到背景/.test(e.text)), 'said so');
+  assert.equal(bridge.aborts, aborts, 'nothing stopped');
+  await sleep(1500);
+  assert.deepEqual(bridge.detached, ['agent-fg1'], 'once');
+  bridge.holdSteer = false;
+  bridge.tasks = [];
   bridge.endTurn();
   await api('POST', `/sessions/${s.id}/autopause`, { enabled: false });
 });

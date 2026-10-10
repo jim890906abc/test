@@ -31,6 +31,9 @@ const IDLE_FOLLOW_MS = 15 * 60_000;
 const MAX_IMAGE_URL = 600_000; // history images larger than this become a placeholder
 // How often a message waiting to cut in (插隊) is offered to Kimi again.
 const CUT_IN_RETRY_MS = 2000;
+// How long an urgent message Kimi has taken in may wait for foreground work
+// before that work is moved to the background (Ctrl+B).
+const URGENT_DETACH_MS = 10_000 * (Number(process.env.AGENT_HUB_AUTOPAUSE_SCALE) || 1);
 
 export function available(agent) {
   const m = machines.getMachine(agent.machineId);
@@ -903,7 +906,9 @@ class Mirror {
 
   // Resolves to { ok } — false (with the error, already shown in the
   // conversation) when Kimi did not take the message.
-  async send(text, images = [], { note, steer } = {}) {
+  // `urgent` (「優雅暫停」): once Kimi has taken it in, foreground work that
+  // keeps it from being read is moved to the background (watchUrgent).
+  async send(text, images = [], { note, steer, urgent } = {}) {
     if (this.inTerminal()) return this.sendToTerminal(text, images, note, steer);
     await ensureServer(this.machineId);
     const ctx = this.ctx;
@@ -911,7 +916,7 @@ class Mirror {
     this.remember(promptId, note);
     const thumbs = images.map((i) => i.thumb || `data:${i.mimeType};base64,${i.data}`);
     const busy = ['running', 'awaiting_permission'].includes(this.session.status);
-    if (busy) this.meta({ queue: [...this.queue(), { promptId, text, images: thumbs, note, ...(steer ? { cutIn: true } : {}) }] });
+    if (busy) this.meta({ queue: [...this.queue(), { promptId, text, images: thumbs, note, ...(steer ? { cutIn: true } : {}), ...(steer && urgent ? { urgent: true } : {}) }] });
     else {
       ctx.emit({ type: 'user', text, images: thumbs, promptId, source: 'hub', note });
       ctx.setStatus('running');
@@ -946,6 +951,7 @@ class Mirror {
     try {
       await this.api('POST', this.path(`/prompts/${promptId}:steer`), {});
       this.markQueued(promptId, { steered: true, cutIn: false });
+      if (this.queue().find((q) => q.promptId === promptId)?.urgent) this.watchUrgent(promptId);
       return true;
     } catch {
       this.markQueued(promptId, { cutIn: true });
@@ -962,6 +968,36 @@ class Mirror {
     if (this.cutInTimer) return;
     this.cutInTimer = setInterval(() => this.tryCutIns(), CUT_IN_RETRY_MS);
     this.cutInTimer.unref?.();
+  }
+
+  // Kimi reads a message it has taken in at its next step, and a step lasts
+  // until what it runs in the foreground (a subagent, a long command) is
+  // done. An urgent message still unread after a while gets that work moved
+  // to the background, as Ctrl+B does: the work goes on, the message is read
+  // now. Only the conversation's own foreground work, only for this.
+  watchUrgent(promptId, round = 0) {
+    const t = setTimeout(async () => {
+      const q = this.queue().find((x) => x.promptId === promptId);
+      if (!q?.steered || !['running', 'awaiting_permission'].includes(this.session.status)) return; // read, or gone
+      const moved = await this.detachForeground().catch(() => 0);
+      if (moved) this.ctx.emit({ type: 'info', text: `為了讓 Kimi 馬上讀到「${q.text}」，把它在前景等的 ${moved} 個工作移到背景（跟 Ctrl+B 一樣，工作會繼續跑）` });
+      if (round < 5) this.watchUrgent(promptId, round + 1);
+    }, URGENT_DETACH_MS);
+    t.unref?.();
+  }
+
+  async detachForeground() {
+    const r = await this.api('GET', this.path('/tasks'));
+    const mine = new Set([...this.tools.keys()].filter((k) => k.startsWith('main:')).map((k) => k.slice(5)));
+    const fg = (r?.items || []).filter((t) => t.run_in_background === false && t.status === 'running' && mine.has(t.parent_tool_call_id));
+    let moved = 0;
+    for (const t of fg) {
+      try {
+        await this.api('POST', this.path(`/tasks/${t.id}:detach`), {});
+        moved++;
+      } catch {}
+    }
+    return moved;
   }
 
   async tryCutIns() {
@@ -1193,10 +1229,10 @@ export async function createRemote({ machineId, cwd, nameHint }) {
   return { kimiSessionId: s.id, cwd: s.metadata?.cwd || dir };
 }
 
-export async function send(session, text, { images = [], note, steer } = {}) {
+export async function send(session, text, { images = [], note, steer, urgent } = {}) {
   const m = mirrorFor(session);
   await m.ensureLive();
-  return m.send(text, images, { note, steer });
+  return m.send(text, images, { note, steer, urgent });
 }
 // Followed right now (subscribed to the machine and caught up), so the
 // hub's status for it is current.

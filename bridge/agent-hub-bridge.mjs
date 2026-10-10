@@ -327,6 +327,8 @@ const ALLOW = [
   ['POST', /^\/api\/v1\/sessions\/session_[\w-]+(:(abort|compact|fork|undo|btw|archive))?$/],
   ['POST', /^\/api\/v1\/sessions\/session_[\w-]+\/(prompts|prompts:steer|prompts\/[\w-]+:(abort|steer)|approvals\/[\w-]+|questions\/[\w-]+(:dismiss)?|profile|skills\/[\w.%-]+:activate)$/],
   ['POST', /^\/api\/v1\/sessions\/session_[\w-]+\/fs:(list|read|stat|git_status|diff|search|grep)$/],
+  // Ctrl+B: move work running in the foreground to the background.
+  ['POST', /^\/api\/v1\/sessions\/session_[\w-]+\/tasks\/[\w-]+:detach$/],
 ];
 const allowed = (method, p) => ALLOW.some(([m, re]) => m === method && re.test(p));
 

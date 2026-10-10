@@ -212,7 +212,7 @@ export function createAutoPause(deps) {
     sending.add(s.id);
     let sent;
     try {
-      sent = await deps.send(s, PAUSE_TEXT, { steer: true, note: `自動暫停：5 小時額度已用 ${pct(r.h5.used)}%（門檻 ${a.threshold}%）` });
+      sent = await deps.send(s, PAUSE_TEXT, { steer: true, urgent: true, note: `自動暫停：5 小時額度已用 ${pct(r.h5.used)}%（門檻 ${a.threshold}%）` });
     } catch (err) {
       return failed(s, 'pause', PAUSE_TEXT, err);
     } finally {
