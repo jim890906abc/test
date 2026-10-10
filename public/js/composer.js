@@ -15,6 +15,8 @@ export const EFFORT_LABELS = { off: '關閉', on: '開啟', low: '低', medium: 
 const MAX_IMAGES = 8;
 
 // Built-in commands; Kimi skills are appended from the session.
+const BG_DESCRIPTION = '移到背景（Ctrl+B）：Kimi 正在等的子代理或指令改到背景繼續跑，Kimi 不用再等它';
+
 export const COMMANDS = [
   { name: 'model', description: '切換模型' },
   { name: 'effort', description: '調整思考強度' },
@@ -24,6 +26,7 @@ export const COMMANDS = [
   { name: 'auto', description: '全部自動：不再詢問' },
   { name: 'manual', description: '每次詢問' },
   { name: 'compact', description: '壓縮對話內容，騰出 context 空間', args: true, hint: '[補充指示]' },
+  { name: 'bg', description: BG_DESCRIPTION, aliases: ['background'] },
   { name: 'undo', description: '撤回上一輪對話' },
   { name: 'btw', description: '順便問一個問題，不影響主對話', args: true, hint: '<問題>' },
   { name: 'goal', description: '設定讓 Kimi 自主完成的目標', args: true, hint: '<目標> | pause | resume | cancel' },
@@ -41,6 +44,7 @@ const HOME_COMMANDS = ['model', 'effort', 'plan', 'permission', 'yolo', 'auto', 
 // A Kimi running in a terminal runs its own slash commands; these are the
 // ones that work without its on-screen pickers.
 const TERMINAL_COMMANDS = [
+  { name: 'bg', description: BG_DESCRIPTION, aliases: ['background'] },
   { name: 'usage', description: '方案用量：5 小時、7 天與本月額度' },
   { name: 'status', description: '目前的模型、權限、context、帳號與電腦' },
   { name: 'compact', description: '壓縮對話內容，騰出 context 空間', args: true, hint: '[補充指示]' },
@@ -327,6 +331,8 @@ export class Composer {
       // While Kimi works: Enter queues the message for after this turn;
       // 插隊 (Ctrl+S, like Kimi's CLI) slips it into the running turn.
       busy && this.hasContent() ? h('button', { class: 'om-btn om-btn--sm steer-btn', type: 'button', title: '插隊：讓 Kimi 在下一步就讀到，不會中斷它（Ctrl+S）', onclick: () => this.submit({ steer: true }) }, '插隊') : null,
+      // Kimi waiting on a subagent or a command in the foreground.
+      stop && s.foreground ? h('button', { class: 'om-btn om-btn--sm bg-btn', type: 'button', title: BG_DESCRIPTION, onclick: () => this.opts.onBackground?.() }, '移到背景') : null,
       stop
         ? h('button', { class: 'send stop', type: 'button', title: '停止（Esc）', 'aria-label': '停止', onclick: () => this.opts.onStop() }, icon('stop'))
         : h('button', { class: 'send', type: 'button', title: busy ? '排隊：這一輪結束後送出（Enter）' : '送出（Enter）', 'aria-label': busy ? '排隊送出' : '送出', disabled: !this.hasContent(), onclick: () => this.submit() }, icon('up')),
@@ -444,6 +450,10 @@ export class Composer {
     } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's' && (this.state.running || this.state.awaiting)) {
       e.preventDefault();
       this.submit({ steer: true });
+    } else if (e.ctrlKey && !e.metaKey && !e.altKey && e.key.toLowerCase() === 'b' && this.state.running && this.opts.onBackground) {
+      // Like Kimi's Ctrl+B, only while it works.
+      e.preventDefault();
+      this.opts.onBackground();
     } else if (e.key === 'Escape' && (this.state.running || this.state.awaiting)) {
       e.preventDefault();
       this.opts.onStop();

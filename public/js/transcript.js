@@ -79,6 +79,7 @@ export class Transcript {
     this.pinBar = h('div', { class: 'prompt-pin-bar', hidden: true }, this.pin);
     this.users = []; // top-level user message ids, in order
     this.agentIds = []; // top-level subagent calls
+    this.mainTools = []; // top-level tool calls
     this.kids = new Map(); // parent id -> ids of its direct children, in order
     this.lastOf = new Map(); // parent id ('' for the top) -> its newest child
     this.deferred = new Set(); // dirty, but inside a closed subagent card
@@ -134,6 +135,7 @@ export class Transcript {
     this.groupOf.clear();
     this.users = [];
     this.agentIds = [];
+    this.mainTools = [];
     this.kids.clear();
     this.lastOf.clear();
     this.deferred.clear();
@@ -177,6 +179,7 @@ export class Transcript {
     this.grew = true;
     if (ev.type === 'user' && !ev.parent) this.users.push(ev.id);
     if (ev.type === 'tool_use' && !ev.parent && isAgent(ev)) this.agentIds.push(ev.id);
+    if (ev.type === 'tool_use' && !ev.parent) this.mainTools.push(ev.id);
     if (ev.parent) {
       const list = this.kids.get(ev.parent);
       if (list) list.push(ev.id);
@@ -273,6 +276,17 @@ export class Transcript {
   runningCount() {
     let n = 0;
     for (const id of this.agentIds) if (this.events.has(id) && agentRunning(this.events.get(id))) n++;
+    return n;
+  }
+
+  // What Kimi is waiting on right now (a foreground subagent or command):
+  // what 移到背景 (Ctrl+B) would move. Only the latest calls can be.
+  foregroundCount() {
+    let n = 0;
+    for (const id of this.mainTools.slice(-40)) {
+      const ev = this.events.get(id);
+      if (ev && ['pending', 'running'].includes(ev.status) && !ev.subagent?.background && !ev.input?.run_in_background) n++;
+    }
     return n;
   }
 

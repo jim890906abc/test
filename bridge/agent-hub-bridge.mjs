@@ -1298,6 +1298,9 @@ const tui = {
       case 'interrupt':
         keys.push('\x1b');
         break;
+      case 'background':
+        keys.push('\x02'); // Ctrl+B
+        break;
       default:
         throw new Error(`未知的操作：${action}`);
     }

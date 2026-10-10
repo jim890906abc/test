@@ -986,18 +986,41 @@ class Mirror {
     t.unref?.();
   }
 
-  async detachForeground() {
+  // `all`: every foreground subagent and command, as Kimi's own Ctrl+B
+  // does; otherwise only what the conversation itself waits on.
+  async detachForeground({ all = false } = {}) {
     const r = await this.api('GET', this.path('/tasks'));
     const mine = new Set([...this.tools.keys()].filter((k) => k.startsWith('main:')).map((k) => k.slice(5)));
-    const fg = (r?.items || []).filter((t) => t.run_in_background === false && t.status === 'running' && mine.has(t.parent_tool_call_id));
+    const fg = (r?.items || []).filter((t) => t.run_in_background === false && t.status === 'running' && ['agent', 'process'].includes(t.kind) && (all || mine.has(t.parent_tool_call_id)));
     let moved = 0;
     for (const t of fg) {
       try {
         await this.api('POST', this.path(`/tasks/${t.id}:detach`), {});
         moved++;
-      } catch {}
+      } catch {
+        continue;
+      }
+      // Its card: a background subagent from now on, kept running past the turn.
+      const card = [...this.tools.entries()].find(([k]) => k.endsWith(`:${t.parent_tool_call_id}`))?.[1];
+      if (card?.subagent) {
+        this.ctx.patch(card, { subagent: { ...card.subagent, background: true } });
+        const a = this.agents.get(card.subagent.id);
+        if (a) a.background = true;
+      }
     }
     return moved;
+  }
+
+  // 移到背景 (Ctrl+B) from the hub: what Kimi runs in the foreground goes
+  // on in the background, and Kimi carries on without waiting for it.
+  async moveToBackground() {
+    if (this.inTerminal()) {
+      await this.tui({ action: 'background' });
+      return { terminal: true };
+    }
+    const moved = await this.detachForeground({ all: true });
+    if (moved) this.ctx.emit({ type: 'info', text: `已把 ${moved} 個前景工作移到背景（工作會繼續跑，Kimi 不用再等它）` });
+    return { moved };
   }
 
   async tryCutIns() {
@@ -1238,6 +1261,11 @@ export async function send(session, text, { images = [], note, steer, urgent } =
 // hub's status for it is current.
 export const isLive = (session) => Boolean(mirrors.get(session.id)?.live);
 export const steerQueued = (session, promptId) => mirrorFor(session).steerQueued(promptId);
+export async function moveToBackground(session) {
+  const m = mirrorFor(session);
+  await m.ensureLive();
+  return m.moveToBackground();
+}
 // Take a conversation locked only because a terminal Kimi runs in its folder.
 export const unlock = (session) => machines.rpc(session.machineId, 'kimi.unlock', { sessionId: session.kimiSessionId });
 

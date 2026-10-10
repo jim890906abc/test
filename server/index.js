@@ -343,6 +343,13 @@ app.post('/api/sessions/:id/queue/:promptId/steer', wrap(async (req) => {
   await ADAPTERS['kimi-remote'].steerQueued(s, req.params.promptId);
 }));
 
+// 移到背景 (Kimi's Ctrl+B).
+app.post('/api/sessions/:id/background', wrap(async (req) => {
+  const s = mustSession(req.params.id);
+  if (!s.kimiSessionId) throw Object.assign(new Error('這個對話不支援移到背景'), { status: 400 });
+  return ADAPTERS['kimi-remote'].moveToBackground(s);
+}));
+
 app.post('/api/sessions/:id/unlock', wrap(async (req) => {
   const s = mustSession(req.params.id);
   if (!s.kimiSessionId) throw Object.assign(new Error('這個對話不需要解除'), { status: 400 });

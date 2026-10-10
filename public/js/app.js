@@ -692,9 +692,11 @@ async function openSession(id) {
       syncAgentPanel(ids);
       // The tray shows only how many: redraw when that changes.
       const n = cur.transcript.runningCount();
-      if (n === cur.agentsWorking) return;
+      const fg = cur.transcript.foregroundCount();
+      if (n === cur.agentsWorking && fg === cur.foreground) return;
       cur.agentsWorking = n;
-      composer.update({ agentsWorking: n });
+      cur.foreground = fg;
+      composer.update({ agentsWorking: n, foreground: fg });
     },
   });
   composer ??= new Composer({
@@ -714,9 +716,10 @@ async function openSession(id) {
     onCancelAutoResume: cancelAutoResume,
     onArmResume: () => armResumeAfterReset(),
     onCancelScheduled: cancelScheduled,
+    onBackground: moveToBackground,
   });
   composer.setKey(id);
-  composer.update({ agentsWorking: 0 });
+  composer.update({ agentsWorking: 0, foreground: 0 });
   cur.composerSig = '';
   fill($view, h('div', { class: 'session' }, cur.transcript.el, h('div', { class: 'composer-dock' }, composer.el)));
   renderToolbar();
@@ -939,6 +942,9 @@ async function sessionCommand(name, args) {
     }
     case 'init':
       return sendMessage({ text: INIT_PROMPT, images: [] });
+    case 'bg':
+    case 'background':
+      return moveToBackground();
     case 'usage':
       return accountDialog(s.machineId);
     case 'autopause': {
@@ -1782,6 +1788,18 @@ async function accountDialog(machineId, rows = null) {
 }
 
 // ----------------------------------------------------------- auto-pause
+
+// 移到背景 (Kimi's Ctrl+B): what Kimi waits on goes on in the background.
+async function moveToBackground() {
+  const s = S.cur?.summary;
+  if (!s) return;
+  try {
+    const r = await post(`/sessions/${s.id}/background`);
+    toast(r?.terminal ? '已在終端機的 Kimi 按下 Ctrl+B' : r?.moved ? `已把 ${r.moved} 個工作移到背景，會繼續跑` : '目前沒有在前景跑的子代理或指令');
+  } catch (err) {
+    fail(err);
+  }
+}
 
 // The hub watches the 5-hour quota and types 「優雅暫停」 / 「繼續」 itself;
 // these only turn it on and off and show what it is doing.

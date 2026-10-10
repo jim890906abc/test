@@ -469,3 +469,37 @@ test('「優雅暫停」 taken in while Kimi waits on a foreground subagent: tha
   bridge.endTurn();
   await api('POST', `/sessions/${s.id}/autopause`, { enabled: false });
 });
+
+test('移到背景 by hand (Ctrl+B): every foreground subagent and command goes on in the background', async () => {
+  const s = await api('POST', `/machines/${MID}/kimi/${KID}/attach`);
+  const session = () => api('GET', `/sessions/${s.id}`);
+  await until(async () => (await session()).status === 'idle', 5000, 'idle');
+  bridge.detached.length = 0;
+  bridge.startTurn('跑全量測試再整理');
+  await until(async () => (await session()).status === 'running', 5000, 'running');
+  bridge.frame('tool.call.started', { turnId: `t${bridge.turn}`, toolCallId: 'call_a', name: 'Agent', args: { description: '跑全量測試', prompt: '跑全量測試' } });
+  bridge.frame('subagent.spawned', { subagentId: 'agent-a1', parentAgentId: 'main', parentToolCallId: 'call_a', subagentName: 'coder', description: '跑全量測試', runInBackground: false });
+  await until(async () => (await session()).events.find((e) => e.toolCallId === 'call_a')?.subagent?.status === 'running', 5000, 'subagent shown');
+  bridge.tasks = [
+    { id: 'agent-a', kind: 'agent', status: 'running', run_in_background: false, parent_tool_call_id: 'call_a' },
+    { id: 'bash-b', kind: 'process', status: 'running', run_in_background: false, parent_tool_call_id: 'call_b' },
+    { id: 'agent-c', kind: 'agent', status: 'running', run_in_background: true, parent_tool_call_id: 'call_c' },
+    { id: 'agent-d', kind: 'agent', status: 'completed', run_in_background: false, parent_tool_call_id: 'call_d' },
+  ];
+  const aborts = bridge.aborts;
+  const r = await api('POST', `/sessions/${s.id}/background`);
+  assert.deepEqual(r, { moved: 2 });
+  assert.deepEqual(bridge.detached.sort(), ['agent-a', 'bash-b']);
+  assert.equal(bridge.aborts, aborts, 'nothing stopped');
+  await until(async () => (await session()).events.some((e) => e.type === 'info' && /已把 2 個前景工作移到背景/.test(e.text)), 5000, 'said so');
+  // Shown as a background subagent from now on, still working past the turn.
+  assert.equal((await session()).events.find((e) => e.toolCallId === 'call_a').subagent.background, true);
+  // Nothing in the foreground: nothing moved.
+  bridge.tasks = [];
+  assert.deepEqual(await api('POST', `/sessions/${s.id}/background`), { moved: 0 });
+  bridge.endTurn();
+  await until(async () => (await session()).status === 'idle', 5000, 'idle');
+  const card = (await session()).events.find((e) => e.toolCallId === 'call_a');
+  assert.equal(card.subagent.status, 'running');
+  assert.notEqual(card.status, 'ended');
+});
