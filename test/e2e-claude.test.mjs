@@ -558,6 +558,53 @@ test('bound to a GitHub repository: cloned on its own branch, everything committ
   assert.equal(mainDone.events.some((e) => e.type === 'info' && /提醒 Claude/.test(e.text)), false);
 });
 
+test('an existing conversation bound to a GitHub repository: moved into a clone, or bound in place', async () => {
+  const origin = path.join(TMP, 'github', 'me', 'proj.git');
+  const env = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
+  const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const turns = (id, n) =>
+    until(async () => {
+      const x = await snap(id);
+      return x.status === 'idle' && x.events.filter((e) => e.type === 'turn_end').length === n && x;
+    }, 20000);
+
+  // A folder that is not the repository: the conversation moves to a clone.
+  const s = await api('POST', '/sessions', { agent: 'claude', prompt: 'BASH', permission: 'auto' });
+  await turns(s.id, 1);
+  const old = s.cwd;
+  await assert.rejects(api('POST', `/sessions/${s.id}/repo`, { repo: 'nope' }), /owner\/repo/);
+  const bound = await api('POST', `/sessions/${s.id}/repo`, { repo: 'me/proj' });
+  assert.notEqual(bound.cwd, old);
+  assert.equal(bound.meta.repo.full, 'me/proj');
+  assert.equal(git(bound.cwd, 'rev-parse', '--abbrev-ref', 'HEAD'), bound.meta.repo.branch);
+  assert.ok(fs.existsSync(old));
+  assert.ok((await snap(s.id)).events.some((e) => e.type === 'info' && /已綁定 me\/proj/.test(e.text)));
+  await assert.rejects(api('POST', `/sessions/${s.id}/repo`, { repo: 'me/proj' }), /已經綁定/);
+  const n0 = messagesSent().length;
+  await api('POST', `/sessions/${s.id}/messages`, { text: 'hello' });
+  await turns(s.id, 2);
+  const req = messagesSent()[n0].body;
+  assert.match(req.system[0].text, /bound to the GitHub repository me\/proj/);
+  assert.match(req.system[0].text, new RegExp(`Working directory: ${bound.cwd.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+  assert.match(JSON.stringify(req.messages.at(-1)), /bound this conversation to the GitHub repository me\/proj/);
+  assert.match(JSON.stringify(req.messages.at(-1)), new RegExp(`bring over into the repository what belongs to the user's task from ${old.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+
+  // A folder that is a clone of it already: bound where it is, on a new
+  // branch from where it was; what Claude leaves is pushed there.
+  const here = path.join(TMP, 'already-cloned');
+  git(TMP, 'clone', '-q', origin, here);
+  git(here, 'config', 'remote.origin.url', 'https://github.com/me/proj.git');
+  git(here, 'config', `url.${path.join(TMP, 'github')}/.insteadOf`, 'https://github.com/');
+  const s2 = await api('POST', '/sessions', { agent: 'claude', cwd: here, permission: 'auto' });
+  const b2 = await api('POST', `/sessions/${s2.id}/repo`, { repo: 'https://github.com/me/proj', branch: 'feature/y' });
+  assert.equal(b2.cwd, here);
+  assert.equal(git(here, 'rev-parse', '--abbrev-ref', 'HEAD'), 'feature/y');
+  await api('POST', `/sessions/${s2.id}/messages`, { text: 'REPOLAZY' });
+  const done = await turns(s2.id, 1);
+  assert.ok(done.events.some((e) => e.type === 'info' && /已自動 commit 並 push 到 feature\/y/.test(e.text)), JSON.stringify(done.events.slice(-4)));
+  assert.equal(git(origin, 'show', 'feature/y:work.txt'), 'work');
+});
+
 test('the daemon bundle the bridges download is built from the current code', async (t) => {
   let esbuild;
   try {

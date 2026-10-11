@@ -358,6 +358,19 @@ app.post('/api/sessions/:id/messages', wrap((req) => {
   runner.startTurn(s, text, { images, note, steer: Boolean(req.body?.steer) });
 }));
 
+// An existing Claude conversation bound to a GitHub repository, for good.
+app.post('/api/sessions/:id/repo', wrap(async (req) => {
+  const s = mustSession(req.params.id);
+  if (s.agentId !== 'claude') throw Object.assign(new Error('只有 Claude 對話可以綁定 GitHub repo'), { status: 400 });
+  const full = parseRepo(req.body?.repo);
+  if (!full) throw Object.assign(new Error('GitHub repo 要寫成 owner/repo（或貼上 GitHub 網址）'), { status: 400 });
+  const branch = req.body?.branch ? validBranch(req.body.branch) : newBranch();
+  if (!branch) throw Object.assign(new Error(`分支名稱不合法：${req.body.branch}`), { status: 400 });
+  await ADAPTERS.claude.bindRepo(s, { full, branch });
+  broadcast({ t: 'session', session: runner.summarize(s) });
+  return runner.summarize(s);
+}));
+
 app.post('/api/sessions/:id/command', wrap(async (req) => {
   const name = String(req.body?.name || '').replace(/^\//, '');
   if (!name) throw Object.assign(new Error('缺少指令名稱'), { status: 400 });

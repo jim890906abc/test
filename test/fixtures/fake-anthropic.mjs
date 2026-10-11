@@ -53,6 +53,8 @@ export function script(body, res) {
   const last = users.at(-1);
   const results = Array.isArray(last.content) ? last.content.filter((b) => b.type === 'tool_result') : [];
   const lastText = textOf(last.content);
+  // What the user said, without Agent Hub's notes before it.
+  const said = lastText.replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, '');
   if (/Write a summary of our conversation/.test(lastText)) return respond(res, { blocks: [{ type: 'text', text: '摘要：建立了 hi.txt。' }] });
   if (body.system[0].text.includes('You are a subagent')) return respond(res, { blocks: [{ type: 'text', text: `子代理報告：${first}` }] });
   // Bound to a repository: Agent Hub's end-of-turn check, done as asked
@@ -73,8 +75,8 @@ export function script(body, res) {
       usage: { input: 2000, output: 300 },
     });
   }
-  if (/^REPO(GOOD|LAZY)/.test(lastText)) return respond(res, { blocks: [tool('toolu_r1', 'Bash', { command: 'echo work > work.txt' })], stop: 'tool_use' });
-  if (/^REPOFORCE/.test(lastText)) return respond(res, { blocks: [tool('toolu_r2', 'Bash', { command: 'git push -f origin main' })], stop: 'tool_use' });
+  if (/^REPO(GOOD|LAZY)/.test(said)) return respond(res, { blocks: [tool('toolu_r1', 'Bash', { command: 'echo work > work.txt' })], stop: 'tool_use' });
+  if (/^REPOFORCE/.test(said)) return respond(res, { blocks: [tool('toolu_r2', 'Bash', { command: 'git push -f origin main' })], stop: 'tool_use' });
   if (/^BASH/.test(lastText)) return respond(res, { blocks: [tool('toolu_b1', 'Bash', { command: 'echo bash-ran', description: 'Say hi' })], stop: 'tool_use' });
   if (/^PLAN/.test(lastText)) return respond(res, { blocks: [tool('toolu_p1', 'ExitPlanMode', { plan: '1. 改 a.txt\n2. 跑測試' })], stop: 'tool_use' });
   if (/^ASK/.test(lastText)) return respond(res, { blocks: [tool('toolu_q1', 'AskUserQuestion', { questions: [{ question: '要用哪個框架？', header: '框架', options: [{ label: 'React' }, { label: 'Vue' }] }] })], stop: 'tool_use' });

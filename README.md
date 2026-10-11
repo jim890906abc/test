@@ -54,6 +54,8 @@ Claude 和 Kimi 都用 git 與 GitHub CLI（`gh`）操作 GitHub：clone、開�
 - 每一輪結束時 Agent Hub 都會檢查：還有沒 commit 或沒 push 的變更，就提醒 Claude 處理（最多兩次）；它還是沒處理，Agent Hub 自己 commit 並 push 到那個分支。
 - push 到其他分支、force push、刪除遠端分支、改 remote 的指令會直接被擋下。
 
+已經開著的 Claude 對話也能綁定：對話右上「⋯」→「綁定 GitHub repo…」。資料夾本來就是那個 repo 的 clone 的話留在原地、切到選的分支；不是的話把 repo clone 到新資料夾，對話改到那裡工作（舊資料夾不動），下一輪 Claude 會先把屬於這個專案的檔案搬進 repo、commit 並 push。綁定規則會寫進 Claude 的系統提示（下一輪要重新讀一次整段對話，一次性多花一些 token），綁定後不能再換。
+
 綁定的 repo 會記在首頁，之後在同一台電腦開的 Claude 新對話也會綁定它（每次一個新分支），直到你在選單裡選「不綁定」。私人 repo 和 push 都需要那台電腦先在「GitHub…」登入。
 
 ## 連接其他電腦

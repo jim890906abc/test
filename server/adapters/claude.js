@@ -140,14 +140,14 @@ async function projectNotes(host, cwd) {
   return null;
 }
 
-function systemPrompt(cwd, { platform, notes, git, computer, repo }) {
+function systemPrompt(cwd, { platform, notes, git, computer, repo, started = Date.now() }) {
   return [
     'You are Claude, working as a coding agent for the user through Agent Hub, a control center they open in a browser or on their phone. You act on their computer only through your tools, which run in the working directory below.',
     '',
     '# Environment',
     `- Working directory: ${cwd}`,
     `- Computer: ${computer} (${platform}); shell: bash`,
-    `- This conversation started on ${new Date().toISOString().slice(0, 10)}.`,
+    `- This conversation started on ${new Date(started).toISOString().slice(0, 10)}.`,
     git ? '- The working directory is a git repository.' : '- The working directory is not a git repository.',
     '',
     '# How to work',
@@ -294,6 +294,12 @@ async function turn(run, { text, images = [], thumbs, note, promptId, resume }) 
   if (c.restarted) {
     content.unshift({ type: 'text', text: `<system-reminder>${RESTART_NOTE}</system-reminder>` });
     c.restarted = false;
+  }
+  // Bound to a repository since the last turn: said once, here (the system
+  // prompt, rewritten then, keeps saying it).
+  if (c.bindNote) {
+    content.unshift({ type: 'text', text: `<system-reminder>${c.bindNote}</system-reminder>` });
+    c.bindNote = null;
   }
   if (!content.length) content.push({ type: 'text', text: 'Continue.' });
   const note2 = planNote(session, c);
@@ -1016,6 +1022,41 @@ async function compact(session, instruction) {
 export const isRunning = (session) => runs.has(session.id);
 
 // --- files and changes panels for a conversation on a connected computer
+
+// An existing conversation bound to a GitHub repository, for good. A folder
+// that is already a clone of it stays (on `branch`); any other folder is
+// left as it is and the conversation moves to a new clone, Claude being told
+// to bring over what belongs in it. The system prompt is rewritten with the
+// binding (once: the next request reads the conversation again, uncached).
+export async function bindRepo(session, { full, branch }) {
+  if (runs.has(session.id)) throw Object.assign(new Error('Claude 正在工作：等這一輪結束（或先停止）再綁定'), { status: 409 });
+  if (session.meta?.repo) throw Object.assign(new Error(`這個對話已經綁定 ${session.meta.repo.full} 的 ${session.meta.repo.branch}，不能再換`), { status: 409 });
+  const host = hostFor(session);
+  const c = st(session);
+  const old = session.cwd;
+  const origin = await host.run(old, 'git config --get remote.origin.url', { timeoutMs: 15_000 }).catch(() => null);
+  const same = origin?.exitCode === 0 && repoBind.parseRepo(origin.output.trim())?.toLowerCase() === full.toLowerCase();
+  if (same) await repoBind.useBranch(host, old, { full, branch });
+  else session.cwd = await repoBind.clone(host, store.WORKSPACES_DIR, { full, branch });
+  const repo = { full, branch };
+  const platform = session.machineId ? machines.getMachine(session.machineId)?.platform || 'unknown' : `${os.platform()} ${os.release()}`;
+  const notes = await projectNotes(host, session.cwd);
+  const computer = session.meta?.machineName || machineName(session);
+  c.system = systemPrompt(session.cwd, { platform, notes, git: true, computer, repo, started: session.createdAt });
+  c.subSystem = subSystemPrompt(session.cwd, platform, repo);
+  c.bindNote = same
+    ? `The user has bound this conversation to the GitHub repository ${full}, branch \`${branch}\`, from now on. The working directory ${old} is already a clone of it and is now on \`${branch}\`. Follow the rules in the system prompt: commit what you have done so far that belongs to the task, push it to \`${branch}\`, and keep doing so.`
+    : `The user has bound this conversation to the GitHub repository ${full}, branch \`${branch}\`, from now on. It was cloned into ${session.cwd}, which is your working directory from now on (it was ${old}, which is unchanged; your earlier work is still there). First bring over into the repository what belongs to the user's task from ${old} (code, docs, configs; not secrets, data dumps, build output or tool caches), commit it with a clear message and push it to \`${branch}\`; tell the user briefly what you brought over and what you left out. Then follow the rules in the system prompt.`;
+  liveContext(session).setMeta({ repo: { ...repo, url: `https://github.com/${full}/tree/${branch}` } });
+  liveContext(session).emit({
+    type: 'info',
+    text: same
+      ? `已綁定 ${full} 的 ${branch}：資料夾本來就是這個 repo，已切到 ${branch}。之後的程式碼都會 commit 並 push 到那裡。`
+      : `已綁定 ${full} 的 ${branch}：repo clone 到 ${session.cwd}，這個對話之後在那裡工作（原本的資料夾 ${old} 保持不動）。下一輪 Claude 會先把屬於這個專案的檔案搬進 repo，commit 並 push。`,
+  });
+  store.saveSession(session, { immediate: true });
+  return { cwd: session.cwd, moved: !same };
+}
 
 export async function listFiles(session, rel = '.') {
   const host = hostFor(session);

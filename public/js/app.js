@@ -1189,6 +1189,9 @@ function claudeSessionMenu(s, anchor) {
       { label: '用量與花費', hint: '/cost', onSelect: claudeCostDialog },
       { label: '花費上限…', hint: s.meta?.budget ? fmtUsd(s.meta.budget) : '關', onSelect: budgetDialog },
       { label: '定時送出…', hint: s.scheduled?.length ? `${s.scheduled.length} 則` : '/later', onSelect: () => scheduleDialog() },
+      s.meta?.repo
+        ? { label: `GitHub：${s.meta.repo.full}`, description: `分支 ${s.meta.repo.branch}（已綁定）`, onSelect: () => window.open(s.meta.repo.url, '_blank', 'noopener') }
+        : { label: '綁定 GitHub repo…', description: '之後的程式碼都 commit 並 push 到那裡', onSelect: () => repoDialog(s.machineId ? machineById(s.machineId) || { id: s.machineId, name: s.meta?.machineName || '那台電腦' } : { id: null, name: hostName() }, s) },
       { label: '複製資料夾路徑', onSelect: () => copyText(s.cwd || '').then(() => toast('已複製')) },
       { separator: true },
       { label: '刪除對話…', destructive: true, onSelect: () => deleteClaude(s) },
@@ -2461,9 +2464,10 @@ async function githubDialog() {
 // A new Claude conversation bound to a GitHub repository: cloned on the
 // chosen computer, on a branch of its own (or one named here), and every
 // change committed and pushed there.
-async function repoDialog(m) {
+// With `session`: that conversation, bound from now on.
+async function repoDialog(m, session = null) {
   const key = m.id || 'hub';
-  const cur = claudeRepo(m) || {};
+  const cur = (session ? null : claudeRepo(m)) || {};
   const repoInput = h('input', { class: 'om-input', type: 'text', autocomplete: 'off', spellcheck: false, placeholder: 'owner/repo 或 GitHub 網址', value: cur.full || '', 'aria-label': 'GitHub repo' });
   const list = h('div', { class: 'repo-list' }, h('div', { class: 'claude-test' }, h('span', { class: 'spinner' }), ` 讀取「${m.name}」上的 GitHub 帳號能 push 的 repo…`));
   const newBranchRadio = h('input', { type: 'radio', name: 'branch-mode', value: 'new', checked: !cur.branch });
@@ -2489,12 +2493,28 @@ async function repoDialog(m) {
   };
   repoInput.addEventListener('input', drawList);
   branchInput.addEventListener('focus', () => (namedRadio.checked = true));
-  const save = (e) => {
+  const submit = h('button', { class: 'om-btn om-btn--primary', type: 'submit' }, '綁定');
+  const save = async (e) => {
     e.preventDefault();
     const full = repoInput.value.trim().replace(/^(?:https?:\/\/)?(?:www\.)?github\.com[/:]/i, '').replace(/^git@github\.com:/i, '').replace(/\.git$/i, '').replace(/\/+$/, '');
     if (!/^[\w.-]+\/[\w.-]+$/.test(full)) return fill(out, 'repo 要寫成 owner/repo（或貼上 GitHub 網址）');
     const branch = namedRadio.checked ? branchInput.value.trim() : '';
     if (namedRadio.checked && !branch) return fill(out, '請輸入分支名稱，或選「開一個新分支」');
+    if (session) {
+      out.className = 'claude-test';
+      fill(out, h('span', { class: 'spinner' }), ` 綁定中（必要時 clone ${full}，可能要一點時間）…`);
+      submit.disabled = true;
+      try {
+        await post(`/sessions/${session.id}/repo`, { repo: full, branch: branch || undefined });
+        d.close();
+        toast(`這個對話已綁定 ${full}`);
+      } catch (err) {
+        out.className = 'claude-test bad';
+        fill(out, err.message);
+        submit.disabled = false;
+      }
+      return;
+    }
     const x = (S.home.claude ??= {});
     x.repoByMachine = { ...(x.repoByMachine || {}), [key]: { full, branch: branch || null } };
     saveHome();
@@ -2512,16 +2532,18 @@ async function repoDialog(m) {
   const form = h(
     'form',
     { class: 'settings' },
-    h('div', { class: 'dialog-title' }, '綁定 GitHub repo'),
+    h('div', { class: 'dialog-title' }, session ? '把這個對話綁定到 GitHub repo' : '綁定 GitHub repo'),
     h(
       'p',
       { class: 'dialog-text settings-lead' },
-      `新對話開始時，會把 repo clone 到「${m.name}」上的一個新資料夾，在一個分支上工作。Claude 寫的所有程式碼都會 commit 並 push 到那個分支；每一輪結束時 Agent Hub 都會檢查，沒上傳的會提醒 Claude，再不行就自動 commit 並 push。綁定會一直跟著這個對話，不會忘記；推到其他分支、force push 或改 remote 的指令都會被擋下。`,
+      session
+        ? `綁定後就不能再換。這個對話的資料夾如果本來就是這個 repo，會留在原地、切到選的分支；不是的話，會把 repo clone 到「${m.name}」上的新資料夾，對話改到那裡工作（原本的資料夾保持不動），下一輪 Claude 會先把屬於這個專案的檔案搬進 repo，commit 並 push。之後每一輪結束都會檢查，沒上傳的會提醒 Claude，再不行就自動 commit 並 push；推到其他分支、force push、改 remote 都會被擋下。Claude 的系統提示會加上綁定規則，所以壓縮對話也不會忘；代價是下一輪要重新讀一次整段對話（一次性多花一些 token）。`
+        : `新對話開始時，會把 repo clone 到「${m.name}」上的一個新資料夾，在一個分支上工作。Claude 寫的所有程式碼都會 commit 並 push 到那個分支；每一輪結束時 Agent Hub 都會檢查，沒上傳的會提醒 Claude，再不行就自動 commit 並 push。綁定會一直跟著這個對話，不會忘記；推到其他分支、force push 或改 remote 的指令都會被擋下。`,
     ),
     h('label', { class: 'om-field' }, h('span', { class: 'om-field__label' }, 'Repo'), repoInput),
     list,
     h('div', { class: 'dialog-subtitle' }, '分支'),
-    h('label', { class: 'settings-switch' }, newBranchRadio, h('span', null, h('span', { class: 'om-field__label' }, '開一個新分支'), h('span', { class: 'om-field__help' }, '從預設分支開出 claude/日期-編號，跟 Claude Code 網頁版一樣，之後再合併'))),
+    h('label', { class: 'settings-switch' }, newBranchRadio, h('span', null, h('span', { class: 'om-field__label' }, '開一個新分支'), h('span', { class: 'om-field__help' }, session ? '開出 claude/日期-編號（資料夾本來就是這個 repo 時，從它現在的位置開，未 commit 的變更會帶著走）' : '從預設分支開出 claude/日期-編號，跟 Claude Code 網頁版一樣，之後再合併'))),
     h('label', { class: 'settings-switch' }, namedRadio, h('span', null, h('span', { class: 'om-field__label' }, '指定分支'), h('span', { class: 'om-field__help' }, '已經存在就接著它做；不存在就從預設分支開出這個名字。填 main 會直接推到 main。'))),
     branchInput,
     out,
@@ -2530,7 +2552,7 @@ async function repoDialog(m) {
       { class: 'dialog-actions' },
       cur.full ? h('button', { class: 'om-btn', type: 'button', onclick: unbind }, '不綁定') : null,
       h('button', { class: 'om-btn', type: 'button', onclick: () => d.close() }, '取消'),
-      h('button', { class: 'om-btn om-btn--primary', type: 'submit' }, '綁定'),
+      submit,
     ),
   );
   form.addEventListener('submit', save);

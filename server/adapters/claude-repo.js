@@ -66,6 +66,25 @@ export async function clone(host, workspaces, { full, branch }) {
   return dir;
 }
 
+// A folder that is already a clone of the repository: onto `branch` (an
+// existing one, the remote's, or a new one from where it is now, keeping
+// uncommitted work).
+export async function useBranch(host, cwd, { branch }) {
+  const script = [
+    'set -e',
+    'git fetch -q origin 2>/dev/null || true',
+    `if [ "$(git symbolic-ref --short -q HEAD || true)" != ${q(branch)} ]; then`,
+    `  if git show-ref -q --verify ${q(`refs/heads/${branch}`)}; then git checkout -q ${q(branch)};`,
+    `  elif git show-ref -q --verify ${q(`refs/remotes/origin/${branch}`)}; then git checkout -q -b ${q(branch)} ${q(`origin/${branch}`)};`,
+    `  else git checkout -q -b ${q(branch)}; fi`,
+    'fi',
+    `git config ${q(`branch.${branch}.remote`)} origin`,
+    `git config ${q(`branch.${branch}.merge`)} ${q(`refs/heads/${branch}`)}`,
+  ].join('\n');
+  const r = await host.run(cwd, script, { timeoutMs: 120_000 });
+  if (r.exitCode !== 0) throw Object.assign(new Error(`沒辦法切到分支 ${branch}：${String(r.output || '').trim().split('\n').slice(-3).join(' ').slice(0, 400)}`), { status: 409 });
+}
+
 export function promptSection({ full, branch }) {
   return [
     '# GitHub repository (bound to this conversation)',

@@ -18271,6 +18271,10 @@ var init_claude_tools = __esm({
 // server/adapters/claude-repo.js
 import fs9 from "node:fs";
 import path9 from "node:path";
+function parseRepo(input) {
+  const s = String(input || "").trim().replace(/^(?:https?:\/\/)?(?:www\.)?github\.com[/:]/i, "").replace(/^git@github\.com:/i, "").replace(/\.git$/i, "").replace(/\/+$/, "");
+  return FULL.test(s) && !s.split("/").some((p) => p === "." || p === "..") ? s : null;
+}
 async function clone(host, workspaces, { full, branch }) {
   fs9.mkdirSync(workspaces, { recursive: true });
   const base = `${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10)}-${full.split("/")[1].toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "repo"}`;
@@ -18293,6 +18297,21 @@ async function clone(host, workspaces, { full, branch }) {
     throw Object.assign(new Error(`${why}\uFF08${tail}\uFF09`), { status: 400 });
   }
   return dir;
+}
+async function useBranch(host, cwd, { branch }) {
+  const script = [
+    "set -e",
+    "git fetch -q origin 2>/dev/null || true",
+    `if [ "$(git symbolic-ref --short -q HEAD || true)" != ${q2(branch)} ]; then`,
+    `  if git show-ref -q --verify ${q2(`refs/heads/${branch}`)}; then git checkout -q ${q2(branch)};`,
+    `  elif git show-ref -q --verify ${q2(`refs/remotes/origin/${branch}`)}; then git checkout -q -b ${q2(branch)} ${q2(`origin/${branch}`)};`,
+    `  else git checkout -q -b ${q2(branch)}; fi`,
+    "fi",
+    `git config ${q2(`branch.${branch}.remote`)} origin`,
+    `git config ${q2(`branch.${branch}.merge`)} ${q2(`refs/heads/${branch}`)}`
+  ].join("\n");
+  const r = await host.run(cwd, script, { timeoutMs: 12e4 });
+  if (r.exitCode !== 0) throw Object.assign(new Error(`\u6C92\u8FA6\u6CD5\u5207\u5230\u5206\u652F ${branch}\uFF1A${String(r.output || "").trim().split("\n").slice(-3).join(" ").slice(0, 400)}`), { status: 409 });
 }
 function promptSection({ full, branch }) {
   return [
@@ -18378,9 +18397,10 @@ function guard(command2, { branch }) {
   }
   return null;
 }
-var GITHUB, q2;
+var FULL, GITHUB, q2;
 var init_claude_repo = __esm({
   "server/adapters/claude-repo.js"() {
+    FULL = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
     GITHUB = process.env.AGENT_HUB_GITHUB_TEST_URL || "https://github.com";
     q2 = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
   }
@@ -18391,6 +18411,7 @@ var claude_exports = {};
 __export(claude_exports, {
   AGENT: () => AGENT,
   available: () => available,
+  bindRepo: () => bindRepo,
   cancelQueued: () => cancelQueued,
   cannotSend: () => cannotSend,
   command: () => command,
@@ -18473,14 +18494,14 @@ async function projectNotes(host, cwd) {
   }
   return null;
 }
-function systemPrompt(cwd, { platform, notes, git, computer, repo }) {
+function systemPrompt(cwd, { platform, notes, git, computer, repo, started = Date.now() }) {
   return [
     "You are Claude, working as a coding agent for the user through Agent Hub, a control center they open in a browser or on their phone. You act on their computer only through your tools, which run in the working directory below.",
     "",
     "# Environment",
     `- Working directory: ${cwd}`,
     `- Computer: ${computer} (${platform}); shell: bash`,
-    `- This conversation started on ${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10)}.`,
+    `- This conversation started on ${new Date(started).toISOString().slice(0, 10)}.`,
     git ? "- The working directory is a git repository." : "- The working directory is not a git repository.",
     "",
     "# How to work",
@@ -18582,6 +18603,10 @@ async function turn(run, { text, images = [], thumbs, note, promptId, resume }) 
   if (c.restarted) {
     content.unshift({ type: "text", text: `<system-reminder>${RESTART_NOTE}</system-reminder>` });
     c.restarted = false;
+  }
+  if (c.bindNote) {
+    content.unshift({ type: "text", text: `<system-reminder>${c.bindNote}</system-reminder>` });
+    c.bindNote = null;
   }
   if (!content.length) content.push({ type: "text", text: "Continue." });
   const note2 = planNote(session, c);
@@ -19213,6 +19238,31 @@ ${summary2}` }] }];
     next(session);
   }
 }
+async function bindRepo(session, { full, branch }) {
+  if (runs.has(session.id)) throw Object.assign(new Error("Claude \u6B63\u5728\u5DE5\u4F5C\uFF1A\u7B49\u9019\u4E00\u8F2A\u7D50\u675F\uFF08\u6216\u5148\u505C\u6B62\uFF09\u518D\u7D81\u5B9A"), { status: 409 });
+  if (session.meta?.repo) throw Object.assign(new Error(`\u9019\u500B\u5C0D\u8A71\u5DF2\u7D93\u7D81\u5B9A ${session.meta.repo.full} \u7684 ${session.meta.repo.branch}\uFF0C\u4E0D\u80FD\u518D\u63DB`), { status: 409 });
+  const host = hostFor(session);
+  const c = st(session);
+  const old = session.cwd;
+  const origin = await host.run(old, "git config --get remote.origin.url", { timeoutMs: 15e3 }).catch(() => null);
+  const same = origin?.exitCode === 0 && parseRepo(origin.output.trim())?.toLowerCase() === full.toLowerCase();
+  if (same) await useBranch(host, old, { full, branch });
+  else session.cwd = await clone(host, WORKSPACES_DIR, { full, branch });
+  const repo = { full, branch };
+  const platform = session.machineId ? getMachine(session.machineId)?.platform || "unknown" : `${os2.platform()} ${os2.release()}`;
+  const notes = await projectNotes(host, session.cwd);
+  const computer = session.meta?.machineName || machineName(session);
+  c.system = systemPrompt(session.cwd, { platform, notes, git: true, computer, repo, started: session.createdAt });
+  c.subSystem = subSystemPrompt(session.cwd, platform, repo);
+  c.bindNote = same ? `The user has bound this conversation to the GitHub repository ${full}, branch \`${branch}\`, from now on. The working directory ${old} is already a clone of it and is now on \`${branch}\`. Follow the rules in the system prompt: commit what you have done so far that belongs to the task, push it to \`${branch}\`, and keep doing so.` : `The user has bound this conversation to the GitHub repository ${full}, branch \`${branch}\`, from now on. It was cloned into ${session.cwd}, which is your working directory from now on (it was ${old}, which is unchanged; your earlier work is still there). First bring over into the repository what belongs to the user's task from ${old} (code, docs, configs; not secrets, data dumps, build output or tool caches), commit it with a clear message and push it to \`${branch}\`; tell the user briefly what you brought over and what you left out. Then follow the rules in the system prompt.`;
+  liveContext(session).setMeta({ repo: { ...repo, url: `https://github.com/${full}/tree/${branch}` } });
+  liveContext(session).emit({
+    type: "info",
+    text: same ? `\u5DF2\u7D81\u5B9A ${full} \u7684 ${branch}\uFF1A\u8CC7\u6599\u593E\u672C\u4F86\u5C31\u662F\u9019\u500B repo\uFF0C\u5DF2\u5207\u5230 ${branch}\u3002\u4E4B\u5F8C\u7684\u7A0B\u5F0F\u78BC\u90FD\u6703 commit \u4E26 push \u5230\u90A3\u88E1\u3002` : `\u5DF2\u7D81\u5B9A ${full} \u7684 ${branch}\uFF1Arepo clone \u5230 ${session.cwd}\uFF0C\u9019\u500B\u5C0D\u8A71\u4E4B\u5F8C\u5728\u90A3\u88E1\u5DE5\u4F5C\uFF08\u539F\u672C\u7684\u8CC7\u6599\u593E ${old} \u4FDD\u6301\u4E0D\u52D5\uFF09\u3002\u4E0B\u4E00\u8F2A Claude \u6703\u5148\u628A\u5C6C\u65BC\u9019\u500B\u5C08\u6848\u7684\u6A94\u6848\u642C\u9032 repo\uFF0Ccommit \u4E26 push\u3002`
+  });
+  saveSession(session, { immediate: true });
+  return { cwd: session.cwd, moved: !same };
+}
 async function listFiles(session, rel = ".") {
   const host = hostFor(session);
   const { files } = await host.walk(session.cwd, rel, 2e3);
@@ -19501,6 +19551,13 @@ var OPS = {
       return { session: snapshot(r.session) };
     }
     return {};
+  },
+  // Bound to a GitHub repository from now on (see claude.bindRepo).
+  async bindRepo({ id, repo }) {
+    const s = must(id);
+    const r = await claude.bindRepo(s, { full: String(repo?.full || ""), branch: String(repo?.branch || "") });
+    publish({ t: "session", sid: s.id, seq: s.seq || 0, session: summary(s) });
+    return r;
   },
   steerQueued: ({ id, promptId }) => claude.steerQueued(must(id), promptId),
   cancelQueued: ({ id, promptId }) => claude.cancelQueued(must(id), promptId),

@@ -190,6 +190,20 @@ export const steerQueued = (session, promptId) => call(session, 'steerQueued', {
 export const cancelQueued = (session, promptId) => call(session, 'cancelQueued', { promptId });
 export const setTitle = (session, title) => call(session, 'title', { title });
 
+// An existing conversation bound to a GitHub repository (it may move to a
+// new clone: its folder comes with the fresh copy taken after).
+export async function bindRepo(session, repo) {
+  const why = cannotSend(session);
+  if (why) throw Object.assign(new Error(why), { status: 409 });
+  try {
+    await call(session, 'bindRepo', { repo }, 660_000);
+  } catch (err) {
+    if (/不認得這個操作/.test(err.message)) throw Object.assign(new Error('Claude 背景程式還是舊版（有對話正在執行，它要等都閒下來才會更新）。等對話都跑完、過一分鐘後再試。'), { status: 409 });
+    throw err;
+  }
+  await sync(session);
+}
+
 export async function command(session, name, args = '') {
   const r = (await call(session, 'command', { name, args })) || {};
   // What it changed (/undo, /compact…) is here before this returns.

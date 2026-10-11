@@ -175,6 +175,13 @@ const OPS = {
     }
     return {};
   },
+  // Bound to a GitHub repository from now on (see claude.bindRepo).
+  async bindRepo({ id, repo }) {
+    const s = must(id);
+    const r = await claude.bindRepo(s, { full: String(repo?.full || ''), branch: String(repo?.branch || '') });
+    publish({ t: 'session', sid: s.id, seq: s.seq || 0, session: summary(s) });
+    return r;
+  },
   steerQueued: ({ id, promptId }) => claude.steerQueued(must(id), promptId),
   cancelQueued: ({ id, promptId }) => claude.cancelQueued(must(id), promptId),
   title({ id, title }) {
