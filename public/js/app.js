@@ -2105,7 +2105,7 @@ async function claudeDialog() {
   const list = (await loadClaudeModels())?.models || [];
   const d0 = acc.defaults || {};
   const form = h('form', { class: 'settings claude-settings' });
-  const keyInput = h('input', { class: 'om-input', type: 'password', autocomplete: 'off', spellcheck: false, placeholder: acc.hasKey ? '貼上新的 key 來更換' : 'sk-ant-api03-…', 'aria-label': 'Claude API key' });
+  const keyInput = h('input', { class: 'om-input', type: 'password', autocomplete: 'off', spellcheck: false, placeholder: acc.hasKey ? '貼上新的 key 來更換' : 'sk-ant-…', 'aria-label': 'Claude API key' });
   const keyNote = h('span', { class: 'om-field__help' });
   const testOut = h('div', { class: 'claude-test', role: 'status' });
   const drawKey = () => {

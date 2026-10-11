@@ -1,5 +1,5 @@
 // The Claude API account the hub talks to Claude with: an API key made in
-// the Claude Console (console.anthropic.com → API Keys, "sk-ant-api…"),
+// the Claude Console (console.anthropic.com → API Keys, "sk-ant-…"),
 // billed per token to that Console organization's credits.
 //
 // Only that. The hub never runs Claude Code and never reads a Claude Code /
@@ -32,9 +32,12 @@ function baseURL() {
 export function checkKey(key) {
   const k = String(key || '').trim();
   if (!k) return '請貼上 API key';
-  if (/^sk-ant-o(at|rt)/i.test(k)) return '這是 Claude Code／Claude 訂閱帳號的登入 token，不是 API key。中控台只用 Claude Console 的 API key：到 console.anthropic.com → API Keys 建立一把（sk-ant-api 開頭）。';
-  if (/^sk-ant-admin/i.test(k)) return '這是 Admin API key，不能拿來對話。請在 Claude Console 建立一般的 API key（sk-ant-api 開頭）。';
-  if (!/^sk-ant-api\d*-[\w-]{20,}$/.test(k)) return '這不是 Claude Console 的 API key（應該是 sk-ant-api 開頭的一長串）。';
+  if (/^sk-ant-o(at|rt)/i.test(k)) return '這是 Claude Code／Claude 訂閱帳號的登入 token，不是 API key。中控台只用 Claude Console 的 API key：到 console.anthropic.com → API Keys 建立一把（sk-ant- 開頭）。';
+  if (/^sk-ant-admin/i.test(k)) return '這是 Admin API key，不能拿來對話。請在 Claude Console 建立一般的 API key（sk-ant- 開頭）。';
+  // Other sk-ant-… keys made in the Console (sk-ant-api…, and newer kinds)
+  // are let through: whether one works is for Anthropic to say, and it is
+  // checked against the API before it is saved. Only ever sent as x-api-key.
+  if (!/^sk-ant-[a-z]+\d*-[\w-]{20,}$/i.test(k)) return '這不是 Claude Console 的 API key（應該是 sk-ant- 開頭的一長串）。';
   return null;
 }
 
@@ -62,7 +65,7 @@ const envKey = () => {
 };
 export const apiKey = () => saved.apiKey || envKey();
 export const keySource = () => (saved.apiKey ? 'hub' : envKey() ? 'env' : null);
-const masked = (k) => (k ? `sk-ant-api…${k.slice(-4)}` : '');
+const masked = (k) => (k ? `${k.split('-').slice(0, 3).join('-')}…${k.slice(-4)}` : '');
 
 export function setKey(key) {
   const k = String(key || '').trim();

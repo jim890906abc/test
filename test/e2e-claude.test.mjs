@@ -80,10 +80,13 @@ test('only a Claude Console API key is accepted, and kept to the hub', async () 
   assert.equal(before.hasKey, false);
   await assert.rejects(api('PUT', '/claude', { apiKey: 'sk-ant-oat01-abcdefghijklmnopqrstuvwxyz' }), /訂閱帳號/);
   await assert.rejects(api('PUT', '/claude', { apiKey: 'sk-ant-api03-wrong-key-xxxxxxxxxxxxxxxxxxx' }), /API key 無效/);
+  // Other Console key kinds go to Anthropic to be checked, not refused here.
+  await assert.rejects(api('PUT', '/claude', { apiKey: 'sk-ant-usr01-some-other-kind-of-key-xxxxxxxx' }), /API key 無效/);
+  await assert.rejects(api('PUT', '/claude', { apiKey: 'sk-ant-admin01-xxxxxxxxxxxxxxxxxxxxxxxx' }), /Admin API key/);
   await assert.rejects(api('POST', '/sessions', { agent: 'claude', prompt: 'hi' }), /還沒有設定 Claude API key/);
   const acc = await api('PUT', '/claude', { apiKey: KEY });
   assert.equal(acc.hasKey, true);
-  assert.equal(acc.keyHint, `sk-ant-api…${KEY.slice(-4)}`);
+  assert.equal(acc.keyHint, `sk-ant-api03…${KEY.slice(-4)}`);
   assert.equal(JSON.stringify(acc).includes(KEY), false);
   const st = fs.statSync(path.join(TMP, 'data', 'claude.json'));
   assert.equal(st.mode & 0o077, 0);

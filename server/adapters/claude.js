@@ -57,7 +57,7 @@ export function available() {
 
 // Refuse up front what cannot be sent.
 export function cannotSend() {
-  if (!account.apiKey()) return '還沒有設定 Claude API key：在左下角「⋯」→「Claude API…」貼上 Claude Console 的 API key（sk-ant-api…）。';
+  if (!account.apiKey()) return '還沒有設定 Claude API key：在左下角「⋯」→「Claude API…」貼上 Claude Console 的 API key（sk-ant-…）。';
   return null;
 }
 
