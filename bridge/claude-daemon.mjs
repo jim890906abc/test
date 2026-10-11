@@ -17788,7 +17788,7 @@ function runCommand(command2, { cwd, signal, timeoutMs = 12e4, onData } = {}) {
     const child = spawn2("bash", ["-c", command2], {
       cwd,
       detached: true,
-      env: { ...process.env, TERM: "dumb", CI: process.env.CI ?? "1" },
+      env: { ...process.env, TERM: "dumb", CI: process.env.CI ?? "1", GIT_TERMINAL_PROMPT: "0", GH_PROMPT_DISABLED: "1" },
       stdio: ["ignore", "pipe", "pipe"]
     });
     let out = "";
@@ -18371,6 +18371,7 @@ function systemPrompt(cwd, { platform, notes, git, computer }) {
     "- When you need a decision that is the user's to make, ask with AskUserQuestion instead of guessing.",
     "- Some tool calls wait for the user's approval. If one is rejected, do not retry it unchanged: read their feedback in the result, then adjust or ask.",
     "- HTML files you write are shown to the user live in a side panel, so a page is a good way to present a report, a dashboard or a prototype.",
+    "- For GitHub (cloning, branches, pushing, pull requests, issues, Actions), use git and the GitHub CLI (gh) through Bash. The user signs this computer in to GitHub from Agent Hub (\u22EF \u2192 GitHub\u2026); if `gh auth status` shows it is not signed in or gh is missing, ask them to do that there. Never ask for a token in the chat, run `gh auth login`, or print a token. Unless the user asked for it, ask before anything that changes GitHub (push, opening, merging or closing a pull request or issue, commenting); work on a new branch rather than the default one, and never force-push unless told to.",
     "- Write to the user in the language they write to you in. Be concise and use Markdown. When you finish, say what you changed and what they should check.",
     "",
     "# Plan mode",

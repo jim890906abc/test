@@ -150,7 +150,7 @@ export function runCommand(command, { cwd, signal, timeoutMs = 120_000, onData }
     const child = spawn('bash', ['-c', command], {
       cwd,
       detached: true,
-      env: { ...process.env, TERM: 'dumb', CI: process.env.CI ?? '1' },
+      env: { ...process.env, TERM: 'dumb', CI: process.env.CI ?? '1', GIT_TERMINAL_PROMPT: '0', GH_PROMPT_DISABLED: '1' },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let out = '';

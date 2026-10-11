@@ -424,6 +424,7 @@ function settingsMenu(anchor) {
       canNotify ? { label: '開啟通知', description: 'Kimi 或 Claude 需要你的時候通知你', onSelect: () => Notification.requestPermission().then(() => toast('已開啟通知')) } : null,
       { label: '設定…', description: 'Kimi 新對話預設的模型、思考強度、權限', onSelect: openSettings },
       { label: 'Claude API…', description: 'API key 與 Claude 新對話的預設', onSelect: claudeDialog },
+      { label: 'GitHub…', description: '讓 Claude 和 Kimi 用你的 GitHub 帳號', onSelect: githubDialog },
       { label: '連接電腦…', onSelect: openMachines },
       { label: '登出', destructive: true, onSelect: logout },
     ].filter(Boolean),
@@ -2289,6 +2290,158 @@ async function claudeDialog() {
   form.addEventListener('submit', save);
   const d = dialog(form);
   if (!acc.hasKey) setTimeout(() => keyInput.focus(), 0);
+}
+
+// GitHub for the agents, one computer at a time: Claude and Kimi use git and
+// the GitHub CLI (gh) there, signed in once from here. The sign-in stays in
+// gh on that computer; the hub keeps no GitHub token.
+const GITHUB_TOKEN_URL = 'https://github.com/settings/tokens/new?scopes=repo,read:org,workflow,gist&description=Agent%20Hub';
+async function githubDialog() {
+  const list = h('div', { class: 'gh-list' }, h('div', { class: 'claude-test' }, h('span', { class: 'spinner' }), ' 檢查各台電腦的 GitHub 登入狀態…'));
+  let timer = null;
+  let open = true;
+  const d = dialog(
+    h(
+      'div',
+      { class: 'settings' },
+      h('div', { class: 'dialog-title' }, 'GitHub'),
+      h(
+        'p',
+        { class: 'dialog-text settings-lead' },
+        'Claude 和 Kimi 在每台電腦上用 git 與 GitHub CLI（gh）操作 GitHub：clone、開分支、push、開 Pull Request、看 Issue 和 Actions。每台電腦登入一次，那台電腦上的對話就都能用。登入資料只存在那台電腦的 gh 裡，中控台不會保存。會改到 GitHub 的動作（push、開 PR、留言）它們會先問過你。',
+      ),
+      list,
+      h('div', { class: 'dialog-actions' }, h('button', { class: 'om-btn om-btn--primary', type: 'button', onclick: () => d.close() }, '完成')),
+    ),
+    { onClose: () => ((open = false), clearTimeout(timer)) },
+  );
+  const call = (c, action, body) => post(`/github/${encodeURIComponent(c.id)}/${action}`, body);
+  const card = (c) => {
+    const box = h('div', { class: 'gh-card' });
+    const out = h('div', { class: 'claude-test', role: 'status' });
+    const busy = (text) => {
+      out.className = 'claude-test';
+      fill(out, h('span', { class: 'spinner' }), ` ${text}`);
+    };
+    const bad = (err) => {
+      out.className = 'claude-test bad';
+      fill(out, err.message || String(err));
+    };
+    const redraw = (next) => {
+      Object.assign(c, next);
+      box.replaceWith(card(c));
+    };
+    const act = async (label, action, body) => {
+      busy(label);
+      try {
+        redraw(action === 'web' ? { pending: await call(c, 'web') } : await call(c, action, body));
+      } catch (err) {
+        bad(err);
+      }
+    };
+    const head = h(
+      'div',
+      { class: 'gh-card__head' },
+      h('span', { class: 'gh-card__name' }, c.name, c.hub ? h('span', { class: 'gh-card__tag' }, '中控台這台') : null),
+      h('span', { class: `gh-card__state${c.login ? ' ok' : ''}` }, c.offline ? '離線' : c.error ? '無法檢查' : c.gh === null ? '沒有 gh' : c.login ? `@${c.login}` : c.pending ? '等你授權' : '未登入'),
+    );
+    const body = [];
+    if (c.offline) body.push(h('div', { class: 'om-field__help' }, '這台電腦的連接器沒有連上。連上後再回來這裡登入。'));
+    else if (c.error) body.push(h('div', { class: 'om-field__help warn' }, c.error));
+    else if (c.gh === null)
+      body.push(
+        h('div', { class: 'om-field__help' }, '這台電腦還沒有安裝 GitHub CLI（gh）。在那台電腦的終端機執行：'),
+        h('div', { class: 'gh-cmd' }, h('code', null, c.install), h('button', { class: 'om-btn om-btn--sm', type: 'button', onclick: () => copyText(c.install).then(() => toast('已複製')) }, '複製')),
+        h('div', { class: 'claude-key-actions' }, h('button', { class: 'om-btn om-btn--sm', type: 'button', onclick: () => act('重新檢查…', 'status') }, '裝好了，重新檢查'), h('a', { class: 'om-btn om-btn--sm', href: 'https://cli.github.com', target: '_blank', rel: 'noopener' }, '其他安裝方式')),
+      );
+    else if (c.login)
+      body.push(
+        h('div', { class: 'om-field__help' }, `已登入 ${c.account ? `${c.account}（@${c.login}）` : `@${c.login}`}。`, c.git?.email ? `commit 署名：${c.git.name || ''} <${c.git.email}>` : ''),
+        h(
+          'div',
+          { class: 'claude-key-actions' },
+          h(
+            'button',
+            {
+              class: 'om-btn om-btn--sm om-btn--destructive',
+              type: 'button',
+              // Asked in a dialog of its own; this one opens again after.
+              onclick: async () => {
+                const ok = await confirmDialog({ title: `讓「${c.name}」登出 GitHub？`, body: '那台電腦上的 Claude 和 Kimi 之後就不能 push 或開 PR，直到你再登入。這不會撤銷 GitHub 上的授權，要撤銷請到 GitHub 的 Settings → Applications。', action: '登出', destructive: true });
+                if (ok) {
+                  try {
+                    await call(c, 'logout');
+                    toast(`「${c.name}」已登出 GitHub`);
+                  } catch (err) {
+                    fail(err);
+                  }
+                }
+                githubDialog();
+              },
+            },
+            '登出',
+          ),
+        ),
+      );
+    else if (c.pending) {
+      body.push(
+        h('div', { class: 'om-field__help' }, '1. 複製這組代碼　2. 打開 GitHub 的裝置登入頁貼上　3. 按 Authorize。完成後這裡會自動更新。'),
+        h('div', { class: 'gh-code' }, h('code', null, c.pending.code), h('button', { class: 'om-btn om-btn--sm', type: 'button', onclick: () => copyText(c.pending.code).then(() => toast('已複製代碼')) }, '複製')),
+        h(
+          'div',
+          { class: 'claude-key-actions' },
+          h('a', { class: 'om-btn om-btn--sm om-btn--primary', href: c.pending.url || 'https://github.com/login/device', target: '_blank', rel: 'noopener', onclick: () => copyText(c.pending.code) }, '打開 GitHub 登入頁'),
+          h('button', { class: 'om-btn om-btn--sm', type: 'button', onclick: () => act('取消中…', 'cancel') }, '取消'),
+        ),
+      );
+      const poll = async () => {
+        if (!open || !box.isConnected) return;
+        try {
+          const next = await call(c, 'status');
+          if (!next.pending) {
+            c.pending = null;
+            redraw(next);
+            if (next.login) toast(`「${c.name}」已登入 GitHub：@${next.login}`);
+            return;
+          }
+        } catch {}
+        timer = setTimeout(poll, 2500);
+      };
+      timer = setTimeout(poll, 2500);
+    } else {
+      const tokenInput = h('input', { class: 'om-input', type: 'password', autocomplete: 'off', spellcheck: false, placeholder: 'ghp_… 或 github_pat_…', 'aria-label': 'GitHub token' });
+      const tokenForm = h(
+        'form',
+        { class: 'gh-token', hidden: true },
+        tokenInput,
+        h('div', { class: 'om-field__help' }, '需要 repo、read:org、workflow 權限。', h('a', { href: GITHUB_TOKEN_URL, target: '_blank', rel: 'noopener' }, '在 GitHub 建立一個'), '。token 直接交給那台電腦的 gh，中控台不保存。'),
+        h('div', { class: 'claude-key-actions' }, h('button', { class: 'om-btn om-btn--sm om-btn--primary', type: 'submit' }, '登入')),
+      );
+      tokenForm.addEventListener('submit', (e) => {
+        e.preventDefault();
+        if (tokenInput.value.trim()) act('向 GitHub 確認…', 'login', { token: tokenInput.value.trim() });
+      });
+      if (c.problem) body.push(h('div', { class: 'om-field__help warn' }, c.problem));
+      body.push(
+        h(
+          'div',
+          { class: 'claude-key-actions' },
+          h('button', { class: 'om-btn om-btn--sm om-btn--primary', type: 'button', onclick: () => act('向 GitHub 要登入代碼…', 'web') }, '用瀏覽器登入'),
+          h('button', { class: 'om-btn om-btn--sm', type: 'button', onclick: () => ((tokenForm.hidden = !tokenForm.hidden), tokenForm.hidden || tokenInput.focus()) }, '改用 token'),
+        ),
+        tokenForm,
+      );
+    }
+    fill(box, head, ...body, out);
+    return box;
+  };
+  const draw = (computers) => fill(list, ...(computers.length ? computers.map(card) : [h('div', { class: 'om-field__help' }, '沒有可以設定的電腦。')]));
+  try {
+    const computers = await get('/github');
+    if (open) draw(computers);
+  } catch (err) {
+    fill(list, h('div', { class: 'claude-test bad' }, err.message));
+  }
 }
 
 // "已用 12 / 50": one of the API's rate limits, as of the last response.

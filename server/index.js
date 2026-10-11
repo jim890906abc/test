@@ -18,6 +18,7 @@ import { createAutoPause, activityOf, timings, isActive } from './autopause.js';
 import { createScheduler, scheduleTimings } from './schedule.js';
 import { mergeQuota, countsOf } from './quota.js';
 import * as claudeAccount from './claude-account.js';
+import * as github from './github.js';
 
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -451,6 +452,45 @@ app.get('/api/sessions/:id/changes', wrap((req) => {
 // ------------------------------------------------------------- machines
 
 app.get('/api/hub', wrap(() => ({ bridgeKey: BRIDGE_KEY, bridgePath: '/bridge/agent-hub-bridge.mjs' })));
+// GitHub for the agents, computer by computer: this one (the hub's own,
+// where its Claude conversations run) and the connected ones (bridge 0.6+).
+// A connected computer that is this one stands for it.
+const GITHUB_BRIDGE = /^0\.[0-5]\./;
+function githubTarget(target) {
+  if (target === 'local') {
+    const ops = { status: github.status, login: (a) => github.loginToken(a.token), web: github.loginWeb, cancel: github.cancelWeb, logout: github.logout };
+    return { call: (op, args) => ops[op](args || {}) };
+  }
+  const m = machines.getMachine(target);
+  if (!m) throw Object.assign(new Error('找不到這台電腦'), { status: 404 });
+  if (!m.online) throw Object.assign(new Error(`「${m.name}」目前離線`), { status: 409 });
+  if (GITHUB_BRIDGE.test(m.bridgeVersion || '0.0.0')) throw Object.assign(new Error(`「${m.name}」的連接器太舊，在那台電腦重新執行連接指令（左下角「連接電腦…」）後再試。`), { status: 409 });
+  return { call: (op, args) => machines.rpc(target, `github.${op}`, args || {}, op === 'login' || op === 'web' ? 60_000 : 30_000) };
+}
+app.get('/api/github', wrap(async () => {
+  const all = machines.listMachines().map((m) => ({ ...m, hostname: machines.getMachine(m.id)?.hostname }));
+  const here = os.hostname();
+  const computers = [
+    ...(all.some((m) => m.online && m.hostname === here) ? [] : [{ id: 'local', name: here, hub: true }]),
+    ...all.map((m) => ({ id: m.id, name: m.name, platform: m.platform, online: m.online, hub: m.hostname === here })),
+  ];
+  return Promise.all(
+    computers.map(async (c) => {
+      if (c.id !== 'local' && !c.online) return { ...c, offline: true };
+      try {
+        return { ...c, ...(await githubTarget(c.id).call('status')) };
+      } catch (err) {
+        return { ...c, error: err.message };
+      }
+    }),
+  );
+}));
+app.post('/api/github/:target/:action', wrap(async (req) => {
+  const { target, action } = req.params;
+  if (!['status', 'login', 'web', 'cancel', 'logout'].includes(action)) throw Object.assign(new Error('不支援的操作'), { status: 404 });
+  return githubTarget(target).call(action, action === 'login' ? { token: String(req.body?.token || '') } : {});
+}));
+
 app.get('/api/machines', wrap(() => machines.listMachines()));
 app.delete('/api/machines/:id', wrap((req) => machines.removeMachine(req.params.id)));
 app.post('/api/machines/:id/refresh', wrap((req) => machines.rpc(req.params.id, 'kimi.status')));

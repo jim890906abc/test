@@ -3215,3 +3215,74 @@ pre.tail {
 .chip.served.bad .served-dot {
   background: var(--danger);
 }
+
+/* GitHub: one card per computer. */
+.gh-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.gh-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+.gh-card__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+.gh-card__name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.gh-card__tag {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--ink-secondary);
+}
+.gh-card__state {
+  flex: none;
+  font-size: 12px;
+  color: var(--ink-secondary);
+}
+.gh-card__state.ok {
+  color: var(--success);
+}
+.gh-cmd,
+.gh-code {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.gh-cmd code,
+.gh-code code {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  border-radius: var(--radius-xs);
+  background: var(--fill-hover);
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+.gh-code code {
+  font-size: 20px;
+  letter-spacing: 0.12em;
+  text-align: center;
+}
+.gh-token {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.gh-token[hidden] {
+  display: none;
+}

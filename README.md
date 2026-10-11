@@ -39,6 +39,12 @@ cd agent-hub; powershell -ExecutionPolicy Bypass -File scripts\start-public.ps1
 
 Claude 的對話由一個獨立的 **Claude 背景程式** 執行（跟 Kimi 的 `kimi web` 一樣）：在中控台這台電腦上由中控台啟動，在已連接的電腦上由那台的連接器啟動（連接器要 0.5 以上，舊的請在那台電腦重新執行連接指令）。中控台只是看和操控它的介面：關掉中控台、甚至關掉連接器，Claude 都照常做完，中控台再開時會補上這段時間的進度。工具（Bash、Read、Write、Edit、Glob、Grep、網路搜尋）在那台電腦上你選的資料夾裡跑。為了在中控台關掉時也能呼叫 API，API key 也會存一份在執行 Claude 的那台電腦上（`~/.agent-hub/claude/`，只有你的帳號能讀）。權限有「每次詢問／自動接受編輯／全部自動」和計畫模式。也支援待辦、提問、子代理、插隊、/compact、/undo、/fork、定時送出；輸入框旁顯示這個對話的估計花費與每次回應實際的模型，`/cost` 看明細與速率限制，`/budget 5` 設定花費上限（花到就先停）。預設模型 Claude Opus 5.5。只用你選的模型：如果回覆來自別的模型（例如被降級），或模型拒絕回答，這一輪會立刻停下、不執行它要的工具，對話裡寫明原因並跳出通知。背景程式本身重新啟動（例如更新）時，被中斷的那一輪會自動接著做。
 
+## GitHub
+
+Claude 和 Kimi 都用 git 與 GitHub CLI（`gh`）操作 GitHub：clone、開分支、push、開 Pull Request、看 Issue 和 Actions。每台電腦登入一次就好：左下角「⋯」→「GitHub…」，選「用瀏覽器登入」（顯示一組代碼，到 github.com/login/device 輸入），或貼上一個 token。登入資料只存在那台電腦的 `gh` 裡，中控台不保存；登入後 git 也會用這個帳號 push（`gh auth setup-git`），commit 沒有設定署名的話會用帳號名稱與 GitHub 的 noreply 信箱。
+
+那台電腦要先裝好 `gh`（Kali／Debian／Ubuntu：`sudo apt install gh`，macOS：`brew install gh`，Windows：`winget install --id GitHub.cli`），連接器要 0.6 以上。連接器也會幫 Kimi 裝一個 `/github` skill；Claude 的系統提示裡有同樣的規則：會改到 GitHub 的動作（push、開 PR、留言）沒被要求就先問你，在新分支上工作，不 force push，也不在對話裡要 token。
+
 ## 連接其他電腦
 
 在那台電腦執行中控台印出的連接指令（左下角「連接電腦…」也看得到）。之後那台電腦的 Kimi 對話會自動出現。

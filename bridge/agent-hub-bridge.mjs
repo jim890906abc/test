@@ -22,7 +22,7 @@
 //   --start-kimi         Start `kimi web --no-open` if no Kimi server is running
 //   --kimi-bin <path>    Kimi Code CLI executable (default: kimi)
 //   --kimi-home <dir>    Kimi data directory (default: $KIMI_CODE_HOME or ~/.kimi-code)
-//   --no-skill           Do not install the /artifact skill into Kimi
+//   --no-skill           Do not install the /artifact and /github skills into Kimi
 //
 // Requires Node.js 22+ (built-in fetch and WebSocket). No dependencies. The
 // `kimi` mode also needs python3 (for the pseudo-terminal) on macOS / Linux.
@@ -32,10 +32,10 @@ import net from 'node:net';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, execFile, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '0.5.0';
+const VERSION = '0.6.0';
 const SCRIPT = fileURLToPath(import.meta.url);
 
 // ------------------------------------------------------------------ args
@@ -1362,6 +1362,160 @@ function listenLocal() {
   });
 }
 
+// ----------------------------------------------------------------- GitHub
+
+// GitHub for the agents here (Kimi, and Claude conversations working on this
+// computer): signed in once with the GitHub CLI, from the hub's "GitHub…".
+// github:begin — generated from server/github.js by scripts/sync-bridge-github.mjs
+const github = (() => {
+  const GH = process.env.AGENT_HUB_GH || 'gh';
+  const HOST = 'github.com';
+  // Asked for on top of gh's own (repo, read:org, gist): pushing changes to
+  // .github/workflows needs it.
+  const EXTRA_SCOPES = ['workflow'];
+  // gh never waits for an answer that will not come.
+  const ENV = { GH_PROMPT_DISABLED: '1', NO_COLOR: '1', GH_NO_UPDATE_NOTIFIER: '1', GIT_TERMINAL_PROMPT: '0' };
+
+  function run(cmd, args, { input, timeoutMs = 20_000 } = {}) {
+    return new Promise((resolve) => {
+      const child = execFile(cmd, args, { timeout: timeoutMs, env: { ...process.env, ...ENV }, windowsHide: true, maxBuffer: 1 << 20 }, (err, stdout, stderr) =>
+        resolve({ ok: !err, missing: err?.code === 'ENOENT', out: String(stdout).trim(), err: String(stderr).trim() }),
+      );
+      child.stdin?.on('error', () => {});
+      if (input != null) child.stdin?.end(input);
+    });
+  }
+
+  const firstLine = (s) => String(s || '').split('\n').map((l) => l.trim()).find(Boolean) || '';
+
+  // How to install gh here, for the user to run.
+  function installHint() {
+    if (process.platform === 'darwin') return 'brew install gh';
+    if (process.platform === 'win32') return 'winget install --id GitHub.cli';
+    let osr = '';
+    try {
+      osr = fs.readFileSync('/etc/os-release', 'utf8').toLowerCase();
+    } catch {}
+    if (/fedora|rhel|centos|rocky|alma/.test(osr)) return 'sudo dnf install gh';
+    if (/arch|manjaro/.test(osr)) return 'sudo pacman -S github-cli';
+    if (/alpine/.test(osr)) return 'sudo apk add github-cli';
+    return 'sudo apt install gh';
+  }
+
+  async function gitIdentity() {
+    const [name, email] = await Promise.all([run('git', ['config', '--global', 'user.name']), run('git', ['config', '--global', 'user.email'])]);
+    return { name: name.out || null, email: email.out || null };
+  }
+
+  // After signing in: git pushes over https with gh's sign-in, and commits get
+  // the account's name (and its private noreply address) unless git already has
+  // an identity.
+  async function finish() {
+    const setup = await run(GH, ['auth', 'setup-git', '--hostname', HOST]);
+    if (!setup.ok) throw new Error(`gh auth setup-git 失敗：${firstLine(setup.err)}`);
+    const u = await run(GH, ['api', 'user', '--hostname', HOST]);
+    if (!u.ok) return;
+    const user = JSON.parse(u.out);
+    const id = await gitIdentity();
+    if (!id.name) await run('git', ['config', '--global', 'user.name', user.name || user.login]);
+    if (!id.email) await run('git', ['config', '--global', 'user.email', `${user.id}+${user.login}@users.noreply.github.com`]);
+  }
+
+  // A sign-in in the browser (gh's device flow): gh shows a code, the user
+  // enters it at github.com/login/device, gh finishes on its own.
+  let web = null; // { child, code, url, state: 'waiting' | 'failed', error }
+
+  async function status() {
+    const v = await run(GH, ['--version']);
+    if (v.missing) return { gh: null, install: installHint() };
+    const base = { gh: v.out.match(/\d+\.\d+\.\d+/)?.[0] || '?', git: await gitIdentity() };
+    if (web?.state === 'waiting') return { ...base, login: null, pending: { code: web.code, url: web.url } };
+    const failed = web?.state === 'failed' ? web.error : null;
+    web = null;
+    const token = await run(GH, ['auth', 'token', '--hostname', HOST]);
+    if (!token.ok) return { ...base, login: null, problem: failed };
+    const u = await run(GH, ['api', 'user', '--hostname', HOST]);
+    if (!u.ok) return { ...base, login: null, problem: `有登入資料，但 GitHub 不接受（${firstLine(u.err) || '連不上 GitHub'}）。重新登入一次。` };
+    const user = JSON.parse(u.out);
+    return { ...base, login: user.login, account: user.name || null };
+  }
+
+  async function loginToken(token) {
+    token = String(token || '').trim();
+    if (!/^(gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}$/.test(token)) throw Object.assign(new Error('這不像 GitHub token（ghp_… 或 github_pat_…）'), { status: 400 });
+    const r = await run(GH, ['auth', 'login', '--hostname', HOST, '--git-protocol', 'https', '--with-token'], { input: `${token}\n`, timeoutMs: 30_000 });
+    if (r.missing) throw Object.assign(new Error(`這台電腦還沒有安裝 GitHub CLI（gh）：${installHint()}`), { status: 409 });
+    if (!r.ok) throw Object.assign(new Error(`GitHub 不接受這個 token：${firstLine(r.err)}`), { status: 400 });
+    await finish();
+    return status();
+  }
+
+  async function loginWeb() {
+    if (web?.state === 'waiting') return { code: web.code, url: web.url };
+    const child = spawn(GH, ['auth', 'login', '--hostname', HOST, '--git-protocol', 'https', '--web', '--skip-ssh-key', ...EXTRA_SCOPES.flatMap((s) => ['--scopes', s])], {
+      env: { ...process.env, ...ENV },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    const job = { child, code: null, url: null, state: 'waiting', error: null };
+    web = job;
+    let out = '';
+    const timer = setTimeout(() => child.kill(), 15 * 60_000);
+    const shown = new Promise((resolve, reject) => {
+      const read = (d) => {
+        out += d;
+        job.code ??= out.match(/one-time code:\s*([A-Z0-9]{4}-[A-Z0-9]{4})/i)?.[1] || null;
+        job.url ??= out.match(/https:\/\/\S+\/login\/device\S*/)?.[0] || null;
+        if (job.code) resolve({ code: job.code, url: job.url || `https://${HOST}/login/device` });
+      };
+      child.stdout.on('data', read);
+      child.stderr.on('data', read);
+      child.on('error', (err) => reject(err.code === 'ENOENT' ? Object.assign(new Error(`這台電腦還沒有安裝 GitHub CLI（gh）：${installHint()}`), { status: 409 }) : err));
+      child.on('close', async (code) => {
+        clearTimeout(timer);
+        reject(new Error(firstLine(out) || 'gh 沒有給出登入碼'));
+        if (web !== job) return;
+        if (code === 0) {
+          try {
+            await finish();
+            web = null;
+          } catch (err) {
+            Object.assign(job, { state: 'failed', error: err.message });
+          }
+        } else Object.assign(job, { state: 'failed', error: job.code ? '沒有完成登入（逾時或被拒絕），再試一次。' : firstLine(out) });
+      });
+    });
+    try {
+      return await Promise.race([shown, new Promise((_, reject) => setTimeout(() => reject(new Error('gh 沒有在時間內給出登入碼')), 30_000))]);
+    } catch (err) {
+      if (web === job) web = null;
+      child.kill();
+      throw err;
+    }
+  }
+
+  async function cancelWeb() {
+    const job = web;
+    web = null;
+    job?.child.kill();
+    return status();
+  }
+
+  async function logout() {
+    await cancelWeb();
+    const s = await status();
+    if (s.login) {
+      let r = await run(GH, ['auth', 'logout', '--hostname', HOST, '--user', s.login]);
+      // gh before 2.40 has one account per host and no --user.
+      if (!r.ok && /unknown flag/.test(r.err)) r = await run(GH, ['auth', 'logout', '--hostname', HOST]);
+      if (!r.ok) throw new Error(`登出失敗：${firstLine(r.err)}`);
+    }
+    return status();
+  }
+  return { status, loginToken, loginWeb, cancelWeb, logout };
+})();
+// github:end
+
 // ------------------------------------------------------- /artifact skill
 
 // Teaches Kimi that the hub renders the HTML files it writes in a side panel
@@ -1408,18 +1562,63 @@ const ARTIFACT_SKILL = [
   '',
 ].join('\n');
 
+// Teaches Kimi to use GitHub the way this computer is set up for it: git and
+// the GitHub CLI, signed in from the hub (never with a token in the chat).
+const GITHUB_SKILL_MARK = '<!-- agent-hub-github v1 -->';
+const GITHUB_SKILL = [
+  '---',
+  'name: github',
+  'description: 用 git 與 GitHub CLI（gh）操作 GitHub：clone、建立分支、commit、push、Pull Request、Issue、Actions、Release。使用者提到 GitHub、repo、PR、issue、push、CI 時使用。',
+  '---',
+  GITHUB_SKILL_MARK,
+  '',
+  '# GitHub（Agent Hub）',
+  '',
+  '這台電腦的 GitHub 帳號由使用者在 Agent Hub 中控台登入（左下角「⋯」→「GitHub…」），登入資料存在 GitHub CLI（gh）裡；git 透過 gh 用 https 取得權限，所以 `git push`、`gh pr create` 等都可以直接用。',
+  '',
+  '## 先確認',
+  '',
+  '- 執行 `gh auth status` 看有沒有登入、登入的是哪個帳號。',
+  '- 沒安裝 gh 或還沒登入：請使用者到 Agent Hub 的「⋯」→「GitHub…」幫這台電腦登入。不要在對話裡跟使用者要 token，也不要自己執行 `gh auth login`。',
+  '',
+  '## 常用指令',
+  '',
+  '- 取得 repo：`gh repo clone owner/repo`；看 repo：`gh repo view owner/repo`',
+  '- Pull Request：`gh pr create --title … --body …`、`gh pr list`、`gh pr view 123`、`gh pr diff 123`、`gh pr checks 123`、`gh pr checkout 123`',
+  '- Issue：`gh issue list`、`gh issue view 45`、`gh issue create --title … --body …`',
+  '- Actions：`gh run list`、`gh run view <id> --log-failed`',
+  '- 其他：`gh api repos/{owner}/{repo}/…`（REST API）、`gh release list`',
+  '- 長的內容（PR 說明、issue 內文）先寫進暫存檔再用 `--body-file` 傳，避免引號出錯。',
+  '',
+  '## 規則',
+  '',
+  '- push、開 PR／issue、留言、合併、關閉、刪除分支、建立 release 這些會改到 GitHub 上的動作：使用者沒有明確要求就先問過再做。',
+  '- 新工作開新分支，不要直接 push 到預設分支（main／master），除非使用者要求。',
+  '- 不要 force push、不要改寫已經 push 的歷史，除非使用者明確要求。',
+  '- commit 訊息寫清楚做了什麼；push 前先跑專案的測試或檢查。',
+  '- 不要印出、複製或寫進檔案任何 token（不要執行 `gh auth token`）。',
+  '- 做完後回報：分支名稱、commit、PR 連結。',
+  '',
+].join('\n');
+
 function installSkill() {
   if (!INSTALL_SKILL) return;
-  const file = path.join(KIMI_HOME, 'skills', 'agent-hub-artifact', 'SKILL.md');
-  try {
-    const cur = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
-    if (cur === ARTIFACT_SKILL) return;
-    if (cur && !cur.includes(SKILL_MARK)) return; // not ours: leave it alone
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(file, ARTIFACT_SKILL);
-    log('✓ 已把 /artifact skill 加進 Kimi（Kimi 寫的 HTML 頁面會顯示在中控台）');
-  } catch (err) {
-    log(`… 沒辦法安裝 /artifact skill：${err.message}`);
+  const skills = [
+    { dir: 'agent-hub-artifact', text: ARTIFACT_SKILL, mark: SKILL_MARK, done: '✓ 已把 /artifact skill 加進 Kimi（Kimi 寫的 HTML 頁面會顯示在中控台）' },
+    { dir: 'agent-hub-github', text: GITHUB_SKILL, mark: GITHUB_SKILL_MARK, done: '✓ 已把 /github skill 加進 Kimi（用 git 與 gh 操作 GitHub）' },
+  ];
+  for (const { dir, text, mark, done } of skills) {
+    const file = path.join(KIMI_HOME, 'skills', dir, 'SKILL.md');
+    try {
+      const cur = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
+      if (cur === text) continue;
+      if (cur && !cur.includes(mark)) continue; // not ours: leave it alone
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, text);
+      log(done);
+    } catch (err) {
+      log(`… 沒辦法安裝 ${dir} skill：${err.message}`);
+    }
   }
 }
 
@@ -1503,7 +1702,7 @@ const tools = {
       const child = spawn(IS_WIN ? 'cmd.exe' : 'bash', IS_WIN ? ['/d', '/s', '/c', String(command)] : ['-c', String(command)], {
         cwd: dir,
         detached: !IS_WIN,
-        env: { ...process.env, TERM: 'dumb', CI: process.env.CI ?? '1' },
+        env: { ...process.env, TERM: 'dumb', CI: process.env.CI ?? '1', GIT_TERMINAL_PROMPT: '0', GH_PROMPT_DISABLED: '1' },
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
       });
@@ -1897,6 +2096,17 @@ const hub = {
         return tools.dirs(args);
       case 'sh.run':
         return tools.run(args);
+      // GitHub on this computer (server/github.js has the hub's own).
+      case 'github.status':
+        return github.status();
+      case 'github.login':
+        return github.loginToken(args.token);
+      case 'github.web':
+        return github.loginWeb();
+      case 'github.cancel':
+        return github.cancelWeb();
+      case 'github.logout':
+        return github.logout();
       case 'sh.kill':
         shells.get(String(args.id || ''))?.('interrupted');
         return { ok: true };
