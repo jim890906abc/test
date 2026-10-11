@@ -39,7 +39,17 @@ function installHint() {
   if (/fedora|rhel|centos|rocky|alma/.test(osr)) return 'sudo dnf install gh';
   if (/arch|manjaro/.test(osr)) return 'sudo pacman -S github-cli';
   if (/alpine/.test(osr)) return 'sudo apk add github-cli';
-  return 'sudo apt install gh';
+  // GitHub's own apt repository: not every Debian-based system carries gh
+  // (Kali does not).
+  const apt = [
+    'mkdir -p -m 755 /etc/apt/keyrings',
+    'wget -qO /etc/apt/keyrings/githubcli-archive-keyring.gpg https://cli.github.com/packages/githubcli-archive-keyring.gpg',
+    'chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg',
+    'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list',
+    'apt update',
+    'apt install -y gh',
+  ].join(' && ');
+  return process.getuid?.() === 0 ? apt : `sudo sh -c '${apt}'`;
 }
 
 async function gitIdentity() {
