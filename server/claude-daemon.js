@@ -135,9 +135,15 @@ function applyAuth(auth) {
 const OPS = {
   async create({ id, cwd, title, config, permissionMode }) {
     if (store.getSession(id)) return snapshot(store.getSession(id));
-    if (!fs.statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) throw Object.assign(new Error(`資料夾不存在：${cwd}`), { status: 400 });
-    const s = store.createSession({ id, agentId: 'claude', cwd, permissionMode: permissionMode || 'ask', title: title || '新對話' });
-    await claude.setup(s, config || {});
+    // Bound to a GitHub repository: the folder is the clone, made in setup.
+    if (!config?.repo && !fs.statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) throw Object.assign(new Error(`資料夾不存在：${cwd}`), { status: 400 });
+    const s = store.createSession({ id, agentId: 'claude', cwd: cwd || '', permissionMode: permissionMode || 'ask', title: title || '新對話' });
+    try {
+      await claude.setup(s, config || {});
+    } catch (err) {
+      store.deleteSession(s.id);
+      throw err;
+    }
     publish({ t: 'session', sid: s.id, seq: s.seq || 0, session: summary(s) });
     return snapshot(s);
   },

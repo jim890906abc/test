@@ -761,7 +761,11 @@ function showClaudeHome() {
         h(
           'p',
           { class: 'home-hint' },
-          where.id ? `工具在「${where.name}」上執行，用中控台的 Claude API key 按用量計費。` : `在中控台這台電腦（${hostName()}）上執行，用 Claude API key 按用量計費。`,
+          claudeRepo(where)
+            ? `會把 ${claudeRepo(where).full} clone 到「${where.id ? where.name : hostName()}」上，在${claudeRepo(where).branch ? `分支 ${claudeRepo(where).branch}` : '一個新分支'}上工作，所有程式碼都 commit 並 push 到那裡。`
+            : where.id
+              ? `工具在「${where.name}」上執行，用中控台的 Claude API key 按用量計費。`
+              : `在中控台這台電腦（${hostName()}）上執行，用 Claude API key 按用量計費。`,
           h('button', { class: 'linklike', type: 'button', onclick: claudeDialog }, 'Claude API 設定…'),
         ),
       ),
@@ -791,6 +795,8 @@ function claudeHomeMachine() {
   return { id: null, name: hostName(), home: S.config?.home };
 }
 const claudeCwd = (m) => S.home.claude?.cwdByMachine?.[m.id || 'hub'];
+// Or a GitHub repository ({ full, branch? }) to clone and bind to.
+const claudeRepo = (m) => S.home.claude?.repoByMachine?.[m.id || 'hub'] || null;
 
 function claudeMachineMenu(anchor) {
   const cur = claudeHomeMachine();
@@ -827,7 +833,8 @@ function updateClaudeHome() {
   claudeHomeComposer.update({
     agent: 'claude',
     machineName: m.id ? m.name : hostName(),
-    folderName: cwd ? baseName(cwd) : '新資料夾',
+    folderName: claudeRepo(m) ? claudeRepo(m).full : cwd ? baseName(cwd) : '新資料夾',
+    folderIcon: claudeRepo(m) ? 'branch' : 'folder',
     models,
     defaultModel: S.claudeModels?.defaultModel,
     model: x.model && models.some((m) => m.id === x.model) ? x.model : S.claudeModels?.defaultModel || '',
@@ -851,13 +858,18 @@ function claudeFolderMenu(anchor) {
   const pick = (cwd) => {
     const x = (S.home.claude ??= {});
     x.cwdByMachine = { ...(x.cwdByMachine || {}), [m.id || 'hub']: cwd };
+    x.repoByMachine = { ...(x.repoByMachine || {}), [m.id || 'hub']: null };
     saveHome();
-    updateClaudeHome();
+    showHome();
   };
   const home = m.home || S.config?.home;
+  const repo = claudeRepo(m);
   openMenu(
     anchor,
     [
+      { section: 'GitHub' },
+      { label: repo ? `${repo.full}（${repo.branch || '新分支'}）` : '綁定一個 GitHub repo…', description: repo ? '換一個 repo 或分支' : 'clone 下來，所有程式碼都 commit 並 push 到那裡', checked: Boolean(repo), onSelect: () => repoDialog(m) },
+      { separator: true },
       recent.length ? { section: '最近使用' } : null,
       ...recent.map((p) => ({ label: baseName(p), description: shortPath(p, home, 4), onSelect: () => pick(p) })),
       recent.length ? { separator: true } : null,
@@ -881,7 +893,8 @@ async function startClaudeSession({ text, images }) {
   claudeHomeComposer.el.classList.add('sending');
   try {
     const m = claudeHomeMachine();
-    const s = await post('/sessions', { agent: 'claude', machineId: m.id || undefined, cwd: claudeCwd(m) || undefined, prompt: text, images, model, effort, permission: x.permission, planMode: x.planMode || undefined });
+    const repo = claudeRepo(m);
+    const s = await post('/sessions', { agent: 'claude', machineId: m.id || undefined, cwd: repo ? undefined : claudeCwd(m) || undefined, repo: repo?.full, branch: repo?.branch || undefined, prompt: text, images, model, effort, permission: x.permission, planMode: x.planMode || undefined });
     S.sessions.set(s.id, s);
     resetHomeChoices();
     go(`#/s/${s.id}`);
@@ -1091,6 +1104,7 @@ function updateComposer() {
     turnModel: meta.turnModel,
     turnEffort: meta.turnEffort,
     servedModel: meta.servedModel || null,
+    repo: meta.repo || null,
     context: meta.context,
     skills: meta.skills || [],
     terminal: meta.owner === 'tui',
@@ -1119,7 +1133,7 @@ function renderToolbar() {
     return;
   }
   const m = machineById(s.machineId);
-  const sub = (isClaude(s) ? ['Claude API', s.meta?.machineName || hostName(), s.cwd ? shortPath(s.cwd, s.machineId ? m?.home : S.config?.home, 3) : null] : [m?.name || s.meta?.machineName, s.cwd ? shortPath(s.cwd, m?.home, 3) : null]).filter(Boolean).join(' · ');
+  const sub = (isClaude(s) ? ['Claude API', s.meta?.machineName || hostName(), s.meta?.repo ? `${s.meta.repo.full} · ${s.meta.repo.branch}` : s.cwd ? shortPath(s.cwd, s.machineId ? m?.home : S.config?.home, 3) : null] : [m?.name || s.meta?.machineName, s.cwd ? shortPath(s.cwd, m?.home, 3) : null]).filter(Boolean).join(' · ');
   const arts = S.artifacts.length;
   fill(
     $toolbar,
@@ -2441,6 +2455,96 @@ async function githubDialog() {
     if (open) draw(computers);
   } catch (err) {
     fill(list, h('div', { class: 'claude-test bad' }, err.message));
+  }
+}
+
+// A new Claude conversation bound to a GitHub repository: cloned on the
+// chosen computer, on a branch of its own (or one named here), and every
+// change committed and pushed there.
+async function repoDialog(m) {
+  const key = m.id || 'hub';
+  const cur = claudeRepo(m) || {};
+  const repoInput = h('input', { class: 'om-input', type: 'text', autocomplete: 'off', spellcheck: false, placeholder: 'owner/repo 或 GitHub 網址', value: cur.full || '', 'aria-label': 'GitHub repo' });
+  const list = h('div', { class: 'repo-list' }, h('div', { class: 'claude-test' }, h('span', { class: 'spinner' }), ` 讀取「${m.name}」上的 GitHub 帳號能 push 的 repo…`));
+  const newBranchRadio = h('input', { type: 'radio', name: 'branch-mode', value: 'new', checked: !cur.branch });
+  const namedRadio = h('input', { type: 'radio', name: 'branch-mode', value: 'named', checked: Boolean(cur.branch) });
+  const branchInput = h('input', { class: 'om-input', type: 'text', autocomplete: 'off', spellcheck: false, placeholder: '例如 main，或已經存在的分支', value: cur.branch || '', 'aria-label': '分支名稱' });
+  const out = h('div', { class: 'claude-test bad', role: 'status' });
+  let repos = [];
+  const drawList = () => {
+    const q = repoInput.value.trim().toLowerCase();
+    const shown = repos.filter((r) => !q || r.full.toLowerCase().includes(q)).slice(0, 50);
+    fill(
+      list,
+      ...shown.map((r) =>
+        h(
+          'button',
+          { class: `repo-row${r.full === repoInput.value.trim() ? ' on' : ''}`, type: 'button', onclick: () => ((repoInput.value = r.full), drawList()) },
+          h('span', { class: 'repo-row__name' }, r.full, r.private ? h('span', { class: 'gh-card__tag' }, '私人') : null),
+          r.description ? h('span', { class: 'repo-row__desc' }, r.description) : null,
+        ),
+      ),
+      repos.length && !shown.length ? h('div', { class: 'om-field__help' }, '清單裡沒有符合的 repo；直接輸入 owner/repo 也可以。') : null,
+    );
+  };
+  repoInput.addEventListener('input', drawList);
+  branchInput.addEventListener('focus', () => (namedRadio.checked = true));
+  const save = (e) => {
+    e.preventDefault();
+    const full = repoInput.value.trim().replace(/^(?:https?:\/\/)?(?:www\.)?github\.com[/:]/i, '').replace(/^git@github\.com:/i, '').replace(/\.git$/i, '').replace(/\/+$/, '');
+    if (!/^[\w.-]+\/[\w.-]+$/.test(full)) return fill(out, 'repo 要寫成 owner/repo（或貼上 GitHub 網址）');
+    const branch = namedRadio.checked ? branchInput.value.trim() : '';
+    if (namedRadio.checked && !branch) return fill(out, '請輸入分支名稱，或選「開一個新分支」');
+    const x = (S.home.claude ??= {});
+    x.repoByMachine = { ...(x.repoByMachine || {}), [key]: { full, branch: branch || null } };
+    saveHome();
+    showHome();
+    d.close();
+    toast(`新對話會綁定 ${full}`);
+  };
+  const unbind = () => {
+    const x = (S.home.claude ??= {});
+    x.repoByMachine = { ...(x.repoByMachine || {}), [key]: null };
+    saveHome();
+    showHome();
+    d.close();
+  };
+  const form = h(
+    'form',
+    { class: 'settings' },
+    h('div', { class: 'dialog-title' }, '綁定 GitHub repo'),
+    h(
+      'p',
+      { class: 'dialog-text settings-lead' },
+      `新對話開始時，會把 repo clone 到「${m.name}」上的一個新資料夾，在一個分支上工作。Claude 寫的所有程式碼都會 commit 並 push 到那個分支；每一輪結束時 Agent Hub 都會檢查，沒上傳的會提醒 Claude，再不行就自動 commit 並 push。綁定會一直跟著這個對話，不會忘記；推到其他分支、force push 或改 remote 的指令都會被擋下。`,
+    ),
+    h('label', { class: 'om-field' }, h('span', { class: 'om-field__label' }, 'Repo'), repoInput),
+    list,
+    h('div', { class: 'dialog-subtitle' }, '分支'),
+    h('label', { class: 'settings-switch' }, newBranchRadio, h('span', null, h('span', { class: 'om-field__label' }, '開一個新分支'), h('span', { class: 'om-field__help' }, '從預設分支開出 claude/日期-編號，跟 Claude Code 網頁版一樣，之後再合併'))),
+    h('label', { class: 'settings-switch' }, namedRadio, h('span', null, h('span', { class: 'om-field__label' }, '指定分支'), h('span', { class: 'om-field__help' }, '已經存在就接著它做；不存在就從預設分支開出這個名字。填 main 會直接推到 main。'))),
+    branchInput,
+    out,
+    h(
+      'div',
+      { class: 'dialog-actions' },
+      cur.full ? h('button', { class: 'om-btn', type: 'button', onclick: unbind }, '不綁定') : null,
+      h('button', { class: 'om-btn', type: 'button', onclick: () => d.close() }, '取消'),
+      h('button', { class: 'om-btn om-btn--primary', type: 'submit' }, '綁定'),
+    ),
+  );
+  form.addEventListener('submit', save);
+  const d = dialog(form);
+  setTimeout(() => repoInput.focus(), 0);
+  try {
+    repos = await post(`/github/${encodeURIComponent(m.id || 'local')}/repos`);
+    drawList();
+  } catch (err) {
+    fill(
+      list,
+      h('div', { class: 'om-field__help warn' }, `${err.message}。直接輸入 owner/repo 也可以（公開 repo 不用登入就能 clone，但要 push 一定要登入）。`),
+      h('div', { class: 'claude-key-actions' }, h('button', { class: 'om-btn om-btn--sm', type: 'button', onclick: githubDialog }, 'GitHub 登入…')),
+    );
   }
 }
 

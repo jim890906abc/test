@@ -5,7 +5,7 @@
 // subagents, stopping, /undo, /compact and the cost.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { startFakeClaude, wait } from './fixtures/fake-anthropic.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -33,6 +33,7 @@ async function startHub(env = hubEnv) {
       AGENT_HUB_DATA: path.join(TMP, 'data'),
       AGENT_HUB_WORKSPACES: path.join(TMP, 'ws'),
       AGENT_HUB_CLAUDE_TEST_URL: fake.url,
+      AGENT_HUB_GITHUB_TEST_URL: path.join(TMP, 'github'),
       // What a machine with Claude Code signed in might have around. None of
       // it may reach the request.
       ANTHROPIC_AUTH_TOKEN: 'sk-ant-oat01-should-never-be-sent',
@@ -491,6 +492,70 @@ test('a conversation the hub ran on a connected computer moves into that compute
       process.kill(JSON.parse(fs.readFileSync(path.join(home, '.agent-hub', 'claude', 'daemon.json'), 'utf8')).pid, 'SIGTERM');
     } catch {}
   }
+});
+
+test('bound to a GitHub repository: cloned on its own branch, everything committed and pushed, other pushes refused', async () => {
+  const origin = path.join(TMP, 'github', 'me', 'proj.git');
+  const seed = path.join(TMP, 'seed');
+  const env = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
+  const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  fs.mkdirSync(origin, { recursive: true });
+  git(origin, 'init', '-q', '--bare', '-b', 'main');
+  fs.mkdirSync(seed);
+  git(seed, 'init', '-q', '-b', 'main');
+  fs.writeFileSync(path.join(seed, 'README.md'), '# proj\n');
+  git(seed, 'add', '.');
+  git(seed, 'commit', '-qm', 'init');
+  git(seed, 'push', '-q', origin, 'main');
+  const finished = (id) =>
+    until(async () => {
+      const x = await snap(id);
+      return x.status === 'idle' && x.events.some((e) => e.type === 'turn_end') && x;
+    }, 20000);
+
+  await assert.rejects(api('POST', '/sessions', { agent: 'claude', repo: 'not a repo' }), /owner\/repo/);
+  await assert.rejects(api('POST', '/sessions', { agent: 'claude', repo: 'me/proj', branch: '-bad' }), /分支名稱不合法/);
+  const before = (await api('GET', '/sessions')).length;
+  await assert.rejects(api('POST', '/sessions', { agent: 'claude', repo: 'me/missing' }), /找不到 me\/missing/);
+  assert.equal((await api('GET', '/sessions')).length, before);
+
+  // A new branch of its own, from the default one. Work left uncommitted:
+  // Claude is reminded, commits and pushes.
+  const s = await api('POST', '/sessions', { agent: 'claude', repo: 'https://github.com/me/proj', prompt: 'REPOGOOD', permission: 'auto' });
+  const branch = s.meta.repo.branch;
+  assert.match(branch, /^claude\/\d{8}-[0-9a-f]{4}$/);
+  assert.equal(s.meta.repo.full, 'me/proj');
+  assert.equal(s.meta.repo.url, `https://github.com/me/proj/tree/${branch}`);
+  assert.equal(git(s.cwd, 'rev-parse', '--abbrev-ref', 'HEAD'), branch);
+  assert.ok(fs.existsSync(path.join(s.cwd, 'README.md')));
+  const done = await finished(s.id);
+  assert.equal(git(origin, 'show', `${branch}:work.txt`), 'work');
+  assert.equal(git(origin, 'log', '-1', '--format=%s', branch), 'Add work.txt');
+  assert.equal(done.events.filter((e) => e.type === 'info' && /提醒 Claude commit 並 push/.test(e.text)).length, 1);
+  assert.equal(done.events.some((e) => e.type === 'error'), false);
+  const first = messagesSent().find((r) => r.body.messages[0].content.at(-1)?.text === 'REPOGOOD').body;
+  assert.match(first.system[0].text, /bound to the GitHub repository me\/proj/);
+  assert.match(first.system[0].text, new RegExp(`git push -u origin ${branch}`));
+
+  // A branch named here (new on the remote). Claude ignores the reminders:
+  // Agent Hub commits and pushes what it left.
+  const lazy = await api('POST', '/sessions', { agent: 'claude', repo: 'me/proj', branch: 'feature/x', prompt: 'REPOLAZY', permission: 'auto' });
+  assert.equal(lazy.meta.repo.branch, 'feature/x');
+  const lazyDone = await finished(lazy.id);
+  assert.equal(lazyDone.events.filter((e) => e.type === 'info' && /提醒 Claude/.test(e.text)).length, 2);
+  assert.ok(lazyDone.events.some((e) => e.type === 'info' && /已自動 commit 並 push 到 feature\/x/.test(e.text)), JSON.stringify(lazyDone.events.slice(-4)));
+  assert.equal(git(origin, 'show', 'feature/x:work.txt'), 'work');
+  assert.match(git(origin, 'log', '-1', '--format=%s', 'feature/x'), /Agent Hub auto-save/);
+
+  // An existing branch: worked on as it is. A force push is refused, and
+  // with nothing left behind there is no reminder.
+  const main = await api('POST', '/sessions', { agent: 'claude', repo: 'me/proj', branch: 'main', prompt: 'REPOFORCE', permission: 'auto' });
+  assert.equal(git(main.cwd, 'rev-parse', '--abbrev-ref', '@{u}'), 'origin/main');
+  const mainDone = await finished(main.id);
+  const pushed = mainDone.events.find((e) => e.type === 'tool_use' && e.name === 'Bash');
+  assert.equal(pushed.status, 'denied');
+  assert.match(mainDone.events.find((e) => e.type === 'text' && /完成/.test(e.text)).text, /Refused by Agent Hub/);
+  assert.equal(mainDone.events.some((e) => e.type === 'info' && /提醒 Claude/.test(e.text)), false);
 });
 
 test('the daemon bundle the bridges download is built from the current code', async (t) => {

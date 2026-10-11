@@ -21,6 +21,7 @@ import * as store from '../store.js';
 import * as machines from '../machines.js';
 import * as account from '../claude-account.js';
 import { apiTools, toolKind, validate, titleOf, execute, localHost, remoteHost } from './claude-tools.js';
+import * as repoBind from './claude-repo.js';
 
 export const live = true;
 export const AGENT = { id: 'claude', name: 'Claude', type: 'claude', enabled: true };
@@ -104,10 +105,13 @@ export async function setup(session, config = {}) {
   const c = st(session);
   const host = hostFor(session);
   const platform = session.machineId ? machines.getMachine(session.machineId)?.platform || 'unknown' : `${os.platform()} ${os.release()}`;
+  // Bound to a GitHub repository: cloned first, into a folder of its own.
+  const repo = config.repo ? { full: config.repo.full, branch: config.repo.branch } : null;
+  if (repo) session.cwd = await repoBind.clone(host, store.WORKSPACES_DIR, repo);
   const [notes, git] = await Promise.all([projectNotes(host, session.cwd), host.stat(session.cwd, '.git').then((x) => x.exists, () => false)]);
   const computer = config.computer || machineName(session);
-  c.system = systemPrompt(session.cwd, { platform, notes, git, computer });
-  c.subSystem = subSystemPrompt(session.cwd, platform);
+  c.system = systemPrompt(session.cwd, { platform, notes, git, computer, repo });
+  c.subSystem = subSystemPrompt(session.cwd, platform, repo);
   c.web = webTools;
   const model = typeof config.model === 'string' && config.model ? config.model : d.model;
   session.meta = {
@@ -120,6 +124,7 @@ export async function setup(session, config = {}) {
     planMode: typeof config.planMode === 'boolean' ? config.planMode : d.planMode,
     queue: [],
     todos: [],
+    ...(repo ? { repo: { ...repo, url: `https://github.com/${repo.full}/tree/${repo.branch}` } } : {}),
   };
   store.saveSession(session);
   refreshModels(session, true);
@@ -135,7 +140,7 @@ async function projectNotes(host, cwd) {
   return null;
 }
 
-function systemPrompt(cwd, { platform, notes, git, computer }) {
+function systemPrompt(cwd, { platform, notes, git, computer, repo }) {
   return [
     'You are Claude, working as a coding agent for the user through Agent Hub, a control center they open in a browser or on their phone. You act on their computer only through your tools, which run in the working directory below.',
     '',
@@ -159,18 +164,22 @@ function systemPrompt(cwd, { platform, notes, git, computer }) {
     '',
     '# Plan mode',
     'When a note says plan mode is on, change nothing: read and research only (Write, Edit and Bash are refused), then call ExitPlanMode with your plan. Once the user approves it, plan mode is off and you carry it out.',
+    repo ? `\n${repoBind.promptSection(repo)}` : '',
     notes ? `\n# Project instructions\nThe working directory has instructions for agents in ${notes.file}. Follow them:\n\n${notes.text}` : '',
   ]
     .join('\n')
     .trim();
 }
 
-function subSystemPrompt(cwd, platform = os.platform()) {
+function subSystemPrompt(cwd, platform = os.platform(), repo = null) {
   return [
     `You are a subagent of Claude, doing one self-contained task in the working directory ${cwd} (${platform}, bash).`,
     'The main agent gave you a brief and sees only your final message, so end with a complete report of what you found or did: paths, names, commands, results.',
     "You can read and search files, run commands with Bash and edit files; some calls wait for the user's approval, and a rejected call should not be retried unchanged. Do only what the brief asks.",
-  ].join('\n');
+    repo ? `The working directory is a clone of the GitHub repository ${repo.full} on the branch ${repo.branch}. Do not commit, push or switch branches: the main agent does that.` : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
 }
 
 // The models this key can use, for the picker (refreshed now and then).
@@ -295,7 +304,25 @@ async function turn(run, { text, images = [], thumbs, note, promptId, resume }) 
 
   let error = null;
   try {
-    await loop(run, { messages: c.messages, model, effort, main: true, system: c.system, tools: mainTools(session, model) });
+    const opts = { messages: c.messages, model, effort, main: true, system: c.system, tools: mainTools(session, model) };
+    let r = await loop(run, opts);
+    // Bound to a repository: nothing may stay behind uncommitted or unpushed.
+    // Claude is told (twice at most), then Agent Hub saves it itself.
+    const repo = session.meta?.repo;
+    const finished = (x) => !x.aborted && !x.halted && !x.budget && !run.aborted && !run.halted && !session.meta?.planMode;
+    if (repo && finished(r)) {
+      let left = await repoBind.check(hostFor(session), session.cwd, repo);
+      for (let i = 0; left && i < 2 && finished(r); i++) {
+        ctx.emit({ type: 'info', text: `Agent Hub 檢查：${left.zh}，提醒 Claude commit 並 push 到 ${repo.branch}` });
+        c.messages.push({ role: 'user', content: [{ type: 'text', text: `<system-reminder>${left.en}</system-reminder>` }] });
+        r = await loop(run, opts);
+        left = finished(r) ? await repoBind.check(hostFor(session), session.cwd, repo) : null;
+      }
+      if (left && finished(r)) {
+        const saved = await repoBind.autoSave(hostFor(session), session.cwd, repo, left);
+        ctx.emit({ type: saved.ok ? 'info' : 'error', text: saved.text });
+      }
+    }
     error = run.halted || null;
   } catch (err) {
     if (run.halted) error = run.halted;
@@ -688,6 +715,12 @@ async function runTool(run, u, ev, opts) {
     st(session).toldPlan = true;
     ctx.patch(ev, { status: 'denied', output: '計畫模式中：還不能修改或執行' });
     return { content: 'Plan mode is on, so nothing can be changed or run yet. Keep researching with Read, Grep and Glob, then present your plan with ExitPlanMode.', isError: true };
+  }
+  const repo = session.meta?.repo;
+  const refused = repo && u.name === 'Bash' && repoBind.guard(u.input.command, repo);
+  if (refused) {
+    ctx.patch(ev, { status: 'denied', output: `Agent Hub 拒絕：這個對話綁定 ${repo.full} 的 ${repo.branch}` });
+    return { content: `Refused by Agent Hub: ${refused}. This conversation is bound to ${repo.full}, branch ${repo.branch}; push your commits there with \`git push -u origin ${repo.branch}\`, and never force-push.`, isError: true };
   }
   if (needsPermission(session, u.name, kind)) {
     const a = await askUser(run, ev, { kind: 'approval', options: APPROVAL_OPTIONS });

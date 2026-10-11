@@ -1344,15 +1344,15 @@ function redactSensitive(body) {
   }
   return null;
 }
-async function checkCredentialsFileSafety(path10, onWarn = (m) => console.warn(`anthropic-sdk: ${m}`)) {
+async function checkCredentialsFileSafety(path11, onWarn = (m) => console.warn(`anthropic-sdk: ${m}`)) {
   if (typeof process === "undefined" || process.platform === "win32")
     return;
-  const { fs: fs10 } = await Promise.resolve().then(() => (init_node(), node_exports));
-  let resolved = path10;
+  const { fs: fs11 } = await Promise.resolve().then(() => (init_node(), node_exports));
+  let resolved = path11;
   let st2;
   try {
-    resolved = await fs10.promises.realpath(path10);
-    st2 = await fs10.promises.stat(resolved);
+    resolved = await fs11.promises.realpath(path11);
+    st2 = await fs11.promises.stat(resolved);
   } catch {
     return;
   }
@@ -1368,26 +1368,26 @@ async function checkCredentialsFileSafety(path10, onWarn = (m) => console.warn(`
   }
 }
 async function writeCredentialsFileAtomic(targetPath, data) {
-  const { fs: fs10, path: path10 } = await Promise.resolve().then(() => (init_node(), node_exports));
-  const dir = path10.dirname(targetPath);
-  await fs10.promises.mkdir(dir, { recursive: true, mode: 448 });
+  const { fs: fs11, path: path11 } = await Promise.resolve().then(() => (init_node(), node_exports));
+  const dir = path11.dirname(targetPath);
+  await fs11.promises.mkdir(dir, { recursive: true, mode: 448 });
   const tmpPath = `${targetPath}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
   try {
-    const fh = await fs10.promises.open(tmpPath, "w", 384);
+    const fh = await fs11.promises.open(tmpPath, "w", 384);
     try {
       await fh.writeFile(JSON.stringify(data, null, 2));
       await fh.sync();
     } finally {
       await fh.close();
     }
-    await fs10.promises.rename(tmpPath, targetPath);
+    await fs11.promises.rename(tmpPath, targetPath);
   } catch (err) {
-    await fs10.promises.unlink(tmpPath).catch(() => {
+    await fs11.promises.unlink(tmpPath).catch(() => {
     });
     throw err;
   }
   try {
-    const dirFh = await fs10.promises.open(dir, "r");
+    const dirFh = await fs11.promises.open(dir, "r");
     try {
       await dirFh.sync();
     } finally {
@@ -1789,11 +1789,11 @@ var init_credentials = __esm({
         return null;
       }
       validateProfileName(profileName);
-      const { fs: fs10, path: path10 } = await Promise.resolve().then(() => (init_node(), node_exports));
-      const configPath = path10.join(rootConfigPath, "configs", `${profileName}.json`);
+      const { fs: fs11, path: path11 } = await Promise.resolve().then(() => (init_node(), node_exports));
+      const configPath = path11.join(rootConfigPath, "configs", `${profileName}.json`);
       let configRaw;
       try {
-        configRaw = await fs10.promises.readFile(configPath, "utf-8");
+        configRaw = await fs11.promises.readFile(configPath, "utf-8");
       } catch (err) {
         if (err?.code !== "ENOENT") {
           throw new Error(`failed to read config file ${configPath}: ${err}`);
@@ -1874,14 +1874,14 @@ var init_credentials = __esm({
         return null;
       }
       validateProfileName(profileName);
-      const { path: path10 } = await Promise.resolve().then(() => (init_node(), node_exports));
-      return path10.join(rootConfigPath, "credentials", `${profileName}.json`);
+      const { path: path11 } = await Promise.resolve().then(() => (init_node(), node_exports));
+      return path11.join(rootConfigPath, "credentials", `${profileName}.json`);
     };
     getRootConfigPath = async () => {
       if (!supportsLocalConfigFiles()) {
         return null;
       }
-      const { path: path10 } = await Promise.resolve().then(() => (init_node(), node_exports));
+      const { path: path11 } = await Promise.resolve().then(() => (init_node(), node_exports));
       const configDir = readEnv("ANTHROPIC_CONFIG_DIR");
       if (configDir) {
         return configDir;
@@ -1890,21 +1890,21 @@ var init_credentials = __esm({
       if (os3 === "Windows") {
         const appData = readEnv("APPDATA");
         if (appData) {
-          return path10.join(appData, "Anthropic");
+          return path11.join(appData, "Anthropic");
         }
         const userProfile = readEnv("USERPROFILE");
         if (userProfile) {
-          return path10.join(userProfile, "AppData", "Roaming", "Anthropic");
+          return path11.join(userProfile, "AppData", "Roaming", "Anthropic");
         }
         return null;
       }
       const xdgConfigHome = readEnv("XDG_CONFIG_HOME");
       if (xdgConfigHome) {
-        return path10.join(xdgConfigHome, "anthropic");
+        return path11.join(xdgConfigHome, "anthropic");
       }
       const home = readEnv("HOME");
       if (home) {
-        return path10.join(home, ".config", "anthropic");
+        return path11.join(home, ".config", "anthropic");
       }
       return null;
     };
@@ -1921,10 +1921,10 @@ var init_credentials = __esm({
       if (profileName) {
         return profileName;
       }
-      const { fs: fs10, path: path10 } = await Promise.resolve().then(() => (init_node(), node_exports));
-      const filePath = path10.join(rootConfigPath, "active_config");
+      const { fs: fs11, path: path11 } = await Promise.resolve().then(() => (init_node(), node_exports));
+      const filePath = path11.join(rootConfigPath, "active_config");
       try {
-        return (await fs10.promises.readFile(filePath, "utf-8")).trim() || "default";
+        return (await fs11.promises.readFile(filePath, "utf-8")).trim() || "default";
       } catch (err) {
         if (err?.code !== "ENOENT") {
           throw new Error(`failed to read ${filePath}: ${err}`);
@@ -1936,21 +1936,21 @@ var init_credentials = __esm({
 });
 
 // node_modules/@anthropic-ai/sdk/lib/credentials/identity-token.mjs
-function identityTokenFromFile(path10) {
-  if (!path10) {
+function identityTokenFromFile(path11) {
+  if (!path11) {
     throw new AnthropicError("Identity token file path is empty");
   }
   return async () => {
-    const { fs: fs10 } = await Promise.resolve().then(() => (init_node(), node_exports));
+    const { fs: fs11 } = await Promise.resolve().then(() => (init_node(), node_exports));
     let content;
     try {
-      content = await fs10.promises.readFile(path10, "utf-8");
+      content = await fs11.promises.readFile(path11, "utf-8");
     } catch (err) {
-      throw new AnthropicError(`Failed to read identity token file at ${path10}: ${err}`);
+      throw new AnthropicError(`Failed to read identity token file at ${path11}: ${err}`);
     }
     const token = content.trim();
     if (!token) {
-      throw new AnthropicError(`Identity token file at ${path10} is empty`);
+      throw new AnthropicError(`Identity token file at ${path11} is empty`);
     }
     return token;
   };
@@ -2035,11 +2035,11 @@ var init_oidc_federation = __esm({
 // node_modules/@anthropic-ai/sdk/lib/credentials/user-oauth.mjs
 function userOAuthProvider(config) {
   return async (opts) => {
-    const { fs: fs10 } = await Promise.resolve().then(() => (init_node(), node_exports));
+    const { fs: fs11 } = await Promise.resolve().then(() => (init_node(), node_exports));
     await checkCredentialsFileSafety(config.credentialsPath, config.onSafetyWarning);
     let raw;
     try {
-      raw = await fs10.promises.readFile(config.credentialsPath, "utf-8");
+      raw = await fs11.promises.readFile(config.credentialsPath, "utf-8");
     } catch (err) {
       throw new WorkloadIdentityError(`Credentials file not found at ${config.credentialsPath}: ${err}`);
     }
@@ -2211,11 +2211,11 @@ function resolveIdentityTokenProvider(auth) {
 }
 function cachedExchangeProvider(exchange, credentialsPath, onCacheWriteError, onSafetyWarning) {
   return async (opts) => {
-    const { fs: fs10 } = await Promise.resolve().then(() => (init_node(), node_exports));
+    const { fs: fs11 } = await Promise.resolve().then(() => (init_node(), node_exports));
     await checkCredentialsFileSafety(credentialsPath, onSafetyWarning);
     let existing;
     try {
-      const raw = await fs10.promises.readFile(credentialsPath, "utf-8");
+      const raw = await fs11.promises.readFile(credentialsPath, "utf-8");
       existing = JSON.parse(raw);
       const token = existing?.["access_token"];
       if (token && !opts?.forceRefresh) {
@@ -3271,12 +3271,12 @@ var init_path = __esm({
   "node_modules/@anthropic-ai/sdk/internal/utils/path.mjs"() {
     init_error();
     EMPTY = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.create(null));
-    createPathTagFunction = (pathEncoder = encodeURIPath) => function path10(statics, ...params) {
+    createPathTagFunction = (pathEncoder = encodeURIPath) => function path11(statics, ...params) {
       if (statics.length === 1)
         return statics[0];
       let postPath = false;
       const invalidSegments = [];
-      const path11 = statics.reduce((previousValue, currentValue, index) => {
+      const path12 = statics.reduce((previousValue, currentValue, index) => {
         if (/[?#]/.test(currentValue)) {
           postPath = true;
         }
@@ -3293,7 +3293,7 @@ var init_path = __esm({
         }
         return previousValue + currentValue + (index === params.length ? "" : encoded);
       }, "");
-      const pathOnly = path11.split(/[?#]/, 1)[0];
+      const pathOnly = path12.split(/[?#]/, 1)[0];
       const invalidSegmentPattern = /(?<=^|\/)(?:\.|%2e){1,2}(?=\/|$)/gi;
       let match;
       while ((match = invalidSegmentPattern.exec(pathOnly)) !== null) {
@@ -3314,10 +3314,10 @@ var init_path = __esm({
         }, "");
         throw new AnthropicError(`Path parameters result in path with invalid segments:
 ${invalidSegments.map((e) => e.error).join("\n")}
-${path11}
+${path12}
 ${underline}`);
       }
-      return path11;
+      return path12;
     };
     path3 = /* @__PURE__ */ createPathTagFunction(encodeURIPath);
   }
@@ -16997,9 +16997,9 @@ var init_client = __esm({
         makeStatusError(status, error, message, headers) {
           return APIError.generate(status, error, message, headers);
         }
-        buildURL(path10, query, defaultBaseURL) {
+        buildURL(path11, query, defaultBaseURL) {
           const baseURL2 = !__classPrivateFieldGet(this, _BaseAnthropic_instances, "m", _BaseAnthropic_baseURLOverridden).call(this) && defaultBaseURL || this.baseURL;
-          const url = isAbsoluteURL(path10) ? new URL(path10) : new URL(baseURL2 + (baseURL2.endsWith("/") && path10.startsWith("/") ? path10.slice(1) : path10));
+          const url = isAbsoluteURL(path11) ? new URL(path11) : new URL(baseURL2 + (baseURL2.endsWith("/") && path11.startsWith("/") ? path11.slice(1) : path11));
           const defaultQuery = this.defaultQuery();
           const pathQuery = Object.fromEntries(url.searchParams);
           if (!isEmptyObj(defaultQuery) || !isEmptyObj(pathQuery)) {
@@ -17071,24 +17071,24 @@ var init_client = __esm({
         backendMiddleware() {
           return [];
         }
-        get(path10, opts) {
-          return this.methodRequest("get", path10, opts);
+        get(path11, opts) {
+          return this.methodRequest("get", path11, opts);
         }
-        post(path10, opts) {
-          return this.methodRequest("post", path10, opts);
+        post(path11, opts) {
+          return this.methodRequest("post", path11, opts);
         }
-        patch(path10, opts) {
-          return this.methodRequest("patch", path10, opts);
+        patch(path11, opts) {
+          return this.methodRequest("patch", path11, opts);
         }
-        put(path10, opts) {
-          return this.methodRequest("put", path10, opts);
+        put(path11, opts) {
+          return this.methodRequest("put", path11, opts);
         }
-        delete(path10, opts) {
-          return this.methodRequest("delete", path10, opts);
+        delete(path11, opts) {
+          return this.methodRequest("delete", path11, opts);
         }
-        methodRequest(method, path10, opts) {
+        methodRequest(method, path11, opts) {
           return this.request(Promise.resolve(opts).then((opts2) => {
-            return { method, path: path10, ...opts2 };
+            return { method, path: path11, ...opts2 };
           }));
         }
         request(options, remainingRetries = null) {
@@ -17209,8 +17209,8 @@ var init_client = __esm({
           armAbandonmentBackstop(response.body ?? response, controller);
           return { response, options, controller, requestLogID, retryOfRequestLogID, startTime };
         }
-        getAPIList(path10, Page2, opts) {
-          return this.requestAPIList(Page2, opts && "then" in opts ? opts.then((opts2) => ({ method: "get", path: path10, ...opts2 })) : { method: "get", path: path10, ...opts });
+        getAPIList(path11, Page2, opts) {
+          return this.requestAPIList(Page2, opts && "then" in opts ? opts.then((opts2) => ({ method: "get", path: path11, ...opts2 })) : { method: "get", path: path11, ...opts });
         }
         requestAPIList(Page2, options) {
           const request = this.makeRequest(options, null, void 0);
@@ -17328,14 +17328,14 @@ var init_client = __esm({
         }
         async buildRequest(inputOptions, { retryCount = 0 } = {}) {
           const options = { ...inputOptions };
-          const { method, path: path10, query, defaultBaseURL } = options;
+          const { method, path: path11, query, defaultBaseURL } = options;
           if (this._authState.resolution) {
             await this._authState.resolution;
           }
           if (!this._baseURLIsExplicit && this._authState.baseURL && this.baseURL !== this._authState.baseURL) {
             this.baseURL = this._authState.baseURL;
           }
-          const url = this.buildURL(path10, query, defaultBaseURL);
+          const url = this.buildURL(path11, query, defaultBaseURL);
           if ("timeout" in options)
             validatePositiveInteger("timeout", options.timeout);
           options.timeout = options.timeout ?? this.timeout;
@@ -18268,6 +18268,124 @@ var init_claude_tools = __esm({
   }
 });
 
+// server/adapters/claude-repo.js
+import fs9 from "node:fs";
+import path9 from "node:path";
+async function clone(host, workspaces, { full, branch }) {
+  fs9.mkdirSync(workspaces, { recursive: true });
+  const base = `${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10)}-${full.split("/")[1].toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "repo"}`;
+  let dir = path9.join(workspaces, base);
+  for (let i = 2; fs9.existsSync(dir); i++) dir = path9.join(workspaces, `${base}-${i}`);
+  const script = [
+    "set -e",
+    `git clone --origin origin -- ${q2(`${GITHUB}/${full}.git`)} ${q2(dir)}`,
+    `cd ${q2(dir)}`,
+    `if git ls-remote --exit-code --heads origin ${q2(branch)} >/dev/null 2>&1; then git checkout -q -B ${q2(branch)} ${q2(`origin/${branch}`)}; else git checkout -q -b ${q2(branch)}; fi`,
+    `git config ${q2(`branch.${branch}.remote`)} origin`,
+    `git config ${q2(`branch.${branch}.merge`)} ${q2(`refs/heads/${branch}`)}`
+  ].join("\n");
+  const r = await host.run(workspaces, script, { timeoutMs: 6e5 });
+  if (r.exitCode !== 0) {
+    fs9.rmSync(dir, { recursive: true, force: true });
+    const out = String(r.output || "");
+    const tail = out.trim().split("\n").slice(-3).join(" ").slice(0, 400);
+    const why = /could not read Username|Authentication failed|Repository not found|not found|does not exist/i.test(out) ? `\u627E\u4E0D\u5230 ${full}\uFF0C\u6216\u9019\u53F0\u96FB\u8166\u6C92\u6709\u6B0A\u9650\u8B80\u5B83\u3002\u79C1\u4EBA repo \u8981\u5148\u5728\u300C\u22EF\u300D\u2192\u300CGitHub\u2026\u300D\u5E6B\u9019\u53F0\u96FB\u8166\u767B\u5165\u3002` : `\u6C92\u8FA6\u6CD5 clone ${full}\u3002`;
+    throw Object.assign(new Error(`${why}\uFF08${tail}\uFF09`), { status: 400 });
+  }
+  return dir;
+}
+function promptSection({ full, branch }) {
+  return [
+    "# GitHub repository (bound to this conversation)",
+    `This conversation is bound to the GitHub repository ${full}, cloned in the working directory, on the branch \`${branch}\` (remote \`origin\`). This does not change for the rest of the conversation: everything you make for the user goes into this repository, on this branch. Work with high discipline:`,
+    `- Work only in this clone and only on \`${branch}\`. Do not switch to or create other branches, do not change the remote, and do not delete branches.`,
+    `- Commit as you go, in small logical commits with clear messages that say what changed and why, and push them with \`git push -u origin ${branch}\`. A piece of work is not done until it is committed and pushed. Agent Hub checks at the end of every turn and reminds you of anything left uncommitted or unpushed; if you still leave it, Agent Hub commits and pushes it with a generic message, which is worse than yours.`,
+    "- Before each commit, look at `git status` and `git diff --staged` and commit only what belongs to the task. Never commit secrets (keys, tokens, passwords, .env files), large generated files, dependencies or build output; add them to .gitignore instead.",
+    "- Run the project's tests, linters or build before you push when it has them, and fix what fails.",
+    "- Never force-push and never rewrite history that was pushed (no rebase, amend, reset or filter of pushed commits). Agent Hub refuses such commands.",
+    `- If a push is rejected because the remote branch moved, run \`git pull --no-rebase origin ${branch}\`, resolve conflicts carefully (keep both sides' intent), run the checks again and push. If it fails for another reason, retry a couple of times, then tell the user exactly what failed.`,
+    "- When you finish, tell the user which commits you pushed (short hash and message)."
+  ].join("\n");
+}
+async function check2(host, cwd, { branch }) {
+  const script = [
+    'echo "branch=$(git symbolic-ref --short -q HEAD || echo detached-HEAD)"',
+    `echo "dirty=$(git status --porcelain | wc -l | tr -d ' ')"`,
+    'echo "ahead=$(git rev-list --count HEAD --not --remotes=origin 2>/dev/null || echo 0)"'
+  ].join("\n");
+  const r = await host.run(cwd, script, { timeoutMs: 3e4 }).catch(() => null);
+  const out = String(r?.output || "");
+  const get = (k) => out.match(new RegExp(`^${k}=(.*)$`, "m"))?.[1]?.trim();
+  if (!get("branch")) return null;
+  const s = { branch: get("branch"), dirty: Number(get("dirty")) || 0, ahead: Number(get("ahead")) || 0 };
+  if (s.branch === branch && !s.dirty && !s.ahead) return null;
+  const zh = [];
+  const en = [];
+  if (s.branch !== branch) {
+    zh.push(`\u505C\u5728\u5206\u652F ${s.branch}\uFF0C\u4E0D\u662F\u7D81\u5B9A\u7684 ${branch}`);
+    en.push(`you are on ${s.branch}, not on \`${branch}\`, the branch this conversation is bound to: bring the work over to \`${branch}\` (git checkout ${branch}, then merge or cherry-pick it)`);
+  }
+  if (s.dirty) {
+    zh.push(`${s.dirty} \u500B\u6A94\u6848\u7684\u8B8A\u66F4\u9084\u6C92 commit`);
+    en.push(`${s.dirty} changed or new file(s) are not committed`);
+  }
+  if (s.ahead) {
+    zh.push(`${s.ahead} \u500B commit \u9084\u6C92 push`);
+    en.push(`${s.ahead} commit(s) are not pushed`);
+  }
+  return {
+    ...s,
+    zh: zh.join("\u3001"),
+    en: `Agent Hub check at the end of your turn: ${en.join("; ")}. This conversation is bound to ${"`"}${branch}${"`"}: commit the work that belongs to the task with a clear message (leave out anything that must not be committed and add it to .gitignore), push it with \`git push -u origin ${branch}\`, then finish your answer.`
+  };
+}
+async function autoSave(host, cwd, { branch }, left) {
+  if (left.branch !== branch) return { ok: false, text: `\u6C92\u8FA6\u6CD5\u81EA\u52D5\u4E0A\u50B3\uFF1AClaude \u505C\u5728\u5206\u652F ${left.branch}\uFF0C\u4E0D\u662F\u7D81\u5B9A\u7684 ${branch}\u3002\u8ACB\u53EB Claude \u5207\u56DE ${branch} \u4E26\u628A\u5DE5\u4F5C\u5E36\u904E\u53BB\u3002` };
+  const script = [
+    "set -e",
+    "git add -A",
+    "if ! git diff --cached --quiet; then if git config user.email >/dev/null; then git commit -q -m 'Agent Hub auto-save: work left uncommitted at the end of a turn'; else git -c user.name='Agent Hub' -c user.email='agent-hub@localhost' commit -q -m 'Agent Hub auto-save: work left uncommitted at the end of a turn'; fi; fi",
+    `git push -q -u origin ${q2(branch)} 2>&1`,
+    "git log -1 --format=%h"
+  ].join("\n");
+  const r = await host.run(cwd, script, { timeoutMs: 18e4 });
+  const out = String(r.output || "").trim();
+  if (r.exitCode !== 0) return { ok: false, text: `\u81EA\u52D5 commit\uFF0Fpush \u5931\u6557\uFF1A${out.split("\n").slice(-3).join(" ").slice(0, 400)}` };
+  return { ok: true, text: `Claude \u7559\u4E0B\u4E86\u6C92\u4E0A\u50B3\u7684\u5DE5\u4F5C\uFF08${left.zh}\uFF09\uFF0CAgent Hub \u5DF2\u81EA\u52D5 commit \u4E26 push \u5230 ${branch}\uFF08${out.split("\n").at(-1)}\uFF09\u3002` };
+}
+function guard(command2, { branch }) {
+  for (const part of String(command2 || "").split(/&&|\|\||[;|\n]/)) {
+    const words = part.trim().split(/\s+/).map((w) => w.replace(/^["']|["']$/g, ""));
+    let i = words.findIndex((w) => !/^\w+=/.test(w));
+    if (words[i] !== "git") continue;
+    for (i++; i < words.length && words[i].startsWith("-"); i++) if (["-C", "-c", "--git-dir", "--work-tree"].includes(words[i])) i++;
+    const sub = words[i];
+    const args = words.slice(i + 1);
+    if (sub === "remote" && ["add", "set-url", "remove", "rm", "rename", "set-head"].includes(args[0])) return `the remote of this repository is fixed (origin), so \`git remote ${args[0]}\` is not allowed`;
+    if (sub !== "push") continue;
+    const opts = args.filter((a) => a.startsWith("-"));
+    const bad = opts.find((o) => /^(-f|--force|--force-with-lease|--force-if-includes|--mirror|--all|--branches|--delete|-d|--prune)(=|$)/.test(o) || /^-[a-z]*f/.test(o));
+    if (bad) return `\`git push ${bad}\` could overwrite or delete what is on the remote`;
+    const positional = args.filter((a) => !a.startsWith("-"));
+    if (positional.length && positional[0] !== "origin") return "pushing goes to origin only";
+    for (const ref of positional.slice(1)) {
+      if (ref.startsWith("+")) return `\`${ref}\` is a forced push`;
+      const [src, dst] = ref.includes(":") ? ref.split(":") : [ref, ref];
+      const to = (dst || "").replace(/^refs\/heads\//, "");
+      const okSrc = ["HEAD", branch, `refs/heads/${branch}`].includes(src);
+      if (!src || !okSrc || to !== branch && !(to === "HEAD" && !ref.includes(":"))) return `this conversation pushes to \`${branch}\` only (got \`${ref}\`)`;
+    }
+  }
+  return null;
+}
+var GITHUB, q2;
+var init_claude_repo = __esm({
+  "server/adapters/claude-repo.js"() {
+    GITHUB = process.env.AGENT_HUB_GITHUB_TEST_URL || "https://github.com";
+    q2 = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
+  }
+});
+
 // server/adapters/claude.js
 var claude_exports = {};
 __export(claude_exports, {
@@ -18321,10 +18439,12 @@ async function setup(session, config = {}) {
   const c = st(session);
   const host = hostFor(session);
   const platform = session.machineId ? getMachine(session.machineId)?.platform || "unknown" : `${os2.platform()} ${os2.release()}`;
+  const repo = config.repo ? { full: config.repo.full, branch: config.repo.branch } : null;
+  if (repo) session.cwd = await clone(host, WORKSPACES_DIR, repo);
   const [notes, git] = await Promise.all([projectNotes(host, session.cwd), host.stat(session.cwd, ".git").then((x) => x.exists, () => false)]);
   const computer = config.computer || machineName(session);
-  c.system = systemPrompt(session.cwd, { platform, notes, git, computer });
-  c.subSystem = subSystemPrompt(session.cwd, platform);
+  c.system = systemPrompt(session.cwd, { platform, notes, git, computer, repo });
+  c.subSystem = subSystemPrompt(session.cwd, platform, repo);
   c.web = webTools2;
   const model = typeof config.model === "string" && config.model ? config.model : d.model;
   session.meta = {
@@ -18336,7 +18456,8 @@ async function setup(session, config = {}) {
     permission: PERMISSIONS2.includes(config.permission) ? config.permission : d.permission,
     planMode: typeof config.planMode === "boolean" ? config.planMode : d.planMode,
     queue: [],
-    todos: []
+    todos: [],
+    ...repo ? { repo: { ...repo, url: `https://github.com/${repo.full}/tree/${repo.branch}` } } : {}
   };
   saveSession(session);
   refreshModels(session, true);
@@ -18352,7 +18473,7 @@ async function projectNotes(host, cwd) {
   }
   return null;
 }
-function systemPrompt(cwd, { platform, notes, git, computer }) {
+function systemPrompt(cwd, { platform, notes, git, computer, repo }) {
   return [
     "You are Claude, working as a coding agent for the user through Agent Hub, a control center they open in a browser or on their phone. You act on their computer only through your tools, which run in the working directory below.",
     "",
@@ -18376,6 +18497,8 @@ function systemPrompt(cwd, { platform, notes, git, computer }) {
     "",
     "# Plan mode",
     "When a note says plan mode is on, change nothing: read and research only (Write, Edit and Bash are refused), then call ExitPlanMode with your plan. Once the user approves it, plan mode is off and you carry it out.",
+    repo ? `
+${promptSection(repo)}` : "",
     notes ? `
 # Project instructions
 The working directory has instructions for agents in ${notes.file}. Follow them:
@@ -18383,12 +18506,13 @@ The working directory has instructions for agents in ${notes.file}. Follow them:
 ${notes.text}` : ""
   ].join("\n").trim();
 }
-function subSystemPrompt(cwd, platform = os2.platform()) {
+function subSystemPrompt(cwd, platform = os2.platform(), repo = null) {
   return [
     `You are a subagent of Claude, doing one self-contained task in the working directory ${cwd} (${platform}, bash).`,
     "The main agent gave you a brief and sees only your final message, so end with a complete report of what you found or did: paths, names, commands, results.",
-    "You can read and search files, run commands with Bash and edit files; some calls wait for the user's approval, and a rejected call should not be retried unchanged. Do only what the brief asks."
-  ].join("\n");
+    "You can read and search files, run commands with Bash and edit files; some calls wait for the user's approval, and a rejected call should not be retried unchanged. Do only what the brief asks.",
+    repo ? `The working directory is a clone of the GitHub repository ${repo.full} on the branch ${repo.branch}. Do not commit, push or switch branches: the main agent does that.` : ""
+  ].filter(Boolean).join("\n");
 }
 async function refreshModels(session, force = false) {
   if (!force && Date.now() - (modelsAt.get(session.id) || 0) < 5 * 6e4) return;
@@ -18433,12 +18557,12 @@ function startTurn(session, prompt) {
 }
 function next(session) {
   if (runs.has(session.id) || getSession(session.id) !== session) return;
-  const q2 = queue(session)[0];
-  if (!q2) return;
+  const q3 = queue(session)[0];
+  if (!q3) return;
   liveContext(session).setMeta({ queue: queue(session).slice(1) });
-  const images = queuedImages.get(session, q2.promptId) || [];
-  queuedImages.delete(session, q2.promptId);
-  startTurn(session, { text: q2.text, images, thumbs: q2.images, note: q2.note, promptId: q2.promptId });
+  const images = queuedImages.get(session, q3.promptId) || [];
+  queuedImages.delete(session, q3.promptId);
+  startTurn(session, { text: q3.text, images, thumbs: q3.images, note: q3.note, promptId: q3.promptId });
 }
 async function turn(run, { text, images = [], thumbs, note, promptId, resume }) {
   const { session, ctx } = run;
@@ -18467,7 +18591,23 @@ async function turn(run, { text, images = [], thumbs, note, promptId, resume }) 
   if (sysNote) c.messages.push(sysNote);
   let error = null;
   try {
-    await loop(run, { messages: c.messages, model, effort, main: true, system: c.system, tools: mainTools(session, model) });
+    const opts = { messages: c.messages, model, effort, main: true, system: c.system, tools: mainTools(session, model) };
+    let r = await loop(run, opts);
+    const repo = session.meta?.repo;
+    const finished = (x) => !x.aborted && !x.halted && !x.budget && !run.aborted && !run.halted && !session.meta?.planMode;
+    if (repo && finished(r)) {
+      let left = await check2(hostFor(session), session.cwd, repo);
+      for (let i = 0; left && i < 2 && finished(r); i++) {
+        ctx.emit({ type: "info", text: `Agent Hub \u6AA2\u67E5\uFF1A${left.zh}\uFF0C\u63D0\u9192 Claude commit \u4E26 push \u5230 ${repo.branch}` });
+        c.messages.push({ role: "user", content: [{ type: "text", text: `<system-reminder>${left.en}</system-reminder>` }] });
+        r = await loop(run, opts);
+        left = finished(r) ? await check2(hostFor(session), session.cwd, repo) : null;
+      }
+      if (left && finished(r)) {
+        const saved2 = await autoSave(hostFor(session), session.cwd, repo, left);
+        ctx.emit({ type: saved2.ok ? "info" : "error", text: saved2.text });
+      }
+    }
     error = run.halted || null;
   } catch (err) {
     if (run.halted) error = run.halted;
@@ -18568,16 +18708,16 @@ async function loop(run, opts) {
 }
 function takeSteered(run) {
   const { session, ctx } = run;
-  const items = queue(session).filter((q2) => q2.steered);
+  const items = queue(session).filter((q3) => q3.steered);
   if (!items.length) return [];
-  ctx.setMeta({ queue: queue(session).filter((q2) => !q2.steered) });
+  ctx.setMeta({ queue: queue(session).filter((q3) => !q3.steered) });
   const blocks = [];
-  for (const q2 of items) {
-    ctx.emit({ type: "user", text: q2.text, images: q2.images || [], promptId: q2.promptId, source: "hub", steered: true, ...q2.note ? { note: q2.note } : {} });
-    const images = queuedImages.get(session, q2.promptId) || [];
-    queuedImages.delete(session, q2.promptId);
+  for (const q3 of items) {
+    ctx.emit({ type: "user", text: q3.text, images: q3.images || [], promptId: q3.promptId, source: "hub", steered: true, ...q3.note ? { note: q3.note } : {} });
+    const images = queuedImages.get(session, q3.promptId) || [];
+    queuedImages.delete(session, q3.promptId);
     blocks.push(...images.map(imageBlock), { type: "text", text: `The user sent this while you were working:
-${q2.text || "(images)"}` });
+${q3.text || "(images)"}` });
   }
   return blocks;
 }
@@ -18794,6 +18934,12 @@ async function runTool(run, u, ev, opts) {
     ctx.patch(ev, { status: "denied", output: "\u8A08\u756B\u6A21\u5F0F\u4E2D\uFF1A\u9084\u4E0D\u80FD\u4FEE\u6539\u6216\u57F7\u884C" });
     return { content: "Plan mode is on, so nothing can be changed or run yet. Keep researching with Read, Grep and Glob, then present your plan with ExitPlanMode.", isError: true };
   }
+  const repo = session.meta?.repo;
+  const refused = repo && u.name === "Bash" && guard(u.input.command, repo);
+  if (refused) {
+    ctx.patch(ev, { status: "denied", output: `Agent Hub \u62D2\u7D55\uFF1A\u9019\u500B\u5C0D\u8A71\u7D81\u5B9A ${repo.full} \u7684 ${repo.branch}` });
+    return { content: `Refused by Agent Hub: ${refused}. This conversation is bound to ${repo.full}, branch ${repo.branch}; push your commits there with \`git push -u origin ${repo.branch}\`, and never force-push.`, isError: true };
+  }
   if (needsPermission(session, u.name, kind)) {
     const a = await askUser(run, ev, { kind: "approval", options: APPROVAL_OPTIONS });
     if (!a) return interrupted(run, ev);
@@ -18847,14 +18993,14 @@ async function respond(session, eventId, optionId, { answers, feedback } = {}) {
   return true;
 }
 async function askQuestions(run, ev, input) {
-  const questions = input.questions.slice(0, 4).map((q2, i) => ({
+  const questions = input.questions.slice(0, 4).map((q3, i) => ({
     id: `q${i}`,
-    question: q2.question,
-    header: q2.header || "",
-    multi_select: Boolean(q2.multiSelect),
+    question: q3.question,
+    header: q3.header || "",
+    multi_select: Boolean(q3.multiSelect),
     allow_other: true,
     other_label: "\u5176\u4ED6\u7B54\u6848",
-    options: (q2.options || []).map((o, j) => ({ id: `o${j}`, label: o.label, description: o.description || "" }))
+    options: (q3.options || []).map((o, j) => ({ id: `o${j}`, label: o.label, description: o.description || "" }))
   }));
   run.ctx.patch(ev, { title: questions[0]?.question || "Claude \u6709\u554F\u984C\u8981\u554F\u4F60" });
   const a = await askUser(run, ev, { kind: "question", questions });
@@ -18863,15 +19009,15 @@ async function askQuestions(run, ev, input) {
     run.ctx.patch(ev, { status: "done" });
     return { content: "The user skipped the questions without answering. Go on with your best judgment, or ask again in plain words if you cannot.", isError: false };
   }
-  const label = (q2, id) => q2.options.find((o) => o.id === id)?.label || id;
-  const lines = questions.map((q2) => {
-    const x = a.answers?.[q2.id];
+  const label = (q3, id) => q3.options.find((o) => o.id === id)?.label || id;
+  const lines = questions.map((q3) => {
+    const x = a.answers?.[q3.id];
     let t = "(skipped)";
-    if (x?.kind === "single") t = label(q2, x.option_id);
-    else if (x?.kind === "multi") t = x.option_ids.map((id) => label(q2, id)).join(", ");
+    if (x?.kind === "single") t = label(q3, x.option_id);
+    else if (x?.kind === "multi") t = x.option_ids.map((id) => label(q3, id)).join(", ");
     else if (x?.kind === "other") t = x.text;
-    else if (x?.kind === "multi_with_other") t = [...x.option_ids.map((id) => label(q2, id)), x.other_text].join(", ");
-    return `- ${q2.question} \u2192 ${t}`;
+    else if (x?.kind === "multi_with_other") t = [...x.option_ids.map((id) => label(q3, id)), x.other_text].join(", ");
+    return `- ${q3.question} \u2192 ${t}`;
   });
   run.ctx.patch(ev, { status: "done", output: lines.join("\n") });
   return { content: `The user answered:
@@ -18940,8 +19086,8 @@ async function interrupt(session) {
   for (const resolve2 of [...run.waits.values()]) resolve2(null);
 }
 function steerQueued(session, promptId) {
-  const q2 = queue(session).find((x) => x.promptId === promptId);
-  if (!q2 || q2.steered) return;
+  const q3 = queue(session).find((x) => x.promptId === promptId);
+  if (!q3 || q3.steered) return;
   liveContext(session).setMeta({ queue: queue(session).map((x) => x.promptId === promptId ? { ...x, steered: true } : x) });
 }
 function cancelQueued(session, promptId) {
@@ -19143,7 +19289,7 @@ function resumeLater(session, wasWorking, tries = 0) {
   t.unref?.();
 }
 function dispose(session) {
-  for (const q2 of queue(session)) queuedImages.delete(session, q2.promptId);
+  for (const q3 of queue(session)) queuedImages.delete(session, q3.promptId);
   interrupt(session);
   modelsAt.delete(session.id);
 }
@@ -19154,6 +19300,7 @@ var init_claude = __esm({
     init_machines();
     init_claude_account();
     init_claude_tools();
+    init_claude_repo();
     live = true;
     AGENT = { id: "claude", name: "Claude", type: "claude", enabled: true };
     PERMISSIONS2 = ["manual", "edits", "auto"];
@@ -19216,21 +19363,21 @@ var init_claude = __esm({
 });
 
 // server/claude-daemon.js
-import fs9 from "node:fs";
-import path9 from "node:path";
+import fs10 from "node:fs";
+import path10 from "node:path";
 import http from "node:http";
 import crypto7 from "node:crypto";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 var argv = process.argv.slice(2);
-var DIR = path9.resolve(argv[argv.indexOf("--dir") + 1] || path9.join(process.env.HOME || ".", ".agent-hub", "claude"));
-fs9.mkdirSync(DIR, { recursive: true, mode: 448 });
+var DIR = path10.resolve(argv[argv.indexOf("--dir") + 1] || path10.join(process.env.HOME || ".", ".agent-hub", "claude"));
+fs10.mkdirSync(DIR, { recursive: true, mode: 448 });
 process.env.AGENT_HUB_DATA = DIR;
-process.env.AGENT_HUB_WORKSPACES ||= path9.join(process.env.HOME || DIR, "agent-hub-workspaces");
+process.env.AGENT_HUB_WORKSPACES ||= path10.join(process.env.HOME || DIR, "agent-hub-workspaces");
 var store = await Promise.resolve().then(() => (init_store(), store_exports));
 var account = await Promise.resolve().then(() => (init_claude_account(), claude_account_exports));
 var claude = await Promise.resolve().then(() => (init_claude(), claude_exports));
 var SELF = fileURLToPath2(import.meta.url);
-var VERSION2 = crypto7.createHash("sha1").update(fs9.readFileSync(SELF)).update(process.env.AGENT_HUB_DAEMON_VERSION || "").digest("hex").slice(0, 12);
+var VERSION2 = crypto7.createHash("sha1").update(fs10.readFileSync(SELF)).update(process.env.AGENT_HUB_DAEMON_VERSION || "").digest("hex").slice(0, 12);
 var clients = /* @__PURE__ */ new Set();
 function publish(msg) {
   const line = `data: ${JSON.stringify(msg)}
@@ -19316,9 +19463,14 @@ function applyAuth(auth) {
 var OPS = {
   async create({ id, cwd, title, config, permissionMode }) {
     if (store.getSession(id)) return snapshot(store.getSession(id));
-    if (!fs9.statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) throw Object.assign(new Error(`\u8CC7\u6599\u593E\u4E0D\u5B58\u5728\uFF1A${cwd}`), { status: 400 });
-    const s = store.createSession({ id, agentId: "claude", cwd, permissionMode: permissionMode || "ask", title: title || "\u65B0\u5C0D\u8A71" });
-    await claude.setup(s, config || {});
+    if (!config?.repo && !fs10.statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) throw Object.assign(new Error(`\u8CC7\u6599\u593E\u4E0D\u5B58\u5728\uFF1A${cwd}`), { status: 400 });
+    const s = store.createSession({ id, agentId: "claude", cwd: cwd || "", permissionMode: permissionMode || "ask", title: title || "\u65B0\u5C0D\u8A71" });
+    try {
+      await claude.setup(s, config || {});
+    } catch (err) {
+      store.deleteSession(s.id);
+      throw err;
+    }
     publish({ t: "session", sid: s.id, seq: s.seq || 0, session: summary(s) });
     return snapshot(s);
   },
@@ -19402,10 +19554,10 @@ var server = http.createServer(async (req, res) => {
   send2(404, { ok: false, error: "not found" });
 });
 server.listen(0, "127.0.0.1", () => {
-  const file = path9.join(DIR, "daemon.json");
+  const file = path10.join(DIR, "daemon.json");
   const tmp = `${file}.${process.pid}.tmp`;
-  fs9.writeFileSync(tmp, JSON.stringify({ port: server.address().port, token: TOKEN, pid: process.pid, version: VERSION2 }), { mode: 384 });
-  fs9.renameSync(tmp, file);
+  fs10.writeFileSync(tmp, JSON.stringify({ port: server.address().port, token: TOKEN, pid: process.pid, version: VERSION2 }), { mode: 384 });
+  fs10.renameSync(tmp, file);
   console.log(`[claude-daemon] ${VERSION2} listening on 127.0.0.1:${server.address().port} (${DIR})`);
 });
 function shutdown() {

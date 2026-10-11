@@ -542,13 +542,21 @@ export async function newSession({ agentId, machineId, cwd, prompt, nameHint, pe
     const why = claude.cannotSend({ machineId });
     if (why) throw Object.assign(new Error(why), { status: 409 });
     let dir = cwd;
-    if (machineId) {
+    // Bound to a GitHub repository: its clone is the folder (made by the
+    // daemon).
+    if (config?.repo) dir = '';
+    else if (machineId) {
       if (!dir) dir = (await machines.rpc(machineId, 'workspace.create', { name: nameHint || prompt || 'claude' })).path;
       const st = await claude.hostFor({ machineId }).stat(dir, '.');
       if (!st.dir) throw Object.assign(new Error(`資料夾不存在：${dir}`), { status: 400 });
     } else dir ||= await createWorkspace(nameHint || prompt || 'claude');
     session = store.createSession({ agentId, cwd: dir, permissionMode, title: title || '新對話', ...(machineId ? { machineId } : {}) });
-    await claude.create(session, config);
+    try {
+      await claude.create(session, config);
+    } catch (err) {
+      store.deleteSession(session.id);
+      throw err;
+    }
   } else {
     const dir = cwd || (await createWorkspace(nameHint || prompt || agent.name));
     session = store.createSession({ agentId, cwd: dir, permissionMode, branch, title: title || '新對話' });

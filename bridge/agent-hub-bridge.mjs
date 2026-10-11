@@ -1511,6 +1511,17 @@ const github = (() => {
     return status();
   }
 
+  // The repositories this account can push to, most recently pushed first
+  // (its own, its organizations', and those it collaborates on).
+  async function repos() {
+    const r = await run(GH, ['api', '--hostname', HOST, 'user/repos?per_page=100&sort=pushed&affiliation=owner,collaborator,organization_member'], { timeoutMs: 30_000 });
+    if (r.missing) throw Object.assign(new Error(`這台電腦還沒有安裝 GitHub CLI（gh）：${installHint()}`), { status: 409 });
+    if (!r.ok) throw Object.assign(new Error(`讀不到 repo 清單：${firstLine(r.err) || '這台電腦還沒登入 GitHub'}`), { status: 409 });
+    return JSON.parse(r.out)
+      .filter((x) => x.permissions?.push !== false)
+      .map((x) => ({ full: x.full_name, private: Boolean(x.private), description: x.description || '', defaultBranch: x.default_branch, pushedAt: x.pushed_at }));
+  }
+
   async function logout() {
     await cancelWeb();
     const s = await status();
@@ -1522,7 +1533,7 @@ const github = (() => {
     }
     return status();
   }
-  return { status, loginToken, loginWeb, cancelWeb, logout };
+  return { status, loginToken, loginWeb, cancelWeb, repos, logout };
 })();
 // github:end
 
@@ -1884,7 +1895,8 @@ const daemon = {
     throw new Error(`Claude 背景程式沒有在 15 秒內啟動，請看 ${logFile}`);
   },
 
-  async rpc(op, args, timeoutMs = 120_000) {
+  async rpc(op, args, timeoutMs) {
+    timeoutMs = Math.min(Math.max(Number(timeoutMs) || 120_000, 1000), 900_000);
     const info = this.info();
     if (!info?.port) throw new Error('Claude 背景程式沒有在執行');
     let res;
@@ -2117,6 +2129,8 @@ const hub = {
         return github.cancelWeb();
       case 'github.logout':
         return github.logout();
+      case 'github.repos':
+        return github.repos();
       case 'sh.kill':
         shells.get(String(args.id || ''))?.('interrupted');
         return { ok: true };
@@ -2125,13 +2139,13 @@ const hub = {
       case 'claude.rpc':
         await daemon.ensure(args.version);
         try {
-          return await daemon.rpc(String(args.op), args.args || {});
+          return await daemon.rpc(String(args.op), args.args || {}, args.timeoutMs);
         } catch (err) {
           // It went away since it was last seen (the call never reached it):
           // start it again and ask once more.
           if (!err.refused) throw err;
           await daemon.ensure(args.version);
-          return daemon.rpc(String(args.op), args.args || {});
+          return daemon.rpc(String(args.op), args.args || {}, args.timeoutMs);
         }
       case 'claude.health':
         return daemon.health();

@@ -18,7 +18,7 @@ export function bridgeCopy() {
     .replace(/^(\/\/.*\n)+\n?/, '')
     .replace(/^export /gm, '')
     .trim();
-  const names = [...body.matchAll(/^(?:async )?function (\w+)/gm)].map((m) => m[1]).filter((n) => /^(status|loginToken|loginWeb|cancelWeb|logout)$/.test(n));
+  const names = [...body.matchAll(/^(?:async )?function (\w+)/gm)].map((m) => m[1]).filter((n) => /^(status|loginToken|loginWeb|cancelWeb|logout|repos)$/.test(n));
   return [
     '// github:begin — generated from server/github.js by scripts/sync-bridge-github.mjs',
     'const github = (() => {',

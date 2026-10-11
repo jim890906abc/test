@@ -296,7 +296,11 @@ export class Composer {
       this.opts.home && this.opts.onPickMachine ? chip(s.machineName || '選擇電腦', (b) => this.opts.onPickMachine(b), { iconName: 'computer', title: '要在哪一台電腦上執行', control: 'machine' }) : null,
       // Claude runs on the hub's own computer.
       this.opts.home && !this.opts.onPickMachine && s.machineName ? h('span', { class: 'chip static', title: 'Claude 由中控台執行，工具在這台電腦上跑' }, icon('computer'), h('span', null, s.machineName)) : null,
-      this.opts.home ? chip(s.folderName || '選擇資料夾', (b) => this.opts.onPickFolder(b), { iconName: 'folder', title: '工作資料夾', control: 'folder' }) : null,
+      this.opts.home ? chip(s.folderName || '選擇資料夾', (b) => this.opts.onPickFolder(b), { iconName: s.folderIcon || 'folder', title: s.folderIcon === 'branch' ? '綁定的 GitHub repo' : '工作資料夾', control: 'folder' }) : null,
+      // Bound to a GitHub repository: where everything goes, for good.
+      !this.opts.home && s.repo
+        ? h('a', { class: 'chip static repo-chip', href: s.repo.url, target: '_blank', rel: 'noopener', title: `這個對話綁定 ${s.repo.full} 的 ${s.repo.branch} 分支：所有程式碼都 commit 並 push 到那裡` }, icon('branch'), h('span', null, `${s.repo.full} · ${s.repo.branch}`))
+        : null,
       chip(s.planMode ? '計畫模式' : permissionLabels(this.agent())[s.permission] || PERMISSION_LABELS.manual, (b) => this.permissionMenu(b), { iconName: s.planMode ? 'map' : 'shield', title: '權限模式', active: s.planMode, control: 'permission' }),
       s.models?.length
         ? chip(`${model?.name || `${agentName(this.agent())} 預設模型`}${nextModel ? '（下一輪）' : ''}`, (b) => this.modelMenu(b), {

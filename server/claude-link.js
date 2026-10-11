@@ -18,7 +18,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DAEMON = path.join(HERE, 'claude-daemon.js');
 // What the daemon runs on: its own code and the engine's. A daemon on other
 // code is restarted (when nothing is running) so updates reach it.
-const ENGINE = ['claude-daemon.js', 'store.js', 'tools.js', 'machines.js', 'claude-account.js', 'adapters/claude.js', 'adapters/claude-tools.js', 'adapters/presets.js'];
+const ENGINE = ['claude-daemon.js', 'store.js', 'tools.js', 'machines.js', 'claude-account.js', 'adapters/claude.js', 'adapters/claude-tools.js', 'adapters/claude-repo.js', 'adapters/presets.js'];
 const engineHash = () => {
   const h = crypto.createHash('sha1');
   for (const f of ENGINE) h.update(fs.readFileSync(path.join(HERE, f)));
@@ -154,9 +154,9 @@ const local = {
     })();
   },
 
-  async rpc(op, args) {
+  async rpc(op, args, timeoutMs) {
     const info = await this.ensure();
-    const r = await this.request(info, 'POST', '/rpc', { op, args });
+    const r = await this.request(info, 'POST', '/rpc', { op, args }, timeoutMs);
     if (!r.ok) throw Object.assign(new Error(r.error || 'Claude 背景程式回報錯誤'), { status: r.status || 500 });
     return r.data;
   },
@@ -207,9 +207,9 @@ function tooOld(err, machineId) {
 
 // Calls `op` on the daemon of `machineId` (null: this computer).
 export async function rpc(machineId, op, args = {}, timeoutMs = 120_000) {
-  if (!machineId) return local.rpc(op, args);
+  if (!machineId) return local.rpc(op, args, timeoutMs);
   try {
-    return await machines.rpc(machineId, 'claude.rpc', { op, args, version: BUNDLE_VERSION }, timeoutMs);
+    return await machines.rpc(machineId, 'claude.rpc', { op, args, version: BUNDLE_VERSION, timeoutMs }, timeoutMs + 30_000);
   } catch (err) {
     throw tooOld(err, machineId);
   }

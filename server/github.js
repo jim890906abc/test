@@ -151,6 +151,17 @@ export async function cancelWeb() {
   return status();
 }
 
+// The repositories this account can push to, most recently pushed first
+// (its own, its organizations', and those it collaborates on).
+export async function repos() {
+  const r = await run(GH, ['api', '--hostname', HOST, 'user/repos?per_page=100&sort=pushed&affiliation=owner,collaborator,organization_member'], { timeoutMs: 30_000 });
+  if (r.missing) throw Object.assign(new Error(`這台電腦還沒有安裝 GitHub CLI（gh）：${installHint()}`), { status: 409 });
+  if (!r.ok) throw Object.assign(new Error(`讀不到 repo 清單：${firstLine(r.err) || '這台電腦還沒登入 GitHub'}`), { status: 409 });
+  return JSON.parse(r.out)
+    .filter((x) => x.permissions?.push !== false)
+    .map((x) => ({ full: x.full_name, private: Boolean(x.private), description: x.description || '', defaultBranch: x.default_branch, pushedAt: x.pushed_at }));
+}
+
 export async function logout() {
   await cancelWeb();
   const s = await status();

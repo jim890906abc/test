@@ -19,6 +19,7 @@ import { createScheduler, scheduleTimings } from './schedule.js';
 import { mergeQuota, countsOf } from './quota.js';
 import * as claudeAccount from './claude-account.js';
 import * as github from './github.js';
+import { parseRepo, validBranch, newBranch } from './adapters/claude-repo.js';
 
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -272,6 +273,17 @@ app.get('/api/sessions', wrap(() =>
 app.post('/api/sessions', wrap(async (req) => {
   const { agentId, machineId, agent, prompt, cwd, permissionMode, images, model, effort, permission, planMode } = req.body || {};
   const claude = agent === 'claude' || agentId === 'claude';
+  // A Claude conversation bound to a GitHub repository (cloned on its
+  // computer, on `branch`: an existing one, or a new one made from the
+  // default branch).
+  let repo;
+  if (claude && req.body?.repo) {
+    const full = parseRepo(req.body.repo);
+    if (!full) throw Object.assign(new Error('GitHub repo 要寫成 owner/repo（或貼上 GitHub 網址）'), { status: 400 });
+    const branch = req.body.branch ? validBranch(req.body.branch) : newBranch();
+    if (!branch) throw Object.assign(new Error(`分支名稱不合法：${req.body.branch}`), { status: 400 });
+    repo = { full, branch };
+  }
   const remote = machineId || (!claude && String(agentId || '').startsWith('kimi@'));
   const dir = cwd ? (remote ? String(cwd) : workspace.validateDir(cwd)) : undefined;
   const s = await runner.newSession({
@@ -280,7 +292,7 @@ app.post('/api/sessions', wrap(async (req) => {
     cwd: dir,
     permissionMode,
     nameHint: prompt,
-    config: remote || claude ? { model, effort, permission, planMode } : undefined,
+    config: remote || claude ? { model, effort, permission, planMode, ...(repo ? { repo } : {}) } : undefined,
   });
   if (prompt?.trim() || images?.length) runner.startTurn(s, prompt || '', { images });
   return runner.summarize(s);
@@ -458,14 +470,14 @@ app.get('/api/hub', wrap(() => ({ bridgeKey: BRIDGE_KEY, bridgePath: '/bridge/ag
 const GITHUB_BRIDGE = /^0\.[0-5]\./;
 function githubTarget(target) {
   if (target === 'local') {
-    const ops = { status: github.status, login: (a) => github.loginToken(a.token), web: github.loginWeb, cancel: github.cancelWeb, logout: github.logout };
+    const ops = { status: github.status, login: (a) => github.loginToken(a.token), web: github.loginWeb, cancel: github.cancelWeb, logout: github.logout, repos: github.repos };
     return { call: (op, args) => ops[op](args || {}) };
   }
   const m = machines.getMachine(target);
   if (!m) throw Object.assign(new Error('找不到這台電腦'), { status: 404 });
   if (!m.online) throw Object.assign(new Error(`「${m.name}」目前離線`), { status: 409 });
   if (GITHUB_BRIDGE.test(m.bridgeVersion || '0.0.0')) throw Object.assign(new Error(`「${m.name}」的連接器太舊，在那台電腦重新執行連接指令（左下角「連接電腦…」）後再試。`), { status: 409 });
-  return { call: (op, args) => machines.rpc(target, `github.${op}`, args || {}, op === 'login' || op === 'web' ? 60_000 : 30_000) };
+  return { call: (op, args) => machines.rpc(target, `github.${op}`, args || {}, op === 'login' || op === 'web' ? 60_000 : 30_000).catch((err) => Promise.reject(machines.tooOld(err, m))) };
 }
 app.get('/api/github', wrap(async () => {
   const all = machines.listMachines().map((m) => ({ ...m, hostname: machines.getMachine(m.id)?.hostname }));
@@ -487,7 +499,7 @@ app.get('/api/github', wrap(async () => {
 }));
 app.post('/api/github/:target/:action', wrap(async (req) => {
   const { target, action } = req.params;
-  if (!['status', 'login', 'web', 'cancel', 'logout'].includes(action)) throw Object.assign(new Error('不支援的操作'), { status: 404 });
+  if (!['status', 'login', 'web', 'cancel', 'logout', 'repos'].includes(action)) throw Object.assign(new Error('不支援的操作'), { status: 404 });
   return githubTarget(target).call(action, action === 'login' ? { token: String(req.body?.token || '') } : {});
 }));
 

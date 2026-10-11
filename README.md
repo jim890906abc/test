@@ -45,6 +45,17 @@ Claude 和 Kimi 都用 git 與 GitHub CLI（`gh`）操作 GitHub：clone、開�
 
 那台電腦要先裝好 `gh`（Kali／Debian／Ubuntu：中控台「GitHub…」裡會顯示加入 GitHub 官方 apt 套件庫再安裝的指令（Kali 的套件庫沒有 gh），macOS：`brew install gh`，Windows：`winget install --id GitHub.cli`），連接器要 0.6 以上。連接器也會幫 Kimi 裝一個 `/github` skill；Claude 的系統提示裡有同樣的規則：會改到 GitHub 的動作（push、開 PR、留言）沒被要求就先問你，在新分支上工作，不 force push，也不在對話裡要 token。
 
+### Claude 對話綁定 GitHub repo
+
+在 Claude 首頁的資料夾選單選「綁定一個 GitHub repo…」，挑一個 repo（列出這台電腦的 GitHub 帳號能 push 的 repo，也可以直接輸入 `owner/repo`），再選「開一個新分支」（`claude/日期-編號`，跟 Claude Code 網頁版一樣）或指定分支（例如 `main`）。新對話開始時會把 repo clone 到那台電腦上的新資料夾、切到那個分支，之後：
+
+- 綁定存在對話裡，也寫在 Claude 的系統提示裡，壓縮對話或重新啟動都不會忘記；對話上方和輸入框會顯示 `owner/repo · 分支`。
+- 系統提示要求高度紀律：小而清楚的 commit、push 前跑測試、不 commit 機密、不改寫已 push 的歷史。
+- 每一輪結束時 Agent Hub 都會檢查：還有沒 commit 或沒 push 的變更，就提醒 Claude 處理（最多兩次）；它還是沒處理，Agent Hub 自己 commit 並 push 到那個分支。
+- push 到其他分支、force push、刪除遠端分支、改 remote 的指令會直接被擋下。
+
+綁定的 repo 會記在首頁，之後在同一台電腦開的 Claude 新對話也會綁定它（每次一個新分支），直到你在選單裡選「不綁定」。私人 repo 和 push 都需要那台電腦先在「GitHub…」登入。
+
 ## 連接其他電腦
 
 在那台電腦執行中控台印出的連接指令（左下角「連接電腦…」也看得到）。之後那台電腦的 Kimi 對話會自動出現。

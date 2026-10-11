@@ -40,7 +40,7 @@ export function cannotSend(session) {
 // The key and Claude settings go along with what may call the API: the
 // daemon keeps them, so it can go on while the hub is closed.
 const auth = () => ({ apiKey: account.apiKey() || undefined, settings: account.settings() });
-const call = (session, op, args = {}) => link.rpc(session.machineId || null, op, { id: session.id, ...args, auth: auth() });
+const call = (session, op, args = {}, timeoutMs = 120_000) => link.rpc(session.machineId || null, op, { id: session.id, ...args, auth: auth() }, timeoutMs);
 const machineName = (session) => (session.machineId ? machines.getMachine(session.machineId)?.name || '那台電腦' : os.hostname());
 
 // --------------------------------------------------------------- mirror
@@ -140,7 +140,8 @@ machines.onBridgeHello((machineId) => {
 
 // A new conversation, made in the daemon of its computer.
 export async function create(session, config = {}) {
-  apply(session, await call(session, 'create', { cwd: session.cwd, title: session.title, permissionMode: session.permissionMode, config: { ...config, computer: machineName(session) } }));
+  // A GitHub repository is cloned first: that may take minutes.
+  apply(session, await call(session, 'create', { cwd: session.cwd, title: session.title, permissionMode: session.permissionMode, config: { ...config, computer: machineName(session) } }, config.repo ? 660_000 : 120_000));
 }
 
 // At hub start: this computer's daemon is started (its conversations went
