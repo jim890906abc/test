@@ -47,7 +47,7 @@ Claude 和 Kimi 都用 git 與 GitHub CLI（`gh`）操作 GitHub：clone、開�
 
 ### Claude 開出的其他對話
 
-叫 Claude「再開兩個對話跟你對抗」之類的，它會用 `StartConversation` 在 Agent Hub 裡開新的 Claude 對話（可以指定模型與思考強度），一樣用 Claude API key 計費、出現在側邊欄，你可以點進去看或直接跟它講話；Claude 用 `ReadConversation` 讀它們的回覆、`MessageConversation` 傳話給它們。Claude 不能從 Bash 啟動 Claude Code（`claude` 指令）或其他 AI 工具，這種指令會被擋下。中控台連上 Claude 背景程式時，也會把那台電腦上所有 Claude 對話都列出來（包括中控台關著時開出的），跟 Kimi 一樣。
+叫 Claude「再開兩個對話跟你對抗」之類的，它會用 `StartConversation` 在 Agent Hub 裡開新的 Claude 對話（可以指定模型與思考強度），一樣用 Claude API key 計費、出現在側邊欄，你可以點進去看或直接跟它講話；Claude 用 `ReadConversation` 讀它們的回覆、`MessageConversation` 傳話給它們。Claude 不能從 Bash 啟動 Claude Code（`claude` 指令）或其他 AI 工具，這種指令會被擋下。側邊欄會列出每台連線電腦上所有的 Claude API 對話（包括 Claude 自己開的、中控台關著時開出的），跟 Kimi 一樣：中控台啟動時會叫起這台電腦有對話的 Claude 背景程式，連接器連上時也會回報那台電腦有幾個 Claude 對話，中控台不知道的就接過來。在中控台刪掉的對話不會再被接回來（那台電腦離線時刪的，等它連上再刪掉）。
 
 ### Claude 對話綁定 GitHub repo
 

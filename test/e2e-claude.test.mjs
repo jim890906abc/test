@@ -635,6 +635,51 @@ test('Claude starts conversations of its own (shown in the sidebar, on the API k
   assert.match(cliDone.events.filter((e) => e.type === 'text').at(-1).text, /Refused by Agent Hub/);
 });
 
+test('the sidebar has every Claude conversation of the computer: unknown ones are taken in, deleted ones stay deleted', async () => {
+  const a = await api('POST', '/sessions', { agent: 'claude', prompt: 'hello', permission: 'auto' });
+  const b = await api('POST', '/sessions', { agent: 'claude', prompt: 'hello', permission: 'auto' });
+  for (const id of [a.id, b.id]) await until(async () => (await snap(id)).status === 'idle' && (await snap(id)).events.some((e) => e.type === 'turn_end'));
+  await api('DELETE', `/sessions/${b.id}`);
+  await until(async () => !fs.existsSync(path.join(TMP, 'data', 'claude-daemon', 'sessions', `${b.id}.json`)));
+  // The hub forgets one (as if it had never known it): the daemon still has it.
+  await new Promise((r) => (server.once('exit', r), server.kill('SIGTERM')));
+  fs.rmSync(path.join(TMP, 'data', 'sessions', `${a.id}.json`));
+  server = await startHub();
+  const back = await until(async () => (await api('GET', '/sessions')).find((x) => x.id === a.id), 15000);
+  assert.equal(back.agentId, 'claude');
+  assert.equal((await snap(a.id)).events[0].text, 'hello');
+  assert.equal((await api('GET', '/sessions')).some((x) => x.id === b.id), false);
+});
+
+test('a connected computer: its Claude conversations the hub does not know are taken in when its bridge says hello', async () => {
+  const home = path.join(TMP, 'adopt-home');
+  const folder = path.join(TMP, 'adopt-folder');
+  fs.mkdirSync(folder, { recursive: true });
+  const keyFile = JSON.parse(fs.readFileSync(path.join(TMP, 'data', 'hub.json'), 'utf8')).bridgeKey;
+  const bridge = spawn(process.execPath, ['bridge/agent-hub-bridge.mjs', '--hub', `http://127.0.0.1:${PORT}`, '--key', keyFile, '--name', 'adopt-box', '--no-skill'], {
+    cwd: ROOT,
+    env: { ...process.env, HOME: home, USERPROFILE: home, KIMI_CODE_HOME: path.join(home, '.kimi-code'), PATH: process.env.PATH, AGENT_HUB_CLAUDE_TEST_URL: fake.url },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  try {
+    const m = await until(async () => (await api('GET', '/machines')).find((x) => x.name === 'adopt-box' && x.online));
+    const s = await api('POST', '/sessions', { agent: 'claude', machineId: m.id, cwd: folder, prompt: 'hello', permission: 'auto' });
+    await until(async () => (await snap(s.id)).events.some((e) => e.type === 'turn_end'), 20000);
+    await new Promise((r) => (server.once('exit', r), server.kill('SIGTERM')));
+    fs.rmSync(path.join(TMP, 'data', 'sessions', `${s.id}.json`));
+    server = await startHub();
+    const back = await until(async () => (await api('GET', '/sessions')).find((x) => x.id === s.id), 30000);
+    assert.equal(back.machineId, m.id);
+    assert.equal(back.cwd, folder);
+    assert.equal((await snap(s.id)).events[0].text, 'hello');
+  } finally {
+    bridge.kill();
+    try {
+      process.kill(JSON.parse(fs.readFileSync(path.join(home, '.agent-hub', 'claude', 'daemon.json'), 'utf8')).pid, 'SIGTERM');
+    } catch {}
+  }
+});
+
 test('the daemon bundle the bridges download is built from the current code', async (t) => {
   let esbuild;
   try {

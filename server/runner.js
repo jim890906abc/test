@@ -149,6 +149,7 @@ ADAPTERS.claude.init(liveContext);
 export function restoreLiveSessions() {
   for (const s of store.listSessions()) if (s.kimiSessionId) ADAPTERS['kimi-remote'].restore(s);
   for (const s of store.listSessions()) if (s.agentId === ADAPTERS.claude.AGENT.id) ADAPTERS.claude.restore(s);
+  ADAPTERS.claude.start();
   machines.onMachineOnline((machineId) => ADAPTERS['kimi-remote'].onMachineOnline(machineId, store.listSessions()));
 }
 

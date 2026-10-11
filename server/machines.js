@@ -158,6 +158,7 @@ export function attachBridge(ws) {
         home: msg.home,
         hostname: msg.hostname,
         bridgeVersion: msg.bridgeVersion,
+        claudeSessions: Number(msg.claudeSessions) || 0,
         online: true,
         ws,
         lastSeen: Date.now(),

@@ -1776,6 +1776,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const daemon = {
   file: path.join(STATE_DIR, 'claude-daemon.mjs'),
   dir: path.join(STATE_DIR, 'claude'),
+  // Conversations kept here: told to the hub, which then has them all shown
+  // (and the daemon started, so they go on after a restart of this computer).
+  count() {
+    try {
+      return fs.readdirSync(path.join(this.dir, 'sessions')).filter((f) => f.endsWith('.json')).length;
+    } catch {
+      return 0;
+    }
+  },
   starting: null,
   checked: null, // { at, health }: the last good health check
   settled: new Map(), // version the hub asked for -> version the daemon it got reports
@@ -2184,6 +2193,7 @@ const hub = {
         node: process.version,
         home: os.homedir(),
         status: await this.status(),
+        claudeSessions: daemon.count(),
       });
       this.sent.clear();
       this.pushSessions(true);

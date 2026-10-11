@@ -6,6 +6,8 @@
 // does for Kimi. A conversation the hub ran itself before there were
 // daemons moves into this computer's (or its computer's) daemon.
 import os from 'node:os';
+import fs from 'node:fs';
+import path from 'node:path';
 import * as store from '../store.js';
 import * as machines from '../machines.js';
 import * as account from '../claude-account.js';
@@ -95,7 +97,30 @@ async function migrate(session) {
 // itself (StartConversation), or while the hub was away. Shown like the
 // others, as Kimi's are.
 const adopting = new Set();
-const gone = new Set(); // deleted here: not taken back from a late message
+// Deleted here: never taken back, and deleted in the daemon once it can be
+// reached (its computer may have been off). Kept on disk.
+const GONE_FILE = path.join(store.DATA_DIR, 'claude-deleted.json');
+const gone = (() => {
+  try {
+    return new Map(Object.entries(JSON.parse(fs.readFileSync(GONE_FILE, 'utf8'))));
+  } catch {
+    return new Map(); // id -> machineId | null
+  }
+})();
+const saveGone = () => {
+  try {
+    fs.writeFileSync(GONE_FILE, JSON.stringify(Object.fromEntries([...gone].slice(-2000))));
+  } catch {}
+};
+function forget(machineId, id) {
+  link.rpc(machineId, 'delete', { id, auth: auth() }).then(
+    () => {
+      gone.delete(id);
+      saveGone();
+    },
+    () => {},
+  );
+}
 async function adopt(machineId, sid) {
   if (adopting.has(sid) || gone.has(sid) || store.getSession(sid)) return;
   adopting.add(sid);
@@ -112,7 +137,10 @@ async function adopt(machineId, sid) {
 }
 async function adoptAll(machineId) {
   try {
-    for (const x of await link.rpc(machineId, 'list', { auth: auth() })) adopt(machineId, x.id);
+    for (const x of await link.rpc(machineId, 'list', { auth: auth() })) {
+      if (gone.has(x.id)) forget(machineId, x.id);
+      else adopt(machineId, x.id);
+    }
   } catch {}
 }
 
@@ -160,9 +188,24 @@ function findEvent(session, id) {
 
 // A connected computer came (back): catch up with its conversations.
 machines.onBridgeHello((machineId) => {
-  for (const s of store.listSessions()) if (s.agentId === AGENT.id && s.machineId === machineId) sync(s).catch((err) => console.warn(`[claude] ${s.id}: ${err.message}`));
-  adoptAll(machineId);
+  const mine = store.listSessions().filter((s) => s.agentId === AGENT.id && s.machineId === machineId);
+  for (const s of mine) sync(s).catch((err) => console.warn(`[claude] ${s.id}: ${err.message}`));
+  // Conversations that computer keeps but the hub does not know, if any
+  // (the bridge says how many; older ones do not say).
+  const m = machines.getMachine(machineId);
+  if (m?.claudeSessions > mine.length || (!m?.claudeSessions && /^0\.5\./.test(m?.bridgeVersion || ''))) adoptAll(machineId);
 });
+
+// At hub start: this computer's daemon, if it has conversations, so they
+// all show (also those the hub does not know) and go on.
+export function start() {
+  try {
+    if (!fs.readdirSync(path.join(store.DATA_DIR, 'claude-daemon', 'sessions')).some((f) => f.endsWith('.json'))) return;
+  } catch {
+    return;
+  }
+  link.startLocal().catch((err) => console.warn(`[claude] ${err.message}`));
+}
 
 // ----------------------------------------------------------- lifecycle
 
@@ -187,8 +230,9 @@ export function view(session) {
 }
 
 export function dispose(session) {
-  gone.add(session.id);
-  call(session, 'delete').catch(() => {});
+  gone.set(session.id, session.machineId || null);
+  saveGone();
+  forget(session.machineId || null, session.id);
   daemonSeq.delete(session.id);
 }
 
