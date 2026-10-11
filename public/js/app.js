@@ -443,10 +443,18 @@ function checkAttention(all) {
   for (const r of all) {
     const prev = S.seen.get(r.key);
     S.seen.set(r.key, r.status);
-    if (prev === undefined || prev === r.status || r.status !== 'awaiting_permission') continue;
+    // A Claude turn that stopped by itself (another model answered, a
+    // refusal, an API error) is said too, so it is never missed.
+    const stopped = r.claude && r.status === 'error';
+    if (prev === undefined || prev === r.status || (r.status !== 'awaiting_permission' && !stopped)) continue;
     const here = S.cur?.summary && r.hub?.id === S.cur.summary.id;
-    if (here && document.hasFocus()) continue;
+    if (here && document.hasFocus() && !stopped) continue;
     const open = () => go(r.hub ? `#/s/${r.hub.id}` : `#/k/${r.machine.id}/${r.kimi.id}`);
+    if (stopped) {
+      toast(`「${r.title}」停下來了，沒有完成，原因寫在對話裡`, { kind: 'error', ...(here ? {} : { action: '查看', onAction: open }) });
+      notify('Claude 停下來了', r.title, open);
+      continue;
+    }
     if (!here) toast(`「${r.title}」需要你核准`, { action: '查看', onAction: open });
     notify(`${r.claude ? 'Claude' : 'Kimi'} 需要你`, r.title, open);
   }

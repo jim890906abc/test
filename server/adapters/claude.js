@@ -49,6 +49,14 @@ export function init(makeContext) {
 }
 
 const runs = new Map(); // session id -> Run: a turn (or a compaction) in progress
+
+// Stop the whole turn for a reason that is not the user's (a swapped model,
+// a refusal): it ends as an error, not as 已中斷.
+function halt(run, why) {
+  run.halted ??= why;
+  run.ac.abort();
+  for (const resolve of [...run.waits.values()]) resolve(null);
+}
 const queuedImages = new Map(); // prompt id -> images of a queued message (kept out of meta)
 
 export function available() {
@@ -261,8 +269,10 @@ async function turn(run, { text, images = [], thumbs, note, promptId }) {
   let error = null;
   try {
     await loop(run, { messages: c.messages, model, effort, main: true, system: c.system, tools: mainTools(session, model) });
+    error = run.halted || null;
   } catch (err) {
-    if (!run.aborted) {
+    if (run.halted) error = run.halted;
+    else if (!run.aborted) {
       error = account.explain(err);
       ctx.emit({ type: 'error', text: error });
     }
@@ -306,7 +316,7 @@ function finishTurn(run, error) {
     if (ev.type === 'tool_use' && ['pending', 'running', 'awaiting'].includes(ev.status)) ctx.patch(ev, { status: run.aborted || ev.status === 'awaiting' ? 'interrupted' : 'ended' });
     if (ev.subagent?.status === 'running') ctx.patch(ev, { subagent: { ...ev.subagent, status: run.aborted ? 'cancelled' : 'error' } });
   }
-  ctx.emit({ type: 'turn_end', durationMs: Date.now() - run.started, usage: { ...run.usage }, interrupted: run.aborted, error: Boolean(error) });
+  ctx.emit({ type: 'turn_end', durationMs: Date.now() - run.started, usage: { ...run.usage }, interrupted: run.aborted && !run.halted, error: Boolean(error) });
   ctx.setMeta({ turnModel: null, turnEffort: null });
   ctx.setStatus(error ? 'error' : 'idle');
   store.saveSession(session, { immediate: true });
@@ -335,12 +345,22 @@ async function loop(run, opts) {
     }
     const msg = r.message;
     count(run, opts, r);
-    if (msg.stop_reason === 'refusal') {
-      // Not kept: a declined answer is no use to the next request.
+    // Only the model that was chosen may go on. An answer from any other
+    // (Anthropic routing the request elsewhere) or a refusal stops the whole
+    // turn, subagents included, before anything it asked for runs. Neither
+    // is kept in the history.
+    const served = msg.model || opts.model;
+    const swapped = !served.startsWith(opts.model);
+    if (swapped || msg.stop_reason === 'refusal') {
       const d = msg.stop_details || {};
       for (const ev of r.byId.values()) ctx.patch(ev, { status: 'ended' });
-      ctx.emit({ type: 'error', text: `Claude 婉拒了這個請求${d.category ? `（安全分類：${d.category}）` : ''}。${d.explanation || ''}`.trim(), ...where });
-      return { finalText, refused: true };
+      const who = opts.main ? '' : '子代理：';
+      const text = swapped
+        ? `${who}這一步是由 ${modelName(served)}（${served}）回覆的，不是你選的 ${modelName(opts.model)}——可能被 Anthropic 降級或改由其他模型接手。為了不在你不知道的情況下用別的模型繼續，已停止這一輪，它要求的工具都沒有執行。要繼續請再送出訊息（或先換模型）。`
+        : `${who}${modelName(opts.model)} 拒絕了這個請求${d.category ? `（安全分類：${d.category}）` : ''}，已停止這一輪。${d.explanation || ''}`.trim();
+      ctx.emit({ type: 'error', text, model: served, ...where });
+      halt(run, text);
+      return { finalText, halted: true };
     }
     messages.push({ role: 'assistant', content: msg.content });
     const text = msg.content.filter((b) => b.type === 'text').map((b) => b.text).join('');
@@ -448,13 +468,9 @@ async function ask(run, { messages, model, effort, system, tools, scope = {}, qu
     ...account.thinkingFor(model, effort),
   };
   if (toolChoice) body.tool_choice = toolChoice;
+  // No server-side fallback: a request the chosen model declines stops
+  // rather than going on with another model (see loop()).
   const betas = [];
-  // A request the model declines goes to another model on Anthropic's side
-  // instead of failing (server-side fallback).
-  if (account.supportsFallback(model) && body.thinking?.type !== 'between_tools' && !c.noFallback) {
-    body.fallbacks = 'default';
-    betas.push('server-side-fallback-2026-07-01');
-  }
   const client = account.client();
   for (let attempt = 0; ; attempt++) {
     const evs = new Map(); // content index -> event (or a placeholder until text arrives)
@@ -477,8 +493,6 @@ async function ask(run, { messages, model, effort, system, tools, scope = {}, qu
             evs.set(e.index, { lazy: b.type, text: b.text || b.thinking || '' });
           } else if (/tool_result$/.test(b.type) && b.tool_use_id && !quiet) {
             serverResult(run, b);
-          } else if (b.type === 'fallback' && !quiet) {
-            ctx.emit({ type: 'info', text: `${modelName(b.from?.model)} 婉拒了這個請求，改由 ${modelName(b.to?.model)} 接手`, ...where });
           }
         } else if (e.type === 'content_block_delta') {
           const d = e.delta;
@@ -515,12 +529,6 @@ async function ask(run, { messages, model, effort, system, tools, scope = {}, qu
       const msg = String(err?.error?.error?.message || err?.message || '');
       if (!quiet) for (const ev of byId.values()) ctx.patch(ev, { status: 'ended' });
       // A 400 before anything was written: fixable once by asking differently.
-      if (attempt === 0 && err?.status === 400 && body.fallbacks && /fallback/i.test(msg)) {
-        c.noFallback = true;
-        delete body.fallbacks;
-        betas.length = 0;
-        continue;
-      }
       if (attempt === 0 && err?.status === 400 && /signature|thinking/i.test(msg) && stripThinking(messages)) continue;
       throw err;
     }
@@ -772,6 +780,10 @@ async function subagent(run, ev, input, { model, effort }) {
     const text = account.explain(err);
     ctx.patch(ev, { status: 'error', isError: true, output: text, subagent: { ...sub, status: 'error', error: text } });
     return { content: `The subagent failed: ${text}`, isError: true };
+  }
+  if (out.halted) {
+    ctx.patch(ev, { status: 'error', subagent: { ...sub, status: 'error', error: run.halted } });
+    return { content: 'Stopped.', isError: true };
   }
   if (out.aborted) {
     ctx.patch(ev, { subagent: { ...sub, status: 'cancelled' } });

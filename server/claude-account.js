@@ -140,15 +140,14 @@ export function publicAccount() {
 // is how to turn thinking off, when the model allows it at its default
 // effort. `sys`: takes `role: "system"` messages mid-conversation. `web`:
 // web search / fetch with dynamic filtering (2026-02-09), else basic search.
-// `fallback`: refusals can go to another model server-side. `summarized`:
-// shows its thinking without being asked (the 4.6 models).
+// `summarized`: shows its thinking without being asked (the 4.6 models).
 const FIVE = ['low', 'medium', 'high', 'xhigh', 'max'];
 const KNOWN = [
-  ['claude-opus-5-5', 'Claude Opus 5.5', { price: [4, 20, 0.2], efforts: FIVE, def: 'medium', sys: true, web: true, fallback: true }],
-  ['claude-fable-5-1', 'Claude Fable 5.1', { price: [10, 50, 0.25], efforts: FIVE, def: 'high', sys: true, fallback: true }],
-  ['claude-sonnet-5-5', 'Claude Sonnet 5.5', { price: [2, 10, 0.2], efforts: FIVE, def: 'high', off: 'between_tools', sys: true, web: true, fallback: true }],
+  ['claude-opus-5-5', 'Claude Opus 5.5', { price: [4, 20, 0.2], efforts: FIVE, def: 'medium', sys: true, web: true}],
+  ['claude-fable-5-1', 'Claude Fable 5.1', { price: [10, 50, 0.25], efforts: FIVE, def: 'high', sys: true}],
+  ['claude-sonnet-5-5', 'Claude Sonnet 5.5', { price: [2, 10, 0.2], efforts: FIVE, def: 'high', off: 'between_tools', sys: true, web: true}],
   ['claude-haiku-5-5', 'Claude Haiku 5.5', { price: [0.1, 0.5, 0.01], longPrice: [0.5, 2.5, 0.05], efforts: FIVE, def: 'medium', off: 'disabled', sys: true }],
-  ['claude-opus-5', 'Claude Opus 5', { price: [5, 25, 0.5], efforts: FIVE, def: 'high', off: 'disabled', sys: true, web: true, fallback: true }],
+  ['claude-opus-5', 'Claude Opus 5', { price: [5, 25, 0.5], efforts: FIVE, def: 'high', off: 'disabled', sys: true, web: true}],
   ['claude-fable-5', 'Claude Fable 5', { price: [10, 50, 1], efforts: FIVE, def: 'high', sys: true }],
   ['claude-sonnet-5', 'Claude Sonnet 5', { price: [2, 10, 0.2], efforts: FIVE, def: 'high', off: 'disabled', web: true }],
   ['claude-opus-4-8', 'Claude Opus 4.8', { price: [5, 25, 0.5], efforts: FIVE, def: 'high', off: 'disabled', sys: true, web: true }],
@@ -228,7 +227,6 @@ export function thinkingFor(model, effort) {
 }
 
 export const supportsSystemMessages = (model) => Boolean(known(model)?.sys);
-export const supportsFallback = (model) => Boolean(known(model)?.fallback);
 
 // Server-side web tools for `model`. Declared from the first request of a
 // conversation, so the prompt stays cacheable.

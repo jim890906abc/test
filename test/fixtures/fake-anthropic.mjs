@@ -72,6 +72,9 @@ export function script(body, res) {
   if (/^TASK/.test(lastText)) {
     return respond(res, { blocks: [tool('toolu_t1', 'Task', { description: '找 A', prompt: 'find A' }), tool('toolu_t2', 'Task', { description: '找 B', prompt: 'find B' })], stop: 'tool_use' });
   }
+  // Answered by another model than the one asked for (a downgrade).
+  if (/^SWAP/.test(lastText)) return respond(res, { blocks: [tool('toolu_s1', 'Bash', { command: 'echo should-not-run > swapped.txt' })], stop: 'tool_use', model: 'claude-opus-4-8' });
+  if (/^REFUSE/.test(lastText)) return respond(res, { blocks: [], stop: 'refusal' });
   if (/^SLOW/.test(lastText)) return respond(res, { blocks: [{ type: 'text', text: '這是一段會慢慢寫出來的回覆，'.repeat(20) }], slow: 60 });
   return respond(res, { blocks: [{ type: 'text', text: `收到：${lastText.slice(0, 40)}` }] });
 }

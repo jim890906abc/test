@@ -131,8 +131,9 @@ test('a turn: streamed thinking and text, a Write run after approval, the result
   assert.deepEqual(b.cache_control, { type: 'ephemeral' });
   assert.deepEqual(b.thinking, { type: 'adaptive', display: 'summarized' });
   assert.deepEqual(b.output_config, { effort: 'high' });
-  assert.equal(b.fallbacks, 'default');
-  assert.match(r1.headers['anthropic-beta'], /server-side-fallback-2026-07-01/);
+  // No server-side fallback: only the chosen model answers.
+  assert.equal(b.fallbacks, undefined);
+  assert.doesNotMatch(r1.headers['anthropic-beta'] || '', /fallback/);
   assert.ok(b.tools.some((t) => t.name === 'Bash' && t.eager_input_streaming === true));
   assert.ok(b.tools.some((t) => t.type === 'web_search_20260209'));
   // Append-only: the second request starts with the first one's messages.
@@ -302,4 +303,25 @@ test('on a connected computer: the tools run there, through its bridge', async (
   } finally {
     bridge.kill();
   }
+});
+
+test('another model answering (a downgrade) or a refusal stops the turn, and says so', async () => {
+  const s = await api('POST', '/sessions', { agent: 'claude', prompt: 'SWAP', permission: 'auto' });
+  const done = await idle(s.id);
+  assert.equal(done.status, 'error');
+  const err = done.events.find((e) => e.type === 'error');
+  assert.match(err.text, /claude-opus-4-8/);
+  assert.match(err.text, /已停止這一輪/);
+  assert.equal(done.events.at(-1).error, true);
+  assert.equal(fs.existsSync(path.join(done.cwd, 'swapped.txt')), false);
+  assert.notEqual(done.events.find((e) => e.name === 'Bash')?.status, 'done');
+  // Not kept: the next request does not carry the other model's answer.
+  await api('POST', `/sessions/${s.id}/messages`, { text: '好' });
+  await until(async () => (await snap(s.id)).events.filter((e) => e.type === 'turn_end').length === 2);
+  assert.equal(messagesSent().at(-1).body.messages.some((m) => m.role === 'assistant'), false);
+
+  const r = await api('POST', '/sessions', { agent: 'claude', prompt: 'REFUSE' });
+  const refused = await idle(r.id);
+  assert.equal(refused.status, 'error');
+  assert.match(refused.events.find((e) => e.type === 'error').text, /拒絕了這個請求，已停止這一輪/);
 });
