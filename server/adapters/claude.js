@@ -57,7 +57,18 @@ function halt(run, why) {
   run.ac.abort();
   for (const resolve of [...run.waits.values()]) resolve(null);
 }
-const queuedImages = new Map(); // prompt id -> images of a queued message (kept out of meta)
+// Images of queued messages, kept with the conversation (not in meta, which
+// goes to every page) so a restart does not lose them.
+const queuedImages = {
+  get: (session, id) => st(session).queuedImages?.[id],
+  set: (session, id, images) => (st(session).queuedImages = { ...(st(session).queuedImages || {}), [id]: images }),
+  delete: (session, id) => {
+    if (st(session).queuedImages) delete st(session).queuedImages[id];
+  },
+};
+// Told to Claude with the next turn after the hub restarted mid-turn.
+const RESTART_NOTE =
+  'Agent Hub restarted while you were working, so your last turn was cut off: a tool call that had not finished was not run (or its result was lost), and subagents that were running were stopped. Check where things stand (files, processes you started), then continue the task from there.';
 
 export function available() {
   return account.apiKey() ? { ok: true } : { ok: false, reason: '還沒有設定 Claude API key' };
@@ -211,7 +222,7 @@ export async function send(session, text, { images = [], note, steer } = {}) {
   const promptId = `p_${crypto.randomBytes(6).toString('hex')}`;
   const thumbs = images.map((i) => i.thumb || `data:${i.mimeType};base64,${i.data}`);
   if (runs.has(session.id)) {
-    if (images.length) queuedImages.set(promptId, images);
+    if (images.length) queuedImages.set(session, promptId, images);
     liveContext(session).setMeta({ queue: [...queue(session), { promptId, text, images: thumbs, ...(note ? { note } : {}), ...(steer ? { steered: true } : {}) }] });
     return { ok: true, promptId, queued: true };
   }
@@ -237,21 +248,28 @@ function next(session) {
   const q = queue(session)[0];
   if (!q) return;
   liveContext(session).setMeta({ queue: queue(session).slice(1) });
-  const images = queuedImages.get(q.promptId) || [];
-  queuedImages.delete(q.promptId);
+  const images = queuedImages.get(session, q.promptId) || [];
+  queuedImages.delete(session, q.promptId);
   startTurn(session, { text: q.text, images, thumbs: q.images, note: q.note, promptId: q.promptId });
 }
 
 const imageBlock = (i) => ({ type: 'image', source: { type: 'base64', media_type: i.mimeType, data: i.data } });
 
-async function turn(run, { text, images = [], thumbs, note, promptId }) {
+// `resume`: no message of the user's; the turn the hub was in when it
+// stopped goes on (see restore()).
+async function turn(run, { text, images = [], thumbs, note, promptId, resume }) {
   const { session, ctx } = run;
   const c = st(session);
   repair(c);
-  const userEv = ctx.emit({ type: 'user', text, images: thumbs || [], promptId, source: 'hub', ...(note ? { note } : {}) });
+  const userEv = resume
+    ? ctx.emit({ type: 'info', text: '中控台重新啟動了：Claude 接著剛才被中斷的工作繼續' })
+    : ctx.emit({ type: 'user', text, images: thumbs || [], promptId, source: 'hub', ...(note ? { note } : {}) });
   c.turns = [...c.turns, { msg: c.messages.length, event: userEv.id, toldPlan: c.toldPlan ?? null }].slice(-50);
-  if (!session.titled) ctx.setTitle(text.replace(/\s+/g, ' ').trim().slice(0, 80) || '新對話');
+  if (!session.titled && !resume) ctx.setTitle(text.replace(/\s+/g, ' ').trim().slice(0, 80) || '新對話');
+  // Kept until the turn ends, so a restart in between knows to go on.
+  c.active = { since: Date.now() };
   ctx.setStatus('running');
+  store.saveSession(session, { immediate: true });
   // The model and thinking are fixed for the whole turn (a change made
   // during it applies from the next one), which also keeps the cache warm.
   const model = session.meta?.model || account.DEFAULT_MODEL;
@@ -259,7 +277,14 @@ async function turn(run, { text, images = [], thumbs, note, promptId }) {
   ctx.setMeta({ turnModel: model, turnEffort: effort });
   refreshModels(session);
 
-  const content = [...images.map(imageBlock), { type: 'text', text: text || '（圖片）' }];
+  const content = resume ? [] : [...images.map(imageBlock), { type: 'text', text: text || '（圖片）' }];
+  // After a restart, the next turn (going on by itself, or the user's own
+  // message) first says what happened.
+  if (c.restarted) {
+    content.unshift({ type: 'text', text: `<system-reminder>${RESTART_NOTE}</system-reminder>` });
+    c.restarted = false;
+  }
+  if (!content.length) content.push({ type: 'text', text: 'Continue.' });
   const note2 = planNote(session, c);
   const sysNote = note2 && account.supportsSystemMessages(model) ? { role: 'system', content: note2 } : null;
   if (note2 && !sysNote) content.push({ type: 'text', text: `<system-reminder>${note2}</system-reminder>` });
@@ -311,6 +336,7 @@ function repair(c) {
 
 function finishTurn(run, error) {
   const { session, ctx } = run;
+  st(session).active = null;
   for (const ev of session.events.slice(run.firstEvent)) {
     if (ev.permission && !ev.permission.chosen) ctx.patch(ev, { permission: { ...ev.permission, chosen: 'cancelled' } });
     if (ev.type === 'tool_use' && ['pending', 'running', 'awaiting'].includes(ev.status)) ctx.patch(ev, { status: run.aborted || ev.status === 'awaiting' ? 'interrupted' : 'ended' });
@@ -402,8 +428,8 @@ function takeSteered(run) {
   const blocks = [];
   for (const q of items) {
     ctx.emit({ type: 'user', text: q.text, images: q.images || [], promptId: q.promptId, source: 'hub', steered: true, ...(q.note ? { note: q.note } : {}) });
-    const images = queuedImages.get(q.promptId) || [];
-    queuedImages.delete(q.promptId);
+    const images = queuedImages.get(session, q.promptId) || [];
+    queuedImages.delete(session, q.promptId);
     blocks.push(...images.map(imageBlock), { type: 'text', text: `The user sent this while you were working:\n${q.text || '(images)'}` });
   }
   return blocks;
@@ -824,7 +850,7 @@ export function steerQueued(session, promptId) {
 }
 
 export function cancelQueued(session, promptId) {
-  queuedImages.delete(promptId);
+  queuedImages.delete(session, promptId);
   liveContext(session).setMeta({ queue: queue(session).filter((x) => x.promptId !== promptId) });
 }
 
@@ -987,7 +1013,9 @@ export async function getChanges(session, summarize) {
   return { git: true, files: summarize(diff), diff };
 }
 
-// At startup: whatever was in progress when the hub stopped is over.
+// At startup: what was in progress when the hub stopped is over — and the
+// turn it was in goes on by itself (Claude is told the hub restarted), with
+// the messages that were waiting for it after.
 export function restore(session) {
   let changed = false;
   for (const ev of session.events) {
@@ -1005,21 +1033,41 @@ export function restore(session) {
     }
   }
   const meta = session.meta || {};
-  if (meta.queue?.length) {
-    session.events.push({ id: store.newId('e_'), ts: Date.now(), type: 'info', text: `中控台重新啟動了，這些排隊中的訊息沒有送出：${meta.queue.map((q) => `「${q.text}」`).join('、')}` });
-    meta.queue = [];
-    changed = true;
-  }
   if (meta.turnModel || meta.turnEffort) {
     meta.turnModel = null;
     meta.turnEffort = null;
     changed = true;
   }
+  const c = st(session);
+  const wasWorking = Boolean(c.active);
+  if (wasWorking) {
+    c.active = null;
+    c.restarted = true;
+    session.events.push({ id: store.newId('e_'), ts: Date.now(), type: 'turn_end', durationMs: 0, usage: { inputTokens: 0, outputTokens: 0, costUsd: 0 }, interrupted: true, restarted: true });
+    changed = true;
+  }
   if (changed) store.saveSession(session);
+  if (wasWorking || meta.queue?.length) resumeLater(session, wasWorking);
+}
+
+// Once Claude can be reached (a key, its computer online), and only if
+// nobody has started anything in the conversation meanwhile.
+function resumeLater(session, wasWorking, tries = 0) {
+  const t = setTimeout(() => {
+    if (store.getSession(session.id) !== session || runs.has(session.id)) return;
+    if (cannotSend(session)) {
+      if (tries < 120) resumeLater(session, wasWorking, tries + 1);
+      else if (queue(session).length) liveContext(session).emit({ type: 'info', text: '中控台重新啟動後一直沒辦法接著做（電腦離線或沒有 API key），排隊中的訊息還在，可以自己送出「繼續」' });
+      return;
+    }
+    if (wasWorking && st(session).restarted) startTurn(session, { resume: true });
+    else next(session);
+  }, tries ? 5000 : 1500);
+  t.unref?.();
 }
 
 export function dispose(session) {
-  for (const q of queue(session)) queuedImages.delete(q.promptId);
+  for (const q of queue(session)) queuedImages.delete(session, q.promptId);
   interrupt(session);
   modelsAt.delete(session.id);
 }

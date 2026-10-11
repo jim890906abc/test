@@ -675,7 +675,7 @@ export class Transcript {
         // Claude: which model(s) actually answered this turn.
         const by = (ev.models || []).map((m) => m.name || m.id).join('、');
         node.el.hidden = !(ev.interrupted || ev.error || by);
-        const what = ev.interrupted ? '已中斷' : ev.error ? '這一輪沒有完成' : '';
+        const what = ev.restarted ? '中控台重新啟動，這一輪被中斷了' : ev.interrupted ? '已中斷' : ev.error ? '這一輪沒有完成' : '';
         return fill(node.el, h('span', { class: 'note', title: (ev.models || []).map((m) => m.id).join('\n') }, [what, by ? `由 ${by} 回覆` : ''].filter(Boolean).join(' · ')));
       }
       default:

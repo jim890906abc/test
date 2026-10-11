@@ -1046,6 +1046,11 @@ function applySnapshot(full) {
   cur.transcript.setStatus(summary.status, busy(summary.status) ? lastUserTs(events) : null, summary.meta?.tps || 0);
   S.artifacts = withOpened(cur.transcript.artifacts());
   cur.knownArtifacts = new Set(S.artifacts.map((a) => a.path));
+  // A fresh copy (after a reconnect or a hub restart) may have stopped the
+  // subagents the tray still counts.
+  cur.agentsWorking = cur.transcript.runningCount();
+  cur.foreground = cur.transcript.foregroundCount();
+  composer?.update({ agentsWorking: cur.agentsWorking, foreground: cur.foreground });
   updateComposer();
   renderToolbar();
   renderSidebar();

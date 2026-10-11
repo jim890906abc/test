@@ -20,12 +20,11 @@ let server;
 let log = '';
 let requests = [];
 
-before(async () => {
-  fake = await startFakeClaude(KEY);
-  requests = fake.requests;
-  const env = { ...process.env };
-  delete env.ANTHROPIC_API_KEY;
-  server = spawn(process.execPath, ['server/index.js'], {
+// The hub, on the test's data folder (started again by the restart test).
+let hubEnv;
+async function startHub(env = hubEnv) {
+  hubEnv = env;
+  const p = spawn(process.execPath, ['server/index.js'], {
     cwd: ROOT,
     env: {
       ...env,
@@ -42,8 +41,17 @@ before(async () => {
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  server.stderr.on('data', (d) => (log += d));
-  await new Promise((resolve) => server.stdout.on('data', (d) => d.toString().includes('已啟動') && resolve()));
+  p.stderr.on('data', (d) => (log += d));
+  await new Promise((resolve) => p.stdout.on('data', (d) => d.toString().includes('已啟動') && resolve()));
+  return p;
+}
+
+before(async () => {
+  fake = await startFakeClaude(KEY);
+  requests = fake.requests;
+  const env = { ...process.env };
+  delete env.ANTHROPIC_API_KEY;
+  server = await startHub(env);
 });
 
 after(() => {
@@ -331,4 +339,22 @@ test('another model answering (a downgrade) or a refusal stops the turn, and say
   const refused = await idle(r.id);
   assert.equal(refused.status, 'error');
   assert.match(refused.events.find((e) => e.type === 'error').text, /拒絕了這個請求，已停止這一輪/);
+});
+
+test('a hub restart mid-turn: the turn goes on by itself, queued messages after it', async () => {
+  const s = await api('POST', '/sessions', { agent: 'claude', prompt: 'SLOW' });
+  await until(async () => (await snap(s.id)).events.some((e) => e.type === 'text' && e.text.length > 20));
+  await api('POST', `/sessions/${s.id}/messages`, { text: '排隊的問題' });
+  const n0 = messagesSent().length;
+  await new Promise((r) => (server.once('exit', r), server.kill('SIGTERM')));
+  server = await startHub();
+  const done = await until(async () => {
+    const x = await snap(s.id);
+    return x.events.filter((e) => e.type === 'turn_end').length === 3 && x.status === 'idle' && x;
+  }, 20000);
+  assert.ok(done.events.some((e) => e.type === 'turn_end' && e.restarted));
+  assert.ok(done.events.some((e) => e.type === 'info' && /接著剛才被中斷的工作/.test(e.text)));
+  const resumed = messagesSent()[n0].body.messages.at(-1);
+  assert.match(resumed.content.map((b) => b.text).join('\n'), /Agent Hub restarted/);
+  assert.equal(done.events.filter((e) => e.type === 'user').at(-1).text, '排隊的問題');
 });
