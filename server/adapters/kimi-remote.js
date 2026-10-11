@@ -6,6 +6,8 @@
 import crypto from 'node:crypto';
 import * as machines from '../machines.js';
 import * as store from '../store.js';
+import * as repoBind from './claude-repo.js';
+import { remoteHost } from './claude-tools.js';
 
 export const live = true;
 
@@ -23,6 +25,8 @@ const APPROVAL_OPTIONS = [
   { optionId: 'rejected', name: '拒絕', kind: 'reject_once' },
 ];
 const PERMISSIONS = ['manual', 'yolo', 'auto'];
+// The note on Agent Hub's own reminders to commit and push (see checkRepo).
+const REPO_CHECK_NOTE = 'Agent Hub 檢查：還有沒上傳到 GitHub 的工作';
 // Turns loaded when a conversation is opened, and per 「載入更早的對話」.
 const HISTORY_TURNS = 10;
 // A conversation nobody has open, that is not working, stops following the
@@ -541,6 +545,15 @@ class Mirror {
         : { kind: 'approval', options: APPROVAL_OPTIONS, chosen: null },
     });
     this.ctx.setStatus('awaiting_permission');
+    // Bound to a GitHub repository: a push elsewhere, a force push or a
+    // change of remote is refused for the user.
+    const repo = this.session.repo;
+    const command = ev.input?.command || display?.command;
+    const why = !plan && repo && /^(Bash|Shell)$/.test(a.tool_name) && typeof command === 'string' && repoBind.guard(command, repo);
+    if (why) {
+      this.ctx.emit({ type: 'info', text: `Agent Hub 擋下了這個指令：這個對話綁定 ${repo.full} 的 ${repo.branch}` });
+      this.respond(ev.id, 'rejected', { feedback: `Refused by Agent Hub: ${why}. This conversation is bound to ${repo.full}, branch ${repo.branch}; push your commits there with \`git push -u origin ${repo.branch}\`, and never force-push.` }).catch(() => {});
+    }
   }
 
   onQuestion(q) {
@@ -833,7 +846,27 @@ class Mirror {
     this.turn = null;
     this.meta({ turnModel: null, turnEffort: null });
     for (const [key, ev] of this.tools) if (!lives(ev)) this.tools.delete(key);
+    if (this.session.repo && !this.batch && p.reason !== 'cancelled' && p.reason !== 'failed') setTimeout(() => this.checkRepo().catch((err) => console.warn(`[kimi] repo check: ${err.message}`)), 300);
     if (!this.batch && this.inTerminal()) setTimeout(() => this.flushTerminalQueue(), 400);
+  }
+
+  // Bound to a GitHub repository: at the end of a turn, nothing may stay
+  // uncommitted or unpushed. Kimi is reminded (twice at most, the rules
+  // with it), then Agent Hub commits and pushes what is left itself.
+  async checkRepo() {
+    const repo = this.session.repo;
+    if (!repo || this.session.meta?.planMode || this.queue().length || ['running', 'awaiting_permission'].includes(this.session.status)) return;
+    const host = remoteHost(this.machineId);
+    const left = await repoBind.check(host, repo.dir, repo);
+    if (!left) return void (this.repoNudges = 0);
+    if ((this.repoNudges || 0) < 2) {
+      this.repoNudges = (this.repoNudges || 0) + 1;
+      await this.send(`${left.en}\n\n${repoBind.rulesNote(repo)}`, [], { note: REPO_CHECK_NOTE });
+      return;
+    }
+    this.repoNudges = 0;
+    const saved = await repoBind.autoSave(host, repo.dir, repo, left);
+    this.ctx.emit({ type: saved.ok ? 'info' : 'error', text: saved.text.replaceAll('Claude', 'Kimi') });
   }
 
   // ------------------------------------------------------------ actions
@@ -922,6 +955,15 @@ class Mirror {
       ctx.setStatus('running');
     }
     const body = { prompt_id: promptId, content: this.content(text, images) };
+    // Bound to a GitHub repository: the rules go with the first message (and
+    // with every reminder after).
+    const repo = this.session.repo;
+    if (repo && !repo.told) {
+      body.content.unshift({ type: 'text', text: `<system-reminder>${repoBind.rulesNote(repo)}</system-reminder>` });
+      this.session.repo = { ...repo, told: true };
+      store.saveSession(this.session);
+    }
+    if (note !== REPO_CHECK_NOTE) this.repoNudges = 0;
     if (this.defaultModel === undefined) await this.loadModels().catch(() => {});
     if (!this.session.meta?.model && this.defaultModel) body.model = this.defaultModel;
     // 插隊 from the tray can come before Kimi has the prompt: it waits.
@@ -1298,6 +1340,30 @@ machines.onSessionChange((machineId, entry) => {
   if (!m) return;
   m.meta({ owner: entry.owner || null, controllable: entry.controllable ?? null, guess: Boolean(entry.guess) });
 });
+
+// An existing Kimi conversation bound to a GitHub repository, for good. Its
+// folder stays (Kimi's conversations live in theirs): when it is not a clone
+// of the repository, the repository is cloned into it, in a folder of its
+// own. Kimi is told at once, and brings its work over.
+export async function bindRepo(session, { full, branch }) {
+  if (session.repo) throw Object.assign(new Error(`這個對話已經綁定 ${session.repo.full} 的 ${session.repo.branch}，不能再換`), { status: 409 });
+  if (['running', 'awaiting_permission'].includes(session.status)) throw Object.assign(new Error('Kimi 正在工作：等這一輪結束（或先停止）再綁定'), { status: 409 });
+  const host = remoteHost(session.machineId);
+  const origin = await host.run(session.cwd, 'git config --get remote.origin.url', { timeoutMs: 15_000 }).catch(() => null);
+  const same = origin?.exitCode === 0 && repoBind.parseRepo(String(origin.output).trim())?.toLowerCase() === full.toLowerCase();
+  if (same) await repoBind.useBranch(host, session.cwd, { branch });
+  const dir = same ? session.cwd : await repoBind.clone(host, session.cwd, { full, branch }, { name: full.split('/')[1] });
+  session.repo = { full, branch, url: `https://github.com/${full}/tree/${branch}`, dir, told: true };
+  store.saveSession(session);
+  const ctx = liveContext(session);
+  ctx.emit({ type: 'info', text: same ? `已綁定 ${full} 的 ${branch}：資料夾本來就是這個 repo，已切到 ${branch}。` : `已綁定 ${full} 的 ${branch}：repo clone 到 ${dir}（在對話資料夾裡）。Kimi 會先把屬於這個專案的檔案搬進去，commit 並 push。` });
+  ctx.setMeta({});
+  const intro = same
+    ? `The user has bound this conversation to the GitHub repository ${full}, branch \`${branch}\`, from now on. Your working directory is already a clone of it and is now on \`${branch}\`. Commit what you have done so far that belongs to the task, push it, and tell the user briefly.`
+    : `The user has bound this conversation to the GitHub repository ${full}, branch \`${branch}\`, from now on. It was cloned into ${dir}, inside your working directory. Bring over into it what belongs to the user's task from your earlier work (code, docs, configs; not secrets, data dumps, build output or tool caches), commit it with a clear message, push it, and tell the user briefly what you brought over and what you left out.`;
+  await send(session, `${intro}\n\n${repoBind.rulesNote(session.repo)}`, { note: '綁定 GitHub repo' });
+  return session;
+}
 
 export function dispose(session) {
   clearInterval(mirrors.get(session.id)?.cutInTimer);

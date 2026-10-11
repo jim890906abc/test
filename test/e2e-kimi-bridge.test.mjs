@@ -37,6 +37,7 @@ const KIMI_PORT = 24000 + Math.floor(Math.random() * 2000);
 const TOKEN = 'e2e-token';
 const procs = [];
 let fake;
+const seen = []; // requests the fake model got
 let kimiToken;
 let machineId;
 
@@ -54,7 +55,12 @@ function startFakeModel() {
       if (!j.stream) return res.end(JSON.stringify({ choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }] }));
       const msgs = j.messages || [];
       const last = msgs.at(-1) || {};
-      const users = msgs.filter((m) => m.role === 'user').map((m) => str(m.content)).filter((t) => !t.trimStart().startsWith('<system-reminder>'));
+      seen.push(j);
+      // What the user said, without the notes Kimi and Agent Hub put around it.
+      const users = msgs
+        .filter((m) => m.role === 'user')
+        .map((m) => str(m.content).replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim())
+        .filter(Boolean);
       const sub = users.some((u) => u.includes('SUBAGENT_TASK'));
       const lastUser = users.at(-1) || '';
       const prevCall = msgs.at(-2)?.tool_calls?.[0]?.function?.name;
@@ -75,6 +81,21 @@ function startFakeModel() {
         { delta: {}, finish_reason: 'tool_calls' },
       ];
       if (sub) return send(last.role === 'tool' ? text('子代理結論：專案裡有 a.txt。') : call('子代理：先看看檔案。', 'Bash', { command: 'ls' }));
+      // Bound to a GitHub repository: Agent Hub's end-of-turn reminder, done
+      // (REPOGOOD) or not; work left uncommitted; a forced push.
+      const bound = lastUser.match(/bound to `([^`]+)`/);
+      if (/Agent Hub check at the end of your turn/.test(lastUser)) {
+        if (last.role === 'tool') return send(text('已經 commit 並 push。'));
+        if (!users[0].includes('REPOGOOD')) return send(text('好的，等一下再處理。'));
+        const dir = lastUser.match(/The clone is at (\S+):/)?.[1] || '.';
+        return send(call('我來 commit 並 push。', 'Bash', { command: `cd ${dir} && git add -A && git -c user.name=Kimi -c user.email=kimi@example.com commit -q -m "Add work.txt" && git push -q -u origin ${bound[1]}` }));
+      }
+      if (/has bound this conversation/.test(lastUser)) {
+        if (last.role === 'tool') return send(text('搬好了。'));
+        return send(call('把檔案搬進 repo。', 'Bash', { command: `cp a.txt ${lastUser.match(/It was cloned into (\S+), inside/)[1]}/moved.txt` }));
+      }
+      if (lastUser.includes('REPOFORCE') && last.role !== 'tool') return send(call('推上去。', 'Bash', { command: 'git push -f origin main' }));
+      if (/REPOGOOD|REPOLAZY/.test(lastUser) && last.role !== 'tool') return send(call('寫檔案。', 'Bash', { command: 'echo work > work.txt' }));
       if (last.role === 'tool') {
         if (prevCall === 'Agent') return send(text('子代理回報完成。'));
         if (prevCall === 'TodoList') return send(text('待辦已建立。'));
@@ -168,7 +189,7 @@ before(async () => {
   kimiToken = fs.readFileSync(path.join(KIMI_HOME, 'server.token'), 'utf8').trim();
   await kimiApi('POST', '/providers', { id: 'fake', type: 'openai', api_key: 'sk-fake', base_url: `http://127.0.0.1:${fake.address().port}/v1`, default_model: 'fake-1', models: [{ model: 'fake-1', max_context_size: 128000 }] });
   await kimiApi('POST', '/models/fake%2Ffake-1:set_default');
-  await run(process.execPath, ['server/index.js'], { PORT: String(HUB_PORT), AGENT_HUB_TOKEN: TOKEN, AGENT_HUB_DATA: path.join(TMP, 'data'), AGENT_HUB_WORKSPACES: path.join(TMP, 'ws') }, /已啟動/);
+  await run(process.execPath, ['server/index.js'], { PORT: String(HUB_PORT), AGENT_HUB_TOKEN: TOKEN, AGENT_HUB_DATA: path.join(TMP, 'data'), AGENT_HUB_WORKSPACES: path.join(TMP, 'ws'), AGENT_HUB_GITHUB_TEST_URL: path.join(TMP, 'github') }, /已啟動/);
   const key = JSON.parse(fs.readFileSync(path.join(TMP, 'data', 'hub.json'), 'utf8')).bridgeKey;
   await run(process.execPath, ['bridge/agent-hub-bridge.mjs', '--hub', `http://127.0.0.1:${HUB_PORT}`, '--key', key, '--name', 'e2e-machine', '--kimi-bin', KIMI], { KIMI_CODE_HOME: KIMI_HOME, HOME }, /已連上中控台/);
   const m = await until(async () => (await api('GET', '/machines')).find((x) => x.online && x.kimi.server), 10000, 'machine online');
@@ -431,6 +452,79 @@ test('a page Kimi wrote outside the conversation folder still opens; other files
 });
 
 // Last: it replaces the Kimi server the other tests talk to directly.
+// A bare repository standing in for GitHub's me/proj (main: README.md).
+function githubRepo() {
+  const origin = path.join(TMP, 'github', 'me', 'proj.git');
+  if (fs.existsSync(origin)) return origin;
+  const env = { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' };
+  const git = (cwd, ...args) => execFileSync('git', args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const seed = path.join(TMP, 'seed');
+  fs.mkdirSync(origin, { recursive: true });
+  fs.mkdirSync(seed, { recursive: true });
+  git(origin, 'init', '-q', '--bare', '-b', 'main');
+  git(seed, 'init', '-q', '-b', 'main');
+  fs.writeFileSync(path.join(seed, 'README.md'), '# proj\n');
+  git(seed, 'add', '.');
+  git(seed, 'commit', '-qm', 'init');
+  git(seed, 'push', '-q', origin, 'main');
+  return origin;
+}
+const gitIn = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+const turnsOf = (sid, n) => until(async () => { const x = await session(sid); return x.status === 'idle' && x.events.filter((e) => e.type === 'turn_end').length >= n && x; }, 40000, `${n} turns`);
+
+test('a new Kimi conversation bound to a GitHub repository: cloned, told the rules, reminded, pushed', { skip: SKIP }, async () => {
+  const origin = githubRepo();
+  const n0 = seen.length;
+  const s = await api('POST', '/sessions', { machineId, repo: 'me/proj', prompt: 'REPOGOOD 寫一個檔案', permission: 'auto' });
+  const branch = s.repo.branch;
+  assert.match(branch, /^claude\/\d{8}-[0-9a-f]{4}$/);
+  assert.equal(s.repo.full, 'me/proj');
+  assert.equal(s.cwd, s.repo.dir);
+  assert.match(s.cwd, /agent-hub-workspaces\/\d{4}-\d\d-\d\d-proj$/);
+  assert.equal(gitIn(s.cwd, 'rev-parse', '--abbrev-ref', 'HEAD'), branch);
+  // Kimi wrote work.txt and stopped; Agent Hub reminded it; it pushed.
+  const done = await until(async () => {
+    const x = await session(s.id);
+    return x.status === 'idle' && x.events.some((e) => e.type === 'text' && e.text.includes('已經 commit 並 push')) && x;
+  }, 60000, 'pushed');
+  assert.equal(gitIn(origin, 'show', `${branch}:work.txt`), 'work');
+  assert.ok(done.events.some((e) => e.type === 'user' && e.note === 'Agent Hub 檢查：還有沒上傳到 GitHub 的工作'));
+  // The rules went with the first message.
+  const first = seen.slice(n0).find((j) => JSON.stringify(j.messages).includes('REPOGOOD'));
+  assert.match(JSON.stringify(first.messages), /bound to the GitHub repository me\/proj/);
+});
+
+test('a forced push asked for in a bound Kimi conversation is refused for the user', { skip: SKIP }, async () => {
+  githubRepo();
+  const s = await api('POST', '/sessions', { machineId, repo: 'me/proj', branch: 'main', prompt: 'REPOFORCE', permission: 'manual' });
+  const done = await until(async () => {
+    const x = await session(s.id);
+    const ev = x.events.find((e) => e.type === 'tool_use' && e.name === 'Bash');
+    return x.status === 'idle' && ev?.permission?.chosen === 'rejected' && x;
+  }, 40000, 'refused');
+  assert.ok(done.events.some((e) => e.type === 'info' && /Agent Hub 擋下了這個指令/.test(e.text)));
+  assert.equal(gitIn(s.cwd, 'rev-parse', '--abbrev-ref', 'HEAD'), 'main');
+});
+
+test('an existing Kimi conversation bound to a repository: cloned inside its folder, work brought over and pushed', { skip: SKIP }, async () => {
+  const origin = githubRepo();
+  const s = await api('POST', '/sessions', { machineId, cwd: PROJECT, prompt: '聊天 你好', permission: 'auto' });
+  await turnsOf(s.id, 1);
+  const b = await api('POST', `/sessions/${s.id}/repo`, { repo: 'me/proj', branch: 'feature/k' });
+  assert.equal(b.repo.dir, path.join(PROJECT, 'proj'));
+  assert.equal(b.cwd, PROJECT);
+  await assert.rejects(api('POST', `/sessions/${s.id}/repo`, { repo: 'me/proj' }), /已經綁定/);
+  // Kimi brings a.txt over and leaves it uncommitted; reminded twice, it
+  // does nothing: Agent Hub pushes it.
+  const done = await until(async () => {
+    const x = await session(s.id);
+    return x.status === 'idle' && x.events.some((e) => e.type === 'info' && /已自動 commit 並 push 到 feature\/k/.test(e.text)) && x;
+  }, 90000, 'auto-saved');
+  assert.equal(done.events.filter((e) => e.type === 'user' && e.note === 'Agent Hub 檢查：還有沒上傳到 GitHub 的工作').length, 2);
+  assert.equal(gitIn(origin, 'show', 'feature/k:moved.txt'), 'hello');
+  assert.match(gitIn(origin, 'log', '-1', '--format=%s', 'feature/k'), /Agent Hub auto-save/);
+});
+
 test('when the Kimi server goes away, the bridge starts a new one on the next message', { skip: SKIP }, async () => {
   const s = await api('POST', '/sessions', { machineId, prompt: '聊天 伺服器在', permission: 'auto' });
   await idle(s.id);

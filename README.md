@@ -62,6 +62,14 @@ Claude 和 Kimi 都用 git 與 GitHub CLI（`gh`）操作 GitHub：clone、開�
 
 綁定的 repo 會記在首頁，之後在同一台電腦開的 Claude 新對話也會綁定它（每次一個新分支），直到你在選單裡選「不綁定」。私人 repo 和 push 都需要那台電腦先在「GitHub…」登入。
 
+### Kimi 對話綁定 GitHub repo
+
+Kimi 也一樣：Kimi 首頁的資料夾選單選「綁定一個 GitHub repo…」，或已經開著的 Kimi 對話右上「⋯」→「綁定 GitHub repo…」。跟 Claude 不同的地方（Kimi 的 agent 是 Kimi Code 自己在跑，Agent Hub 改不了它的系統提示、也攔不到它自己執行的指令）：
+
+- 規則跟著第一則訊息一起給 Kimi，之後每次提醒也會附上；Kimi 壓縮對話後忘了也沒關係，每一輪結束的檢查（提醒兩次、再不行 Agent Hub 自動 commit 並 push）照樣有效。
+- 已經開著的對話：資料夾不是那個 repo 的話，repo 會 clone 到對話資料夾裡的子資料夾（Kimi 的對話不能換資料夾），綁定後馬上傳一則訊息請 Kimi 把檔案搬進去並 push（會用掉一輪）。
+- 推到其他分支、force push、改 remote 的指令：Kimi 先問你要不要執行時會自動拒絕；全部自動（yolo）模式下 Kimi 不會先問，這一項就擋不了。
+
 ## 連接其他電腦
 
 在那台電腦執行中控台印出的連接指令（左下角「連接電腦…」也看得到）。之後那台電腦的 Kimi 對話會自動出現。

@@ -5,8 +5,6 @@
 // the system prompt for good; Agent Hub checks at the end of every turn and
 // has Claude commit and push what is left (or does it itself), and refuses
 // commands that would push anywhere else or rewrite what was pushed.
-import fs from 'node:fs';
-import path from 'node:path';
 import crypto from 'node:crypto';
 
 const FULL = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
@@ -40,23 +38,26 @@ const q = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
 // Cloned into a new folder under `workspaces`, on `branch`: the remote's
 // branch if it has one, else a new one from the default branch. Resolves to
 // the folder.
-export async function clone(host, workspaces, { full, branch }) {
-  fs.mkdirSync(workspaces, { recursive: true });
-  const base = `${new Date().toISOString().slice(0, 10)}-${full.split('/')[1].toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'repo'}`;
-  let dir = path.join(workspaces, base);
-  for (let i = 2; fs.existsSync(dir); i++) dir = path.join(workspaces, `${base}-${i}`);
+// `name` (default: date-repo) in `parent`, made unique with -2, -3…; the
+// work is done by the shell of that computer (this one, or a connected one).
+export async function clone(host, parent, { full, branch }, { name } = {}) {
+  const base = name || `${new Date().toISOString().slice(0, 10)}-${full.split('/')[1].toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'repo'}`;
   const script = [
     'set -e',
-    `git clone --origin origin -- ${q(`${GITHUB}/${full}.git`)} ${q(dir)}`,
-    `cd ${q(dir)}`,
+    `mkdir -p ${q(parent)}`,
+    `d=${q(`${parent.replace(/\/+$/, '')}/${base}`)}; i=2`,
+    `while [ -e "$d" ]; do d=${q(`${parent.replace(/\/+$/, '')}/${base}-`)}"$i"; i=$((i+1)); done`,
+    `if ! git clone --origin origin -- ${q(`${GITHUB}/${full}.git`)} "$d"; then rm -rf "$d"; exit 1; fi`,
+    'cd "$d"',
     `if git ls-remote --exit-code --heads origin ${q(branch)} >/dev/null 2>&1; then git checkout -q -B ${q(branch)} ${q(`origin/${branch}`)}; else git checkout -q -b ${q(branch)}; fi`,
     `git config ${q(`branch.${branch}.remote`)} origin`,
     `git config ${q(`branch.${branch}.merge`)} ${q(`refs/heads/${branch}`)}`,
+    'echo "AGENT_HUB_CLONED=$d"',
   ].join('\n');
-  const r = await host.run(workspaces, script, { timeoutMs: 600_000 });
-  if (r.exitCode !== 0) {
-    fs.rmSync(dir, { recursive: true, force: true });
-    const out = String(r.output || '');
+  const r = await host.run('/', script, { timeoutMs: 600_000 });
+  const out = String(r.output || '');
+  const dir = out.match(/^AGENT_HUB_CLONED=(.*)$/m)?.[1]?.trim();
+  if (r.exitCode !== 0 || !dir) {
     const tail = out.trim().split('\n').slice(-3).join(' ').slice(0, 400);
     const why = /could not read Username|Authentication failed|Repository not found|not found|does not exist/i.test(out)
       ? `找不到 ${full}，或這台電腦沒有權限讀它。私人 repo 要先在「⋯」→「GitHub…」幫這台電腦登入。`
@@ -97,6 +98,12 @@ export function promptSection({ full, branch }) {
     `- If a push is rejected because the remote branch moved, run \`git pull --no-rebase origin ${branch}\`, resolve conflicts carefully (keep both sides' intent), run the checks again and push. If it fails for another reason, retry a couple of times, then tell the user exactly what failed.`,
     '- When you finish, tell the user which commits you pushed (short hash and message).',
   ].join('\n');
+}
+
+// The rules, told to an agent whose instructions Agent Hub does not write
+// (Kimi): with where the clone is when it is not the working directory.
+export function rulesNote(repo) {
+  return [promptSection(repo), repo.dir ? `\nThe clone is at ${repo.dir}: run git and the project's commands there (cd into it first), and keep the work for this repository inside it.` : ''].join('');
 }
 
 // What is left at the end of a turn: on another branch, uncommitted changes,

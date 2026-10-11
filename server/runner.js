@@ -7,6 +7,8 @@ import { TOOL_DEFS, toolKind, validateInput, executeTool } from './tools.js';
 import { ADAPTERS } from './adapters/index.js';
 import { createWorkspace } from './workspace.js';
 import * as machines from './machines.js';
+import * as repoBind from './adapters/claude-repo.js';
+import { remoteHost } from './adapters/claude-tools.js';
 
 let broadcast = () => {};
 export function setBroadcast(fn) {
@@ -33,6 +35,8 @@ export function summarize(s) {
     permissionMode: s.permissionMode,
     machineId: s.machineId,
     kimiSessionId: s.kimiSessionId,
+    // Bound to a GitHub repository (Claude keeps it in meta, Kimi beside it).
+    repo: s.meta?.repo || (s.repo ? { full: s.repo.full, branch: s.repo.branch, url: s.repo.url, dir: s.repo.dir } : null),
     meta: s.meta,
     usage: s.usage,
     autoPause: s.autoPause || null,
@@ -530,8 +534,17 @@ export async function newSession({ agentId, machineId, cwd, prompt, nameHint, pe
     const kimi = ADAPTERS['kimi-remote'];
     const availability = kimi.available(agent);
     if (!availability.ok) throw Object.assign(new Error(availability.reason), { status: 409 });
-    const r = await kimi.createRemote({ machineId: agent.machineId, cwd, nameHint: nameHint || prompt });
-    session = store.createSession({ agentId, cwd: r.cwd, machineId: agent.machineId, kimiSessionId: r.kimiSessionId, permissionMode, title: title || '新對話' });
+    // Bound to a GitHub repository: cloned on that computer first, and the
+    // conversation starts in the clone.
+    const { repo, ...settings } = config || {};
+    let dir = cwd;
+    if (repo) {
+      const m = machines.getMachine(agent.machineId);
+      dir = await repoBind.clone(remoteHost(agent.machineId), `${String(m?.home || '~').replace(/\/+$/, '')}/agent-hub-workspaces`, repo);
+    }
+    const r = await kimi.createRemote({ machineId: agent.machineId, cwd: dir, nameHint: nameHint || prompt });
+    session = store.createSession({ agentId, cwd: r.cwd, machineId: agent.machineId, kimiSessionId: r.kimiSessionId, permissionMode, title: title || '新對話', ...(repo ? { repo: { ...repo, url: `https://github.com/${repo.full}/tree/${repo.branch}`, dir: r.cwd } } : {}) });
+    config = Object.keys(settings).length ? settings : undefined;
     session.state.defaultsApplied = true; // started with what was picked on the home screen
     kimi.restore(session);
     await kimi.attach(session);

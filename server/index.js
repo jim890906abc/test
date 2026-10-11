@@ -277,7 +277,7 @@ app.post('/api/sessions', wrap(async (req) => {
   // computer, on `branch`: an existing one, or a new one made from the
   // default branch).
   let repo;
-  if (claude && req.body?.repo) {
+  if ((claude || machineId) && req.body?.repo) {
     const full = parseRepo(req.body.repo);
     if (!full) throw Object.assign(new Error('GitHub repo 要寫成 owner/repo（或貼上 GitHub 網址）'), { status: 400 });
     const branch = req.body.branch ? validBranch(req.body.branch) : newBranch();
@@ -361,12 +361,13 @@ app.post('/api/sessions/:id/messages', wrap((req) => {
 // An existing Claude conversation bound to a GitHub repository, for good.
 app.post('/api/sessions/:id/repo', wrap(async (req) => {
   const s = mustSession(req.params.id);
-  if (s.agentId !== 'claude') throw Object.assign(new Error('只有 Claude 對話可以綁定 GitHub repo'), { status: 400 });
+  const kimi = Boolean(s.kimiSessionId);
+  if (s.agentId !== 'claude' && !kimi) throw Object.assign(new Error('只有 Claude 和 Kimi 對話可以綁定 GitHub repo'), { status: 400 });
   const full = parseRepo(req.body?.repo);
   if (!full) throw Object.assign(new Error('GitHub repo 要寫成 owner/repo（或貼上 GitHub 網址）'), { status: 400 });
   const branch = req.body?.branch ? validBranch(req.body.branch) : newBranch();
   if (!branch) throw Object.assign(new Error(`分支名稱不合法：${req.body.branch}`), { status: 400 });
-  await ADAPTERS.claude.bindRepo(s, { full, branch });
+  await (kimi ? ADAPTERS['kimi-remote'] : ADAPTERS.claude).bindRepo(s, { full, branch });
   broadcast({ t: 'session', session: runner.summarize(s) });
   return runner.summarize(s);
 }));

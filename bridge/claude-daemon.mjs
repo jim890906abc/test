@@ -1344,15 +1344,15 @@ function redactSensitive(body) {
   }
   return null;
 }
-async function checkCredentialsFileSafety(path12, onWarn = (m) => console.warn(`anthropic-sdk: ${m}`)) {
+async function checkCredentialsFileSafety(path11, onWarn = (m) => console.warn(`anthropic-sdk: ${m}`)) {
   if (typeof process === "undefined" || process.platform === "win32")
     return;
-  const { fs: fs12 } = await Promise.resolve().then(() => (init_node(), node_exports));
-  let resolved = path12;
+  const { fs: fs11 } = await Promise.resolve().then(() => (init_node(), node_exports));
+  let resolved = path11;
   let st2;
   try {
-    resolved = await fs12.promises.realpath(path12);
-    st2 = await fs12.promises.stat(resolved);
+    resolved = await fs11.promises.realpath(path11);
+    st2 = await fs11.promises.stat(resolved);
   } catch {
     return;
   }
@@ -1368,26 +1368,26 @@ async function checkCredentialsFileSafety(path12, onWarn = (m) => console.warn(`
   }
 }
 async function writeCredentialsFileAtomic(targetPath, data) {
-  const { fs: fs12, path: path12 } = await Promise.resolve().then(() => (init_node(), node_exports));
-  const dir = path12.dirname(targetPath);
-  await fs12.promises.mkdir(dir, { recursive: true, mode: 448 });
+  const { fs: fs11, path: path11 } = await Promise.resolve().then(() => (init_node(), node_exports));
+  const dir = path11.dirname(targetPath);
+  await fs11.promises.mkdir(dir, { recursive: true, mode: 448 });
   const tmpPath = `${targetPath}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
   try {
-    const fh = await fs12.promises.open(tmpPath, "w", 384);
+    const fh = await fs11.promises.open(tmpPath, "w", 384);
     try {
       await fh.writeFile(JSON.stringify(data, null, 2));
       await fh.sync();
     } finally {
       await fh.close();
     }
-    await fs12.promises.rename(tmpPath, targetPath);
+    await fs11.promises.rename(tmpPath, targetPath);
   } catch (err) {
-    await fs12.promises.unlink(tmpPath).catch(() => {
+    await fs11.promises.unlink(tmpPath).catch(() => {
     });
     throw err;
   }
   try {
-    const dirFh = await fs12.promises.open(dir, "r");
+    const dirFh = await fs11.promises.open(dir, "r");
     try {
       await dirFh.sync();
     } finally {
@@ -1789,11 +1789,11 @@ var init_credentials = __esm({
         return null;
       }
       validateProfileName(profileName);
-      const { fs: fs12, path: path12 } = await Promise.resolve().then(() => (init_node(), node_exports));
-      const configPath = path12.join(rootConfigPath, "configs", `${profileName}.json`);
+      const { fs: fs11, path: path11 } = await Promise.resolve().then(() => (init_node(), node_exports));
+      const configPath = path11.join(rootConfigPath, "configs", `${profileName}.json`);
       let configRaw;
       try {
-        configRaw = await fs12.promises.readFile(configPath, "utf-8");
+        configRaw = await fs11.promises.readFile(configPath, "utf-8");
       } catch (err) {
         if (err?.code !== "ENOENT") {
           throw new Error(`failed to read config file ${configPath}: ${err}`);
@@ -1874,14 +1874,14 @@ var init_credentials = __esm({
         return null;
       }
       validateProfileName(profileName);
-      const { path: path12 } = await Promise.resolve().then(() => (init_node(), node_exports));
-      return path12.join(rootConfigPath, "credentials", `${profileName}.json`);
+      const { path: path11 } = await Promise.resolve().then(() => (init_node(), node_exports));
+      return path11.join(rootConfigPath, "credentials", `${profileName}.json`);
     };
     getRootConfigPath = async () => {
       if (!supportsLocalConfigFiles()) {
         return null;
       }
-      const { path: path12 } = await Promise.resolve().then(() => (init_node(), node_exports));
+      const { path: path11 } = await Promise.resolve().then(() => (init_node(), node_exports));
       const configDir = readEnv("ANTHROPIC_CONFIG_DIR");
       if (configDir) {
         return configDir;
@@ -1890,21 +1890,21 @@ var init_credentials = __esm({
       if (os3 === "Windows") {
         const appData = readEnv("APPDATA");
         if (appData) {
-          return path12.join(appData, "Anthropic");
+          return path11.join(appData, "Anthropic");
         }
         const userProfile = readEnv("USERPROFILE");
         if (userProfile) {
-          return path12.join(userProfile, "AppData", "Roaming", "Anthropic");
+          return path11.join(userProfile, "AppData", "Roaming", "Anthropic");
         }
         return null;
       }
       const xdgConfigHome = readEnv("XDG_CONFIG_HOME");
       if (xdgConfigHome) {
-        return path12.join(xdgConfigHome, "anthropic");
+        return path11.join(xdgConfigHome, "anthropic");
       }
       const home = readEnv("HOME");
       if (home) {
-        return path12.join(home, ".config", "anthropic");
+        return path11.join(home, ".config", "anthropic");
       }
       return null;
     };
@@ -1921,10 +1921,10 @@ var init_credentials = __esm({
       if (profileName) {
         return profileName;
       }
-      const { fs: fs12, path: path12 } = await Promise.resolve().then(() => (init_node(), node_exports));
-      const filePath = path12.join(rootConfigPath, "active_config");
+      const { fs: fs11, path: path11 } = await Promise.resolve().then(() => (init_node(), node_exports));
+      const filePath = path11.join(rootConfigPath, "active_config");
       try {
-        return (await fs12.promises.readFile(filePath, "utf-8")).trim() || "default";
+        return (await fs11.promises.readFile(filePath, "utf-8")).trim() || "default";
       } catch (err) {
         if (err?.code !== "ENOENT") {
           throw new Error(`failed to read ${filePath}: ${err}`);
@@ -1936,21 +1936,21 @@ var init_credentials = __esm({
 });
 
 // node_modules/@anthropic-ai/sdk/lib/credentials/identity-token.mjs
-function identityTokenFromFile(path12) {
-  if (!path12) {
+function identityTokenFromFile(path11) {
+  if (!path11) {
     throw new AnthropicError("Identity token file path is empty");
   }
   return async () => {
-    const { fs: fs12 } = await Promise.resolve().then(() => (init_node(), node_exports));
+    const { fs: fs11 } = await Promise.resolve().then(() => (init_node(), node_exports));
     let content;
     try {
-      content = await fs12.promises.readFile(path12, "utf-8");
+      content = await fs11.promises.readFile(path11, "utf-8");
     } catch (err) {
-      throw new AnthropicError(`Failed to read identity token file at ${path12}: ${err}`);
+      throw new AnthropicError(`Failed to read identity token file at ${path11}: ${err}`);
     }
     const token = content.trim();
     if (!token) {
-      throw new AnthropicError(`Identity token file at ${path12} is empty`);
+      throw new AnthropicError(`Identity token file at ${path11} is empty`);
     }
     return token;
   };
@@ -2035,11 +2035,11 @@ var init_oidc_federation = __esm({
 // node_modules/@anthropic-ai/sdk/lib/credentials/user-oauth.mjs
 function userOAuthProvider(config) {
   return async (opts) => {
-    const { fs: fs12 } = await Promise.resolve().then(() => (init_node(), node_exports));
+    const { fs: fs11 } = await Promise.resolve().then(() => (init_node(), node_exports));
     await checkCredentialsFileSafety(config.credentialsPath, config.onSafetyWarning);
     let raw;
     try {
-      raw = await fs12.promises.readFile(config.credentialsPath, "utf-8");
+      raw = await fs11.promises.readFile(config.credentialsPath, "utf-8");
     } catch (err) {
       throw new WorkloadIdentityError(`Credentials file not found at ${config.credentialsPath}: ${err}`);
     }
@@ -2211,11 +2211,11 @@ function resolveIdentityTokenProvider(auth) {
 }
 function cachedExchangeProvider(exchange, credentialsPath, onCacheWriteError, onSafetyWarning) {
   return async (opts) => {
-    const { fs: fs12 } = await Promise.resolve().then(() => (init_node(), node_exports));
+    const { fs: fs11 } = await Promise.resolve().then(() => (init_node(), node_exports));
     await checkCredentialsFileSafety(credentialsPath, onSafetyWarning);
     let existing;
     try {
-      const raw = await fs12.promises.readFile(credentialsPath, "utf-8");
+      const raw = await fs11.promises.readFile(credentialsPath, "utf-8");
       existing = JSON.parse(raw);
       const token = existing?.["access_token"];
       if (token && !opts?.forceRefresh) {
@@ -3271,12 +3271,12 @@ var init_path = __esm({
   "node_modules/@anthropic-ai/sdk/internal/utils/path.mjs"() {
     init_error();
     EMPTY = /* @__PURE__ */ Object.freeze(/* @__PURE__ */ Object.create(null));
-    createPathTagFunction = (pathEncoder = encodeURIPath) => function path12(statics, ...params) {
+    createPathTagFunction = (pathEncoder = encodeURIPath) => function path11(statics, ...params) {
       if (statics.length === 1)
         return statics[0];
       let postPath = false;
       const invalidSegments = [];
-      const path13 = statics.reduce((previousValue, currentValue, index) => {
+      const path12 = statics.reduce((previousValue, currentValue, index) => {
         if (/[?#]/.test(currentValue)) {
           postPath = true;
         }
@@ -3293,7 +3293,7 @@ var init_path = __esm({
         }
         return previousValue + currentValue + (index === params.length ? "" : encoded);
       }, "");
-      const pathOnly = path13.split(/[?#]/, 1)[0];
+      const pathOnly = path12.split(/[?#]/, 1)[0];
       const invalidSegmentPattern = /(?<=^|\/)(?:\.|%2e){1,2}(?=\/|$)/gi;
       let match;
       while ((match = invalidSegmentPattern.exec(pathOnly)) !== null) {
@@ -3314,10 +3314,10 @@ var init_path = __esm({
         }, "");
         throw new AnthropicError(`Path parameters result in path with invalid segments:
 ${invalidSegments.map((e) => e.error).join("\n")}
-${path13}
+${path12}
 ${underline}`);
       }
-      return path13;
+      return path12;
     };
     path3 = /* @__PURE__ */ createPathTagFunction(encodeURIPath);
   }
@@ -16997,9 +16997,9 @@ var init_client = __esm({
         makeStatusError(status, error, message, headers) {
           return APIError.generate(status, error, message, headers);
         }
-        buildURL(path12, query, defaultBaseURL) {
+        buildURL(path11, query, defaultBaseURL) {
           const baseURL2 = !__classPrivateFieldGet(this, _BaseAnthropic_instances, "m", _BaseAnthropic_baseURLOverridden).call(this) && defaultBaseURL || this.baseURL;
-          const url = isAbsoluteURL(path12) ? new URL(path12) : new URL(baseURL2 + (baseURL2.endsWith("/") && path12.startsWith("/") ? path12.slice(1) : path12));
+          const url = isAbsoluteURL(path11) ? new URL(path11) : new URL(baseURL2 + (baseURL2.endsWith("/") && path11.startsWith("/") ? path11.slice(1) : path11));
           const defaultQuery = this.defaultQuery();
           const pathQuery = Object.fromEntries(url.searchParams);
           if (!isEmptyObj(defaultQuery) || !isEmptyObj(pathQuery)) {
@@ -17071,24 +17071,24 @@ var init_client = __esm({
         backendMiddleware() {
           return [];
         }
-        get(path12, opts) {
-          return this.methodRequest("get", path12, opts);
+        get(path11, opts) {
+          return this.methodRequest("get", path11, opts);
         }
-        post(path12, opts) {
-          return this.methodRequest("post", path12, opts);
+        post(path11, opts) {
+          return this.methodRequest("post", path11, opts);
         }
-        patch(path12, opts) {
-          return this.methodRequest("patch", path12, opts);
+        patch(path11, opts) {
+          return this.methodRequest("patch", path11, opts);
         }
-        put(path12, opts) {
-          return this.methodRequest("put", path12, opts);
+        put(path11, opts) {
+          return this.methodRequest("put", path11, opts);
         }
-        delete(path12, opts) {
-          return this.methodRequest("delete", path12, opts);
+        delete(path11, opts) {
+          return this.methodRequest("delete", path11, opts);
         }
-        methodRequest(method, path12, opts) {
+        methodRequest(method, path11, opts) {
           return this.request(Promise.resolve(opts).then((opts2) => {
-            return { method, path: path12, ...opts2 };
+            return { method, path: path11, ...opts2 };
           }));
         }
         request(options, remainingRetries = null) {
@@ -17209,8 +17209,8 @@ var init_client = __esm({
           armAbandonmentBackstop(response.body ?? response, controller);
           return { response, options, controller, requestLogID, retryOfRequestLogID, startTime };
         }
-        getAPIList(path12, Page2, opts) {
-          return this.requestAPIList(Page2, opts && "then" in opts ? opts.then((opts2) => ({ method: "get", path: path12, ...opts2 })) : { method: "get", path: path12, ...opts });
+        getAPIList(path11, Page2, opts) {
+          return this.requestAPIList(Page2, opts && "then" in opts ? opts.then((opts2) => ({ method: "get", path: path11, ...opts2 })) : { method: "get", path: path11, ...opts });
         }
         requestAPIList(Page2, options) {
           const request = this.makeRequest(options, null, void 0);
@@ -17328,14 +17328,14 @@ var init_client = __esm({
         }
         async buildRequest(inputOptions, { retryCount = 0 } = {}) {
           const options = { ...inputOptions };
-          const { method, path: path12, query, defaultBaseURL } = options;
+          const { method, path: path11, query, defaultBaseURL } = options;
           if (this._authState.resolution) {
             await this._authState.resolution;
           }
           if (!this._baseURLIsExplicit && this._authState.baseURL && this.baseURL !== this._authState.baseURL) {
             this.baseURL = this._authState.baseURL;
           }
-          const url = this.buildURL(path12, query, defaultBaseURL);
+          const url = this.buildURL(path11, query, defaultBaseURL);
           if ("timeout" in options)
             validatePositiveInteger("timeout", options.timeout);
           options.timeout = options.timeout ?? this.timeout;
@@ -18312,29 +18312,28 @@ var init_claude_tools = __esm({
 });
 
 // server/adapters/claude-repo.js
-import fs9 from "node:fs";
-import path9 from "node:path";
 function parseRepo(input) {
   const s = String(input || "").trim().replace(/^(?:https?:\/\/)?(?:www\.)?github\.com[/:]/i, "").replace(/^git@github\.com:/i, "").replace(/\.git$/i, "").replace(/\/+$/, "");
   return FULL.test(s) && !s.split("/").some((p) => p === "." || p === "..") ? s : null;
 }
-async function clone(host, workspaces, { full, branch }) {
-  fs9.mkdirSync(workspaces, { recursive: true });
-  const base = `${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10)}-${full.split("/")[1].toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "repo"}`;
-  let dir = path9.join(workspaces, base);
-  for (let i = 2; fs9.existsSync(dir); i++) dir = path9.join(workspaces, `${base}-${i}`);
+async function clone(host, parent, { full, branch }, { name } = {}) {
+  const base = name || `${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10)}-${full.split("/")[1].toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "repo"}`;
   const script = [
     "set -e",
-    `git clone --origin origin -- ${q2(`${GITHUB}/${full}.git`)} ${q2(dir)}`,
-    `cd ${q2(dir)}`,
+    `mkdir -p ${q2(parent)}`,
+    `d=${q2(`${parent.replace(/\/+$/, "")}/${base}`)}; i=2`,
+    `while [ -e "$d" ]; do d=${q2(`${parent.replace(/\/+$/, "")}/${base}-`)}"$i"; i=$((i+1)); done`,
+    `if ! git clone --origin origin -- ${q2(`${GITHUB}/${full}.git`)} "$d"; then rm -rf "$d"; exit 1; fi`,
+    'cd "$d"',
     `if git ls-remote --exit-code --heads origin ${q2(branch)} >/dev/null 2>&1; then git checkout -q -B ${q2(branch)} ${q2(`origin/${branch}`)}; else git checkout -q -b ${q2(branch)}; fi`,
     `git config ${q2(`branch.${branch}.remote`)} origin`,
-    `git config ${q2(`branch.${branch}.merge`)} ${q2(`refs/heads/${branch}`)}`
+    `git config ${q2(`branch.${branch}.merge`)} ${q2(`refs/heads/${branch}`)}`,
+    'echo "AGENT_HUB_CLONED=$d"'
   ].join("\n");
-  const r = await host.run(workspaces, script, { timeoutMs: 6e5 });
-  if (r.exitCode !== 0) {
-    fs9.rmSync(dir, { recursive: true, force: true });
-    const out = String(r.output || "");
+  const r = await host.run("/", script, { timeoutMs: 6e5 });
+  const out = String(r.output || "");
+  const dir = out.match(/^AGENT_HUB_CLONED=(.*)$/m)?.[1]?.trim();
+  if (r.exitCode !== 0 || !dir) {
     const tail = out.trim().split("\n").slice(-3).join(" ").slice(0, 400);
     const why = /could not read Username|Authentication failed|Repository not found|not found|does not exist/i.test(out) ? `\u627E\u4E0D\u5230 ${full}\uFF0C\u6216\u9019\u53F0\u96FB\u8166\u6C92\u6709\u6B0A\u9650\u8B80\u5B83\u3002\u79C1\u4EBA repo \u8981\u5148\u5728\u300C\u22EF\u300D\u2192\u300CGitHub\u2026\u300D\u5E6B\u9019\u53F0\u96FB\u8166\u767B\u5165\u3002` : `\u6C92\u8FA6\u6CD5 clone ${full}\u3002`;
     throw Object.assign(new Error(`${why}\uFF08${tail}\uFF09`), { status: 400 });
@@ -18476,8 +18475,8 @@ __export(claude_exports, {
   view: () => view
 });
 import os2 from "node:os";
-import fs10 from "node:fs";
-import path10 from "node:path";
+import fs9 from "node:fs";
+import path9 from "node:path";
 import crypto6 from "node:crypto";
 function init(makeContext) {
   liveContext = makeContext;
@@ -19074,8 +19073,8 @@ async function conversationTool(run, ev, u) {
   try {
     let text;
     if (u.name === "StartConversation") {
-      const folder = input.folder === "new" ? path10.join(WORKSPACES_DIR, `${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10)}-${crypto6.randomBytes(3).toString("hex")}`) : session.cwd;
-      if (input.folder === "new") fs10.mkdirSync(folder, { recursive: true });
+      const folder = input.folder === "new" ? path9.join(WORKSPACES_DIR, `${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10)}-${crypto6.randomBytes(3).toString("hex")}`) : session.cwd;
+      if (input.folder === "new") fs9.mkdirSync(folder, { recursive: true });
       const s = createSession({ agentId: "claude", cwd: folder, permissionMode: session.permissionMode, title: String(input.title).slice(0, 120) });
       s.titled = true;
       await setup(s, { model: input.model || session.meta?.model, effort: input.effort || session.meta?.effort, permission: session.meta?.permission, computer: session.meta?.machineName });
@@ -19542,21 +19541,21 @@ var init_claude = __esm({
 });
 
 // server/claude-daemon.js
-import fs11 from "node:fs";
-import path11 from "node:path";
+import fs10 from "node:fs";
+import path10 from "node:path";
 import http from "node:http";
 import crypto7 from "node:crypto";
 import { fileURLToPath as fileURLToPath2 } from "node:url";
 var argv = process.argv.slice(2);
-var DIR = path11.resolve(argv[argv.indexOf("--dir") + 1] || path11.join(process.env.HOME || ".", ".agent-hub", "claude"));
-fs11.mkdirSync(DIR, { recursive: true, mode: 448 });
+var DIR = path10.resolve(argv[argv.indexOf("--dir") + 1] || path10.join(process.env.HOME || ".", ".agent-hub", "claude"));
+fs10.mkdirSync(DIR, { recursive: true, mode: 448 });
 process.env.AGENT_HUB_DATA = DIR;
-process.env.AGENT_HUB_WORKSPACES ||= path11.join(process.env.HOME || DIR, "agent-hub-workspaces");
+process.env.AGENT_HUB_WORKSPACES ||= path10.join(process.env.HOME || DIR, "agent-hub-workspaces");
 var store = await Promise.resolve().then(() => (init_store(), store_exports));
 var account = await Promise.resolve().then(() => (init_claude_account(), claude_account_exports));
 var claude = await Promise.resolve().then(() => (init_claude(), claude_exports));
 var SELF = fileURLToPath2(import.meta.url);
-var VERSION2 = crypto7.createHash("sha1").update(fs11.readFileSync(SELF)).update(process.env.AGENT_HUB_DAEMON_VERSION || "").digest("hex").slice(0, 12);
+var VERSION2 = crypto7.createHash("sha1").update(fs10.readFileSync(SELF)).update(process.env.AGENT_HUB_DAEMON_VERSION || "").digest("hex").slice(0, 12);
 var clients = /* @__PURE__ */ new Set();
 function publish(msg) {
   const line = `data: ${JSON.stringify(msg)}
@@ -19642,7 +19641,7 @@ function applyAuth(auth) {
 var OPS = {
   async create({ id, cwd, title, config, permissionMode }) {
     if (store.getSession(id)) return snapshot(store.getSession(id));
-    if (!config?.repo && !fs11.statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) throw Object.assign(new Error(`\u8CC7\u6599\u593E\u4E0D\u5B58\u5728\uFF1A${cwd}`), { status: 400 });
+    if (!config?.repo && !fs10.statSync(cwd, { throwIfNoEntry: false })?.isDirectory()) throw Object.assign(new Error(`\u8CC7\u6599\u593E\u4E0D\u5B58\u5728\uFF1A${cwd}`), { status: 400 });
     const s = store.createSession({ id, agentId: "claude", cwd: cwd || "", permissionMode: permissionMode || "ask", title: title || "\u65B0\u5C0D\u8A71" });
     try {
       await claude.setup(s, config || {});
@@ -19740,10 +19739,10 @@ var server = http.createServer(async (req, res) => {
   send2(404, { ok: false, error: "not found" });
 });
 server.listen(0, "127.0.0.1", () => {
-  const file = path11.join(DIR, "daemon.json");
+  const file = path10.join(DIR, "daemon.json");
   const tmp = `${file}.${process.pid}.tmp`;
-  fs11.writeFileSync(tmp, JSON.stringify({ port: server.address().port, token: TOKEN, pid: process.pid, version: VERSION2 }), { mode: 384 });
-  fs11.renameSync(tmp, file);
+  fs10.writeFileSync(tmp, JSON.stringify({ port: server.address().port, token: TOKEN, pid: process.pid, version: VERSION2 }), { mode: 384 });
+  fs10.renameSync(tmp, file);
   console.log(`[claude-daemon] ${VERSION2} listening on 127.0.0.1:${server.address().port} (${DIR})`);
 });
 function shutdown() {

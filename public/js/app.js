@@ -648,7 +648,8 @@ function updateHomeComposer() {
   const folder = S.home.cwdByMachine?.[m?.id];
   homeComposer.update({
     machineName: m?.name,
-    folderName: folder === null ? '新資料夾' : folder ? baseName(folder) : '新資料夾',
+    folderName: kimiRepo(m) ? kimiRepo(m).full : folder === null ? '新資料夾' : folder ? baseName(folder) : '新資料夾',
+    folderIcon: kimiRepo(m) ? 'branch' : 'folder',
     models: mm?.models || [],
     defaultModel: mm?.defaultModel,
     model: S.home.model && mm?.models?.some((x) => x.id === S.home.model) ? S.home.model : '',
@@ -688,18 +689,26 @@ function machineMenu(anchor) {
   );
 }
 
+// A GitHub repository a new Kimi conversation on `m` is bound to.
+const kimiRepo = (m) => (m ? S.home.repoByMachine?.[m.id] || null : null);
+
 function folderMenu(anchor) {
   const m = homeMachine();
   if (!m) return openMachines();
   const recent = [...new Set((m.sessions || []).map((s) => s.cwd).filter(Boolean))].slice(0, 6);
   const pick = (cwd) => {
     S.home.cwdByMachine = { ...(S.home.cwdByMachine || {}), [m.id]: cwd };
+    S.home.repoByMachine = { ...(S.home.repoByMachine || {}), [m.id]: null };
     saveHome();
-    updateHomeComposer();
+    showHome();
   };
+  const repo = kimiRepo(m);
   openMenu(
     anchor,
     [
+      { section: 'GitHub' },
+      { label: repo ? `${repo.full}（${repo.branch || '新分支'}）` : '綁定一個 GitHub repo…', description: repo ? '換一個 repo 或分支' : 'clone 下來，所有程式碼都 commit 並 push 到那裡', checked: Boolean(repo), onSelect: () => repoDialog(m, null, 'kimi') },
+      { separator: true },
       recent.length ? { section: '最近使用' } : null,
       ...recent.map((p) => ({ label: baseName(p), description: shortPath(p, m.home, 4), onSelect: () => pick(p) })),
       recent.length ? { separator: true } : null,
@@ -909,7 +918,8 @@ async function startClaudeSession({ text, images }) {
 async function startSession({ text, images }) {
   const m = homeMachine();
   if (!m) return openMachines();
-  const cwd = S.home.cwdByMachine?.[m.id] || undefined;
+  const repo = kimiRepo(m);
+  const cwd = repo ? undefined : S.home.cwdByMachine?.[m.id] || undefined;
   const mm = machineModels.get(m.id);
   const model = S.home.model && mm?.models?.some((x) => x.id === S.home.model) ? S.home.model : undefined;
   // The thinking chosen (or from 設定), when the model that will be used
@@ -918,7 +928,7 @@ async function startSession({ text, images }) {
   const effort = S.home.effort && used?.efforts?.includes(S.home.effort) ? S.home.effort : undefined;
   homeComposer.el.classList.add('sending');
   try {
-    const s = await post('/sessions', { machineId: m.id, cwd, prompt: text, images, model, effort, permission: S.home.permission, planMode: S.home.planMode || undefined });
+    const s = await post('/sessions', { machineId: m.id, cwd, repo: repo?.full, branch: repo?.branch || undefined, prompt: text, images, model, effort, permission: S.home.permission, planMode: S.home.planMode || undefined });
     S.sessions.set(s.id, s);
     resetHomeChoices(); // the next new conversation starts from the defaults again
     go(`#/s/${s.id}`);
@@ -1104,7 +1114,7 @@ function updateComposer() {
     turnModel: meta.turnModel,
     turnEffort: meta.turnEffort,
     servedModel: meta.servedModel || null,
-    repo: meta.repo || null,
+    repo: s.repo || null,
     context: meta.context,
     skills: meta.skills || [],
     terminal: meta.owner === 'tui',
@@ -1133,7 +1143,7 @@ function renderToolbar() {
     return;
   }
   const m = machineById(s.machineId);
-  const sub = (isClaude(s) ? ['Claude API', s.meta?.machineName || hostName(), s.meta?.repo ? `${s.meta.repo.full} · ${s.meta.repo.branch}` : s.cwd ? shortPath(s.cwd, s.machineId ? m?.home : S.config?.home, 3) : null] : [m?.name || s.meta?.machineName, s.cwd ? shortPath(s.cwd, m?.home, 3) : null]).filter(Boolean).join(' · ');
+  const sub = (isClaude(s) ? ['Claude API', s.meta?.machineName || hostName(), s.repo ? `${s.repo.full} · ${s.repo.branch}` : s.cwd ? shortPath(s.cwd, s.machineId ? m?.home : S.config?.home, 3) : null] : [m?.name || s.meta?.machineName, s.repo ? `${s.repo.full} · ${s.repo.branch}` : s.cwd ? shortPath(s.cwd, m?.home, 3) : null]).filter(Boolean).join(' · ');
   const arts = S.artifacts.length;
   fill(
     $toolbar,
@@ -1170,10 +1180,15 @@ function sessionMenu(anchor) {
       { label: '壓縮對話', hint: '/compact', onSelect: () => sessionCommand('compact', '') },
       { label: '自動暫停…', hint: s.autoPause?.enabled ? `${s.autoPause.threshold}%` : '關', onSelect: autoPauseDialog },
       { label: '定時送出…', hint: s.scheduled?.length ? `${s.scheduled.length} 則` : '/later', onSelect: () => scheduleDialog() },
+      s.kimiSessionId
+        ? s.repo
+          ? { label: `GitHub：${s.repo.full}`, description: `分支 ${s.repo.branch}（已綁定）`, onSelect: () => window.open(s.repo.url, '_blank', 'noopener') }
+          : { label: '綁定 GitHub repo…', description: '之後的程式碼都 commit 並 push 到那裡', onSelect: () => repoDialog(machineById(s.machineId) || { id: s.machineId, name: s.meta?.machineName || '那台電腦' }, s) }
+        : null,
       { label: '複製資料夾路徑', onSelect: () => copyText(s.cwd || '').then(() => toast('已複製')) },
       { separator: true },
       { label: '刪除對話…', destructive: true, onSelect: () => deleteRow({ key: `${s.machineId}:${s.kimiSessionId}`, title: s.title }, s.machineId, s.kimiSessionId) },
-    ],
+    ].filter(Boolean),
     { align: 'end', width: 220 },
   );
 }
@@ -1189,8 +1204,8 @@ function claudeSessionMenu(s, anchor) {
       { label: '用量與花費', hint: '/cost', onSelect: claudeCostDialog },
       { label: '花費上限…', hint: s.meta?.budget ? fmtUsd(s.meta.budget) : '關', onSelect: budgetDialog },
       { label: '定時送出…', hint: s.scheduled?.length ? `${s.scheduled.length} 則` : '/later', onSelect: () => scheduleDialog() },
-      s.meta?.repo
-        ? { label: `GitHub：${s.meta.repo.full}`, description: `分支 ${s.meta.repo.branch}（已綁定）`, onSelect: () => window.open(s.meta.repo.url, '_blank', 'noopener') }
+      s.repo
+        ? { label: `GitHub：${s.repo.full}`, description: `分支 ${s.repo.branch}（已綁定）`, onSelect: () => window.open(s.repo.url, '_blank', 'noopener') }
         : { label: '綁定 GitHub repo…', description: '之後的程式碼都 commit 並 push 到那裡', onSelect: () => repoDialog(s.machineId ? machineById(s.machineId) || { id: s.machineId, name: s.meta?.machineName || '那台電腦' } : { id: null, name: hostName() }, s) },
       { label: '複製資料夾路徑', onSelect: () => copyText(s.cwd || '').then(() => toast('已複製')) },
       { separator: true },
@@ -2465,9 +2480,21 @@ async function githubDialog() {
 // chosen computer, on a branch of its own (or one named here), and every
 // change committed and pushed there.
 // With `session`: that conversation, bound from now on.
-async function repoDialog(m, session = null) {
-  const key = m.id || 'hub';
-  const cur = (session ? null : claudeRepo(m)) || {};
+// `agent`: whose new conversations ('claude' or 'kimi').
+async function repoDialog(m, session = null, agent = session ? (isClaude(session) ? 'claude' : 'kimi') : 'claude') {
+  const kimi = agent === 'kimi';
+  const who = kimi ? 'Kimi' : 'Claude';
+  const key = kimi ? m.id : m.id || 'hub';
+  const cur = (session ? null : kimi ? kimiRepo(m) : claudeRepo(m)) || {};
+  const store = (value) => {
+    if (kimi) S.home.repoByMachine = { ...(S.home.repoByMachine || {}), [key]: value };
+    else {
+      const x = (S.home.claude ??= {});
+      x.repoByMachine = { ...(x.repoByMachine || {}), [key]: value };
+    }
+    saveHome();
+    showHome();
+  };
   const repoInput = h('input', { class: 'om-input', type: 'text', autocomplete: 'off', spellcheck: false, placeholder: 'owner/repo 或 GitHub 網址', value: cur.full || '', 'aria-label': 'GitHub repo' });
   const list = h('div', { class: 'repo-list' }, h('div', { class: 'claude-test' }, h('span', { class: 'spinner' }), ` 讀取「${m.name}」上的 GitHub 帳號能 push 的 repo…`));
   const newBranchRadio = h('input', { type: 'radio', name: 'branch-mode', value: 'new', checked: !cur.branch });
@@ -2515,18 +2542,12 @@ async function repoDialog(m, session = null) {
       }
       return;
     }
-    const x = (S.home.claude ??= {});
-    x.repoByMachine = { ...(x.repoByMachine || {}), [key]: { full, branch: branch || null } };
-    saveHome();
-    showHome();
+    store({ full, branch: branch || null });
     d.close();
     toast(`新對話會綁定 ${full}`);
   };
   const unbind = () => {
-    const x = (S.home.claude ??= {});
-    x.repoByMachine = { ...(x.repoByMachine || {}), [key]: null };
-    saveHome();
-    showHome();
+    store(null);
     d.close();
   };
   const form = h(
@@ -2536,9 +2557,11 @@ async function repoDialog(m, session = null) {
     h(
       'p',
       { class: 'dialog-text settings-lead' },
-      session
+      session && kimi
+        ? `綁定後就不能再換。這個對話的資料夾如果本來就是這個 repo，會留在原地、切到選的分支；不是的話，會把 repo clone 到對話資料夾裡的一個子資料夾。綁定後會馬上傳一則訊息給 Kimi（會用掉一輪），請它把屬於這個專案的檔案搬進 repo，commit 並 push。之後每一輪結束都會檢查，沒上傳的會提醒 Kimi，再不行就自動 commit 並 push。Kimi 問你要不要執行指令時，推到其他分支、force push、改 remote 的指令會自動拒絕（全部自動模式下 Kimi 不會先問，這一項就擋不了，但每輪的檢查照樣會把工作推上去）。`
+        : session
         ? `綁定後就不能再換。這個對話的資料夾如果本來就是這個 repo，會留在原地、切到選的分支；不是的話，會把 repo clone 到「${m.name}」上的新資料夾，對話改到那裡工作（原本的資料夾保持不動），下一輪 Claude 會先把屬於這個專案的檔案搬進 repo，commit 並 push。之後每一輪結束都會檢查，沒上傳的會提醒 Claude，再不行就自動 commit 並 push；推到其他分支、force push、改 remote 都會被擋下。Claude 的系統提示會加上綁定規則，所以壓縮對話也不會忘；代價是下一輪要重新讀一次整段對話（一次性多花一些 token）。`
-        : `新對話開始時，會把 repo clone 到「${m.name}」上的一個新資料夾，在一個分支上工作。Claude 寫的所有程式碼都會 commit 並 push 到那個分支；每一輪結束時 Agent Hub 都會檢查，沒上傳的會提醒 Claude，再不行就自動 commit 並 push。綁定會一直跟著這個對話，不會忘記；推到其他分支、force push 或改 remote 的指令都會被擋下。`,
+        : `新對話開始時，會把 repo clone 到「${m.name}」上的一個新資料夾，在一個分支上工作。${who} 寫的所有程式碼都會 commit 並 push 到那個分支；每一輪結束時 Agent Hub 都會檢查，沒上傳的會提醒 ${who}，再不行就自動 commit 並 push。綁定會一直跟著這個對話，不會忘記；推到其他分支、force push 或改 remote 的指令${kimi ? '在 Kimi 問你要不要執行時會自動拒絕（全部自動模式下擋不了，但每輪的檢查照樣會把工作推上去）' : '都會被擋下'}。`,
     ),
     h('label', { class: 'om-field' }, h('span', { class: 'om-field__label' }, 'Repo'), repoInput),
     list,
