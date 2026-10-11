@@ -7,9 +7,12 @@
 //   • actions: a whitelisted subset of Kimi's Server API (`kimi web`), or
 //     keystrokes into a terminal Kimi started with `agent-hub-bridge.mjs kimi`.
 // Kimi keeps running on this computer, with this computer's Kimi login.
-// Claude conversations the hub runs (Claude API, with the hub's API key) can
-// also work in a folder here: the hub asks the bridge to run their tools —
-// commands, and files read and written inside the conversation's folder.
+// Claude conversations (Claude API, with the hub's API key) can also work in
+// a folder here: they run in a Claude daemon the bridge starts on this
+// computer (downloaded from the hub), which keeps them going when the hub or
+// the bridge is closed; the bridge relays the hub's requests and the
+// daemon's events. Their tools are commands, and files read and written
+// inside the conversation's folder.
 //
 //   node agent-hub-bridge.mjs --hub https://your-hub.example.com --key <bridge key>
 //   node agent-hub-bridge.mjs kimi [Kimi options]    # Kimi in this terminal, controllable from the hub
@@ -32,7 +35,7 @@ import { StringDecoder } from 'node:string_decoder';
 import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '0.4.0';
+const VERSION = '0.5.0';
 const SCRIPT = fileURLToPath(import.meta.url);
 
 // ------------------------------------------------------------------ args
@@ -295,6 +298,8 @@ async function runBridge() {
   else await server.discover();
   disk.scan();
   hub.connect(MACHINE_ID);
+  // A Claude daemon from an earlier run may still be running conversations.
+  if (fs.existsSync(path.join(daemon.dir, 'daemon.json'))) daemon.follow();
 
   setInterval(() => hub.send({ t: 'ping' }), 25_000);
   setInterval(() => !server.instance && server.discover(), 4000);
@@ -302,6 +307,7 @@ async function runBridge() {
   setInterval(() => disk.poll(), 150);
   setInterval(() => procs.scan(), 2000);
   setInterval(() => hub.pushSessions(true), 30_000);
+  // The Claude daemon is left running: it is not ours to stop.
   for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => process.exit(0));
 }
 
@@ -1538,6 +1544,209 @@ const tools = {
   },
 };
 
+// ------------------------------------------------------- the Claude daemon
+// Claude conversations run in a process of their own on this computer (the
+// hub's bridge/claude-daemon.mjs, one file), started here and detached from
+// the bridge: closing the bridge, its terminal, or the hub leaves them
+// running. The bridge only starts it, relays the hub's calls to it and
+// forwards what it streams.
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const daemon = {
+  file: path.join(STATE_DIR, 'claude-daemon.mjs'),
+  dir: path.join(STATE_DIR, 'claude'),
+  starting: null,
+  checked: null, // { at, health }: the last good health check
+  settled: new Map(), // version the hub asked for -> version the daemon it got reports
+  streaming: false,
+  wake: null, // cuts the forwarder's wait short
+
+  // What the daemon reports as its version (with no AGENT_HUB_DAEMON_VERSION).
+  versionOf(file) {
+    try {
+      return crypto.createHash('sha1').update(fs.readFileSync(file)).digest('hex').slice(0, 12);
+    } catch {
+      return null;
+    }
+  },
+
+  info() {
+    try {
+      return JSON.parse(fs.readFileSync(path.join(this.dir, 'daemon.json'), 'utf8'));
+    } catch {
+      return null;
+    }
+  },
+
+  async health() {
+    const info = this.info();
+    if (!info?.port || !info.token) return null;
+    try {
+      const res = await fetch(`http://127.0.0.1:${info.port}/health`, { headers: { 'x-daemon-token': info.token }, signal: AbortSignal.timeout(2000) });
+      const h = res.ok ? await res.json() : null;
+      if (h?.ok) this.checked = { at: Date.now(), health: h };
+      return h?.ok ? h : null;
+    } catch {
+      return null;
+    }
+  },
+
+  // The hub asks for its own build. A hub whose version is not simply the
+  // file's hash would otherwise have the daemon restarted on every call.
+  current(h, version) {
+    return !version || h.version === version || this.settled.get(version) === h.version;
+  },
+
+  // A daemon on the code the hub has, started if need be. Every call goes
+  // through here, so a recent check is trusted for a few seconds.
+  async ensure(version) {
+    const c = this.checked;
+    if (c && Date.now() - c.at < 5000 && this.current(c.health, version)) {
+      this.follow();
+      return c.health;
+    }
+    this.starting ??= this.launch(version).finally(() => (this.starting = null));
+    const h = await this.starting;
+    this.follow(true);
+    return h;
+  },
+
+  async launch(version) {
+    const h = await this.health();
+    if (h && this.current(h, version)) return h;
+    if (h) {
+      // Stopping it would stop the conversations running in it: the old code
+      // serves until they are done (a later call updates it).
+      if (h.running?.length) return h;
+      log('更新 Claude 背景程式 …');
+      try {
+        process.kill(h.pid, 'SIGTERM');
+      } catch {}
+      for (let i = 0; i < 25 && server.alive(h.pid); i++) await sleep(200);
+      // Two daemons on the same folder would both write its conversations.
+      if (server.alive(h.pid)) {
+        log('… 舊的 Claude 背景程式沒有結束，先繼續用它');
+        return h;
+      }
+    }
+    if (!fs.existsSync(this.file) || (version && this.versionOf(this.file) !== version)) await this.download();
+    const started = await this.spawn();
+    if (version && started.version !== version) this.settled.set(version, started.version);
+    return started;
+  },
+
+  async download() {
+    log('從中控台下載 Claude 背景程式 …');
+    const res = await fetch(`${HUB}/bridge/claude-daemon.mjs`, { signal: AbortSignal.timeout(120_000) });
+    if (!res.ok) throw new Error(`無法從中控台下載 Claude 背景程式（HTTP ${res.status}）`);
+    const body = Buffer.from(await res.arrayBuffer());
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    // Written whole, then swapped in: a daemon starting meanwhile never runs half a file.
+    const tmp = `${this.file}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, body);
+    fs.renameSync(tmp, this.file);
+  },
+
+  async spawn() {
+    fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
+    const logFile = path.join(this.dir, 'daemon.log');
+    const out = fs.openSync(logFile, 'a');
+    let failed = null;
+    let exited = null;
+    // Its own process group (session): Ctrl+C in the bridge's terminal, or
+    // the bridge exiting, does not reach it.
+    const child = spawn(process.execPath, [this.file, '--dir', this.dir], { detached: true, stdio: ['ignore', out, out], windowsHide: true, env: process.env });
+    fs.closeSync(out);
+    child.on('error', (err) => (failed = err.message));
+    child.on('exit', (code, signal) => (exited = code ?? signal));
+    child.unref();
+    for (let i = 0; i < 75; i++) {
+      await sleep(200);
+      if (failed) throw new Error(`無法啟動 Claude 背景程式：${failed}`);
+      if (exited !== null) throw new Error(`Claude 背景程式啟動後馬上結束了（代碼 ${exited}），請看 ${logFile}`);
+      if (this.info()?.pid !== child.pid) continue;
+      const h = await this.health();
+      if (h?.pid === child.pid) {
+        log(`✓ Claude 背景程式已啟動（${h.version}，pid ${h.pid}）`);
+        return h;
+      }
+    }
+    throw new Error(`Claude 背景程式沒有在 15 秒內啟動，請看 ${logFile}`);
+  },
+
+  async rpc(op, args, timeoutMs = 120_000) {
+    const info = this.info();
+    if (!info?.port) throw new Error('Claude 背景程式沒有在執行');
+    let res;
+    try {
+      res = await fetch(`http://127.0.0.1:${info.port}/rpc`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-daemon-token': info.token },
+        body: JSON.stringify({ op, args }),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch (err) {
+      this.checked = null; // gone: the next call starts it again
+      throw Object.assign(new Error(`連不上 Claude 背景程式：${err.message}`), { refused: err.cause?.code === 'ECONNREFUSED' });
+    }
+    const j = await res.json().catch(() => null);
+    if (!j?.ok) throw Object.assign(new Error(j?.error || `Claude 背景程式回應 HTTP ${res.status}`), { status: j?.status });
+    return j.data;
+  },
+
+  // Forward the daemon's event stream to the hub for as long as there is a
+  // daemon. Only ensure() starts one: a daemon that is gone is waited for.
+  follow(now = false) {
+    // Just (re)started: connect to it now, not after the backoff.
+    if (this.streaming) return now && this.wake?.();
+    this.streaming = true;
+    this.stream().finally(() => (this.streaming = false));
+  },
+
+  async stream() {
+    let backoff = 1000;
+    while (fs.existsSync(path.join(this.dir, 'daemon.json'))) {
+      const info = this.info();
+      try {
+        const res = await fetch(`http://127.0.0.1:${info?.port}/events`, { headers: { 'x-daemon-token': info?.token || '' } });
+        if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+        backoff = 1000;
+        // Whatever happened while not connected was not seen: the hub reloads.
+        hub.send({ t: 'claude.event', msg: { t: 'resync' } });
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          let i;
+          while ((i = buf.indexOf('\n\n')) !== -1) {
+            const block = buf.slice(0, i);
+            buf = buf.slice(i + 2);
+            const data = block
+              .split('\n')
+              .filter((l) => l.startsWith('data:'))
+              .map((l) => l.slice(5).replace(/^ /, ''))
+              .join('\n');
+            if (!data) continue; // `: ping`
+            try {
+              hub.send({ t: 'claude.event', msg: JSON.parse(data) });
+            } catch {}
+          }
+        }
+      } catch {}
+      await new Promise((r) => {
+        this.wake = r;
+        setTimeout(r, backoff);
+      });
+      this.wake = null;
+      backoff = Math.min(backoff * 2, 30_000);
+    }
+  },
+};
+
 // ------------------------------------------------------------- the hub
 
 const hub = {
@@ -1691,6 +1900,21 @@ const hub = {
       case 'sh.kill':
         shells.get(String(args.id || ''))?.('interrupted');
         return { ok: true };
+      // Claude conversations: calls into this computer's Claude daemon,
+      // started (or updated to the hub's build) first if need be.
+      case 'claude.rpc':
+        await daemon.ensure(args.version);
+        try {
+          return await daemon.rpc(String(args.op), args.args || {});
+        } catch (err) {
+          // It went away since it was last seen (the call never reached it):
+          // start it again and ask once more.
+          if (!err.refused) throw err;
+          await daemon.ensure(args.version);
+          return daemon.rpc(String(args.op), args.args || {});
+        }
+      case 'claude.health':
+        return daemon.health();
       case 'workspace.create': {
         const slug = String(args.name || 'workspace').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32) || 'workspace';
         let dir = path.join(WORKSPACES, `${new Date().toISOString().slice(0, 10)}-${slug}`);
@@ -1720,6 +1944,7 @@ const hub = {
         t: 'hello',
         machineId,
         name: NAME,
+        hostname: os.hostname(),
         platform: `${os.platform()} ${os.arch()}`,
         bridgeVersion: VERSION,
         node: process.version,
@@ -1740,7 +1965,7 @@ const hub = {
         try {
           this.send({ t: 'res', id: m.id, ok: true, data: await this.handle(m.op, m.args) });
         } catch (err) {
-          this.send({ t: 'res', id: m.id, ok: false, error: err.message });
+          this.send({ t: 'res', id: m.id, ok: false, error: err.message, status: err.status });
         }
       } else if (m.t === 'error') {
         log(`✗ 中控台拒絕連線：${m.message}`);

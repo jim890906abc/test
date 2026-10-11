@@ -10,7 +10,8 @@
     "test": "node --test test/*.test.mjs",
     "check": "for f in server/*.js server/adapters/*.js public/js/*.js bridge/*.mjs test/*.mjs; do node --check \"$f\" || exit 1; done",
     "public": "bash scripts/start-public.sh",
-    "bridge": "node bridge/agent-hub-bridge.mjs"
+    "bridge": "node bridge/agent-hub-bridge.mjs",
+    "build:daemon": "esbuild server/claude-daemon.js --bundle --platform=node --format=esm --target=node22 --outfile=bridge/claude-daemon.mjs \"--banner:js=/* Generated from server/claude-daemon.js by npm run build:daemon (do not edit). */ import { createRequire as __agentHubCreateRequire } from 'node:module'; const require = __agentHubCreateRequire(import.meta.url);\""
   },
   "engines": {
     "node": ">=20"
@@ -22,5 +23,8 @@
     "express": "^5.2.1",
     "marked": "^18.0.14",
     "ws": "^8.22.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
   }
 }

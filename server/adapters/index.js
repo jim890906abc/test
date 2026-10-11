@@ -3,7 +3,8 @@ import * as cli from './cli.js';
 import * as openai from './openai.js';
 import * as demo from './demo.js';
 import * as kimiRemote from './kimi-remote.js';
-import * as claude from './claude.js';
+// Claude: the hub mirrors conversations that Claude daemons run.
+import * as claude from './claude-mirror.js';
 
 // type -> { available(agent), run(ctx, text, opts), test?(agent), configure?, dispose? }
 export const ADAPTERS = { acp, cli, openai, demo, 'kimi-remote': kimiRemote, claude };

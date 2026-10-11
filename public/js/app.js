@@ -782,7 +782,7 @@ async function loadClaudeModels(force = false) {
 
 // Where a new Claude conversation's tools run: the hub's own computer
 // ({ id: null }), or a connected one (its bridge runs them).
-const bridgeReady = (m) => m.online && !/^0\.[0-3]\./.test(m.bridgeVersion || '0.0.0');
+const bridgeReady = (m) => m.online && !/^0\.[0-4]\./.test(m.bridgeVersion || '0.0.0');
 function claudeHomeMachine() {
   const id = S.home.claude?.machineId;
   const m = id && machineById(id);
@@ -1770,7 +1770,7 @@ function agentSplit(bar, key, grow) {
 function agentModel(a) {
   const models = S.cur?.summary?.meta?.models || [];
   const m = a.model && (models.find((x) => x.id === a.model)?.name || a.model.split('/').pop());
-  const e = a.effort && a.effort !== 'off' ? `思考 ${EFFORT_LABELS[a.effort] || a.effort}` : a.effort === 'off' ? '不思考' : '';
+  const e = a.effort ? `思考 ${EFFORT_LABELS[a.effort] || a.effort}` : '';
   return [m, e].filter(Boolean).join(' · ');
 }
 

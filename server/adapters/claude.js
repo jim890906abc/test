@@ -105,14 +105,15 @@ export async function setup(session, config = {}) {
   const host = hostFor(session);
   const platform = session.machineId ? machines.getMachine(session.machineId)?.platform || 'unknown' : `${os.platform()} ${os.release()}`;
   const [notes, git] = await Promise.all([projectNotes(host, session.cwd), host.stat(session.cwd, '.git').then((x) => x.exists, () => false)]);
-  c.system = systemPrompt(session.cwd, { platform, notes, git, computer: machineName(session) });
+  const computer = config.computer || machineName(session);
+  c.system = systemPrompt(session.cwd, { platform, notes, git, computer });
   c.subSystem = subSystemPrompt(session.cwd, platform);
   c.web = webTools;
   const model = typeof config.model === 'string' && config.model ? config.model : d.model;
   session.meta = {
     ...(session.meta || {}),
     agent: 'claude',
-    machineName: machineName(session),
+    machineName: computer,
     model,
     effort: typeof config.effort === 'string' && config.effort ? config.effort : d.effort,
     permission: PERMISSIONS.includes(config.permission) ? config.permission : d.permission,

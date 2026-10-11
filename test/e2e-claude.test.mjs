@@ -54,7 +54,15 @@ before(async () => {
   server = await startHub(env);
 });
 
+// The Claude daemon outlives the hub (that is its point): stop it here.
+function stopDaemon() {
+  try {
+    process.kill(JSON.parse(fs.readFileSync(path.join(TMP, 'data', 'claude-daemon', 'daemon.json'), 'utf8')).pid, 'SIGTERM');
+  } catch {}
+}
+
 after(() => {
+  stopDaemon();
   server.kill('SIGTERM');
   fake.close();
   fs.rmSync(TMP, { recursive: true, force: true });
@@ -277,7 +285,7 @@ test('sessions show in the list and the files panel reads their folder', async (
   assert.ok(changes.files.some((f) => f.path === 'hi.txt'));
 });
 
-test('on a connected computer: the tools run there, through its bridge', async () => {
+test('on a connected computer: Claude runs in that computer\'s daemon, started by its bridge', async () => {
   const home = path.join(TMP, 'box-home');
   const folder = path.join(TMP, 'box-folder');
   fs.mkdirSync(folder, { recursive: true });
@@ -285,7 +293,7 @@ test('on a connected computer: the tools run there, through its bridge', async (
   const keyFile = JSON.parse(fs.readFileSync(path.join(TMP, 'data', 'hub.json'), 'utf8')).bridgeKey;
   const bridge = spawn(process.execPath, ['bridge/agent-hub-bridge.mjs', '--hub', `http://127.0.0.1:${PORT}`, '--key', keyFile, '--name', 'box', '--no-skill'], {
     cwd: ROOT,
-    env: { ...process.env, HOME: home, USERPROFILE: home, KIMI_CODE_HOME: path.join(home, '.kimi-code'), PATH: process.env.PATH },
+    env: { ...process.env, HOME: home, USERPROFILE: home, KIMI_CODE_HOME: path.join(home, '.kimi-code'), PATH: process.env.PATH, AGENT_HUB_CLAUDE_TEST_URL: fake.url },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   try {
@@ -315,6 +323,9 @@ test('on a connected computer: the tools run there, through its bridge', async (
     assert.equal(f.content, 'hello from claude\n');
   } finally {
     bridge.kill();
+    try {
+      process.kill(JSON.parse(fs.readFileSync(path.join(home, '.agent-hub', 'claude', 'daemon.json'), 'utf8')).pid, 'SIGTERM');
+    } catch {}
   }
 });
 
@@ -341,20 +352,92 @@ test('another model answering (a downgrade) or a refusal stops the turn, and say
   assert.match(refused.events.find((e) => e.type === 'error').text, /拒絕了這個請求，已停止這一輪/);
 });
 
-test('a hub restart mid-turn: the turn goes on by itself, queued messages after it', async () => {
+test('closing the hub stops nothing: Claude goes on in its daemon, the hub catches up', async () => {
   const s = await api('POST', '/sessions', { agent: 'claude', prompt: 'SLOW' });
   await until(async () => (await snap(s.id)).events.some((e) => e.type === 'text' && e.text.length > 20));
   await api('POST', `/sessions/${s.id}/messages`, { text: '排隊的問題' });
   const n0 = messagesSent().length;
   await new Promise((r) => (server.once('exit', r), server.kill('SIGTERM')));
+  // With the hub gone, the turn finishes and the queued message goes out.
+  await until(() => messagesSent().slice(n0).some((r) => JSON.stringify(r.body.messages.at(-1)).includes('排隊的問題')), 20000);
+  await wait(300);
   server = await startHub();
   const done = await until(async () => {
     const x = await snap(s.id);
-    return x.events.filter((e) => e.type === 'turn_end').length === 3 && x.status === 'idle' && x;
+    return x.events.filter((e) => e.type === 'turn_end').length === 2 && x.status === 'idle' && x;
   }, 20000);
+  assert.equal(done.events.some((e) => e.type === 'turn_end' && (e.interrupted || e.restarted)), false);
+  assert.match(done.events.find((e) => e.type === 'text').text, /慢慢寫出來的回覆/);
+  assert.equal(done.events.filter((e) => e.type === 'user').at(-1).text, '排隊的問題');
+});
+
+test('the daemon itself stopping mid-turn: it is started again and the turn goes on', async () => {
+  const s = await api('POST', '/sessions', { agent: 'claude', prompt: 'SLOW' });
+  await until(async () => (await snap(s.id)).events.some((e) => e.type === 'text' && e.text.length > 20));
+  const n0 = messagesSent().length;
+  const pid = JSON.parse(fs.readFileSync(path.join(TMP, 'data', 'claude-daemon', 'daemon.json'), 'utf8')).pid;
+  process.kill(pid, 'SIGKILL');
+  const done = await until(async () => {
+    const x = await snap(s.id);
+    return x.events.filter((e) => e.type === 'turn_end').length === 2 && x.status === 'idle' && x;
+  }, 30000);
   assert.ok(done.events.some((e) => e.type === 'turn_end' && e.restarted));
   assert.ok(done.events.some((e) => e.type === 'info' && /接著剛才被中斷的工作/.test(e.text)));
-  const resumed = messagesSent()[n0].body.messages.at(-1);
-  assert.match(resumed.content.map((b) => b.text).join('\n'), /Agent Hub restarted/);
-  assert.equal(done.events.filter((e) => e.type === 'user').at(-1).text, '排隊的問題');
+  assert.match(JSON.stringify(messagesSent()[n0].body.messages.at(-1)), /Agent Hub restarted/);
+});
+
+test('a conversation the hub ran itself (before daemons) moves into the daemon, history and all', async () => {
+  const id = 's_legacy000001';
+  const cwd = fs.mkdtempSync(path.join(TMP, 'legacy-'));
+  const legacy = {
+    id,
+    agentId: 'claude',
+    title: '舊的 Claude 對話',
+    titled: true,
+    status: 'running',
+    cwd,
+    permissionMode: 'ask',
+    allowedTools: [],
+    events: [
+      { id: 'e_old1', ts: 1, type: 'user', text: '之前問的問題', source: 'hub' },
+      { id: 'e_old2', ts: 2, type: 'text', text: '之前的回答' },
+    ],
+    meta: { agent: 'claude', model: 'claude-opus-5-5', effort: 'high', permission: 'auto', planMode: false, queue: [], todos: [] },
+    usage: { inputTokens: 10, outputTokens: 5, costUsd: 1.5 },
+    state: { claude: { system: 'You are Claude (old system prompt).', subSystem: 'sub', web: false, messages: [{ role: 'user', content: [{ type: 'text', text: '之前問的問題' }] }, { role: 'assistant', content: [{ type: 'text', text: '之前的回答' }] }], turns: [], usage: { input: 10, cacheWrite: 0, cacheRead: 0, output: 5, searches: 0, requests: 1, cost: 1.5 }, active: { since: 1 } } },
+    createdAt: 1,
+    updatedAt: 2,
+  };
+  await new Promise((r) => (server.once('exit', r), server.kill('SIGTERM')));
+  fs.writeFileSync(path.join(TMP, 'data', 'sessions', `${id}.json`), JSON.stringify(legacy));
+  const n0 = messagesSent().length;
+  server = await startHub();
+  // It was working when the hub stopped: the daemon goes on with it.
+  const done = await until(async () => {
+    const x = await snap(id);
+    return x.events.some((e) => e.type === 'turn_end' && !e.restarted) && x.status === 'idle' && x;
+  }, 20000);
+  assert.equal(done.events[0].text, '之前問的問題');
+  assert.equal(done.usage.costUsd > 1.5, true);
+  const req = messagesSent()[n0].body;
+  assert.equal(req.system[0].text, 'You are Claude (old system prompt).');
+  assert.equal(req.messages[0].content[0].text, '之前問的問題');
+  assert.equal(req.messages[1].content[0].text, '之前的回答');
+  // The hub no longer keeps the API history itself.
+  const file = JSON.parse(fs.readFileSync(path.join(TMP, 'data', 'sessions', `${id}.json`), 'utf8'));
+  assert.equal(file.state.claude, undefined);
+});
+
+test('the daemon bundle the bridges download is built from the current code', async (t) => {
+  let esbuild;
+  try {
+    esbuild = await import('esbuild');
+  } catch {
+    return t.skip('esbuild is not installed');
+  }
+  const out = path.join(TMP, 'bundle-check.mjs');
+  const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+  const banner = pkg.scripts['build:daemon'].match(/--banner:js=(.*)"$/)[1];
+  await esbuild.build({ entryPoints: [path.join(ROOT, 'server/claude-daemon.js')], bundle: true, platform: 'node', format: 'esm', target: 'node22', outfile: out, banner: { js: banner }, logLevel: 'silent' });
+  assert.equal(fs.readFileSync(out, 'utf8'), fs.readFileSync(path.join(ROOT, 'bridge/claude-daemon.mjs'), 'utf8'), 'bridge/claude-daemon.mjs is stale: run npm run build:daemon');
 });

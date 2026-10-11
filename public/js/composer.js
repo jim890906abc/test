@@ -12,7 +12,8 @@ const PERMISSION_DESC = {
   yolo: '一般修改與指令直接做，有風險的才問',
   auto: '全部自動決定，不會打斷你',
 };
-export const EFFORT_LABELS = { off: '關閉', on: '開啟', low: '低', medium: '中', high: '高', xhigh: '很高', max: '最高' };
+// Thinking levels by their official names (Kimi's and Claude's alike).
+export const EFFORT_LABELS = { off: 'off', on: 'on', low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' };
 // Claude's permission modes, as Claude Code names them.
 export const CLAUDE_PERMISSION_LABELS = { manual: '每次詢問', edits: '自動接受編輯', auto: '全部自動' };
 const CLAUDE_PERMISSION_DESC = {

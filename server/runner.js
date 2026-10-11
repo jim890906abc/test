@@ -133,6 +133,14 @@ export function liveContext(session) {
       store.saveSession(session);
       broadcast({ t: 'reset', sid: session.id, seq: session.seq });
     },
+    // An event made elsewhere (a Claude daemon), kept as it is.
+    insert(ev) {
+      session.events.push(ev);
+      session.seq = (session.seq || 0) + 1;
+      store.saveSession(session);
+      broadcast({ t: 'event', sid: session.id, seq: session.seq, ev });
+      return ev;
+    },
   };
 }
 ADAPTERS['kimi-remote'].init(liveContext);
@@ -528,8 +536,8 @@ export async function newSession({ agentId, machineId, cwd, prompt, nameHint, pe
     await kimi.attach(session);
     if (config && Object.values(config).some((v) => v !== undefined && v !== '')) await kimi.configure(session, config).catch((err) => console.warn(`[kimi] configure: ${err.message}`));
   } else if (agent.type === 'claude') {
-    // On this computer, or on a connected one (`machineId`): only the tools
-    // run there; the conversation and the API key stay on the hub.
+    // Run by the Claude daemon of this computer, or of a connected one
+    // (`machineId`), which keeps going while the hub is closed.
     const claude = ADAPTERS.claude;
     const why = claude.cannotSend({ machineId });
     if (why) throw Object.assign(new Error(why), { status: 409 });
@@ -540,7 +548,7 @@ export async function newSession({ agentId, machineId, cwd, prompt, nameHint, pe
       if (!st.dir) throw Object.assign(new Error(`資料夾不存在：${dir}`), { status: 400 });
     } else dir ||= await createWorkspace(nameHint || prompt || 'claude');
     session = store.createSession({ agentId, cwd: dir, permissionMode, title: title || '新對話', ...(machineId ? { machineId } : {}) });
-    await claude.setup(session, config);
+    await claude.create(session, config);
   } else {
     const dir = cwd || (await createWorkspace(nameHint || prompt || agent.name));
     session = store.createSession({ agentId, cwd: dir, permissionMode, branch, title: title || '新對話' });

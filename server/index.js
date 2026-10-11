@@ -316,6 +316,7 @@ app.patch('/api/sessions/:id', wrap((req) => {
   if (typeof title === 'string' && title.trim()) {
     s.title = title.trim().slice(0, 120);
     s.titled = true;
+    if (s.agentId === 'claude') ADAPTERS.claude.setTitle(s, s.title).catch(() => {});
   }
   if (['ask', 'auto_edits', 'bypass'].includes(permissionMode)) s.permissionMode = permissionMode;
   store.saveSession(s);
@@ -532,6 +533,8 @@ app.post('/api/machines/:mid/kimi/:kid/:action', wrap(async (req) => {
 const ROOT = store.ROOT_DIR;
 app.get('/vendor/marked.esm.js', (req, res) => res.sendFile(path.join(ROOT, 'node_modules/marked/lib/marked.esm.js')));
 app.get('/vendor/purify.es.mjs', (req, res) => res.sendFile(path.join(ROOT, 'node_modules/dompurify/dist/purify.es.mjs')));
+// The one-file Claude daemon bridges download to run Claude on their computer.
+app.get('/bridge/claude-daemon.mjs', (req, res) => res.type('text/javascript').sendFile(path.join(ROOT, 'bridge/claude-daemon.mjs')));
 // The bridge script holds no secrets; serving it lets machines fetch it with curl.
 app.get('/bridge/agent-hub-bridge.mjs', (req, res) => res.type('text/javascript').sendFile(path.join(ROOT, 'bridge/agent-hub-bridge.mjs')));
 app.use(express.static(path.join(ROOT, 'public'), { index: 'index.html' }));

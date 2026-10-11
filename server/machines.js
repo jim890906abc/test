@@ -12,6 +12,8 @@ const listeners = new Set(); // (machineId, frame) => void   for Kimi events
 const onlineListeners = new Set(); // (machineId) => void
 const sessionListeners = new Set(); // (machineId, entry) => void
 const streams = new Map(); // stream id -> (chunk) => void   (a command's output as it comes)
+const messageListeners = new Set(); // (machineId, msg) => void   for every other message
+const helloListeners = new Set(); // (machineId) => void   a bridge (re)connected
 let broadcast = () => {};
 
 export function setBroadcast(fn) {
@@ -26,6 +28,12 @@ export function onMachineOnline(fn) {
 }
 export function onSessionChange(fn) {
   sessionListeners.add(fn);
+}
+export function onBridgeMessage(fn) {
+  messageListeners.add(fn);
+}
+export function onBridgeHello(fn) {
+  helloListeners.add(fn);
 }
 
 try {
@@ -148,6 +156,7 @@ export function attachBridge(ws) {
         name: String(msg.name || id).slice(0, 80),
         platform: msg.platform,
         home: msg.home,
+        hostname: msg.hostname,
         bridgeVersion: msg.bridgeVersion,
         online: true,
         ws,
@@ -160,6 +169,7 @@ export function attachBridge(ws) {
       persist();
       changed(m);
       if (m.kimi?.available) for (const fn of onlineListeners) fn(m.id);
+      for (const fn of helloListeners) fn(m.id);
       return;
     }
     if (!m) return;
@@ -173,6 +183,8 @@ export function attachBridge(ws) {
       else p.reject(new Error(msg.error || '連接器回報錯誤'));
     } else if (msg.t === 'sh.data') {
       streams.get(msg.id)?.(String(msg.chunk || ''));
+    } else if (msg.t === 'claude.event') {
+      for (const fn of messageListeners) fn(m.id, msg);
     } else if (msg.t === 'kimi.event') {
       trackSession(m, msg.frame);
       for (const fn of listeners) fn(m.id, msg.frame);
