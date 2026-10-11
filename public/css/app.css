@@ -86,6 +86,51 @@
   --row-active: #141413;
 }
 
+/* Claude mode (the Claude home, a Claude conversation): Claude's classic
+   near-black with its orange, whatever the theme. Set by app.js as
+   data-agent; after the dark blocks, so it wins over them. */
+:root[data-agent='claude'] {
+  color-scheme: dark;
+  --desktop: #0b0b0a;
+  --window: #141413;
+  --window-raised: #1f1e1c;
+  --titlebar: #141413;
+  --sidebar: #0f0f0e;
+  --material-sidebar: #0f0f0e;
+  --material-popover: #1f1e1cf5;
+  --control: #1f1e1c;
+  --control-pressed: #2b2a27;
+  --track: #0f0f0e;
+  --fill-hover: #faf9f50d;
+  --line: #2b2a27;
+  --control-border: #5e5c56;
+  --ink: #faf9f5;
+  --ink-secondary: #b7b5ac;
+  --ink-disabled: #6b6963;
+  --icon-ink: #918f87;
+  --accent: #d97757;
+  --accent-pressed: #c6613f;
+  --on-accent: #ffffff;
+  --accent-soft: #3a2219;
+  --link: #d97757;
+  --danger: #f0857a;
+  --danger-soft: #36201e;
+  --on-danger: #141413;
+  --warning: #e3b35b;
+  --warning-soft: #33291a;
+  --success: #8cc0e0;
+  --success-soft: #1a2d38;
+  --scrim: #000000b3;
+  --shadow-control: 0 1px 2px #00000080;
+  --shadow-card: 0 1px 2px #00000066;
+  --shadow-popover: 0 0 0 0.5px #faf9f51a, 0 12px 32px #000000a6;
+  --shadow-window: none;
+  --shadow-inset: inset 0 1px 1px #00000059;
+  --focus-ring: 0 0 0 2px #141413, 0 0 0 4px #d97757;
+  --user-bubble: #262624;
+  --row-active: #262624;
+}
+
 :root {
   --side-w: 248px;
   --col: 768px;
@@ -953,6 +998,42 @@ pre.result-out {
 }
 pre.result-out + .result {
   margin-top: -6px;
+}
+/* Claude's web search results and fetched page, as links */
+.web-links {
+  margin: 0;
+  padding: var(--space-1) 0;
+  list-style: none;
+  max-height: 320px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--window-raised);
+}
+.web-links li {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  padding: 3px 10px;
+  font-size: 12.5px;
+  line-height: 18px;
+  min-width: 0;
+}
+.web-links a {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-decoration: none;
+}
+.web-links a:hover {
+  text-decoration: underline;
+}
+.web-host {
+  flex: none;
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--ink-secondary);
 }
 .group-body {
   min-width: 0;
@@ -2581,6 +2662,15 @@ pre.tail {
   color: var(--ink);
 }
 :root[data-theme='dark'] .composer-box {
+  border-radius: 18px;
+}
+:root[data-agent='claude'] .om-btn--plain {
+  color: var(--link);
+}
+:root[data-agent='claude'] .side-row[aria-current='page'] {
+  color: var(--ink);
+}
+:root[data-agent='claude'] .composer-box {
   border-radius: 18px;
 }
 

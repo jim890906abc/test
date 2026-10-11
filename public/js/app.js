@@ -173,6 +173,22 @@ function applyTheme(t, { save = true } = {}) {
 }
 const theme = () => document.documentElement.dataset.theme || 'auto';
 
+// Claude mode (the Claude home, a Claude conversation) wears Claude's own
+// near-black look (app.css, data-agent); the theme above is for Kimi.
+function setLook(agent) {
+  const root = document.documentElement;
+  if (agent === 'claude') root.dataset.agent = 'claude';
+  else delete root.dataset.agent;
+  for (const m of document.querySelectorAll('meta[name="theme-color"]')) {
+    m.dataset.base ??= m.content;
+    m.content = agent === 'claude' ? '#141413' : m.dataset.base;
+  }
+  // index.html puts it back on before the first paint of the next visit.
+  try {
+    localStorage.setItem('hubLook', agent === 'claude' ? 'claude' : 'kimi');
+  } catch {}
+}
+
 // ------------------------------------------------------------- sidebar
 
 // One row per Kimi conversation on any connected machine: the ones the hub
@@ -235,7 +251,7 @@ function drawSidebar() {
       const href = r.hub ? `#/s/${r.hub.id}` : `#/k/${r.machine.id}/${r.kimi.id}`;
       const active = current && ((r.hub && r.hub.id === current.id) || (r.kimi && current.kimiSessionId === r.kimi.id && current.machineId === r.machine?.id));
       const owner = r.kimi?.owner || r.hub?.meta?.owner;
-      const sub = (r.claude ? ['Claude', r.cwd ? baseName(r.cwd) : null] : [owner === 'tui' ? '終端機' : null, multi && r.machine ? r.machine.name : null, r.cwd ? baseName(r.cwd) : null]).filter(Boolean).join(' · ');
+      const sub = (r.claude ? ['Claude', r.hub.machineId ? r.hub.meta?.machineName || machineById(r.hub.machineId)?.name : null, r.cwd ? baseName(r.cwd) : null] : [owner === 'tui' ? '終端機' : null, multi && r.machine ? r.machine.name : null, r.cwd ? baseName(r.cwd) : null]).filter(Boolean).join(' · ');
       items.push(
         h(
           'a',
@@ -464,6 +480,7 @@ async function route() {
 
 // All pages Kimi made, across conversations, like Claude's Artifacts list.
 async function showArtifacts() {
+  setLook('kimi');
   leaveSession();
   hidePanel();
   S.route = 'artifacts';
@@ -500,6 +517,7 @@ async function showArtifacts() {
 }
 
 async function attachAndOpen(machineId, kimiSessionId) {
+  setLook('kimi');
   leaveSession();
   S.route = `k:${kimiSessionId}`;
   fill($toolbar, sidebarToggle(), h('div', { class: 'toolbar-titles' }, h('div', { class: 'om-toolbar__title' }, rows().find((r) => r.kimi?.id === kimiSessionId)?.title || '載入中…')));
@@ -541,6 +559,7 @@ function agentSwitch(cur) {
 }
 
 async function showHome() {
+  setLook(homeAgent());
   leaveSession();
   S.route = 'home';
   hidePanel();
@@ -704,10 +723,12 @@ function showClaudeHome() {
       saveHome();
       updateClaudeHome();
     },
+    onPickMachine: claudeMachineMenu,
     onPickFolder: claudeFolderMenu,
     onError: (t) => toast(t),
   });
   claudeHomeComposer.setKey('home-claude');
+  const where = claudeHomeMachine();
   fill(
     $view,
     h(
@@ -731,7 +752,7 @@ function showClaudeHome() {
         h(
           'p',
           { class: 'home-hint' },
-          `在中控台這台電腦（${hostName()}）上執行，用 Claude API key 按用量計費。`,
+          where.id ? `工具在「${where.name}」上執行，用中控台的 Claude API key 按用量計費。` : `在中控台這台電腦（${hostName()}）上執行，用 Claude API key 按用量計費。`,
           h('button', { class: 'linklike', type: 'button', onclick: claudeDialog }, 'Claude API 設定…'),
         ),
       ),
@@ -751,14 +772,53 @@ async function loadClaudeModels(force = false) {
   return S.claudeModels;
 }
 
+// Where a new Claude conversation's tools run: the hub's own computer
+// ({ id: null }), or a connected one (its bridge runs them).
+const bridgeReady = (m) => m.online && !/^0\.[0-3]\./.test(m.bridgeVersion || '0.0.0');
+function claudeHomeMachine() {
+  const id = S.home.claude?.machineId;
+  const m = id && machineById(id);
+  if (m && bridgeReady(m)) return m;
+  return { id: null, name: hostName(), home: S.config?.home };
+}
+const claudeCwd = (m) => S.home.claude?.cwdByMachine?.[m.id || 'hub'];
+
+function claudeMachineMenu(anchor) {
+  const cur = claudeHomeMachine();
+  const pick = (id) => {
+    S.home.claude = { ...(S.home.claude || {}), machineId: id };
+    saveHome();
+    showHome();
+  };
+  openMenu(
+    anchor,
+    [
+      { label: `中控台這台電腦（${hostName()}）`, description: '工具在中控台所在的電腦上執行', checked: !cur.id, onSelect: () => pick(null) },
+      ...(S.machines.length ? [{ section: '已連接的電腦' }] : []),
+      ...S.machines.map((m) => ({
+        label: m.name,
+        description: !m.online ? '離線' : !bridgeReady(m) ? '連接器太舊：在那台電腦重新執行連接指令' : m.platform,
+        checked: cur.id === m.id,
+        disabled: !bridgeReady(m),
+        onSelect: () => pick(m.id),
+      })),
+      { separator: true },
+      { label: '連接其他電腦…', onSelect: openMachines },
+    ],
+    { width: 280 },
+  );
+}
+
 function updateClaudeHome() {
   if (!claudeHomeComposer) return;
   const x = S.home.claude || {};
   const models = S.claudeModels?.models || [];
+  const m = claudeHomeMachine();
+  const cwd = claudeCwd(m);
   claudeHomeComposer.update({
     agent: 'claude',
-    machineName: hostName(),
-    folderName: x.cwd ? baseName(x.cwd) : '新資料夾',
+    machineName: m.id ? m.name : hostName(),
+    folderName: cwd ? baseName(cwd) : '新資料夾',
     models,
     defaultModel: S.claudeModels?.defaultModel,
     model: x.model && models.some((m) => m.id === x.model) ? x.model : S.claudeModels?.defaultModel || '',
@@ -775,23 +835,25 @@ function claudeHomeCommand(name) {
   if (name === 'status') return claudeDialog();
 }
 
-// Folders on the hub's own computer, where Claude's tools run.
+// Folders on the computer Claude's tools will run on.
 function claudeFolderMenu(anchor) {
-  const recent = [...new Set([...S.sessions.values()].filter(isClaude).sort((a, b) => b.updatedAt - a.updatedAt).map((s) => s.cwd).filter(Boolean))].slice(0, 6);
+  const m = claudeHomeMachine();
+  const recent = [...new Set([...S.sessions.values()].filter((s) => isClaude(s) && (s.machineId || null) === m.id).sort((a, b) => b.updatedAt - a.updatedAt).map((s) => s.cwd).filter(Boolean))].slice(0, 6);
   const pick = (cwd) => {
-    S.home.claude = { ...(S.home.claude || {}), cwd };
+    const x = (S.home.claude ??= {});
+    x.cwdByMachine = { ...(x.cwdByMachine || {}), [m.id || 'hub']: cwd };
     saveHome();
     updateClaudeHome();
   };
-  const home = S.config?.home;
+  const home = m.home || S.config?.home;
   openMenu(
     anchor,
     [
       recent.length ? { section: '最近使用' } : null,
       ...recent.map((p) => ({ label: baseName(p), description: shortPath(p, home, 4), onSelect: () => pick(p) })),
       recent.length ? { separator: true } : null,
-      { label: '瀏覽資料夾…', description: `「${hostName()}」上的資料夾`, onSelect: () => browseFolders({ id: null, name: hostName(), home }, pick, S.home.claude?.cwd) },
-      { label: '新的空白資料夾', description: S.config?.workspacesDir ? `在 ${shortPath(S.config.workspacesDir, home, 3)} 建立` : null, onSelect: () => pick(null) },
+      { label: '瀏覽資料夾…', description: `「${m.name}」上的資料夾`, onSelect: () => browseFolders(m, pick, claudeCwd(m)) },
+      { label: '新的空白資料夾', description: m.id ? '在 ~/agent-hub-workspaces 建立' : S.config?.workspacesDir ? `在 ${shortPath(S.config.workspacesDir, home, 3)} 建立` : null, onSelect: () => pick(null) },
     ].filter(Boolean),
     { width: 300 },
   );
@@ -809,7 +871,8 @@ async function startClaudeSession({ text, images }) {
   const effort = x.effort && (!used || used.efforts.includes(x.effort)) ? x.effort : undefined;
   claudeHomeComposer.el.classList.add('sending');
   try {
-    const s = await post('/sessions', { agent: 'claude', cwd: x.cwd || undefined, prompt: text, images, model, effort, permission: x.permission, planMode: x.planMode || undefined });
+    const m = claudeHomeMachine();
+    const s = await post('/sessions', { agent: 'claude', machineId: m.id || undefined, cwd: claudeCwd(m) || undefined, prompt: text, images, model, effort, permission: x.permission, planMode: x.planMode || undefined });
     S.sessions.set(s.id, s);
     resetHomeChoices();
     go(`#/s/${s.id}`);
@@ -878,6 +941,8 @@ async function openSession(id) {
   S.route = `s:${id}`;
   if (S.panel?.tab === 'artifact') hidePanel();
   const summary = S.sessions.get(id);
+  // Not known yet: the snapshot decides.
+  if (summary) setLook(isClaude(summary) ? 'claude' : 'kimi');
   const cur = { id, summary, seq: 0, transcript: null, loading: true, syncing: true };
   S.cur = cur;
   // Keeps the conversation followed on the machine while it is open.
@@ -962,6 +1027,7 @@ function applySnapshot(full) {
   const { events, seq, ...summary } = full;
   cur.summary = summary;
   cur.seq = seq;
+  setLook(isClaude(summary) ? 'claude' : 'kimi');
   cur.loading = true; // pages already there are not "new" while it loads
   S.sessions.set(summary.id, summary);
   cur.transcript.opts.cwd = summary.cwd;
@@ -1037,7 +1103,7 @@ function renderToolbar() {
     return;
   }
   const m = machineById(s.machineId);
-  const sub = (isClaude(s) ? ['Claude API', hostName(), s.cwd ? shortPath(s.cwd, S.config?.home, 3) : null] : [m?.name || s.meta?.machineName, s.cwd ? shortPath(s.cwd, m?.home, 3) : null]).filter(Boolean).join(' · ');
+  const sub = (isClaude(s) ? ['Claude API', s.meta?.machineName || hostName(), s.cwd ? shortPath(s.cwd, s.machineId ? m?.home : S.config?.home, 3) : null] : [m?.name || s.meta?.machineName, s.cwd ? shortPath(s.cwd, m?.home, 3) : null]).filter(Boolean).join(' · ');
   const arts = S.artifacts.length;
   fill(
     $toolbar,
@@ -1246,7 +1312,7 @@ async function claudeCommand(s, name, args) {
       return toast(`權限模式：${CLAUDE_PERMISSION_LABELS[name]}`);
     case 'new':
       S.home.agent = 'claude';
-      S.home.claude = { ...(S.home.claude || {}), cwd: s.cwd };
+      S.home.claude = { ...(S.home.claude || {}), machineId: s.machineId || null, cwdByMachine: { ...(S.home.claude?.cwdByMachine || {}), [s.machineId || 'hub']: s.cwd } };
       saveHome();
       return go('#/');
     case 'copy': {
@@ -1452,7 +1518,7 @@ function panelHead(...right) {
 // Artifact tab: the newest version of the chosen page, kept in sync while
 // Kimi writes it.
 function showArtifact(path, version) {
-  if (!S.artifacts.length) return emptyPane('artifact', 'Kimi 還沒有在這個對話裡做出頁面。它寫的 HTML 會顯示在這裡。');
+  if (!S.artifacts.length) return emptyPane('artifact', `${nameFor(S.cur?.summary)} 還沒有在這個對話裡做出頁面。它寫的 HTML 會顯示在這裡。`);
   const wasArtifact = S.panel?.tab === 'artifact';
   const art = S.artifacts.find((a) => a.path === (path || S.panel?.path)) || S.artifacts.at(-1);
   closeAgentPanel();
@@ -1615,7 +1681,7 @@ function showAgents(id) {
   artifactView = null;
   closeAgentPanel();
   showPanel('agents');
-  const steps = new Transcript({ cwd: S.cur.summary?.cwd, onRespond: respond, onImage: lightbox, onLink: openFileLink });
+  const steps = new Transcript({ cwd: S.cur.summary?.cwd, agentName: nameFor(S.cur.summary), onRespond: respond, onImage: lightbox, onLink: openFileLink });
   const section = (label, ...right) => h('div', { class: 'agent-sec' }, h('span', { class: 'agent-sec-label' }, label), h('span', { class: 'om-toolbar__spacer' }), ...right);
   applyPanes();
   agentPanel = {
@@ -1789,7 +1855,7 @@ function drawTodos() {
         { class: 'panel-body' },
         todos.length
           ? [h('div', { class: 'todo-sum' }, h('span', { class: 'todo-progress' }, `${done}/${todos.length} 完成`), h('div', { class: 'quota-bar' }, h('span', { style: { width: `${Math.round((done / todos.length) * 100)}%` } }))), todoList(todos)]
-          : h('div', { class: 'panel-empty' }, 'Kimi 還沒有列待辦。'),
+          : h('div', { class: 'panel-empty' }, `${nameFor(S.cur?.summary)} 還沒有列待辦。`),
       ),
     ),
   );
@@ -2297,7 +2363,7 @@ function claudeStatusDialog() {
     ctx?.size ? ['Context', `${Math.round((ctx.used / ctx.size) * 100)}% · ${fmtK(ctx.used)} / ${fmtK(ctx.size)} tokens`] : null,
     ['花費', `約 ${fmtUsd(s.usage?.costUsd || 0)}${meta.budget ? `（上限 ${fmtUsd(meta.budget)}）` : ''}`],
     ['資料夾', s.cwd || '—'],
-    ['執行在', `中控台這台電腦（${hostName()}）`],
+    ['執行在', s.machineId ? `「${s.meta?.machineName || machineById(s.machineId)?.name || '那台電腦'}」（工具透過連接器執行，API key 留在中控台）` : `中控台這台電腦（${hostName()}）`],
     ['計費', 'Claude API · Console 帳戶，按 token'],
     ['API key', acc.hasKey ? `${acc.keyHint}${acc.keySource === 'env' ? '（環境變數）' : ''}` : '還沒有設定'],
   ].filter(Boolean);

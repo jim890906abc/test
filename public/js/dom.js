@@ -154,6 +154,8 @@ export function clockTime(ts) {
 
 export function fmtTokens(n) {
   if (!n) return '0';
+  // 1M, 1.5M (Claude's 1M context), not 1000k.
+  if (n >= 999_500) return `${+(n / 1_000_000).toFixed(n >= 9_950_000 ? 0 : 1)}M`;
   return n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : String(n);
 }
 

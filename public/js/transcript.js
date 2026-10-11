@@ -59,6 +59,27 @@ const LOOK = /^(Read|ReadFile|ReadMediaFile|Glob|Grep|FetchURL|WebFetch|WebSearc
 const lineCount = (t) => (t ? String(t).replace(/\n+$/, '').split('\n').length : 0);
 const isAgent = (ev) => Boolean(ev.subagent) || /^(Agent|AgentSwarm|Task)$/.test(ev.name);
 const isTodo = (ev) => /^(TodoList|TodoWrite|SetTodoList)$/.test(ev.name);
+// Claude's web search and fetch (run by the Claude API) come back as
+// "title\n  url" per search result, or "title\nurl" for the fetched page.
+function webLinks(ev) {
+  if (!/^(WebSearch|WebFetch)$/.test(ev.name) || ev.status !== 'done') return null;
+  const lines = String(ev.output || '').trim().split('\n').map((l) => l.trim());
+  const url = (l) => /^https?:\/\/\S+$/.test(l || '');
+  if (lines.length === 1 && url(lines[0])) return [{ title: lines[0], url: lines[0] }];
+  const links = [];
+  for (let i = 0; i < lines.length; i += 2) {
+    if (!url(lines[i + 1])) return null;
+    links.push({ title: lines[i] || lines[i + 1], url: lines[i + 1] });
+  }
+  return links.length ? links : null;
+}
+const hostOf = (u) => {
+  try {
+    return new URL(u).hostname.replace(/^www\./, '');
+  } catch {
+    return '';
+  }
+};
 // Following the newest message: back on when you reach the end by
 // scrolling down (within this many pixels), off as soon as you scroll up.
 const STICK_PX = 32;
@@ -806,8 +827,13 @@ export class Transcript {
       const cwd = this.opts.cwd;
       return cwd && p?.startsWith(`${cwd}/`) ? p.slice(cwd.length + 1) : p;
     };
-    if (ev.name === 'Bash' || ev.name === 'Shell') return h('code', null, (input.command || ev.title || '').split('\n')[0]);
+    if (ev.name === 'Bash' || ev.name === 'Shell') {
+      const cmd = (input.command || ev.title || '').split('\n')[0];
+      // Claude says what a command does: that, with the command in the card.
+      return input.description ? h('span', { title: cmd }, input.description) : h('code', null, cmd);
+    }
     if (input.path || input.file_path) return h('code', null, rel(input.path || input.file_path));
+    if (ev.name === 'CodeExecution' && (input.code || input.command)) return h('code', null, String(input.code || input.command).split('\n')[0]);
     if (input.pattern) return h('code', null, input.pattern);
     if (input.url) return h('span', null, input.url);
     if (ev.name === 'AskUserQuestion') return h('span', null, ev.title);
@@ -842,7 +868,7 @@ export class Transcript {
   // "⎿ Read 120 lines": the first lines of a command's output, how many
   // lines were read, how many matches were found.
   peek(ev) {
-    const bash = /^(Bash|Shell)$/.test(ev.name);
+    const bash = /^(Bash|Shell|CodeExecution)$/.test(ev.name);
     if (ev.status === 'running' && ev.output && bash) {
       return [h('pre', { class: 'tail' }, ev.output.replace(/\n$/, '').split('\n').slice(-3).join('\n'))];
     }
@@ -851,13 +877,23 @@ export class Transcript {
     const n = lineCount(out);
     const line = (text) => [h('div', { class: 'result' }, text)];
     if (bash) {
-      if (!out) return line('（沒有輸出）');
+      if (!out || out === '(no output)') return line('（沒有輸出）');
       const lines = out.split('\n');
       return [h('pre', { class: 'result-out' }, lines.slice(0, 3).join('\n')), lines.length > 3 ? h('div', { class: 'result' }, `… 還有 ${lines.length - 3} 行`) : null].filter(Boolean);
     }
-    if (/^Read/.test(ev.name)) return line(n ? `讀了 ${n} 行` : '空的檔案');
-    if (ev.name === 'Grep') return line(n ? `找到 ${n} 筆` : '沒有找到');
-    if (ev.name === 'Glob') return line(n ? `找到 ${n} 個檔案` : '沒有找到');
+    // Claude's Read, Grep and Glob end a long result with "… 120 more lines".
+    const more = out.match(/\n… (?:and )?(\d+) more[^\n]*$/);
+    const shown = more ? n - 1 : n;
+    if (/^Read/.test(ev.name)) {
+      if (/^（圖片/.test(out)) return line(out);
+      if (!shown || out === '(the file is empty)') return line('空的檔案');
+      return line(`讀了 ${shown} 行${more ? `，還有 ${more[1]} 行` : ''}`);
+    }
+    const total = shown + (more ? Number(more[1]) : 0);
+    if (ev.name === 'Grep') return line(total ? `找到 ${total} 筆` : '沒有找到');
+    if (ev.name === 'Glob') return line(total ? `找到 ${total} 個檔案` : '沒有找到');
+    const links = webLinks(ev);
+    if (links) return line(ev.name === 'WebSearch' ? `找到 ${links.length} 個結果` : links[0].title);
     if (/^(Write|WriteFile|Edit|MultiEdit|StrReplaceFile|TodoList|TodoWrite|SetTodoList|ExitPlanMode|EnterPlanMode|AskUserQuestion)$/.test(ev.name)) return [];
     if (!out) return [];
     const first = out.split('\n')[0];
@@ -871,9 +907,22 @@ export class Transcript {
     switch (ev.name) {
       case 'Bash':
       case 'Shell':
-        if (input?.command?.includes('\n')) out.push(h('pre', { class: 'out cmd' }, input.command));
+        // On one line in the row, unless a description took its place.
+        if (input?.command && (input.description || input.command.includes('\n'))) out.push(h('pre', { class: 'out cmd' }, input.command));
         output(ev.output, ev.status === 'error' ? 'err' : '');
         break;
+      case 'CodeExecution':
+        // Run in the Claude API's sandbox, not on this computer.
+        if (input?.code || input?.command?.includes('\n')) out.push(h('pre', { class: 'out cmd' }, input.code || input.command));
+        output(ev.output, ev.status === 'error' ? 'err' : '');
+        break;
+      case 'WebSearch':
+      case 'WebFetch': {
+        const links = webLinks(ev);
+        if (!links) return this.toolArgs(ev, input, out);
+        out.push(h('ul', { class: 'web-links' }, ...links.map((l) => h('li', null, h('a', { href: l.url, target: '_blank', rel: 'noopener noreferrer' }, l.title), h('span', { class: 'web-host' }, hostOf(l.url))))));
+        break;
+      }
       case 'Edit':
       case 'StrReplaceFile':
         if (typeof input?.old_string === 'string') out.push(renderLineDiff(input.old_string, input.new_string ?? '', { context: 2 }));
@@ -893,12 +942,18 @@ export class Transcript {
         else output(ev.output);
         break;
       default:
-        if (input && !/^(Read|ReadFile|Glob|Grep|AskUserQuestion)$/.test(ev.name)) {
-          const keys = Object.keys(input).filter((k) => input[k] !== '' && input[k] != null);
-          if (keys.length) out.push(h('pre', { class: 'out args' }, keys.map((k) => `${k}: ${typeof input[k] === 'string' ? input[k] : JSON.stringify(input[k])}`).join('\n')));
-        } else if (!input && ev.argsText) out.push(h('pre', { class: 'out args' }, ev.argsText));
-        output(ev.output, ev.status === 'error' ? 'err' : '');
+        return this.toolArgs(ev, input, out);
     }
+    return out;
+  }
+
+  // Any other tool: its arguments, then its output.
+  toolArgs(ev, input, out) {
+    if (input && !/^(Read|ReadFile|Glob|Grep|AskUserQuestion)$/.test(ev.name)) {
+      const keys = Object.keys(input).filter((k) => input[k] !== '' && input[k] != null);
+      if (keys.length) out.push(h('pre', { class: 'out args' }, keys.map((k) => `${k}: ${typeof input[k] === 'string' ? input[k] : JSON.stringify(input[k])}`).join('\n')));
+    } else if (!input && ev.argsText) out.push(h('pre', { class: 'out args' }, ev.argsText));
+    if (ev.output) out.push(h('pre', { class: `out ${ev.status === 'error' ? 'err' : ''}` }, ev.output.replace(/\n$/, '')));
     return out;
   }
 
