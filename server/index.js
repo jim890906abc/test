@@ -17,6 +17,7 @@ import * as machines from './machines.js';
 import { createAutoPause, activityOf, timings, isActive } from './autopause.js';
 import { createScheduler, scheduleTimings } from './schedule.js';
 import { mergeQuota, countsOf } from './quota.js';
+import * as claudeAccount from './claude-account.js';
 
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -103,9 +104,48 @@ app.get('/api/config', wrap(() => ({
   version: '0.3.0',
   workspacesDir: store.WORKSPACES_DIR,
   home: os.homedir(),
+  hostname: os.hostname(),
   host: HOST,
   settings: readSettings(),
+  claude: claudeAccount.publicAccount(),
 })));
+
+// ------------------------------------------------------------ Claude API
+
+// The Claude Console API key (only ever sent here, never back), and the
+// defaults for new Claude conversations.
+app.get('/api/claude', wrap(() => claudeAccount.publicAccount()));
+
+app.put('/api/claude', wrap(async (req) => {
+  const { apiKey, clearKey, defaults, webTools } = req.body || {};
+  if (clearKey) claudeAccount.clearKey();
+  else if (typeof apiKey === 'string' && apiKey.trim()) {
+    const why = claudeAccount.checkKey(apiKey);
+    if (why) throw Object.assign(new Error(why), { status: 400 });
+    // Saved only once Anthropic accepts it.
+    try {
+      await claudeAccount.client(apiKey.trim()).models.list({ limit: 1 });
+    } catch (err) {
+      throw Object.assign(new Error(claudeAccount.explain(err)), { status: 400 });
+    }
+    claudeAccount.setKey(apiKey);
+  }
+  if (defaults || typeof webTools === 'boolean') claudeAccount.setSettings({ defaults, webTools });
+  const account = claudeAccount.publicAccount();
+  broadcast({ t: 'claude', account });
+  return account;
+}));
+
+app.post('/api/claude/test', wrap(async () => {
+  try {
+    const models = await claudeAccount.models({ fresh: true });
+    return { ok: true, message: `連線成功：這把 API key 可以使用 ${models.length} 個模型`, models };
+  } catch (err) {
+    return { ok: false, message: claudeAccount.explain(err) };
+  }
+}));
+
+app.get('/api/claude/models', wrap(async () => ({ defaultModel: claudeAccount.DEFAULT_MODEL, models: await claudeAccount.models() })));
 
 app.put('/api/settings', wrap((req) => {
   const d = req.body?.defaults || {};
@@ -196,7 +236,7 @@ app.post('/api/agents/:id/test', wrap(async (req) => {
 app.get('/api/artifacts', wrap(() => {
   const out = [];
   for (const s of store.listSessions()) {
-    if (!s.kimiSessionId) continue;
+    if (!s.kimiSessionId && s.agentId !== 'claude') continue;
     const byPath = new Map();
     for (const ev of s.events || []) {
       if (ev.type !== 'tool_use' || !/^(Write|Edit|MultiEdit|WriteFile|StrReplaceFile)$/.test(ev.name) || ev.status === 'error') continue;
@@ -220,16 +260,19 @@ app.get('/api/sessions', wrap(() =>
 
 // New conversation. On a connected machine ({ machineId, cwd }) the folder is
 // a path on that machine; otherwise a local agent ({ agentId }) is used.
+// { agent: 'claude', cwd } starts a Claude API conversation in a folder on
+// this computer.
 app.post('/api/sessions', wrap(async (req) => {
-  const { agentId, machineId, prompt, cwd, permissionMode, images, model, effort, permission, planMode } = req.body || {};
-  const remote = machineId || String(agentId || '').startsWith('kimi@');
+  const { agentId, machineId, agent, prompt, cwd, permissionMode, images, model, effort, permission, planMode } = req.body || {};
+  const claude = agent === 'claude' || agentId === 'claude';
+  const remote = !claude && (machineId || String(agentId || '').startsWith('kimi@'));
   const dir = cwd ? (remote ? String(cwd) : workspace.validateDir(cwd)) : undefined;
   const s = await runner.newSession({
-    agentId: machineId ? `kimi@${machineId}` : agentId,
+    agentId: claude ? 'claude' : machineId ? `kimi@${machineId}` : agentId,
     cwd: dir,
     permissionMode,
     nameHint: prompt,
-    config: remote ? { model, effort, permission, planMode } : undefined,
+    config: remote || claude ? { model, effort, permission, planMode } : undefined,
   });
   if (prompt?.trim() || images?.length) runner.startTurn(s, prompt || '', { images });
   return runner.summarize(s);
@@ -240,10 +283,15 @@ app.post('/api/sessions', wrap(async (req) => {
 // one does not hold up the live stream.
 const snapshotOf = (s) => ({ ...runner.summarize(s), seq: s.seq || 0, allowedTools: s.allowedTools, events: s.events.map((e) => ({ ...e })) });
 
+const viewed = (s) => {
+  if (s.kimiSessionId) kimiRemote.view(s);
+  else if (s.agentId === 'claude') ADAPTERS.claude.view(s);
+};
+
 app.get('/api/sessions/:id', async (req, res) => {
   try {
     const s = mustSession(req.params.id);
-    if (s.kimiSessionId) kimiRemote.view(s);
+    viewed(s);
     res.type('json').send(await store.jsonInSlices(snapshotOf(s), 'events'));
   } catch (err) {
     res.status(err.status || 500).json({ error: err.message || String(err) });
@@ -252,8 +300,7 @@ app.get('/api/sessions/:id', async (req, res) => {
 
 // The page pings while a conversation is open, so it stays followed.
 app.post('/api/sessions/:id/viewing', wrap((req) => {
-  const s = mustSession(req.params.id);
-  if (s.kimiSessionId) kimiRemote.view(s);
+  viewed(mustSession(req.params.id));
 }));
 
 app.patch('/api/sessions/:id', wrap((req) => {
@@ -326,7 +373,7 @@ app.post('/api/sessions/:id/autopause', wrap(async (req) => {
 // 定時送出: { text, at } (ms) adds a message to send at that time.
 app.post('/api/sessions/:id/schedule', wrap((req) => {
   const s = mustSession(req.params.id);
-  if (!s.kimiSessionId) throw Object.assign(new Error('只有 Kimi 對話可以定時送出'), { status: 400 });
+  if (!s.kimiSessionId && s.agentId !== 'claude') throw Object.assign(new Error('這個對話不能定時送出'), { status: 400 });
   scheduler.add(s, req.body || {});
   return runner.summarize(s);
 }));
@@ -338,9 +385,7 @@ app.delete('/api/sessions/:id/schedule/:item', wrap((req) => {
 
 // 插隊: slip a queued message into the running turn (Kimi's Ctrl-S).
 app.post('/api/sessions/:id/queue/:promptId/steer', wrap(async (req) => {
-  const s = mustSession(req.params.id);
-  if (!s.kimiSessionId) throw Object.assign(new Error('這個對話不支援插隊'), { status: 400 });
-  await ADAPTERS['kimi-remote'].steerQueued(s, req.params.promptId);
+  await runner.steerQueued(mustSession(req.params.id), req.params.promptId);
 }));
 
 // 移到背景 (Kimi's Ctrl+B).
@@ -559,7 +604,7 @@ async function watch(ws, sid) {
   if (!sid) return;
   const s = store.getSession(sid);
   if (!s) return queue(ws, JSON.stringify({ t: 'snapshot', sid, error: '找不到 session' }));
-  if (s.kimiSessionId) kimiRemote.view(s);
+  viewed(s);
   // Taken now, in order with the stream: what happens while it is being
   // written out is queued behind it.
   const snap = snapshotOf(s);
@@ -625,11 +670,13 @@ machines.onSessionChange((mid, entry) => {
   if (isActive(s?.autoPause)) autoPause.observe(s);
 });
 autoPause.start();
+// Claude conversations run here, so they are always "online".
+const isClaude = (s) => s.agentId === 'claude';
 const scheduler = createScheduler({
-  sessions: () => store.listSessions().filter((s) => s.kimiSessionId && s.scheduled?.length),
-  online: (s) => activityOf(s, machines.getMachine(s.machineId), kimiRemote.isLive(s)).online,
+  sessions: () => store.listSessions().filter((s) => (s.kimiSessionId || isClaude(s)) && s.scheduled?.length),
+  online: (s) => isClaude(s) || activityOf(s, machines.getMachine(s.machineId), kimiRemote.isLive(s)).online,
   send: (s, text, opts) => runner.deliver(s, text, opts),
-  cannotSend: (s) => kimiRemote.cannotSend(s),
+  cannotSend: (s) => (isClaude(s) ? ADAPTERS.claude.cannotSend(s) : kimiRemote.cannotSend(s)),
   changed: persist,
   newId: () => store.newId('q_'),
   timings: scheduleTimings(Number(process.env.AGENT_HUB_AUTOPAUSE_SCALE) || 1),

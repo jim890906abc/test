@@ -99,6 +99,8 @@ export function remoteAgents() {
 
 export function agentFor(id) {
   if (String(id).startsWith('kimi@')) return remoteAgents().find((a) => a.id === id) || null;
+  // Claude through the Claude API (claude-account.js), run by the hub here.
+  if (id === ADAPTERS.claude.AGENT.id) return ADAPTERS.claude.AGENT;
   return store.getAgent(id);
 }
 
@@ -134,9 +136,11 @@ export function liveContext(session) {
   };
 }
 ADAPTERS['kimi-remote'].init(liveContext);
+ADAPTERS.claude.init(liveContext);
 
 export function restoreLiveSessions() {
   for (const s of store.listSessions()) if (s.kimiSessionId) ADAPTERS['kimi-remote'].restore(s);
+  for (const s of store.listSessions()) if (s.agentId === ADAPTERS.claude.AGENT.id) ADAPTERS.claude.restore(s);
   machines.onMachineOnline((machineId) => ADAPTERS['kimi-remote'].onMachineOnline(machineId, store.listSessions()));
 }
 
@@ -482,7 +486,18 @@ export async function command(session, name, args) {
   if (!adapter?.command) throw Object.assign(new Error('這個對話不支援指令'), { status: 400 });
   const r = (await adapter.command(session, name, args)) || {};
   if (r.kimiSessionId) return { session: summarize(await attachKimi(session.machineId, r.kimiSessionId)) };
+  if (r.session) {
+    broadcast({ t: 'session', session: summarize(r.session) });
+    return { session: summarize(r.session) };
+  }
   return {};
+}
+
+// 插隊 for a message waiting in the queue.
+export async function steerQueued(session, promptId) {
+  const adapter = adapterFor(session);
+  if (!adapter?.steerQueued) throw Object.assign(new Error('這個對話不支援插隊'), { status: 400 });
+  await adapter.steerQueued(session, promptId);
 }
 
 export async function cancelQueued(session, promptId) {
@@ -512,6 +527,13 @@ export async function newSession({ agentId, cwd, prompt, nameHint, permissionMod
     kimi.restore(session);
     await kimi.attach(session);
     if (config && Object.values(config).some((v) => v !== undefined && v !== '')) await kimi.configure(session, config).catch((err) => console.warn(`[kimi] configure: ${err.message}`));
+  } else if (agent.type === 'claude') {
+    const claude = ADAPTERS.claude;
+    const why = claude.cannotSend();
+    if (why) throw Object.assign(new Error(why), { status: 409 });
+    const dir = cwd || (await createWorkspace(nameHint || prompt || 'claude'));
+    session = store.createSession({ agentId, cwd: dir, permissionMode, title: title || '新對話' });
+    claude.setup(session, config);
   } else {
     const dir = cwd || (await createWorkspace(nameHint || prompt || agent.name));
     session = store.createSession({ agentId, cwd: dir, permissionMode, branch, title: title || '新對話' });

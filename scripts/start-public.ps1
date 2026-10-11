@@ -18,7 +18,12 @@ function Say($m) { Write-Host "▸ $m" -ForegroundColor DarkYellow }
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) { throw '需要 Node.js 22 以上：https://nodejs.org' }
 $major = [int]((node -v).TrimStart('v').Split('.')[0])
 if ($major -lt 22) { throw "Node.js 版本太舊（$(node -v)），需要 22 以上" }
-if (-not (Test-Path node_modules)) { Say '安裝相依套件（npm install）…'; npm install --omit=dev --no-audit --no-fund | Out-Null }
+# Installed again whenever package-lock.json changed (an update added a package).
+$lockStamp = 'node_modules\.agent-hub-lock.json'
+if (-not (Test-Path node_modules) -or -not (Test-Path $lockStamp) -or ((Get-FileHash package-lock.json).Hash -ne (Get-FileHash $lockStamp).Hash)) {
+  Say '安裝相依套件（npm install）…'; npm install --omit=dev --no-audit --no-fund | Out-Null
+  Copy-Item package-lock.json $lockStamp
+}
 
 $cf = (Get-Command cloudflared -ErrorAction SilentlyContinue).Source
 if (-not $cf) {

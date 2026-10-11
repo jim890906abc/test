@@ -30,6 +30,15 @@ cd agent-hub; powershell -ExecutionPolicy Bypass -File scripts\start-public.ps1
 
 **更新**：在 `agent-hub` 資料夾裡執行 `git pull`，再執行一次上面的啟動指令。
 
+## Claude API
+
+首頁上方切到「Claude API」，就能直接和 Claude 對話。中控台用 Anthropic 官方 SDK 呼叫 Claude API（api.anthropic.com），**只用 Claude Console 的 API key**（`sk-ant-api…`），依 token 從 Console 帳戶的額度扣款；不經過 Claude Code，也不會用 Claude Pro／Max 訂閱，訂閱帳號的登入 token（`sk-ant-oat…`）會被拒絕。
+
+1. 到 [Claude Console → API Keys](https://console.anthropic.com/settings/keys) 建立一把 key。
+2. 左下角「⋯」→「Claude API…」貼上 key 後儲存（中控台會先向 Anthropic 確認 key 有效；key 只存在 `data/claude.json`，不會傳回瀏覽器）。也可以改用環境變數 `ANTHROPIC_API_KEY`。
+
+Claude 由中控台在**這台電腦**上執行：工具（Bash、Read、Write、Edit、Glob、Grep、網路搜尋）在你選的資料夾裡跑，權限有「每次詢問／自動接受編輯／全部自動」和計畫模式。也支援待辦、提問、子代理、插隊、/compact、/undo、/fork、定時送出；輸入框旁顯示這個對話的估計花費，`/cost` 看明細與速率限制，`/budget 5` 設定花費上限（花到就先停）。預設模型 Claude Opus 5.5。
+
 ## 連接其他電腦
 
 在那台電腦執行中控台印出的連接指令（左下角「連接電腦…」也看得到）。之後那台電腦的 Kimi 對話會自動出現。

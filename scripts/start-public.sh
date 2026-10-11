@@ -21,9 +21,11 @@ command -v node >/dev/null || die "需要 Node.js 22 以上：https://nodejs.org
 NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
 [ "$NODE_MAJOR" -ge 22 ] || die "Node.js 版本太舊（$(node -v)），需要 22 以上"
 
-if [ ! -d node_modules ]; then
+# Installed again whenever package-lock.json changed (an update added a package).
+if [ ! -d node_modules ] || ! cmp -s package-lock.json node_modules/.agent-hub-lock.json; then
   say "安裝相依套件（npm install）…"
   npm install --omit=dev --no-audit --no-fund >/dev/null
+  cp package-lock.json node_modules/.agent-hub-lock.json
 fi
 
 # cloudflared: use the installed one, or download the official binary once.

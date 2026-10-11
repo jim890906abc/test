@@ -26,6 +26,7 @@ export const TOOLS = {
   WebFetch: ['globe', '讀取網頁'],
   WebSearch: ['globe', '搜尋網路'],
   SearchWeb: ['globe', '搜尋網路'],
+  CodeExecution: ['terminal', '雲端執行程式'],
   Agent: ['agents', '子代理'],
   AgentSwarm: ['agents', '子代理群'],
   Task: ['agents', '子代理'],
@@ -76,7 +77,7 @@ const agentRunning = (ev) => {
 };
 
 export class Transcript {
-  // opts: { cwd, onRespond(ev, optionId, extra), onOpenArtifact(path, versionId), onCopy }
+  // opts: { cwd, agentName ('Kimi' | 'Claude'), onRespond(ev, optionId, extra), onOpenArtifact(path, versionId), onCopy }
   constructor(opts) {
     this.opts = opts;
     this.column = h('div', { class: 'column' });
@@ -653,7 +654,7 @@ export class Transcript {
   renderUser(node) {
     const ev = node.ev;
     const images = (ev.images || []).map((src) => (src ? h('img', { class: 'user-img', src, alt: '附加的圖片', loading: 'lazy', onclick: () => this.opts.onImage?.(src) }) : h('span', { class: 'user-img placeholder' }, icon('image'), '圖片')));
-    const note = [ev.note, ev.steered ? '在 Kimi 工作時插入' : null].filter(Boolean).join(' · ');
+    const note = [ev.note, ev.steered ? `在 ${this.name()} 工作時插入` : null].filter(Boolean).join(' · ');
     fill(
       node.el,
       h('div', { class: 'bubble' }, images.length ? h('div', { class: 'user-imgs' }, images) : null, ev.text ? h('div', { class: 'user-text' }, ev.text) : null),
@@ -678,7 +679,11 @@ export class Transcript {
     );
   }
 
-  // The newest unfinished row while Kimi is working.
+  name() {
+    return this.opts.agentName || 'Kimi';
+  }
+
+  // The newest unfinished row while the agent is working.
   isLive(ev) {
     return this.status === 'running' && this.lastOf.get(ev.parent || '') === ev.id;
   }
@@ -888,7 +893,7 @@ export class Transcript {
         else output(ev.output);
         break;
       default:
-        if (input && !/^(Read|ReadFile|Glob|Grep)$/.test(ev.name)) {
+        if (input && !/^(Read|ReadFile|Glob|Grep|AskUserQuestion)$/.test(ev.name)) {
           const keys = Object.keys(input).filter((k) => input[k] !== '' && input[k] != null);
           if (keys.length) out.push(h('pre', { class: 'out args' }, keys.map((k) => `${k}: ${typeof input[k] === 'string' ? input[k] : JSON.stringify(input[k])}`).join('\n')));
         } else if (!input && ev.argsText) out.push(h('pre', { class: 'out args' }, ev.argsText));
@@ -1002,7 +1007,7 @@ export class Transcript {
     }
     const verb = /^(Bash|Shell)$/.test(ev.name) ? '執行這個指令' : /^(Write|Edit|MultiEdit|StrReplaceFile)$/.test(ev.name) ? '修改這個檔案' : `使用 ${ev.name}`;
     box.append(
-      h('div', { class: 'ask-q' }, `要讓 Kimi ${verb}嗎？`),
+      h('div', { class: 'ask-q' }, `要讓 ${this.name()} ${verb}嗎？`),
       h(
         'div',
         { class: 'ask-actions' },
@@ -1023,7 +1028,7 @@ export class Transcript {
         type: 'button',
         onclick: (e) => {
           const actions = e.currentTarget.parentElement;
-          const ta = h('textarea', { class: 'om-input', rows: 2, placeholder: '告訴 Kimi 要改成怎麼做（可以留白）' });
+          const ta = h('textarea', { class: 'om-input', rows: 2, placeholder: `告訴 ${this.name()} 要改成怎麼做（可以留白）` });
           const form = h(
             'div',
             { class: 'ask-reject' },
@@ -1142,7 +1147,7 @@ export class Transcript {
         this.workingKind = 'running';
         this.secsEl = h('span', { class: 'muted' });
         this.tpsEl = h('span', { class: 'muted', title: '產生速度：這一輪生成的 token 數 ÷ 生成時間' });
-        fill(this.working, h('div', { class: 'working-line' }, h('span', { class: 'pulse' }), h('span', null, 'Kimi 正在處理'), this.secsEl, this.tpsEl, h('span', { class: 'muted hint' }, ' · Esc 停止')));
+        fill(this.working, h('div', { class: 'working-line' }, h('span', { class: 'pulse' }), h('span', null, `${this.name()} 正在處理`), this.secsEl, this.tpsEl, h('span', { class: 'muted hint' }, ' · Esc 停止')));
       }
       this.secsEl.textContent = secs ? ` · ${secs}` : '';
       this.tpsEl.textContent = this.tps ? ` · ${this.tps} tok/s` : '';

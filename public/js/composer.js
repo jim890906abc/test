@@ -1,6 +1,7 @@
 // The message box: auto-growing input, / commands, images, and the
 // model / thinking / permission controls. Used on the home screen (new
-// conversation) and under every conversation.
+// conversation) and under every conversation, for Kimi and for Claude
+// (state.agent === 'claude': Claude through the Claude API, run by the hub).
 import { h, fill, icon, fmtTokens, clockTime, fmtCountdown } from './dom.js';
 import { openMenu, closeMenu, place } from './menu.js';
 import { todoList } from './transcript.js';
@@ -12,6 +13,17 @@ const PERMISSION_DESC = {
   auto: '全部自動決定，不會打斷你',
 };
 export const EFFORT_LABELS = { off: '關閉', on: '開啟', low: '低', medium: '中', high: '高', xhigh: '很高', max: '最高' };
+// Claude's permission modes, as Claude Code names them.
+export const CLAUDE_PERMISSION_LABELS = { manual: '每次詢問', edits: '自動接受編輯', auto: '全部自動' };
+const CLAUDE_PERMISSION_DESC = {
+  manual: '每個檔案修改與指令都先問你',
+  edits: '修改檔案直接做，執行指令前先問你',
+  auto: '全部直接做，不會打斷你',
+};
+export const permissionLabels = (agent) => (agent === 'claude' ? CLAUDE_PERMISSION_LABELS : PERMISSION_LABELS);
+export const agentName = (agent) => (agent === 'claude' ? 'Claude' : 'Kimi');
+// US$, with more digits while it is small.
+export const fmtUsd = (n) => `US$${n >= 1 ? n.toFixed(2) : n >= 0.01 ? n.toFixed(3) : (n || 0).toFixed(4)}`;
 const MAX_IMAGES = 8;
 
 // Built-in commands; Kimi skills are appended from the session.
@@ -41,6 +53,28 @@ export const COMMANDS = [
   { name: 'later', description: '定時送出：幾分鐘後、指定時間，或 5 小時額度恢復後送出訊息', args: true, hint: '[30 | 15:30 | reset] [訊息]' },
 ];
 const HOME_COMMANDS = ['model', 'effort', 'plan', 'permission', 'yolo', 'auto', 'manual', 'usage', 'status'];
+// Claude through the Claude API: the hub runs it, so these are the hub's.
+export const CLAUDE_COMMANDS = [
+  { name: 'model', description: '切換模型' },
+  { name: 'effort', description: '調整思考強度' },
+  { name: 'plan', description: '開關計畫模式：先規劃，你同意後才動手' },
+  { name: 'permission', description: '選擇權限模式' },
+  { name: 'manual', description: '每次詢問：修改檔案與執行指令前都先問你' },
+  { name: 'edits', description: '自動接受編輯：修改檔案直接做，執行指令前先問你', aliases: ['accept-edits'] },
+  { name: 'auto', description: '全部自動：不再詢問' },
+  { name: 'compact', description: '壓縮對話：讓 Claude 寫摘要取代前面的內容，省下之後每一輪的 token', args: true, hint: '[補充指示]' },
+  { name: 'undo', description: '撤回上一輪對話（檔案的修改不會還原）', aliases: ['rewind'] },
+  { name: 'init', description: '分析專案並寫出 CLAUDE.md' },
+  { name: 'fork', description: '複製這個對話成新的對話', args: true, hint: '[標題]' },
+  { name: 'title', description: '修改對話標題', args: true, hint: '<標題>' },
+  { name: 'new', description: '在同一個資料夾開新對話', aliases: ['clear'] },
+  { name: 'copy', description: '複製 Claude 最後一則回覆' },
+  { name: 'cost', description: '這個對話花了多少（依 API 用量估計）與速率限制', aliases: ['usage'] },
+  { name: 'budget', description: '花費上限：這個對話花到這個金額就先停下', args: true, hint: '<美元> | off' },
+  { name: 'status', description: '目前的模型、權限、context、API key 與資料夾' },
+  { name: 'later', description: '定時送出：幾分鐘後或指定時間送出訊息', args: true, hint: '[30 | 15:30] [訊息]' },
+];
+const CLAUDE_HOME_COMMANDS = ['model', 'effort', 'plan', 'permission', 'manual', 'edits', 'auto', 'status'];
 // A Kimi running in a terminal runs its own slash commands; these are the
 // ones that work without its on-screen pickers.
 const TERMINAL_COMMANDS = [
@@ -112,7 +146,7 @@ export class Composer {
     this.images = [];
     this.drafts = new Map();
     this.key = null;
-    this.input = h('textarea', { class: 'composer-input', rows: 1, placeholder: opts.placeholder || '回覆 Kimi…', 'aria-label': '訊息' });
+    this.input = h('textarea', { class: 'composer-input', rows: 1, placeholder: opts.placeholder || `回覆 ${agentName(opts.agent)}…`, 'aria-label': '訊息' });
     this.thumbs = h('div', { class: 'composer-images', hidden: true });
     this.left = h('div', { class: 'composer-tools' });
     this.right = h('div', { class: 'composer-actions' });
@@ -196,6 +230,7 @@ export class Composer {
   //          effort, permission, planMode, context, skills, machineName, folderName }
   update(state) {
     this.state = { ...this.state, ...state };
+    if (!this.opts.placeholder) this.input.placeholder = `回覆 ${agentName(this.agent())}…`;
     const readOnly = this.state.terminal && !this.state.controllable;
     this.box.hidden = readOnly;
     if (readOnly) {
@@ -226,6 +261,14 @@ export class Composer {
 
   // ------------------------------------------------------------- tools
 
+  agent() {
+    return this.state.agent || this.opts.agent || 'kimi';
+  }
+
+  claude() {
+    return this.agent() === 'claude';
+  }
+
   currentModel() {
     const s = this.state;
     const id = s.model || s.defaultModel;
@@ -249,18 +292,20 @@ export class Composer {
       this.left,
       s.terminal ? null : h('button', { class: 'chip icon-only', type: 'button', title: '加入圖片', 'aria-label': '加入圖片', onclick: () => this.file.click() }, icon('attach')),
       s.terminal ? h('span', { class: 'chip static', title: '這個對話在終端機的 Kimi 裡執行，你的訊息會打進那個終端機' }, icon('terminal'), h('span', null, '終端機')) : null,
-      this.opts.home ? chip(s.machineName || '選擇電腦', (b) => this.opts.onPickMachine(b), { iconName: 'computer', title: '要在哪一台電腦上執行', control: 'machine' }) : null,
+      this.opts.home && this.opts.onPickMachine ? chip(s.machineName || '選擇電腦', (b) => this.opts.onPickMachine(b), { iconName: 'computer', title: '要在哪一台電腦上執行', control: 'machine' }) : null,
+      // Claude runs on the hub's own computer.
+      this.opts.home && !this.opts.onPickMachine && s.machineName ? h('span', { class: 'chip static', title: 'Claude 由中控台執行，工具在這台電腦上跑' }, icon('computer'), h('span', null, s.machineName)) : null,
       this.opts.home ? chip(s.folderName || '選擇資料夾', (b) => this.opts.onPickFolder(b), { iconName: 'folder', title: '工作資料夾', control: 'folder' }) : null,
-      chip(s.planMode ? '計畫模式' : PERMISSION_LABELS[s.permission] || PERMISSION_LABELS.manual, (b) => this.permissionMenu(b), { iconName: s.planMode ? 'map' : 'shield', title: '權限模式', active: s.planMode, control: 'permission' }),
+      chip(s.planMode ? '計畫模式' : permissionLabels(this.agent())[s.permission] || PERMISSION_LABELS.manual, (b) => this.permissionMenu(b), { iconName: s.planMode ? 'map' : 'shield', title: '權限模式', active: s.planMode, control: 'permission' }),
       s.models?.length
-        ? chip(`${model?.name || 'Kimi 預設模型'}${nextModel ? '（下一輪）' : ''}`, (b) => this.modelMenu(b), {
-            title: nextModel ? `這一輪是用「${nameOf(s.turnModel)}」開始的。Kimi 每一輪開始時就固定模型，「${nameOf(s.model)}」從下一輪起使用` : '模型',
+        ? chip(`${model?.name || `${agentName(this.agent())} 預設模型`}${nextModel ? '（下一輪）' : ''}`, (b) => this.modelMenu(b), {
+            title: nextModel ? `這一輪是用「${nameOf(s.turnModel)}」開始的。${agentName(this.agent())} 每一輪開始時就固定模型，「${nameOf(s.model)}」從下一輪起使用` : '模型',
             control: 'model',
           })
         : null,
       efforts.length > 1
         ? chip(`思考 ${EFFORT_LABELS[s.effort] || s.effort || EFFORT_LABELS[model.defaultEffort] || '預設'}${nextEffort ? '（下一輪）' : ''}`, (b) => this.effortMenu(b), {
-            title: nextEffort ? `這一輪是用「${effortName(s.turnEffort)}」開始的。Kimi 每一輪開始時就固定思考強度，「${effortName(s.effort)}」從下一輪起使用` : '思考強度',
+            title: nextEffort ? `這一輪是用「${effortName(s.turnEffort)}」開始的。${agentName(this.agent())} 每一輪開始時就固定思考強度，「${effortName(s.effort)}」從下一輪起使用` : '思考強度',
             control: 'effort',
           })
         : null,
@@ -276,10 +321,12 @@ export class Composer {
 
   permissionMenu(anchor) {
     const s = this.state;
+    const labels = permissionLabels(this.agent());
+    const desc = this.claude() ? CLAUDE_PERMISSION_DESC : PERMISSION_DESC;
     openMenu(
       anchor,
       [
-        ...['manual', 'yolo', 'auto'].map((p) => ({ label: PERMISSION_LABELS[p], description: PERMISSION_DESC[p], checked: (s.permission || 'manual') === p, onSelect: () => this.opts.onConfig({ permission: p }) })),
+        ...Object.keys(labels).map((p) => ({ label: labels[p], description: desc[p], checked: (s.permission || 'manual') === p, onSelect: () => this.opts.onConfig({ permission: p }) })),
         { separator: true },
         { label: '計畫模式', description: '先寫好計畫，你同意後才開始修改', checked: Boolean(s.planMode), onSelect: () => this.opts.onConfig({ planMode: !s.planMode }) },
       ],
@@ -322,17 +369,24 @@ export class Composer {
     const s = this.state;
     const busy = s.running || s.awaiting;
     const ctx = s.context;
-    const ap = this.opts.onAutoPause ? { state: s.autoPause, open: this.opts.onAutoPause, arm: this.opts.onArmResume } : null;
-    const ring = ctx?.size ? contextRing(ctx, () => this.opts.onCommand('compact', ''), this.opts.onQuotaNode, ap) : null;
+    const claude = this.claude();
+    const name = agentName(this.agent());
+    // 自動暫停 watches Kimi's plan quota; Claude's API key has none.
+    const ap = this.opts.onAutoPause && !claude ? { state: s.autoPause, open: this.opts.onAutoPause, arm: this.opts.onArmResume } : null;
+    const ring = ctx?.size ? contextRing(ctx, () => this.opts.onCommand('compact', ''), this.opts.onQuotaNode, ap, claude ? '花費' : '方案用量') : null;
     const stop = busy && !this.hasContent();
     fill(
       this.right,
+      // What this conversation has cost so far (Claude API, per token).
+      claude && !this.opts.home && s.cost != null
+        ? h('button', { class: `cost-chip${s.budget && s.cost >= s.budget ? ' over' : ''}`, type: 'button', title: `這個對話到目前約花了 ${fmtUsd(s.cost)}（依 Claude API 公開價格估計）${s.budget ? `，上限 ${fmtUsd(s.budget)}` : ''}。點一下看明細`, onclick: () => this.opts.onCommand('cost', '') }, fmtUsd(s.cost))
+        : null,
       ring,
-      // While Kimi works: Enter queues the message for after this turn;
-      // 插隊 (Ctrl+S, like Kimi's CLI) slips it into the running turn.
-      busy && this.hasContent() ? h('button', { class: 'om-btn om-btn--sm steer-btn', type: 'button', title: '插隊：讓 Kimi 在下一步就讀到，不會中斷它（Ctrl+S）', onclick: () => this.submit({ steer: true }) }, '插隊') : null,
+      // While the agent works: Enter queues the message for after this
+      // turn; 插隊 (Ctrl+S, like Kimi's CLI) slips it into the running turn.
+      busy && this.hasContent() ? h('button', { class: 'om-btn om-btn--sm steer-btn', type: 'button', title: `插隊：讓 ${name} 在下一步就讀到，不會中斷它（Ctrl+S）`, onclick: () => this.submit({ steer: true }) }, '插隊') : null,
       // Kimi waiting on a subagent or a command in the foreground.
-      stop && s.foreground ? h('button', { class: 'om-btn om-btn--sm bg-btn', type: 'button', title: BG_DESCRIPTION, onclick: () => this.opts.onBackground?.() }, '移到背景') : null,
+      stop && s.foreground && !claude ? h('button', { class: 'om-btn om-btn--sm bg-btn', type: 'button', title: BG_DESCRIPTION, onclick: () => this.opts.onBackground?.() }, '移到背景') : null,
       stop
         ? h('button', { class: 'send stop', type: 'button', title: '停止（Esc）', 'aria-label': '停止', onclick: () => this.opts.onStop() }, icon('stop'))
         : h('button', { class: 'send', type: 'button', title: busy ? '排隊：這一輪結束後送出（Enter）' : '送出（Enter）', 'aria-label': busy ? '排隊送出' : '送出', disabled: !this.hasContent(), onclick: () => this.submit() }, icon('up')),
@@ -381,7 +435,7 @@ export class Composer {
           { class: 'queued' },
           h('span', { class: 'queued-label', title: q.cutIn && !q.steered ? CUT_IN_WHY : undefined }, q.steered ? '下一步插入' : q.cutIn ? '等待插隊' : '排隊中'),
           h('span', { class: 'queued-text' }, q.text || (q.images?.length ? `${q.images.length} 張圖片` : '')),
-          !q.steered && !q.cutIn && !q.foreign ? h('button', { class: 'om-btn om-btn--sm', type: 'button', title: '讓 Kimi 在下一步就讀到這則訊息，不會中斷它', onclick: () => this.opts.onSteerQueued(q.promptId) }, '插隊') : null,
+          !q.steered && !q.cutIn && !q.foreign ? h('button', { class: 'om-btn om-btn--sm', type: 'button', title: `讓 ${agentName(this.agent())} 在下一步就讀到這則訊息，不會中斷它`, onclick: () => this.opts.onSteerQueued(q.promptId) }, '插隊') : null,
           q.foreign ? null : h('button', { class: 'om-btn om-btn--toolbar om-btn--sm', type: 'button', title: '取消這則訊息', 'aria-label': '取消這則訊息', onclick: () => this.opts.onCancelQueued(q.promptId) }, icon('x')),
         ),
       );
@@ -450,7 +504,7 @@ export class Composer {
     } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's' && (this.state.running || this.state.awaiting)) {
       e.preventDefault();
       this.submit({ steer: true });
-    } else if (e.ctrlKey && !e.metaKey && !e.altKey && e.key.toLowerCase() === 'b' && this.state.running && this.opts.onBackground) {
+    } else if (e.ctrlKey && !e.metaKey && !e.altKey && e.key.toLowerCase() === 'b' && this.state.running && this.opts.onBackground && !this.claude()) {
       // Like Kimi's Ctrl+B, only while it works.
       e.preventDefault();
       this.opts.onBackground();
@@ -490,6 +544,7 @@ export class Composer {
 
   commands() {
     const skills = (this.state.skills || []).map((s) => ({ name: s.name, description: s.description, skill: true, args: true, source: s.source }));
+    if (this.claude()) return this.opts.home ? CLAUDE_COMMANDS.filter((c) => CLAUDE_HOME_COMMANDS.includes(c.name)) : CLAUDE_COMMANDS;
     const base = this.opts.home ? COMMANDS.filter((c) => HOME_COMMANDS.includes(c.name)) : this.state.terminal ? TERMINAL_COMMANDS : COMMANDS;
     const names = new Set(base.map((c) => c.name));
     return [...base, ...skills.filter((s) => !names.has(s.name))];
@@ -626,7 +681,7 @@ async function readImage(file) {
   return { mimeType, data, thumb, name: file.name };
 }
 
-function contextRing(ctx, onCompact, quotaNode, autoPause) {
+function contextRing(ctx, onCompact, quotaNode, autoPause, quotaLabel) {
   const pct = Math.min(1, ctx.used / ctx.size);
   const r = 7;
   const c = 2 * Math.PI * r;
@@ -646,7 +701,7 @@ function contextRing(ctx, onCompact, quotaNode, autoPause) {
         [
           { section: 'Context' },
           { node: h('div', { class: 'menu-quota' }, h('div', { class: 'quota' }, h('div', { class: 'quota-head' }, h('span', null, `${fmtTokens(ctx.used)} / ${fmtTokens(ctx.size)}`), h('span', { class: 'muted' }, `已用 ${Math.round(pct * 100)}%`)), h('div', { class: `quota-bar${level ? ` ${level}` : ''}` }, h('span', { style: { width: `${Math.round(pct * 100)}%` } })))) },
-          ...(quota ? [{ separator: true }, { section: '方案用量' }, { node: quota }] : []),
+          ...(quota ? [{ separator: true }, { section: quotaLabel }, { node: quota }] : []),
           ...(autoPause
             ? [
                 { label: '自動暫停…', hint: autoPause.state?.enabled ? `${autoPause.state.threshold}%` : '關', onSelect: autoPause.open },

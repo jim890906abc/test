@@ -1,16 +1,19 @@
-// Agent Hub — Kimi Code on all your machines, in one window.
+// Agent Hub — Kimi Code on all your machines, and Claude through the Claude
+// API (run by the hub on this computer), in one window.
 import { h, fill, icon, relTime, dayGroup, shortPath, baseName, copyText, clockTime, fmtCountdown } from './dom.js';
-import { get, post, put, del, connect, setToken } from './api.js';
+import { get, post, put, del, patch as apiPatch, connect, setToken } from './api.js';
 import { renderHunks, parseUnifiedDiff, renderMarkdown } from './markdown.js';
 import { openMenu, closeMenu, menuOpen, pointAnchor } from './menu.js';
 import { Transcript, todoList } from './transcript.js';
-import { Composer, PERMISSION_LABELS, EFFORT_LABELS, autoPauseStatus, whenText } from './composer.js';
+import { Composer, PERMISSION_LABELS, CLAUDE_PERMISSION_LABELS, EFFORT_LABELS, autoPauseStatus, whenText, agentName, fmtUsd } from './composer.js';
 import { ArtifactView, downloadHtml, htmlTitle } from './artifacts.js';
 
 const S = {
   config: null,
   machines: [],
-  sessions: new Map(), // hub sessions (Kimi conversations taken over by the hub)
+  sessions: new Map(), // hub sessions: Kimi conversations taken over by the hub, and Claude conversations
+  claude: null, // the Claude API account: { hasKey, keyHint, keySource, defaults, webTools }
+  claudeModels: null, // { defaultModel, models } this key can use
   cur: null, // { id, summary, seq, transcript }
   route: null,
   panel: null, // { tab: 'artifact' | 'changes', path, version, wide }
@@ -24,6 +27,8 @@ const S = {
 
 const INIT_PROMPT =
   '請分析這個專案：找出主要的設定檔、技術架構、建置與測試方式、程式碼的組織方式與開發慣例，然後把整理好的內容寫進專案根目錄的 AGENTS.md。已經有這個檔案的話，先讀它，保留仍然正確的部分，整理成一份完整的新版本。AGENTS.md 是給 AI coding agent 看的說明，讀者完全不了解這個專案。請使用這個專案的註解與文件主要使用的語言。';
+const CLAUDE_INIT_PROMPT =
+  '請分析這個專案：找出主要的設定檔、技術架構、建置與測試方式、程式碼的組織方式與開發慣例，然後把整理好的內容寫進專案根目錄的 CLAUDE.md。已經有這個檔案的話，先讀它，保留仍然正確的部分，整理成一份完整的新版本。CLAUDE.md 是給 Claude 看的專案說明，之後在這個資料夾開的 Claude 對話一開始就會讀到它；讀者完全不了解這個專案。請使用這個專案的註解與文件主要使用的語言。';
 
 // ------------------------------------------------------------- helpers
 
@@ -56,8 +61,12 @@ const defaults = () => S.config?.settings?.defaults || {};
 function resetHomeChoices() {
   const d = defaults();
   Object.assign(S.home, { model: d.model || '', effort: d.effort || '', permission: d.permission || 'manual', planMode: Boolean(d.planMode) });
+  // Claude's own defaults (Claude API 設定); the folder stays.
+  const c = S.claude?.defaults || {};
+  S.home.claude = { ...(S.home.claude || {}), model: c.model || '', effort: c.effort || '', permission: c.permission || 'manual', planMode: Boolean(c.planMode) };
   saveHome();
   updateHomeComposer();
+  updateClaudeHome();
 }
 
 function saveHome() {
@@ -68,6 +77,10 @@ function saveHome() {
 
 const machineById = (id) => S.machines.find((m) => m.id === id);
 const busy = (status) => status === 'running' || status === 'awaiting_permission';
+// Claude through the Claude API (run by the hub), as opposed to Kimi.
+const isClaude = (s) => s?.agentId === 'claude';
+const nameFor = (s) => agentName(isClaude(s) ? 'claude' : 'kimi');
+const hostName = () => S.config?.hostname || '這台電腦';
 
 function toast(text, { action, onAction, kind = '' } = {}) {
   const el = h('div', { class: `toast ${kind}`, role: 'status' }, h('span', null, text), action ? h('button', { class: 'om-btn om-btn--plain om-btn--sm', type: 'button', onclick: () => (onAction(), el.remove()) }, action) : null);
@@ -178,6 +191,8 @@ function rows() {
     }
   }
   for (const [key, s] of followed) out.push({ key, hub: s, machine: machineById(s.machineId), title: s.title, cwd: s.cwd, status: s.status, updatedAt: s.updatedAt, offline: !machineById(s.machineId)?.online });
+  // Claude conversations live on the hub itself.
+  for (const s of S.sessions.values()) if (isClaude(s)) out.push({ key: `claude:${s.id}`, hub: s, claude: true, title: s.title || '新對話', cwd: s.cwd, status: s.status, updatedAt: s.updatedAt });
   return out.sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
@@ -209,7 +224,7 @@ function drawSidebar() {
     multi,
     all.length,
     S.machines.some((m) => m.online),
-    [...groups].map(([g, rs]) => [g, rs.map((r) => [r.key, r.title, r.cwd, r.status, r.offline, r.kimi?.owner || r.hub?.meta?.owner, r.machine?.name, relTime(r.updatedAt)])]),
+    [...groups].map(([g, rs]) => [g, rs.map((r) => [r.key, r.title, r.cwd, r.status, r.offline, r.claude, r.kimi?.owner || r.hub?.meta?.owner, r.machine?.name, relTime(r.updatedAt)])]),
   ]);
   if (sig === lastSidebar) return;
   lastSidebar = sig;
@@ -220,7 +235,7 @@ function drawSidebar() {
       const href = r.hub ? `#/s/${r.hub.id}` : `#/k/${r.machine.id}/${r.kimi.id}`;
       const active = current && ((r.hub && r.hub.id === current.id) || (r.kimi && current.kimiSessionId === r.kimi.id && current.machineId === r.machine?.id));
       const owner = r.kimi?.owner || r.hub?.meta?.owner;
-      const sub = [owner === 'tui' ? '終端機' : null, multi && r.machine ? r.machine.name : null, r.cwd ? baseName(r.cwd) : null].filter(Boolean).join(' · ');
+      const sub = (r.claude ? ['Claude', r.cwd ? baseName(r.cwd) : null] : [owner === 'tui' ? '終端機' : null, multi && r.machine ? r.machine.name : null, r.cwd ? baseName(r.cwd) : null]).filter(Boolean).join(' · ');
       items.push(
         h(
           'a',
@@ -265,7 +280,7 @@ function drawSidebar() {
     }
   }
   if (!all.length) {
-    items.push(h('div', { class: 'side-empty' }, S.machines.some((m) => m.online) ? '在任一台電腦的 Kimi 裡輸入 /web，或在這裡開一個新對話。' : '連接一台電腦後，它的 Kimi 對話會出現在這裡。'));
+    items.push(h('div', { class: 'side-empty' }, S.machines.some((m) => m.online) ? '在任一台電腦的 Kimi 裡輸入 /web，或在這裡開一個新對話（Kimi 或 Claude）。' : '在這裡開一個 Claude 對話，或連接一台電腦使用 Kimi，對話會出現在這裡。'));
   }
   fill($list, ...items);
   $search.parentElement.hidden = all.length < 8 && !S.query;
@@ -275,6 +290,7 @@ function drawSidebar() {
 
 // Right-click (or the … button) on a conversation in the sidebar.
 function rowMenu(r, anchor) {
+  if (r.claude) return claudeRowMenu(r, anchor);
   const href = r.hub ? `#/s/${r.hub.id}` : `#/k/${r.machine?.id}/${r.kimi?.id}`;
   const reachable = r.machine?.online && r.machine.kimi?.available;
   const kid = r.kimi?.id || r.hub?.kimiSessionId;
@@ -291,6 +307,44 @@ function rowMenu(r, anchor) {
     ].filter(Boolean),
     { width: 200 },
   );
+}
+
+function claudeRowMenu(r, anchor) {
+  openMenu(
+    anchor,
+    [
+      { label: '在新分頁開啟', onSelect: () => window.open(`${location.pathname}#/s/${r.hub.id}`, '_blank', 'noopener') },
+      { label: '重新命名…', onSelect: () => renameClaude(r.hub) },
+      { label: S.pins.has(r.key) ? '取消釘選' : '釘選', onSelect: () => togglePin(r.key) },
+      r.cwd ? { label: '複製資料夾路徑', onSelect: () => copyText(r.cwd).then(() => toast('已複製')) } : null,
+      { separator: true },
+      { label: '刪除…', destructive: true, onSelect: () => deleteClaude(r.hub) },
+    ].filter(Boolean),
+    { width: 200 },
+  );
+}
+
+async function renameClaude(s) {
+  const title = await promptDialog({ title: '要把對話改成什麼名稱？', value: s.title, action: '重新命名' });
+  if (!title?.trim() || title.trim() === s.title) return;
+  try {
+    upsertSession(await apiPatch(`/sessions/${s.id}`, { title: title.trim() }));
+  } catch (err) {
+    fail(err);
+  }
+}
+
+async function deleteClaude(s) {
+  const ok = await confirmDialog({ title: `要刪除「${s.title}」嗎？`, body: '對話紀錄會從中控台刪除。資料夾裡的檔案不會動。', action: '刪除', destructive: true });
+  if (!ok) return;
+  try {
+    await del(`/sessions/${s.id}`);
+    S.pins.delete(`claude:${s.id}`);
+    if (S.cur?.id === s.id) go('#/');
+    toast('已刪除對話');
+  } catch (err) {
+    fail(err);
+  }
 }
 
 async function renameRow(r, mid, kid) {
@@ -351,8 +405,9 @@ function settingsMenu(anchor) {
       { label: '淺色', checked: t === 'light', onSelect: () => applyTheme('light') },
       { label: '深色', checked: t === 'dark', onSelect: () => applyTheme('dark') },
       { separator: true },
-      canNotify ? { label: '開啟通知', description: 'Kimi 需要你的時候通知你', onSelect: () => Notification.requestPermission().then(() => toast('已開啟通知')) } : null,
-      { label: '設定…', description: '新對話預設的模型、思考強度、權限', onSelect: openSettings },
+      canNotify ? { label: '開啟通知', description: 'Kimi 或 Claude 需要你的時候通知你', onSelect: () => Notification.requestPermission().then(() => toast('已開啟通知')) } : null,
+      { label: '設定…', description: 'Kimi 新對話預設的模型、思考強度、權限', onSelect: openSettings },
+      { label: 'Claude API…', description: 'API key 與 Claude 新對話的預設', onSelect: claudeDialog },
       { label: '連接電腦…', onSelect: openMachines },
       { label: '登出', destructive: true, onSelect: logout },
     ].filter(Boolean),
@@ -377,7 +432,7 @@ function checkAttention(all) {
     if (here && document.hasFocus()) continue;
     const open = () => go(r.hub ? `#/s/${r.hub.id}` : `#/k/${r.machine.id}/${r.kimi.id}`);
     if (!here) toast(`「${r.title}」需要你核准`, { action: '查看', onAction: open });
-    notify('Kimi 需要你', r.title, open);
+    notify(`${r.claude ? 'Claude' : 'Kimi'} 需要你`, r.title, open);
   }
 }
 
@@ -424,7 +479,7 @@ async function showArtifacts() {
     return fill(body, h('div', { class: 'panel-empty' }, err.message));
   }
   if (S.route !== 'artifacts') return;
-  if (!list.length) return fill(body, h('div', { class: 'artifacts-empty' }, h('div', { class: 'large-title' }, '還沒有 Artifact'), h('p', { class: 'home-lead' }, '請 Kimi 做一個頁面（例如輸入 /artifact 做一個進度頁），它寫的 HTML 會出現在這裡。')));
+  if (!list.length) return fill(body, h('div', { class: 'artifacts-empty' }, h('div', { class: 'large-title' }, '還沒有 Artifact'), h('p', { class: 'home-lead' }, '請 Kimi 或 Claude 做一個頁面（例如輸入 /artifact 做一個進度頁），它寫的 HTML 會出現在這裡。')));
   fill(
     body,
     h(
@@ -467,11 +522,30 @@ function homeMachine() {
   return machineById(S.home.machineId && ready.some((m) => m.id === S.home.machineId) ? S.home.machineId : ready[0]?.id) || null;
 }
 
+// Which agent a new conversation goes to: Kimi on a connected machine, or
+// Claude through the Claude API, run here.
+const homeAgent = () => S.home.agent || (S.machines.length ? 'kimi' : 'claude');
+
+function agentSwitch(cur) {
+  const pick = (a) => {
+    S.home.agent = a;
+    saveHome();
+    showHome();
+  };
+  return h(
+    'div',
+    { class: 'om-seg om-seg--sm home-agent', role: 'group', 'aria-label': '用哪個 agent' },
+    h('button', { class: 'om-seg__item', type: 'button', 'aria-pressed': String(cur === 'kimi'), title: '你電腦上的 Kimi Code（用那台電腦登入的 Kimi 帳號）', onclick: () => pick('kimi') }, 'Kimi Code'),
+    h('button', { class: 'om-seg__item', type: 'button', 'aria-pressed': String(cur === 'claude'), title: 'Claude API（Claude Console 的 API key，按用量計費）', onclick: () => pick('claude') }, 'Claude API'),
+  );
+}
+
 async function showHome() {
   leaveSession();
   S.route = 'home';
   hidePanel();
   renderToolbar();
+  if (homeAgent() === 'claude') return showClaudeHome();
   const m = homeMachine();
   if (!S.machines.length) {
     fill(
@@ -482,6 +556,7 @@ async function showHome() {
         h(
           'div',
           { class: 'home-inner empty' },
+          agentSwitch('kimi'),
           h('div', { class: 'large-title' }, '先連接一台電腦'),
           h('p', { class: 'home-lead' }, '中控台透過你電腦上的連接器操作 Kimi Code。Kimi 只在你自己的電腦上登入，中控台不需要你的 Kimi 帳號。'),
           h('button', { class: 'om-btn om-btn--primary om-btn--lg', type: 'button', onclick: openMachines }, '連接電腦…'),
@@ -517,6 +592,7 @@ async function showHome() {
       h(
         'div',
         { class: 'home-inner' },
+        agentSwitch('kimi'),
         h('div', { class: 'large-title' }, '要讓 Kimi 做什麼？'),
         homeComposer.el,
         h('p', { class: 'home-hint' }, m ? `會在「${m.name}」上的 Kimi 執行，用那台電腦登入的帳號。` : '連接的電腦目前都沒有執行中的 Kimi。在那台電腦的 Kimi 裡輸入 /web，或執行 kimi web。'),
@@ -606,6 +682,145 @@ function folderMenu(anchor) {
   );
 }
 
+// ---------------------------------------------------------- Claude home
+
+let claudeHomeComposer = null;
+
+function showClaudeHome() {
+  const acc = S.claude || {};
+  claudeHomeComposer ??= new Composer({
+    home: true,
+    agent: 'claude',
+    placeholder: '要讓 Claude 做什麼？輸入 / 看指令',
+    onSend: startClaudeSession,
+    onCommand: claudeHomeCommand,
+    onStop: () => {},
+    onConfig: (c) => {
+      const x = (S.home.claude ??= {});
+      if (c.model) x.model = c.model;
+      if (c.effort) x.effort = c.effort;
+      if (c.permission) x.permission = c.permission;
+      if ('planMode' in c) x.planMode = c.planMode;
+      saveHome();
+      updateClaudeHome();
+    },
+    onPickFolder: claudeFolderMenu,
+    onError: (t) => toast(t),
+  });
+  claudeHomeComposer.setKey('home-claude');
+  fill(
+    $view,
+    h(
+      'div',
+      { class: 'home' },
+      h(
+        'div',
+        { class: 'home-inner' },
+        agentSwitch('claude'),
+        h('div', { class: 'large-title' }, '要讓 Claude 做什麼？'),
+        acc.hasKey
+          ? null
+          : h(
+              'div',
+              { class: 'callout claude-key' },
+              icon('alert'),
+              h('div', { class: 'callout-text' }, '還沒有設定 Claude API key。中控台用你在 Claude Console 建立的 API key 呼叫 Claude API，按用量從 Console 帳戶的額度扣款；不經過 Claude Code，也不用 Pro／Max 訂閱。'),
+              h('button', { class: 'om-btn om-btn--primary om-btn--sm', type: 'button', onclick: claudeDialog }, '設定 API key…'),
+            ),
+        claudeHomeComposer.el,
+        h(
+          'p',
+          { class: 'home-hint' },
+          `在中控台這台電腦（${hostName()}）上執行，用 Claude API key 按用量計費。`,
+          h('button', { class: 'linklike', type: 'button', onclick: claudeDialog }, 'Claude API 設定…'),
+        ),
+      ),
+    ),
+  );
+  updateClaudeHome();
+  claudeHomeComposer.focus();
+  loadClaudeModels();
+}
+
+async function loadClaudeModels(force = false) {
+  if (S.claudeModels && !force) return S.claudeModels;
+  try {
+    S.claudeModels = await get('/claude/models');
+    updateClaudeHome();
+  } catch {}
+  return S.claudeModels;
+}
+
+function updateClaudeHome() {
+  if (!claudeHomeComposer) return;
+  const x = S.home.claude || {};
+  const models = S.claudeModels?.models || [];
+  claudeHomeComposer.update({
+    agent: 'claude',
+    machineName: hostName(),
+    folderName: x.cwd ? baseName(x.cwd) : '新資料夾',
+    models,
+    defaultModel: S.claudeModels?.defaultModel,
+    model: x.model && models.some((m) => m.id === x.model) ? x.model : S.claudeModels?.defaultModel || '',
+    effort: x.effort,
+    permission: x.permission || 'manual',
+    planMode: Boolean(x.planMode),
+  });
+}
+
+function claudeHomeCommand(name) {
+  if (['model', 'effort', 'permission'].includes(name)) return claudeHomeComposer.openControl(name) || toast('這個模型沒有提供這個選項');
+  if (name === 'plan') return claudeHomeComposer.opts.onConfig({ planMode: !S.home.claude?.planMode });
+  if (['manual', 'edits', 'auto'].includes(name)) return claudeHomeComposer.opts.onConfig({ permission: name });
+  if (name === 'status') return claudeDialog();
+}
+
+// Folders on the hub's own computer, where Claude's tools run.
+function claudeFolderMenu(anchor) {
+  const recent = [...new Set([...S.sessions.values()].filter(isClaude).sort((a, b) => b.updatedAt - a.updatedAt).map((s) => s.cwd).filter(Boolean))].slice(0, 6);
+  const pick = (cwd) => {
+    S.home.claude = { ...(S.home.claude || {}), cwd };
+    saveHome();
+    updateClaudeHome();
+  };
+  const home = S.config?.home;
+  openMenu(
+    anchor,
+    [
+      recent.length ? { section: '最近使用' } : null,
+      ...recent.map((p) => ({ label: baseName(p), description: shortPath(p, home, 4), onSelect: () => pick(p) })),
+      recent.length ? { separator: true } : null,
+      { label: '瀏覽資料夾…', description: `「${hostName()}」上的資料夾`, onSelect: () => browseFolders({ id: null, name: hostName(), home }, pick, S.home.claude?.cwd) },
+      { label: '新的空白資料夾', description: S.config?.workspacesDir ? `在 ${shortPath(S.config.workspacesDir, home, 3)} 建立` : null, onSelect: () => pick(null) },
+    ].filter(Boolean),
+    { width: 300 },
+  );
+}
+
+async function startClaudeSession({ text, images }) {
+  if (!S.claude?.hasKey) {
+    claudeHomeComposer.setText(text);
+    return claudeDialog();
+  }
+  const x = S.home.claude || {};
+  const list = S.claudeModels?.models || [];
+  const model = x.model && list.some((m) => m.id === x.model) ? x.model : undefined;
+  const used = list.find((m) => m.id === (model || S.claudeModels?.defaultModel));
+  const effort = x.effort && (!used || used.efforts.includes(x.effort)) ? x.effort : undefined;
+  claudeHomeComposer.el.classList.add('sending');
+  try {
+    const s = await post('/sessions', { agent: 'claude', cwd: x.cwd || undefined, prompt: text, images, model, effort, permission: x.permission, planMode: x.planMode || undefined });
+    S.sessions.set(s.id, s);
+    resetHomeChoices();
+    go(`#/s/${s.id}`);
+  } catch (err) {
+    claudeHomeComposer.setText(text);
+    fail(err);
+  } finally {
+    claudeHomeComposer.el.classList.remove('sending');
+  }
+}
+
 async function startSession({ text, images }) {
   const m = homeMachine();
   if (!m) return openMachines();
@@ -669,6 +884,7 @@ async function openSession(id) {
   cur.ping = setInterval(() => document.visibilityState === 'visible' && post(`/sessions/${id}/viewing`).catch(() => {}), 60_000);
   cur.transcript = new Transcript({
     cwd: summary?.cwd,
+    agentName: nameFor(summary),
     onRespond: respond,
     onOpenArtifact: (path, version) => showArtifact(path, version),
     onArtifacts: (list) => {
@@ -719,7 +935,7 @@ async function openSession(id) {
     onBackground: moveToBackground,
   });
   composer.setKey(id);
-  composer.update({ agentsWorking: 0, foreground: 0 });
+  composer.update({ agent: isClaude(summary) ? 'claude' : 'kimi', agentsWorking: 0, foreground: 0 });
   cur.composerSig = '';
   fill($view, h('div', { class: 'session' }, cur.transcript.el, h('div', { class: 'composer-dock' }, composer.el)));
   renderToolbar();
@@ -749,6 +965,7 @@ function applySnapshot(full) {
   cur.loading = true; // pages already there are not "new" while it loads
   S.sessions.set(summary.id, summary);
   cur.transcript.opts.cwd = summary.cwd;
+  cur.transcript.opts.agentName = nameFor(summary);
   cur.transcript.load(events);
   cur.loading = false;
   cur.transcript.setStatus(summary.status, busy(summary.status) ? lastUserTs(events) : null, summary.meta?.tps || 0);
@@ -777,6 +994,9 @@ function updateComposer() {
   }
   const meta = s.meta || {};
   const state = {
+    agent: isClaude(s) ? 'claude' : 'kimi',
+    cost: isClaude(s) ? s.usage?.costUsd || 0 : null,
+    budget: meta.budget || null,
     running: s.status === 'running',
     awaiting: s.status === 'awaiting_permission',
     queue: meta.queue || [],
@@ -817,7 +1037,7 @@ function renderToolbar() {
     return;
   }
   const m = machineById(s.machineId);
-  const sub = [m?.name || s.meta?.machineName, s.cwd ? shortPath(s.cwd, m?.home, 3) : null].filter(Boolean).join(' · ');
+  const sub = (isClaude(s) ? ['Claude API', hostName(), s.cwd ? shortPath(s.cwd, S.config?.home, 3) : null] : [m?.name || s.meta?.machineName, s.cwd ? shortPath(s.cwd, m?.home, 3) : null]).filter(Boolean).join(' · ');
   const arts = S.artifacts.length;
   fill(
     $toolbar,
@@ -833,6 +1053,7 @@ function renderToolbar() {
         m && !m.online ? h('span', { class: 'om-badge om-badge--danger' }, '電腦離線') : null,
         s.meta?.owner === 'tui' ? h('span', { class: 'om-badge', title: s.meta.guess ? '同一個資料夾有終端機的 Kimi 開著，可能正在用這個對話，這裡先只能看' : s.meta.controllable ? '在終端機的 Kimi 裡執行，可以從這裡操作' : '在終端機的 Kimi 裡執行，這裡只能看' }, s.meta.controllable ? '終端機' : '終端機 · 唯讀') : null,
         autoPauseBadge(s),
+        isClaude(s) && s.meta?.budget ? h('button', { class: `om-badge${(s.usage?.costUsd || 0) >= s.meta.budget ? ' om-badge--warning' : ''}`, type: 'button', title: '這個對話的花費上限', onclick: budgetDialog }, `上限 ${fmtUsd(s.meta.budget)}`) : null,
       ),
     ),
     h('span', { class: 'om-toolbar__spacer' }),
@@ -844,6 +1065,7 @@ function renderToolbar() {
 function sessionMenu(anchor) {
   const s = S.cur?.summary;
   if (!s) return;
+  if (isClaude(s)) return claudeSessionMenu(s, anchor);
   openMenu(
     anchor,
     [
@@ -855,6 +1077,25 @@ function sessionMenu(anchor) {
       { label: '複製資料夾路徑', onSelect: () => copyText(s.cwd || '').then(() => toast('已複製')) },
       { separator: true },
       { label: '刪除對話…', destructive: true, onSelect: () => deleteRow({ key: `${s.machineId}:${s.kimiSessionId}`, title: s.title }, s.machineId, s.kimiSessionId) },
+    ],
+    { align: 'end', width: 220 },
+  );
+}
+
+function claudeSessionMenu(s, anchor) {
+  openMenu(
+    anchor,
+    [
+      { label: '重新命名…', onSelect: renameSession },
+      { label: '複製成新對話', hint: '/fork', onSelect: () => sessionCommand('fork', '') },
+      { label: '壓縮對話', hint: '/compact', onSelect: () => sessionCommand('compact', '') },
+      { label: '撤回上一輪', hint: '/undo', onSelect: () => sessionCommand('undo', '') },
+      { label: '用量與花費', hint: '/cost', onSelect: claudeCostDialog },
+      { label: '花費上限…', hint: s.meta?.budget ? fmtUsd(s.meta.budget) : '關', onSelect: budgetDialog },
+      { label: '定時送出…', hint: s.scheduled?.length ? `${s.scheduled.length} 則` : '/later', onSelect: () => scheduleDialog() },
+      { label: '複製資料夾路徑', onSelect: () => copyText(s.cwd || '').then(() => toast('已複製')) },
+      { separator: true },
+      { label: '刪除對話…', destructive: true, onSelect: () => deleteClaude(s) },
     ],
     { align: 'end', width: 220 },
   );
@@ -894,10 +1135,10 @@ async function configure(change) {
   if (!s) return;
   try {
     await post(`/sessions/${s.id}/config`, change);
-    // Kimi keeps the turn it is in on what it started with.
+    // The agent keeps the turn it is in on what it started with.
     if (busy(s.status) && (change.model || change.effort)) {
       const what = change.effort ? `思考強度改成「${EFFORT_LABELS[change.effort] || change.effort}」` : '模型已切換';
-      toast(`${what}，從下一輪開始生效：Kimi 每一輪開始時就固定模型和思考強度，正在進行的這一輪不變`);
+      toast(`${what}，從下一輪開始生效：${nameFor(s)} 每一輪開始時就固定模型和思考強度，正在進行的這一輪不變`);
     }
   } catch (err) {
     fail(err);
@@ -917,6 +1158,7 @@ async function respond(ev, optionId, extra = {}) {
 async function sessionCommand(name, args) {
   const s = S.cur?.summary;
   if (!s) return;
+  if (isClaude(s)) return claudeCommand(s, name, args);
   const meta = s.meta || {};
   switch (name) {
     case 'model':
@@ -980,6 +1222,63 @@ async function sessionCommand(name, args) {
       toast('已複製成新對話', { action: '開啟', onAction: () => go(`#/s/${r.session.id}`) });
     } else if (name === 'undo') toast('已撤回上一輪');
     else if (name === 'goal') toast('已更新目標');
+  } catch (err) {
+    fail(err);
+  }
+}
+
+// Slash commands in a Claude conversation. What the hub does on its own
+// (compact, undo, fork, title, budget) goes to the server.
+async function claudeCommand(s, name, args) {
+  const meta = s.meta || {};
+  switch (name) {
+    case 'model':
+    case 'effort':
+    case 'permission':
+      if (!composer.openControl(name)) toast('這個模型沒有提供這個選項');
+      return;
+    case 'plan':
+      return configure({ planMode: !meta.planMode });
+    case 'manual':
+    case 'edits':
+    case 'auto':
+      await configure({ permission: name });
+      return toast(`權限模式：${CLAUDE_PERMISSION_LABELS[name]}`);
+    case 'new':
+      S.home.agent = 'claude';
+      S.home.claude = { ...(S.home.claude || {}), cwd: s.cwd };
+      saveHome();
+      return go('#/');
+    case 'copy': {
+      const last = S.cur.transcript.all().reverse().find((e) => e.type === 'text' && !e.parent && e.text?.trim());
+      if (!last) return toast('還沒有回覆可以複製');
+      await copyText(last.text);
+      return toast('已複製 Claude 的回覆');
+    }
+    case 'init':
+      return sendMessage({ text: CLAUDE_INIT_PROMPT, images: [] });
+    case 'cost':
+    case 'usage':
+      return claudeCostDialog();
+    case 'status':
+      return claudeStatusDialog();
+    case 'later':
+      return laterCommand(args);
+    case 'bg':
+    case 'background':
+      return toast('Claude 由中控台直接執行，沒有前景工作需要移到背景');
+    case 'autopause':
+      return toast('自動暫停看的是 Kimi 方案的 5 小時額度。Claude API 按用量計費，可以用 /budget 設定這個對話的花費上限。');
+  }
+  try {
+    const r = await post(`/sessions/${s.id}/command`, { name, args });
+    if (r.session) {
+      S.sessions.set(r.session.id, r.session);
+      renderSidebar();
+      toast('已複製成新對話', { action: '開啟', onAction: () => go(`#/s/${r.session.id}`) });
+    } else if (name === 'undo') toast('已撤回上一輪對話（檔案的修改不會還原）');
+    else if (name === 'compact') toast('已壓縮對話');
+    else if (name === 'budget') toast(/^(|off|關|關閉|0)$/i.test(String(args).trim()) ? '已關閉花費上限' : `花費上限：US$${String(args).trim().replace(/^us\$|^\$/i, '')}`);
   } catch (err) {
     fail(err);
   }
@@ -1739,8 +2038,10 @@ function fetchUsage(machineId) {
   return p;
 }
 
-// The 5-hour and 7-day quota under the context ring's menu.
+// The 5-hour and 7-day quota under the context ring's menu (for Claude:
+// what the conversation has cost, and the API's rate limits).
 function quotaMenuNode() {
+  if (isClaude(S.cur?.summary)) return claudeCostNode();
   const mid = S.cur?.summary?.machineId;
   if (!mid) return null;
   const box = h('div', { class: 'menu-quota' }, h('div', { class: 'muted' }, '讀取方案用量…'));
@@ -1787,6 +2088,260 @@ async function accountDialog(machineId, rows = null) {
     info.length ? h('dl', { class: 'kv' }, info.flatMap(([k, v]) => [h('dt', null, k), h('dd', null, v)])) : null,
     h('div', { class: 'dialog-actions' }, h('button', { class: 'om-btn om-btn--primary', type: 'button', onclick: () => d.close() }, '好')),
   );
+}
+
+// ----------------------------------------------------------- Claude API
+
+const CONSOLE_KEYS = 'https://console.anthropic.com/settings/keys';
+const CONSOLE_BILLING = 'https://console.anthropic.com/settings/billing';
+
+// Claude API 設定: the Console API key (sent here once, never shown again
+// in full) and the defaults for new Claude conversations.
+async function claudeDialog() {
+  let acc = S.claude || {};
+  try {
+    acc = S.claude = await get('/claude');
+  } catch {}
+  const list = (await loadClaudeModels())?.models || [];
+  const d0 = acc.defaults || {};
+  const form = h('form', { class: 'settings claude-settings' });
+  const keyInput = h('input', { class: 'om-input', type: 'password', autocomplete: 'off', spellcheck: false, placeholder: acc.hasKey ? '貼上新的 key 來更換' : 'sk-ant-api03-…', 'aria-label': 'Claude API key' });
+  const keyNote = h('span', { class: 'om-field__help' });
+  const testOut = h('div', { class: 'claude-test', role: 'status' });
+  const drawKey = () => {
+    fill(
+      keyNote,
+      acc.hasKey
+        ? acc.keySource === 'env'
+          ? `目前用的是環境變數 ANTHROPIC_API_KEY（${acc.keyHint}）。在這裡貼上 key 會改用這把。`
+          : `已設定：${acc.keyHint}。key 只存在這台中控台，不會再傳回瀏覽器。`
+        : '還沒有設定。',
+    );
+  };
+  drawKey();
+  const modelSel = h('select', { class: 'om-input', name: 'model' }, ...list.map((x) => h('option', { value: x.id, selected: x.id === d0.model }, x.name || x.id)));
+  if (d0.model && !list.some((x) => x.id === d0.model)) modelSel.append(h('option', { value: d0.model, selected: true }, d0.model));
+  const effortSel = h('select', { class: 'om-input', name: 'effort' });
+  const fillEfforts = () => {
+    const mod = list.find((x) => x.id === modelSel.value);
+    const efforts = mod?.efforts || [];
+    const cur = effortSel.value || d0.effort;
+    fill(effortSel, ...efforts.map((e) => h('option', { value: e, selected: e === cur }, `${EFFORT_LABELS[e] || e}${e === mod.defaultEffort ? '（模型預設）' : ''}`)));
+    effortSel.disabled = efforts.length < 2;
+  };
+  modelSel.addEventListener('change', fillEfforts);
+  fillEfforts();
+  const permSel = h('select', { class: 'om-input', name: 'permission' }, ...Object.entries(CLAUDE_PERMISSION_LABELS).map(([k, v]) => h('option', { value: k, selected: k === (d0.permission || 'manual') }, v)));
+  const plan = h('input', { class: 'om-switch', type: 'checkbox', checked: Boolean(d0.planMode) });
+  const web = h('input', { class: 'om-switch', type: 'checkbox', checked: acc.webTools !== false });
+  const field = (label, control, help) => h('label', { class: 'om-field' }, h('span', { class: 'om-field__label' }, label), control, help ? (typeof help === 'string' ? h('span', { class: 'om-field__help' }, help) : help) : null);
+  const test = async () => {
+    fill(testOut, h('span', { class: 'spinner' }), ' 連線中…');
+    testOut.className = 'claude-test';
+    try {
+      const r = await post('/claude/test');
+      testOut.className = `claude-test ${r.ok ? 'ok' : 'bad'}`;
+      fill(testOut, r.message);
+      if (r.ok) S.claudeModels = { defaultModel: S.claudeModels?.defaultModel, models: r.models };
+    } catch (err) {
+      testOut.className = 'claude-test bad';
+      fill(testOut, err.message);
+    }
+  };
+  const removeKey = async () => {
+    if (!(await confirmDialog({ title: '要移除這把 API key 嗎？', body: '移除後，Claude 對話要等你再設定一把 key 才能繼續。這不會撤銷 key 本身，要撤銷請到 Claude Console。', action: '移除', destructive: true }))) return;
+    try {
+      acc = S.claude = await put('/claude', { clearKey: true });
+      drawKey();
+      fill(testOut);
+      toast('已移除 API key');
+    } catch (err) {
+      fail(err);
+    }
+  };
+  const save = async (e) => {
+    e.preventDefault();
+    const key = keyInput.value.trim();
+    fill(testOut, key ? [h('span', { class: 'spinner' }), ' 向 Anthropic 確認這把 key…'] : null);
+    testOut.className = 'claude-test';
+    try {
+      acc = S.claude = await put('/claude', {
+        apiKey: key || undefined,
+        defaults: { model: modelSel.value, effort: effortSel.disabled ? '' : effortSel.value, permission: permSel.value, planMode: plan.checked },
+        webTools: web.checked,
+      });
+      if (key) loadClaudeModels(true);
+      resetHomeChoices();
+      d.close();
+      toast(key ? '已設定 Claude API key' : '已儲存 Claude 設定');
+      if (S.route === 'home') showHome();
+    } catch (err) {
+      testOut.className = 'claude-test bad';
+      fill(testOut, err.message);
+    }
+  };
+  fill(
+    form,
+    h('div', { class: 'dialog-title' }, 'Claude API'),
+    h(
+      'p',
+      { class: 'dialog-text settings-lead' },
+      '中控台直接呼叫 Anthropic 官方的 Claude API（api.anthropic.com），用你在 Claude Console 建立的 API key，依用量（token）從 Console 帳戶的額度扣款。不會經過 Claude Code，也不會用到 Claude Pro／Max 訂閱；訂閱帳號的登入 token（sk-ant-oat…）會被拒絕。',
+    ),
+    field('API key', keyInput, keyNote),
+    h(
+      'div',
+      { class: 'claude-key-actions' },
+      h('a', { class: 'om-btn om-btn--sm', href: CONSOLE_KEYS, target: '_blank', rel: 'noopener' }, '到 Claude Console 建立 key'),
+      acc.hasKey ? h('button', { class: 'om-btn om-btn--sm', type: 'button', onclick: test }, '測試連線') : null,
+      acc.hasKey && acc.keySource === 'hub' ? h('button', { class: 'om-btn om-btn--sm om-btn--destructive', type: 'button', onclick: removeKey }, '移除 key') : null,
+    ),
+    testOut,
+    h('div', { class: 'dialog-subtitle' }, '新對話的預設'),
+    field('模型', modelSel, list.length ? null : '設定 API key 後，會列出這把 key 能用的模型'),
+    field('思考強度', effortSel, '越高越仔細，也花越多 token'),
+    field('權限', permSel, '每次詢問：修改檔案和執行指令前都問你 · 自動接受編輯：只有指令要問 · 全部自動：不會打斷你'),
+    h('label', { class: 'settings-switch' }, plan, h('span', null, h('span', { class: 'om-field__label' }, '計畫模式'), h('span', { class: 'om-field__help' }, '先規劃，你同意後才動手'))),
+    h('label', { class: 'settings-switch' }, web, h('span', null, h('span', { class: 'om-field__label' }, '網路搜尋與讀取網頁'), h('span', { class: 'om-field__help' }, 'Anthropic 端執行；搜尋每 1000 次 US$10 另計'))),
+    h('div', { class: 'dialog-actions' }, h('button', { class: 'om-btn', type: 'button', onclick: () => d.close() }, '取消'), h('button', { class: 'om-btn om-btn--primary', type: 'submit' }, '儲存')),
+  );
+  form.addEventListener('submit', save);
+  const d = dialog(form);
+  if (!acc.hasKey) setTimeout(() => keyInput.focus(), 0);
+}
+
+// "已用 12 / 50": one of the API's rate limits, as of the last response.
+const RATE_LIMITS = { requests: '每分鐘請求', 'input-tokens': '每分鐘輸入 tokens', 'output-tokens': '每分鐘輸出 tokens', tokens: '每分鐘 tokens' };
+function rateBars(rl, only) {
+  if (!rl) return [];
+  return Object.entries(RATE_LIMITS)
+    .filter(([k]) => rl[k]?.limit && (!only || only.includes(k)))
+    .map(([k, label]) => {
+      const { limit, remaining, reset } = rl[k];
+      const pct = Math.round(Math.min(1, Math.max(0, (limit - remaining) / limit)) * 100);
+      return h(
+        'div',
+        { class: 'quota' },
+        h('div', { class: 'quota-head' }, h('span', null, label), h('span', { class: 'muted' }, `剩 ${fmtK(remaining)} / ${fmtK(limit)}`)),
+        h('div', { class: `quota-bar${pct >= 90 ? ' danger' : pct >= 75 ? ' warning' : ''}` }, h('span', { style: { width: `${pct}%` } })),
+      );
+    });
+}
+
+// Under the context ring: what this conversation cost, against its cap.
+function claudeCostNode() {
+  const s = S.cur?.summary;
+  const meta = s?.meta || {};
+  const cost = s?.usage?.costUsd || 0;
+  const cap = meta.budget;
+  const pct = cap ? Math.round(Math.min(1, cost / cap) * 100) : 0;
+  return h(
+    'div',
+    { class: 'menu-quota' },
+    h(
+      'div',
+      { class: 'quota' },
+      h('div', { class: 'quota-head' }, h('span', null, '這個對話'), h('span', { class: 'muted' }, cap ? `約 ${fmtUsd(cost)} / 上限 ${fmtUsd(cap)}` : `約 ${fmtUsd(cost)}`)),
+      cap ? h('div', { class: `quota-bar${pct >= 90 ? ' danger' : pct >= 75 ? ' warning' : ''}` }, h('span', { style: { width: `${pct}%` } })) : null,
+    ),
+    ...rateBars(meta.rateLimits, ['requests', 'output-tokens']),
+  );
+}
+
+function claudeCostDialog() {
+  const s = S.cur?.summary;
+  if (!s) return;
+  const meta = s.meta || {};
+  const u = meta.claudeUsage || {};
+  const t = (n) => `${fmtK(n || 0)} tokens`;
+  const rows = [
+    ['這個對話', `約 ${fmtUsd(s.usage?.costUsd || 0)}${u.unpriced ? '（有用到中控台不知道價格的模型，那部分沒算進去）' : ''}`],
+    ['API 請求', `${u.requests || 0} 次`],
+    ['輸入', t(u.input)],
+    ['快取讀取', `${t(u.cacheRead)}（約 1 折）`],
+    ['快取寫入', `${t(u.cacheWrite)}（1.25 倍）`],
+    ['輸出', `${t(u.output)}（含思考）`],
+    u.searches ? ['網路搜尋', `${u.searches} 次`] : null,
+    ['花費上限', meta.budget ? fmtUsd(meta.budget) : '沒有設定'],
+  ].filter(Boolean);
+  const bars = rateBars(meta.rateLimits);
+  const body = h(
+    'div',
+    { class: 'account' },
+    h('div', { class: 'dialog-title' }, '用量與花費'),
+    h('dl', { class: 'kv' }, rows.flatMap(([k, v]) => [h('dt', null, k), h('dd', null, v)])),
+    bars.length ? [h('div', { class: 'dialog-subtitle' }, 'API 速率限制（最近一次回應）'), h('div', { class: 'quotas' }, bars)] : null,
+    h(
+      'p',
+      { class: 'quota-note muted' },
+      '金額是中控台依 Claude API 公開價格估計的，實際以 Claude Console 的帳單為準。一般 API key 讀不到帳戶餘額，請到 ',
+      h('a', { href: CONSOLE_BILLING, target: '_blank', rel: 'noopener' }, 'Claude Console → Billing'),
+      ' 查看。',
+    ),
+    h('div', { class: 'dialog-actions' }, h('button', { class: 'om-btn', type: 'button', onclick: () => (d.close(), budgetDialog()) }, '花費上限…'), h('button', { class: 'om-btn om-btn--primary', type: 'button', onclick: () => d.close() }, '好')),
+  );
+  const d = dialog(body);
+}
+
+function claudeStatusDialog() {
+  const s = S.cur?.summary;
+  if (!s) return;
+  const meta = s.meta || {};
+  const model = (meta.models || []).find((x) => x.id === meta.model);
+  const ctx = meta.context;
+  const acc = S.claude || {};
+  const rows = [
+    ['模型', model?.name || meta.model || '—'],
+    meta.effort ? ['思考強度', EFFORT_LABELS[meta.effort] || meta.effort] : null,
+    ['權限', `${CLAUDE_PERMISSION_LABELS[meta.permission] || CLAUDE_PERMISSION_LABELS.manual}${meta.planMode ? ' · 計畫模式' : ''}`],
+    ctx?.size ? ['Context', `${Math.round((ctx.used / ctx.size) * 100)}% · ${fmtK(ctx.used)} / ${fmtK(ctx.size)} tokens`] : null,
+    ['花費', `約 ${fmtUsd(s.usage?.costUsd || 0)}${meta.budget ? `（上限 ${fmtUsd(meta.budget)}）` : ''}`],
+    ['資料夾', s.cwd || '—'],
+    ['執行在', `中控台這台電腦（${hostName()}）`],
+    ['計費', 'Claude API · Console 帳戶，按 token'],
+    ['API key', acc.hasKey ? `${acc.keyHint}${acc.keySource === 'env' ? '（環境變數）' : ''}` : '還沒有設定'],
+  ].filter(Boolean);
+  const body = h(
+    'div',
+    { class: 'account' },
+    h('div', { class: 'dialog-title' }, '狀態'),
+    h('dl', { class: 'kv' }, rows.flatMap(([k, v]) => [h('dt', null, k), h('dd', null, v)])),
+    h('div', { class: 'dialog-actions' }, h('button', { class: 'om-btn', type: 'button', onclick: () => (d.close(), claudeDialog()) }, 'Claude API 設定…'), h('button', { class: 'om-btn om-btn--primary', type: 'button', onclick: () => d.close() }, '好')),
+  );
+  const d = dialog(body);
+}
+
+// 花費上限: the conversation stops (between steps) once it has cost this much.
+function budgetDialog() {
+  const s = S.cur?.summary;
+  if (!s) return;
+  const cap = s.meta?.budget;
+  const on = h('input', { class: 'om-switch', type: 'checkbox', checked: Boolean(cap) });
+  const amount = h('input', { class: 'om-input ap-pct', type: 'number', min: '0.01', step: '0.5', inputmode: 'decimal', value: String(cap || 5), 'aria-label': '上限（美元）' });
+  const err = h('div', { class: 'om-field__error', role: 'alert' });
+  const save = async (e) => {
+    e.preventDefault();
+    const n = Number(amount.value);
+    if (on.checked && !(n > 0)) return (err.textContent = '請輸入大於 0 的金額');
+    try {
+      await post(`/sessions/${s.id}/command`, { name: 'budget', args: on.checked ? String(n) : 'off' });
+      d.close();
+      toast(on.checked ? `花費上限：${fmtUsd(Math.round(n * 100) / 100)}` : '已關閉花費上限');
+    } catch (x) {
+      err.textContent = x.message;
+    }
+  };
+  const form = h(
+    'form',
+    { class: 'settings autopause', onsubmit: save },
+    h('div', { class: 'dialog-title' }, '花費上限'),
+    h('p', { class: 'dialog-text settings-lead' }, `這個對話（含子代理）花到這個金額，Claude 做完手上這一步就停下，不會再送出新的請求。目前約 ${fmtUsd(s.usage?.costUsd || 0)}。之後調高或關閉上限，再送出「繼續」就好。`),
+    h('label', { class: 'settings-switch' }, on, h('span', null, h('span', { class: 'om-field__label' }, '開啟花費上限'), h('span', { class: 'om-field__help' }, '只對這個對話'))),
+    h('label', { class: 'om-field' }, h('span', { class: 'om-field__label' }, '上限'), h('div', { class: 'ap-pct-row' }, h('span', null, 'US$'), amount)),
+    err,
+    h('div', { class: 'dialog-actions' }, h('button', { class: 'om-btn', type: 'button', onclick: () => d.close() }, '取消'), h('button', { class: 'om-btn om-btn--primary', type: 'submit' }, '儲存')),
+  );
+  const d = dialog(form);
 }
 
 // ----------------------------------------------------------- auto-pause
@@ -1904,13 +2459,13 @@ function laterCommand(args) {
   const [, when, rest] = a.match(/^(\S+)\s*([\s\S]*)$/);
   const text = rest.trim() || '繼續';
   const w = when.toLowerCase();
-  if (['reset', '額度', '恢復'].includes(w)) return armResumeAfterReset(text);
+  if (['reset', '額度', '恢復'].includes(w)) return isClaude(S.cur?.summary) ? toast('Claude API 沒有 5 小時額度，請用分鐘數或時間：/later 30 繼續、/later 15:30 繼續', { kind: 'error' }) : armResumeAfterReset(text);
   let m;
   let at = null;
   if (/^\d{1,2}:\d{2}$/.test(w)) at = nextClock(w);
   else if ((m = w.match(/^(\d+(?:\.\d+)?)(m|min|分|分鐘)?$/))) at = Date.now() + Math.round(parseFloat(m[1]) * 60_000);
   else if ((m = w.match(/^(\d+(?:\.\d+)?)(h|hr|小時)$/))) at = Date.now() + Math.round(parseFloat(m[1]) * 3_600_000);
-  if (!at || at - Date.now() < 30_000) return toast('用法：/later 30 繼續（30 分鐘後）、/later 15:30 繼續、/later reset 繼續（5 小時額度恢復後）', { kind: 'error' });
+  if (!at || at - Date.now() < 30_000) return toast(isClaude(S.cur?.summary) ? '用法：/later 30 繼續（30 分鐘後）、/later 15:30 繼續' : '用法：/later 30 繼續（30 分鐘後）、/later 15:30 繼續、/later reset 繼續（5 小時額度恢復後）', { kind: 'error' });
   return scheduleMessage(text, at);
 }
 
@@ -1928,7 +2483,8 @@ function scheduleDialog() {
   const usageNote = h('p', { class: 'dialog-text muted' }, '讀取 5 小時額度…');
   const err = h('div', { class: 'om-field__error', role: 'alert' });
   const pending = h('div', { class: 'sched-pending' });
-  const modes = { minutes: '幾分鐘後', clock: '指定時間', reset: '5 小時額度恢復後' };
+  const claude = isClaude(s);
+  const modes = claude ? { minutes: '幾分鐘後', clock: '指定時間' } : { minutes: '幾分鐘後', clock: '指定時間', reset: '5 小時額度恢復後' };
   let mode = 'minutes';
   const seg = h('div', { class: 'om-seg om-seg--sm', role: 'group', 'aria-label': '什麼時候送出' });
   const panes = {
@@ -1978,7 +2534,7 @@ function scheduleDialog() {
     'form',
     { class: 'settings schedule', onsubmit: save },
     h('div', { class: 'dialog-title' }, '定時送出'),
-    h('p', { class: 'dialog-text settings-lead' }, '到時候由中控台替你在這個對話送出訊息，關掉網頁也照常。Kimi 正在工作時，會排在這一輪之後。'),
+    h('p', { class: 'dialog-text settings-lead' }, `到時候由中控台替你在這個對話送出訊息，關掉網頁也照常。${nameFor(s)} 正在工作時，會排在這一輪之後。`),
     h('label', { class: 'om-field' }, h('span', { class: 'om-field__label' }, '訊息'), text),
     h('div', { class: 'om-field' }, h('span', { class: 'om-field__label' }, '什麼時候'), seg, ...Object.values(panes)),
     err,
@@ -1989,6 +2545,7 @@ function scheduleDialog() {
   S.scheduleDraw = drawPending;
   drawWhen();
   drawPending();
+  if (claude) return;
   fetchUsage(s.machineId).then((data) => {
     const u = data.usage;
     const h5 = u?.kind === 'ok' ? u.quota?.usages?.limit5h : null;
@@ -2214,14 +2771,15 @@ async function removeMachine(m) {
 
 // A folder tree on the machine: click a row to select it, the caret (or
 // clicking the selected row again) to open it; double-click picks it.
-function browseFolders(m, pick) {
+// `m` with no id: this computer (the hub's own folders, for Claude).
+function browseFolders(m, pick, start = S.home.cwdByMachine?.[m.id]) {
   const tree = h('div', { class: 'tree', role: 'tree', 'aria-label': '資料夾' });
   const chosen = h('div', { class: 'tree-path' });
   const up = h('button', { class: 'om-btn om-btn--sm', type: 'button', disabled: true }, '上一層');
   let selected = null;
   let root = null;
   const join = (p, name) => `${p.replace(/\/$/, '')}/${name}`;
-  const list = (path) => get(`/fs/dirs?machine=${encodeURIComponent(m.id)}${path ? `&path=${encodeURIComponent(path)}` : ''}`);
+  const list = (path) => get(`/fs/dirs?${new URLSearchParams({ ...(m.id ? { machine: m.id } : {}), ...(path ? { path } : {}) })}`);
   const choose = h('button', { class: 'om-btn om-btn--primary', type: 'button', disabled: true, onclick: () => selected && (pick(selected), d.close()) }, '選擇這個資料夾');
   const select = (path, row) => {
     selected = path;
@@ -2305,7 +2863,6 @@ function browseFolders(m, pick) {
     ),
     { wide: true },
   );
-  const start = S.home.cwdByMachine?.[m.id];
   showRoot('', start);
 }
 
@@ -2358,12 +2915,12 @@ async function loadMachines() {
 
 async function loadSessions() {
   const list = await get('/sessions');
-  S.sessions = new Map(list.filter((s) => s.kimiSessionId).map((s) => [s.id, s]));
+  S.sessions = new Map(list.filter((s) => s.kimiSessionId || isClaude(s)).map((s) => [s.id, s]));
   renderSidebar();
 }
 
 function upsertSession(s) {
-  if (!s.kimiSessionId) return;
+  if (!s.kimiSessionId && !isClaude(s)) return;
   const prev = S.sessions.get(s.id);
   S.sessions.set(s.id, s);
   renderSidebar();
@@ -2430,6 +2987,11 @@ function onMessage(m) {
     }
     case 'machines':
       return loadMachines().then(() => machinesDialog?.draw());
+    case 'claude':
+      S.claude = m.account;
+      if (S.config) S.config.claude = m.account;
+      if (S.route === 'home' && homeAgent() === 'claude') showHome();
+      return;
     case 'kimi.session': {
       const mc = machineById(m.machineId);
       if (!mc) return;
@@ -2467,6 +3029,7 @@ async function start() {
   } catch {}
   try {
     S.config = await get('/config');
+    S.claude = S.config.claude || null;
     resetHomeChoices();
   } catch (err) {
     if (err.status === 401) return showLogin();

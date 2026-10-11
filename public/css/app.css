@@ -3039,3 +3039,71 @@ pre.tail {
   min-width: 0;
   overflow-wrap: anywhere;
 }
+
+/* ------------------------------------------------------------ Claude API */
+
+/* Which agent a new conversation goes to (home). */
+.home-agent {
+  align-self: center;
+}
+.callout.claude-key {
+  align-items: center;
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+.callout.claude-key .callout-text {
+  flex: 1;
+  white-space: normal;
+}
+.linklike {
+  margin-left: 6px;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: var(--link);
+  cursor: pointer;
+}
+.linklike:hover {
+  text-decoration: underline;
+}
+/* What the conversation has cost so far, next to the context ring. */
+.cost-chip {
+  height: 26px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  font-size: 11px;
+  line-height: 14px;
+  color: var(--ink-secondary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.cost-chip:hover {
+  background: var(--fill-hover);
+}
+.cost-chip.over {
+  color: var(--warning);
+}
+.claude-key-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+.claude-test {
+  font-size: 12px;
+  line-height: 17px;
+  color: var(--ink-secondary);
+  overflow-wrap: anywhere;
+}
+.claude-test:empty {
+  display: none;
+}
+.claude-test.ok {
+  color: var(--success);
+}
+.claude-test.bad {
+  color: var(--danger);
+}
