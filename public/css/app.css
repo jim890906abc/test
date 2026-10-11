@@ -3197,3 +3197,21 @@ pre.tail {
 .claude-test.bad {
   color: var(--danger);
 }
+
+/* The model that produced the last response (Claude), next to the picker. */
+.chip.served {
+  gap: 6px;
+}
+.served-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--success);
+}
+.chip.served.bad,
+.chip.served.bad:hover {
+  color: var(--danger);
+}
+.chip.served.bad .served-dot {
+  background: var(--danger);
+}

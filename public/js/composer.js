@@ -303,6 +303,8 @@ export class Composer {
             control: 'model',
           })
         : null,
+      // Which model Anthropic says answered, as of the last response.
+      this.claude() && s.servedModel ? servedChip(s) : null,
       efforts.length > 1
         ? chip(`思考 ${EFFORT_LABELS[s.effort] || s.effort || EFFORT_LABELS[model.defaultEffort] || '預設'}${nextEffort ? '（下一輪）' : ''}`, (b) => this.effortMenu(b), {
             title: nextEffort ? `這一輪是用「${effortName(s.turnEffort)}」開始的。${agentName(this.agent())} 每一輪開始時就固定思考強度，「${effortName(s.effort)}」從下一輪起使用` : '思考強度',
@@ -656,6 +658,16 @@ export class Composer {
     const model = this.currentModel();
     if (this.images.length && model && !model.image) this.opts.onError?.(`${model.name} 可能看不懂圖片`);
   }
+}
+
+// "實際 Claude Opus 5.5": the model that produced the last response,
+// updated with each one. Red when it is not the one chosen (the turn has
+// then been stopped).
+function servedChip(s) {
+  const x = s.servedModel;
+  const bad = Boolean(x.asked) && !x.id.startsWith(x.asked);
+  const title = `Anthropic 回報最近一次回應（${clockTime(x.at)}）是由 ${x.id} 產生的。每次回應都會更新；跟你選的模型不同時，這一輪會立刻停下。`;
+  return h('span', { class: `chip static served${bad ? ' bad' : ''}`, title }, h('span', { class: 'served-dot', 'aria-hidden': 'true' }), h('span', null, `實際 ${x.name || x.id}`));
 }
 
 // Downscale to at most 2000px (and a small thumbnail for the transcript).

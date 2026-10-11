@@ -357,6 +357,12 @@ export class Transcript {
     return collectArtifacts(this.all());
   }
 
+  // The model that produced the last response (Claude), shown while working.
+  setServed(name) {
+    this.served = name || '';
+    if (this.servedEl) this.servedEl.textContent = this.served ? ` · ${this.served}` : '';
+  }
+
   setStatus(status, since, tps) {
     this.status = status;
     if (since) this.since = since;
@@ -524,7 +530,8 @@ export class Transcript {
         activity: activity.slice(0, 120),
         steps: kids.filter((k) => k.type === 'tool_use').length,
         background: Boolean(sub.background),
-        model: sub.model || '',
+        // The model that answered its last step, once one has.
+        model: sub.served || sub.model || '',
         effort: sub.effort || '',
         running,
         failed,
@@ -664,9 +671,13 @@ export class Transcript {
         return fill(node.el, h('span', { class: 'note' }, ev.text));
       case 'error':
         return fill(node.el, h('div', { class: 'callout danger' }, icon('alert'), h('div', { class: 'callout-text' }, ev.text)));
-      case 'turn_end':
-        node.el.hidden = !(ev.interrupted || ev.error);
-        return fill(node.el, h('span', { class: 'note' }, ev.interrupted ? '已中斷' : '這一輪沒有完成'));
+      case 'turn_end': {
+        // Claude: which model(s) actually answered this turn.
+        const by = (ev.models || []).map((m) => m.name || m.id).join('、');
+        node.el.hidden = !(ev.interrupted || ev.error || by);
+        const what = ev.interrupted ? '已中斷' : ev.error ? '這一輪沒有完成' : '';
+        return fill(node.el, h('span', { class: 'note', title: (ev.models || []).map((m) => m.id).join('\n') }, [what, by ? `由 ${by} 回覆` : ''].filter(Boolean).join(' · ')));
+      }
       default:
         node.el.hidden = true;
     }
@@ -1202,7 +1213,8 @@ export class Transcript {
         this.workingKind = 'running';
         this.secsEl = h('span', { class: 'muted' });
         this.tpsEl = h('span', { class: 'muted', title: '產生速度：這一輪生成的 token 數 ÷ 生成時間' });
-        fill(this.working, h('div', { class: 'working-line' }, h('span', { class: 'pulse' }), h('span', null, `${this.name()} 正在處理`), this.secsEl, this.tpsEl, h('span', { class: 'muted hint' }, ' · Esc 停止')));
+        this.servedEl = h('span', { class: 'muted', title: '最近一次回應實際由這個模型產生（每次回應都會更新）' }, this.served ? ` · ${this.served}` : '');
+        fill(this.working, h('div', { class: 'working-line' }, h('span', { class: 'pulse' }), h('span', null, `${this.name()} 正在處理`), this.servedEl, this.secsEl, this.tpsEl, h('span', { class: 'muted hint' }, ' · Esc 停止')));
       }
       this.secsEl.textContent = secs ? ` · ${secs}` : '';
       this.tpsEl.textContent = this.tps ? ` · ${this.tps} tok/s` : '';

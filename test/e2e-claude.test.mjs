@@ -116,6 +116,10 @@ test('a turn: streamed thinking and text, a Write run after approval, the result
   assert.ok(Math.abs(done.usage.costUsd - (3000 * 4 + 400 * 20) / 1e6) < 1e-9, String(done.usage.costUsd));
   assert.equal(done.meta.rateLimits.requests.limit, 50);
   assert.equal(done.meta.context.size, 1000000);
+  // The model that answered, as Anthropic reported it, after each response.
+  assert.equal(done.meta.servedModel.id, 'claude-opus-5-5');
+  assert.equal(done.meta.servedModel.name, 'Claude Opus 5.5');
+  assert.deepEqual(done.events.at(-1).models, [{ id: 'claude-opus-5-5', name: 'Claude Opus 5.5' }]);
 
   const [r1, r2] = messagesSent().slice(n0);
   // The key and nothing else: no bearer token, whatever the environment says.
@@ -209,6 +213,7 @@ test('Task: two subagents run side by side and report back', async () => {
   const cards = done.events.filter((e) => e.name === 'Task');
   assert.equal(cards.length, 2);
   assert.deepEqual(cards.map((c) => c.subagent.status), ['done', 'done']);
+  assert.deepEqual(cards.map((c) => c.subagent.served), ['claude-opus-5-5', 'claude-opus-5-5']);
   assert.equal(cards[0].subagent.summary, '子代理報告：find A');
   const inside = done.events.filter((e) => e.parent === cards[1].id);
   assert.equal(inside[0].text, '子代理報告：find B');
@@ -311,6 +316,8 @@ test('another model answering (a downgrade) or a refusal stops the turn, and say
   assert.equal(done.status, 'error');
   const err = done.events.find((e) => e.type === 'error');
   assert.match(err.text, /claude-opus-4-8/);
+  assert.equal(done.meta.servedModel.id, 'claude-opus-4-8');
+  assert.equal(done.meta.servedModel.asked, 'claude-opus-5-5');
   assert.match(err.text, /已停止這一輪/);
   assert.equal(done.events.at(-1).error, true);
   assert.equal(fs.existsSync(path.join(done.cwd, 'swapped.txt')), false);

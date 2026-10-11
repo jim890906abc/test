@@ -1042,6 +1042,7 @@ function applySnapshot(full) {
   cur.transcript.opts.agentName = nameFor(summary);
   cur.transcript.load(events);
   cur.loading = false;
+  cur.transcript.setServed(summary.meta?.servedModel?.name);
   cur.transcript.setStatus(summary.status, busy(summary.status) ? lastUserTs(events) : null, summary.meta?.tps || 0);
   S.artifacts = withOpened(cur.transcript.artifacts());
   cur.knownArtifacts = new Set(S.artifacts.map((a) => a.path));
@@ -1083,6 +1084,7 @@ function updateComposer() {
     planMode: meta.planMode,
     turnModel: meta.turnModel,
     turnEffort: meta.turnEffort,
+    servedModel: meta.servedModel || null,
     context: meta.context,
     skills: meta.skills || [],
     terminal: meta.owner === 'tui',
@@ -3002,6 +3004,7 @@ function upsertSession(s) {
     const was = S.cur.summary?.status;
     S.cur.summary = s;
     const tps = s.meta?.tps || 0;
+    if (s.meta?.servedModel?.name !== prev?.meta?.servedModel?.name) S.cur.transcript.setServed(s.meta?.servedModel?.name);
     if (was !== s.status || tps !== (prev?.meta?.tps || 0)) S.cur.transcript.setStatus(s.status, busy(s.status) && !busy(was) ? Date.now() : null, tps);
     updateComposer();
     const apChanged = JSON.stringify(prev?.autoPause || null) !== JSON.stringify(s.autoPause || null);

@@ -316,7 +316,8 @@ function finishTurn(run, error) {
     if (ev.type === 'tool_use' && ['pending', 'running', 'awaiting'].includes(ev.status)) ctx.patch(ev, { status: run.aborted || ev.status === 'awaiting' ? 'interrupted' : 'ended' });
     if (ev.subagent?.status === 'running') ctx.patch(ev, { subagent: { ...ev.subagent, status: run.aborted ? 'cancelled' : 'error' } });
   }
-  ctx.emit({ type: 'turn_end', durationMs: Date.now() - run.started, usage: { ...run.usage }, interrupted: run.aborted && !run.halted, error: Boolean(error) });
+  const models = [...(run.models || new Map())].map(([id, name]) => ({ id, name }));
+  ctx.emit({ type: 'turn_end', durationMs: Date.now() - run.started, usage: { ...run.usage }, models, interrupted: run.aborted && !run.halted, error: Boolean(error) });
   ctx.setMeta({ turnModel: null, turnEffort: null });
   ctx.setStatus(error ? 'error' : 'idle');
   store.saveSession(session, { immediate: true });
@@ -350,6 +351,7 @@ async function loop(run, opts) {
     // turn, subagents included, before anything it asked for runs. Neither
     // is kept in the history.
     const served = msg.model || opts.model;
+    noteServed(run, opts, served);
     const swapped = !served.startsWith(opts.model);
     if (swapped || msg.stop_reason === 'refusal') {
       const d = msg.stop_details || {};
@@ -405,6 +407,18 @@ function takeSteered(run) {
     blocks.push(...images.map(imageBlock), { type: 'text', text: `The user sent this while you were working:\n${q.text || '(images)'}` });
   }
   return blocks;
+}
+
+// The model Anthropic says produced a response, shown as it comes: next to
+// the composer (the conversation's own), on a subagent's card, and with
+// the turn when it ends.
+function noteServed(run, opts, served) {
+  const name = modelName(served);
+  (run.models ??= new Map()).set(served, name);
+  if (opts.quiet) return;
+  if (opts.main) return run.ctx.setMeta({ servedModel: { id: served, name, asked: opts.model, at: Date.now() } });
+  const card = opts.scope?.parent && run.session.events.find((e) => e.id === opts.scope.parent);
+  if (card?.subagent) run.ctx.patch(card, { subagent: { ...card.subagent, served, servedAt: Date.now() } });
 }
 
 // Tokens, cost, context, speed and rate limits after a response.
@@ -774,23 +788,23 @@ async function subagent(run, ev, input, { model, effort }) {
     });
   } catch (err) {
     if (run.aborted) {
-      ctx.patch(ev, { subagent: { ...sub, status: 'cancelled' } });
+      ctx.patch(ev, { subagent: { ...ev.subagent, status: 'cancelled' } });
       return interrupted(run, ev);
     }
     const text = account.explain(err);
-    ctx.patch(ev, { status: 'error', isError: true, output: text, subagent: { ...sub, status: 'error', error: text } });
+    ctx.patch(ev, { status: 'error', isError: true, output: text, subagent: { ...ev.subagent, status: 'error', error: text } });
     return { content: `The subagent failed: ${text}`, isError: true };
   }
   if (out.halted) {
-    ctx.patch(ev, { status: 'error', subagent: { ...sub, status: 'error', error: run.halted } });
+    ctx.patch(ev, { status: 'error', subagent: { ...ev.subagent, status: 'error', error: run.halted } });
     return { content: 'Stopped.', isError: true };
   }
   if (out.aborted) {
-    ctx.patch(ev, { subagent: { ...sub, status: 'cancelled' } });
+    ctx.patch(ev, { subagent: { ...ev.subagent, status: 'cancelled' } });
     return interrupted(run, ev);
   }
   const summary = out.finalText.trim();
-  ctx.patch(ev, { status: 'done', output: summary, subagent: { ...sub, status: 'done', summary } });
+  ctx.patch(ev, { status: 'done', output: summary, subagent: { ...ev.subagent, status: 'done', summary } });
   return { content: summary || '(The subagent finished without a report.)', isError: false };
 }
 
