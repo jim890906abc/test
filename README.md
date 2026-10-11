@@ -45,6 +45,10 @@ Claude 和 Kimi 都用 git 與 GitHub CLI（`gh`）操作 GitHub：clone、開�
 
 那台電腦要先裝好 `gh`（Kali／Debian／Ubuntu：中控台「GitHub…」裡會顯示加入 GitHub 官方 apt 套件庫再安裝的指令（Kali 的套件庫沒有 gh），macOS：`brew install gh`，Windows：`winget install --id GitHub.cli`），連接器要 0.6 以上。連接器也會幫 Kimi 裝一個 `/github` skill；Claude 的系統提示裡有同樣的規則：會改到 GitHub 的動作（push、開 PR、留言）沒被要求就先問你，在新分支上工作，不 force push，也不在對話裡要 token。
 
+### Claude 開出的其他對話
+
+叫 Claude「再開兩個對話跟你對抗」之類的，它會用 `StartConversation` 在 Agent Hub 裡開新的 Claude 對話（可以指定模型與思考強度），一樣用 Claude API key 計費、出現在側邊欄，你可以點進去看或直接跟它講話；Claude 用 `ReadConversation` 讀它們的回覆、`MessageConversation` 傳話給它們。Claude 不能從 Bash 啟動 Claude Code（`claude` 指令）或其他 AI 工具，這種指令會被擋下。中控台連上 Claude 背景程式時，也會把那台電腦上所有 Claude 對話都列出來（包括中控台關著時開出的），跟 Kimi 一樣。
+
 ### Claude 對話綁定 GitHub repo
 
 在 Claude 首頁的資料夾選單選「綁定一個 GitHub repo…」，挑一個 repo（列出這台電腦的 GitHub 帳號能 push 的 repo，也可以直接輸入 `owner/repo`），再選「開一個新分支」（`claude/日期-編號`，跟 Claude Code 網頁版一樣）或指定分支（例如 `main`）。新對話開始時會把 repo clone 到那台電腦上的新資料夾、切到那個分支，之後：

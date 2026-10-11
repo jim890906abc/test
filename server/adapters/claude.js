@@ -16,6 +16,8 @@
 // conversation starts, the tool set never changes, and plan-mode changes are
 // told to Claude as a note after the user's message.
 import os from 'node:os';
+import fs from 'node:fs';
+import path from 'node:path';
 import crypto from 'node:crypto';
 import * as store from '../store.js';
 import * as machines from '../machines.js';
@@ -159,6 +161,7 @@ function systemPrompt(cwd, { platform, notes, git, computer, repo, started = Dat
     "- When you need a decision that is the user's to make, ask with AskUserQuestion instead of guessing.",
     "- Some tool calls wait for the user's approval. If one is rejected, do not retry it unchanged: read their feedback in the result, then adjust or ask.",
     '- HTML files you write are shown to the user live in a side panel, so a page is a good way to present a report, a dashboard or a prototype.',
+    "- When the user asks for other conversations or agents they can watch (a second opinion, an adversarial reviewer or opponent, a parallel job), start them with StartConversation and follow them with ReadConversation and MessageConversation. Never start Claude Code (the `claude` command) or another AI tool from Bash: those are not part of Agent Hub, the user cannot see them, and they are billed elsewhere.",
     '- For GitHub (cloning, branches, pushing, pull requests, issues, Actions), use git and the GitHub CLI (gh) through Bash. The user signs this computer in to GitHub from Agent Hub (⋯ → GitHub…); if `gh auth status` shows it is not signed in or gh is missing, ask them to do that there. Never ask for a token in the chat, run `gh auth login`, or print a token. Unless the user asked for it, ask before anything that changes GitHub (push, opening, merging or closing a pull request or issue, commenting); work on a new branch rather than the default one, and never force-push unless told to.',
     '- Write to the user in the language they write to you in. Be concise and use Markdown. When you finish, say what you changed and what they should check.',
     '',
@@ -722,6 +725,14 @@ async function runTool(run, u, ev, opts) {
     ctx.patch(ev, { status: 'denied', output: '計畫模式中：還不能修改或執行' });
     return { content: 'Plan mode is on, so nothing can be changed or run yet. Keep researching with Read, Grep and Glob, then present your plan with ExitPlanMode.', isError: true };
   }
+  if (u.name === 'Bash' && startsAiCli(u.input.command)) {
+    ctx.patch(ev, { status: 'denied', output: 'Agent Hub 拒絕：Claude API 對話不能啟動 Claude Code 或其他 AI 工具' });
+    return {
+      content:
+        'Refused by Agent Hub: this conversation runs on the Claude API with the user\'s Console API key and must not start Claude Code (the `claude` command) or other AI command-line tools: the user cannot see those sessions in Agent Hub, and they are billed to another account. To run another Claude conversation the user can watch, use StartConversation; for a self-contained subtask, use Task.',
+      isError: true,
+    };
+  }
   const repo = session.meta?.repo;
   const refused = repo && u.name === 'Bash' && repoBind.guard(u.input.command, repo);
   if (refused) {
@@ -737,6 +748,7 @@ async function runTool(run, u, ev, opts) {
     }
     if (a.optionId === 'approved_session' && !session.allowedTools.includes(u.name)) session.allowedTools.push(u.name);
   }
+  if (CONVERSATION_TOOLS.has(u.name)) return conversationTool(run, ev, u);
   ctx.patch(ev, { status: 'running', output: '' });
   // A long command's output streams onto its card, a few times a second.
   let pending = '';
@@ -757,6 +769,90 @@ async function runTool(run, u, ev, opts) {
   clearTimeout(timer);
   ctx.patch(ev, { status: run.aborted ? 'interrupted' : r.isError ? 'error' : 'done', output: r.output, isError: r.isError });
   return { content: r.content, isError: r.isError };
+}
+
+// Claude Code (or another AI CLI) started from a Bash command: `claude …`,
+// `npx @anthropic-ai/claude-code`, also behind sudo, nohup, env, timeout or
+// inside quotes (tmux, sh -c).
+const AI_CLIS = new Set(['claude', 'claude-code']);
+function startsAiCli(command) {
+  const text = String(command || '');
+  if (/@anthropic-ai\/claude-code\b/.test(text)) return true;
+  for (const part of text.split(/&&|\|\||[;|\n&()`]|\$\(/)) {
+    const words = part.trim().split(/\s+/).filter(Boolean).map((w) => w.replace(/^["']+|["']+$/g, ''));
+    for (let i = 0; i < words.length; i++) {
+      const base = words[i].split('/').pop();
+      if (!AI_CLIS.has(base)) continue;
+      // The command itself (after VAR=…, sudo, nohup…), or followed by its flags.
+      const before = words.slice(0, i).every((w) => /^\w+=/.test(w) || ['sudo', 'nohup', 'exec', 'env', 'time', 'command', 'setsid', 'nice', 'stdbuf', 'timeout'].includes(w) || /^-|^\d+[smh]?$/.test(w));
+      if (before || /^-/.test(words[i + 1] || '') || i === words.length - 1) return true;
+    }
+  }
+  return false;
+}
+
+// ------------------------------------------- conversations of their own
+// Claude can start other conversations in Agent Hub (StartConversation):
+// shown in the sidebar like any other, run by this daemon on the same key.
+// It can only read and message the ones it started.
+const CONVERSATION_TOOLS = new Set(['StartConversation', 'MessageConversation', 'ReadConversation']);
+
+function childOf(session, id) {
+  const s = store.getSession(String(id || ''));
+  if (!s || s.meta?.parent?.id !== session.id) throw new Error(`No conversation ${id} started by this one. Use the id StartConversation returned.`);
+  return s;
+}
+
+const STATUS_EN = { running: 'working', awaiting_permission: "waiting for the user's approval or answer (in that conversation)", idle: 'idle (its turn is over)', error: 'stopped on an error' };
+
+async function conversationTool(run, ev, u) {
+  const { session, ctx } = run;
+  const input = u.input;
+  ctx.patch(ev, { status: 'running', output: '' });
+  try {
+    let text;
+    if (u.name === 'StartConversation') {
+      const folder = input.folder === 'new' ? path.join(store.WORKSPACES_DIR, `${new Date().toISOString().slice(0, 10)}-${crypto.randomBytes(3).toString('hex')}`) : session.cwd;
+      if (input.folder === 'new') fs.mkdirSync(folder, { recursive: true });
+      const s = store.createSession({ agentId: 'claude', cwd: folder, permissionMode: session.permissionMode, title: String(input.title).slice(0, 120) });
+      s.titled = true;
+      await setup(s, { model: input.model || session.meta?.model, effort: input.effort || session.meta?.effort, permission: session.meta?.permission, computer: session.meta?.machineName });
+      liveContext(s).setMeta({ parent: { id: session.id, title: session.title } });
+      await send(s, input.prompt, { note: `由「${session.title}」開啟` });
+      ctx.patch(ev, { conversation: { id: s.id, title: s.title } });
+      text = `Started the conversation "${s.title}" (id ${s.id}, model ${s.meta.model}${s.meta.effort ? `, effort ${s.meta.effort}` : ''}) in ${folder}. It is working on your prompt and shows in the user's sidebar. Read its answer with ReadConversation (wait: true).`;
+    } else if (u.name === 'MessageConversation') {
+      const s = childOf(session, input.id);
+      const r = await send(s, input.text, { note: `由「${session.title}」送出` });
+      text = r.queued ? `Queued: "${s.title}" is working; it reads this when its current turn ends.` : `Sent to "${s.title}"; it is working on it.`;
+    } else {
+      const s = childOf(session, input.id);
+      if (input.wait) {
+        const until = Date.now() + 30 * 60_000;
+        while (runs.has(s.id) && s.status !== 'awaiting_permission' && !run.aborted && Date.now() < until) await new Promise((r) => setTimeout(r, 1000));
+        if (run.aborted) return interrupted(run, ev);
+      }
+      const n = Math.min(Math.max(Number(input.replies) || 1, 1), 10);
+      const replies = [];
+      let cur = '';
+      for (const e of s.events) {
+        if (e.type === 'user' && !e.steered) cur = '';
+        else if (e.type === 'text' && !e.parent && e.text?.trim()) cur = e.text;
+        else if (e.type === 'turn_end' && cur) replies.push(cur);
+      }
+      if (runs.has(s.id) && cur) replies.push(`${cur}\n(…still working)`);
+      const last = replies.slice(-n).map((t) => (t.length > 20_000 ? `${t.slice(0, 20_000)}\n… (cut)` : t));
+      text = [
+        `"${s.title}" (id ${s.id}) is ${STATUS_EN[runs.has(s.id) ? (s.status === 'awaiting_permission' ? 'awaiting_permission' : 'running') : s.status] || s.status}. Cost so far: US$${fmtUsd(s.usage?.costUsd || 0)}.`,
+        last.length ? `Its last ${last.length === 1 ? 'reply' : `${last.length} replies`}:\n\n${last.join('\n\n---\n\n')}` : 'No reply yet.',
+      ].join('\n\n');
+    }
+    ctx.patch(ev, { status: 'done', output: text });
+    return { content: text, isError: false };
+  } catch (err) {
+    ctx.patch(ev, { status: 'error', isError: true, output: err.message });
+    return { content: err.message, isError: true };
+  }
 }
 
 // Show a choice on the card and wait. Resolves to { optionId, answers,

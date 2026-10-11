@@ -6,7 +6,9 @@ import http from 'node:http';
 export const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // A streamed Messages API response made of `blocks`.
-async function respond(res, { blocks, stop = 'end_turn', usage = {}, slow = 0, model = 'claude-opus-5-5' }) {
+// Answers as the model asked for (unless told otherwise).
+let asked = 'claude-opus-5-5';
+async function respond(res, { blocks, stop = 'end_turn', usage = {}, slow = 0, model = asked }) {
   res.writeHead(200, {
     'content-type': 'text/event-stream',
     'request-id': 'req_fake',
@@ -47,6 +49,7 @@ const tool = (id, name, input) => ({ type: 'tool_use', id, name, input });
 
 // What the fake model does, from the request.
 export function script(body, res) {
+  asked = body.model || 'claude-opus-5-5';
   const msgs = body.messages;
   const users = msgs.filter((m) => m.role === 'user');
   const first = textOf(users[0]?.content);
@@ -64,6 +67,9 @@ export function script(body, res) {
     const branch = lastText.match(/bound to `([^`]+)`/)[1];
     return respond(res, { blocks: [tool(`toolu_g${msgs.length}`, 'Bash', { command: `git add -A && git -c user.name=Claude -c user.email=claude@example.com commit -q -m "Add work.txt" && git push -q -u origin ${branch}` })], stop: 'tool_use' });
   }
+  // Conversations of its own: started, then read once it answered.
+  const started = results.length && textOf(results[0].content).match(/^Started the conversation .*\(id (\S+),/);
+  if (started) return respond(res, { blocks: [tool(`toolu_rc${msgs.length}`, 'ReadConversation', { id: started[1], wait: true })], stop: 'tool_use' });
   if (results.length) {
     if (/TASK/.test(first) && results.length === 2) return respond(res, { blocks: [{ type: 'text', text: `兩個子代理都回來了：${results.map((r) => textOf(r.content)).join(' / ')}` }] });
     return respond(res, { blocks: [{ type: 'text', text: `完成：${textOf(results[0].content).slice(0, 60)}` }] });
@@ -75,6 +81,8 @@ export function script(body, res) {
       usage: { input: 2000, output: 300 },
     });
   }
+  if (/^SPAWN/.test(said)) return respond(res, { blocks: [tool('toolu_sc1', 'StartConversation', { title: '對抗者 A', prompt: 'CHILD 你好', model: 'claude-sonnet-5-5', effort: 'high' })], stop: 'tool_use' });
+  if (/^CLAUDECLI/.test(said)) return respond(res, { blocks: [tool('toolu_cc1', 'Bash', { command: 'nohup claude -p "attack the plan" --model claude-opus-5-5 > a.log 2>&1 &' })], stop: 'tool_use' });
   if (/^REPO(GOOD|LAZY)/.test(said)) return respond(res, { blocks: [tool('toolu_r1', 'Bash', { command: 'echo work > work.txt' })], stop: 'tool_use' });
   if (/^REPOFORCE/.test(said)) return respond(res, { blocks: [tool('toolu_r2', 'Bash', { command: 'git push -f origin main' })], stop: 'tool_use' });
   if (/^BASH/.test(lastText)) return respond(res, { blocks: [tool('toolu_b1', 'Bash', { command: 'echo bash-ran', description: 'Say hi' })], stop: 'tool_use' });

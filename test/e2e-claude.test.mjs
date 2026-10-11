@@ -605,6 +605,36 @@ test('an existing conversation bound to a GitHub repository: moved into a clone,
   assert.equal(git(origin, 'show', 'feature/y:work.txt'), 'work');
 });
 
+test('Claude starts conversations of its own (shown in the sidebar, on the API key), never Claude Code', async () => {
+  const s = await api('POST', '/sessions', { agent: 'claude', prompt: 'SPAWN', permission: 'auto' });
+  const done = await until(async () => {
+    const x = await snap(s.id);
+    return x.status === 'idle' && x.events.some((e) => e.type === 'turn_end') && x;
+  }, 20000);
+  const child = (await api('GET', '/sessions')).find((x) => x.title === '對抗者 A');
+  assert.ok(child, 'the conversation it started is in the list');
+  assert.equal(child.agentId, 'claude');
+  assert.equal(child.meta.parent.id, s.id);
+  assert.equal(child.meta.model, 'claude-sonnet-5-5');
+  assert.equal(child.meta.effort, 'high');
+  const c = await snap(child.id);
+  assert.equal(c.events[0].text, 'CHILD 你好');
+  assert.match(c.events[0].note, /由「SPAWN」開啟/);
+  // What it answered came back to the one that started it.
+  const read = done.events.find((e) => e.type === 'tool_use' && e.name === 'ReadConversation');
+  assert.equal(read.status, 'done');
+  assert.match(read.output, /收到：CHILD 你好/);
+
+  const cli = await api('POST', '/sessions', { agent: 'claude', prompt: 'CLAUDECLI', permission: 'auto' });
+  const cliDone = await until(async () => {
+    const x = await snap(cli.id);
+    return x.status === 'idle' && x.events.some((e) => e.type === 'turn_end') && x;
+  }, 20000);
+  const bash = cliDone.events.find((e) => e.type === 'tool_use' && e.name === 'Bash');
+  assert.equal(bash.status, 'denied');
+  assert.match(cliDone.events.filter((e) => e.type === 'text').at(-1).text, /Refused by Agent Hub/);
+});
+
 test('the daemon bundle the bridges download is built from the current code', async (t) => {
   let esbuild;
   try {

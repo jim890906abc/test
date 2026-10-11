@@ -168,6 +168,45 @@ export const TOOLS = [
       required: ['description', 'prompt'],
     },
   },
+  // Conversations of their own, in Agent Hub (see claude.js).
+  {
+    name: 'StartConversation',
+    kind: 'exec',
+    description:
+      "Start a new, separate Claude conversation in Agent Hub, on this computer: it works on its own, in its own context, and shows in the user's sidebar, where they can watch it and talk to it. Use it when the user asks for other conversations or agents — a second opinion, an adversarial reviewer or opponent, a long parallel job they want to follow. It runs on the same Claude API key, with the same permission mode as this conversation, in this working directory (folder 'same') or a new empty folder ('new'). It sees nothing of this conversation, so make `prompt` a complete brief. Returns its id: read its answers with ReadConversation and reply with MessageConversation. For a quick self-contained task only you need the result of, use Task instead. Never start Claude Code (the `claude` command) or another AI tool from Bash instead: the user cannot see those, and they are billed elsewhere.",
+    input_schema: {
+      type: 'object',
+      properties: {
+        title: str('A short name for it, shown in the sidebar (e.g. "對抗者 A").'),
+        prompt: str('Its first message: the complete brief.'),
+        model: str("Model id (e.g. claude-opus-5-5, claude-fable-5-1); default: this conversation's model."),
+        effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max'], description: "Thinking effort; default: this conversation's." },
+        folder: { type: 'string', enum: ['same', 'new'], description: "'same' (default): this working directory. 'new': a new empty folder." },
+      },
+      required: ['title', 'prompt'],
+    },
+  },
+  {
+    name: 'MessageConversation',
+    kind: 'exec',
+    description: 'Send a message to a conversation you started with StartConversation, as the next thing it reads. If it is working, the message waits until its current turn ends.',
+    input_schema: { type: 'object', properties: { id: str('The conversation id StartConversation returned.'), text: str('The message.') }, required: ['id', 'text'] },
+  },
+  {
+    name: 'ReadConversation',
+    kind: 'read',
+    description:
+      "Read a conversation you started with StartConversation: whether it is working, waiting for the user, idle or stopped on an error, what it cost, and its last replies. With wait: true, first wait until its current turn ends (at most 30 minutes, or until it waits for the user's approval).",
+    input_schema: {
+      type: 'object',
+      properties: {
+        id: str('The conversation id.'),
+        wait: { type: 'boolean', description: 'Wait for its current turn to end first.' },
+        replies: int('How many of its last replies to return (default 1, at most 10).'),
+      },
+      required: ['id'],
+    },
+  },
 ];
 
 const byName = new Map(TOOLS.map((t) => [t.name, t]));
@@ -230,6 +269,12 @@ export function titleOf(name, input = {}, cwd = '') {
       return `${input.pattern || ''}${input.path ? ` in ${rel(input.path)}` : ''}`;
     case 'Task':
       return input.description || '';
+    case 'StartConversation':
+      return input.title || '';
+    case 'MessageConversation':
+      return (input.text || '').slice(0, 80);
+    case 'ReadConversation':
+      return input.wait ? '等它這一輪結束再讀' : '讀它的最新回覆';
     case 'AskUserQuestion':
       return input.questions?.[0]?.question || 'Claude 有問題要問你';
     case 'ExitPlanMode':

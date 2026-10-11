@@ -91,13 +91,40 @@ async function migrate(session) {
   apply(session, snap);
 }
 
+// Conversations a daemon has that the hub does not (yet): started by Claude
+// itself (StartConversation), or while the hub was away. Shown like the
+// others, as Kimi's are.
+const adopting = new Set();
+const gone = new Set(); // deleted here: not taken back from a late message
+async function adopt(machineId, sid) {
+  if (adopting.has(sid) || gone.has(sid) || store.getSession(sid)) return;
+  adopting.add(sid);
+  try {
+    const snap = await link.rpc(machineId, 'snapshot', { id: sid, auth: auth() });
+    if (store.getSession(sid) || gone.has(sid)) return;
+    const s = store.createSession({ id: sid, agentId: AGENT.id, cwd: snap.cwd, title: snap.title || '新對話', titled: true, ...(machineId ? { machineId } : {}) });
+    apply(s, snap);
+  } catch (err) {
+    console.warn(`[claude] ${sid}: ${err.message}`);
+  } finally {
+    adopting.delete(sid);
+  }
+}
+async function adoptAll(machineId) {
+  try {
+    for (const x of await link.rpc(machineId, 'list', { auth: auth() })) adopt(machineId, x.id);
+  } catch {}
+}
+
 // One message of a daemon's stream.
 function onEvent(machineId, msg) {
   if (msg.t === 'resync') {
     for (const s of store.listSessions()) if (s.agentId === AGENT.id && (s.machineId || null) === machineId) sync(s).catch(() => {});
+    adoptAll(machineId);
     return;
   }
   const session = store.getSession(msg.sid);
+  if (!session && msg.t === 'session') return void adopt(machineId, msg.sid);
   if (!session || session.agentId !== AGENT.id || (session.machineId || null) !== machineId) return;
   if (syncing.has(session.id) && msg.t !== 'deleted') return void held.get(session.id)?.push(msg);
   const ctx = liveContext(session);
@@ -134,6 +161,7 @@ function findEvent(session, id) {
 // A connected computer came (back): catch up with its conversations.
 machines.onBridgeHello((machineId) => {
   for (const s of store.listSessions()) if (s.agentId === AGENT.id && s.machineId === machineId) sync(s).catch((err) => console.warn(`[claude] ${s.id}: ${err.message}`));
+  adoptAll(machineId);
 });
 
 // ----------------------------------------------------------- lifecycle
@@ -159,6 +187,7 @@ export function view(session) {
 }
 
 export function dispose(session) {
+  gone.add(session.id);
   call(session, 'delete').catch(() => {});
   daemonSeq.delete(session.id);
 }
@@ -211,7 +240,7 @@ export async function command(session, name, args = '') {
   if (!r.session) return {};
   // /fork: a new conversation in the same daemon, mirrored here too.
   const snap = r.session;
-  const copy = store.createSession({ id: snap.id, agentId: AGENT.id, cwd: snap.cwd, title: snap.title, titled: true, ...(session.machineId ? { machineId: session.machineId } : {}) });
+  const copy = store.getSession(snap.id) || store.createSession({ id: snap.id, agentId: AGENT.id, cwd: snap.cwd, title: snap.title, titled: true, ...(session.machineId ? { machineId: session.machineId } : {}) });
   apply(copy, snap);
   return { session: copy };
 }
