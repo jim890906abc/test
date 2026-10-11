@@ -428,6 +428,71 @@ test('a conversation the hub ran itself (before daemons) moves into the daemon, 
   assert.equal(file.state.claude, undefined);
 });
 
+test('a conversation the hub ran on a connected computer moves into that computer\'s daemon', async () => {
+  const home = path.join(TMP, 'legacy-box-home');
+  const cwd = fs.mkdtempSync(path.join(TMP, 'legacy-box-'));
+  const keyFile = JSON.parse(fs.readFileSync(path.join(TMP, 'data', 'hub.json'), 'utf8')).bridgeKey;
+  const bridge = spawn(process.execPath, ['bridge/agent-hub-bridge.mjs', '--hub', `http://127.0.0.1:${PORT}`, '--key', keyFile, '--name', 'legacy-box', '--no-skill'], {
+    cwd: ROOT,
+    env: { ...process.env, HOME: home, USERPROFILE: home, KIMI_CODE_HOME: path.join(home, '.kimi-code'), PATH: process.env.PATH, AGENT_HUB_CLAUDE_TEST_URL: fake.url },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  try {
+    const m = await until(async () => (await api('GET', '/machines')).find((x) => x.name === 'legacy-box' && x.online));
+    const id = 's_legacybox001';
+    const legacy = {
+      id,
+      agentId: 'claude',
+      machineId: m.id,
+      title: '舊的遠端 Claude 對話',
+      titled: true,
+      status: 'idle',
+      cwd,
+      permissionMode: 'ask',
+      allowedTools: [],
+      events: [
+        { id: 'e_old1', ts: 1, type: 'user', text: '遠端之前問的', source: 'hub' },
+        { id: 'e_old2', ts: 2, type: 'text', text: '遠端之前的回答' },
+      ],
+      meta: { agent: 'claude', model: 'claude-opus-5-5', effort: 'high', permission: 'auto', planMode: false, queue: [], todos: [] },
+      usage: { inputTokens: 10, outputTokens: 5, costUsd: 0.5 },
+      state: { claude: { system: 'You are Claude (old remote prompt).', subSystem: 'sub', web: false, messages: [{ role: 'user', content: [{ type: 'text', text: '遠端之前問的' }] }, { role: 'assistant', content: [{ type: 'text', text: '遠端之前的回答' }] }], turns: [], usage: { input: 10, cacheWrite: 0, cacheRead: 0, output: 5, searches: 0, requests: 1, cost: 0.5 }, active: null } },
+      createdAt: 1,
+      updatedAt: 2,
+    };
+    await new Promise((r) => (server.once('exit', r), server.kill('SIGTERM')));
+    fs.writeFileSync(path.join(TMP, 'data', 'sessions', `${id}.json`), JSON.stringify(legacy));
+    server = await startHub();
+    await until(async () => (await api('GET', '/machines')).find((x) => x.id === m.id && x.online), 20000);
+    const n0 = messagesSent().length;
+    // The first thing said after the update goes on from the old history.
+    await until(async () => {
+      try {
+        await api('POST', `/sessions/${id}/messages`, { text: '繼續' });
+        return true;
+      } catch (err) {
+        if (err.status === 409) return false; // the bridge not back yet
+        throw err;
+      }
+    }, 20000);
+    const done = await until(async () => {
+      const x = await snap(id);
+      return x.events.some((e) => e.type === 'turn_end') && x.status === 'idle' && x;
+    }, 20000);
+    assert.equal(done.events.some((e) => e.type === 'error'), false, JSON.stringify(done.events.filter((e) => e.type === 'error')));
+    assert.equal(done.events[0].text, '遠端之前問的');
+    const req = messagesSent()[n0].body;
+    assert.equal(req.system[0].text, 'You are Claude (old remote prompt).');
+    assert.equal(req.messages[1].content[0].text, '遠端之前的回答');
+    assert.ok(fs.existsSync(path.join(home, '.agent-hub', 'claude', 'sessions', `${id}.json`)));
+  } finally {
+    bridge.kill();
+    try {
+      process.kill(JSON.parse(fs.readFileSync(path.join(home, '.agent-hub', 'claude', 'daemon.json'), 'utf8')).pid, 'SIGTERM');
+    } catch {}
+  }
+});
+
 test('the daemon bundle the bridges download is built from the current code', async (t) => {
   let esbuild;
   try {

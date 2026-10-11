@@ -180,7 +180,8 @@ export function attachBridge(ws) {
       m.pending.delete(msg.id);
       clearTimeout(p.timer);
       if (msg.ok) p.resolve(msg.data);
-      else p.reject(new Error(msg.error || '連接器回報錯誤'));
+      // With the status the bridge said (a 404 there is a 404 here too).
+      else p.reject(Object.assign(new Error(msg.error || '連接器回報錯誤'), Number.isInteger(msg.status) ? { status: msg.status } : {}));
     } else if (msg.t === 'sh.data') {
       streams.get(msg.id)?.(String(msg.chunk || ''));
     } else if (msg.t === 'claude.event') {
