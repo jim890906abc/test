@@ -21,7 +21,7 @@ if ($major -lt 22) { throw "Node.js 版本太舊（$(node -v)），需要 22 以
 # Installed again whenever package-lock.json changed (an update added a package).
 $lockStamp = 'node_modules\.agent-hub-lock.json'
 if (-not (Test-Path node_modules) -or -not (Test-Path $lockStamp) -or ((Get-FileHash package-lock.json).Hash -ne (Get-FileHash $lockStamp).Hash)) {
-  Say '安裝相依套件（npm install）…'; npm install --omit=dev --no-audit --no-fund | Out-Null
+  Say '安裝相依套件（npm ci）…'; npm ci --omit=dev --no-audit --no-fund | Out-Null
   Copy-Item package-lock.json $lockStamp
 }
 

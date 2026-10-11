@@ -23,8 +23,10 @@ NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
 
 # Installed again whenever package-lock.json changed (an update added a package).
 if [ ! -d node_modules ] || ! cmp -s package-lock.json node_modules/.agent-hub-lock.json; then
-  say "安裝相依套件（npm install）…"
-  npm install --omit=dev --no-audit --no-fund >/dev/null
+  # npm ci installs exactly what package-lock.json says and leaves it as it
+  # is, so the next git pull is not blocked by a rewritten lockfile.
+  say "安裝相依套件（npm ci）…"
+  npm ci --omit=dev --no-audit --no-fund >/dev/null
   cp package-lock.json node_modules/.agent-hub-lock.json
 fi
 
