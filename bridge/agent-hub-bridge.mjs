@@ -7,6 +7,9 @@
 //   • actions: a whitelisted subset of Kimi's Server API (`kimi web`), or
 //     keystrokes into a terminal Kimi started with `agent-hub-bridge.mjs kimi`.
 // Kimi keeps running on this computer, with this computer's Kimi login.
+// Claude conversations the hub runs (Claude API, with the hub's API key) can
+// also work in a folder here: the hub asks the bridge to run their tools —
+// commands, and files read and written inside the conversation's folder.
 //
 //   node agent-hub-bridge.mjs --hub https://your-hub.example.com --key <bridge key>
 //   node agent-hub-bridge.mjs kimi [Kimi options]    # Kimi in this terminal, controllable from the hub
@@ -29,7 +32,7 @@ import { StringDecoder } from 'node:string_decoder';
 import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '0.3.0';
+const VERSION = '0.4.0';
 const SCRIPT = fileURLToPath(import.meta.url);
 
 // ------------------------------------------------------------------ args
@@ -1414,6 +1417,127 @@ function installSkill() {
   }
 }
 
+// ------------------------------------------------------- Claude's tools
+
+// A path inside a conversation's folder (symlinks included), or an error.
+function inFolder(cwd, p) {
+  const root = fs.realpathSync(path.resolve(String(cwd || '')));
+  const target = path.resolve(root, String(p || '.'));
+  let probe = target;
+  while (!fs.existsSync(probe)) probe = path.dirname(probe);
+  const real = path.join(fs.realpathSync(probe), path.relative(probe, target));
+  for (const c of [target, real]) {
+    const rel = path.relative(root, c);
+    if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) throw new Error(`path "${p}" is outside the working directory`);
+  }
+  return { abs: target, rel: path.relative(root, target).split(path.sep).join('/') || '.' };
+}
+
+const WALK_SKIP = new Set(['.git', 'node_modules', '.venv', 'venv', '__pycache__', '.next', '.cache', 'dist', 'build', '.turbo']);
+const shells = new Map(); // id -> running command
+
+const tools = {
+  stat({ cwd, path: p }) {
+    const at = inFolder(cwd, p);
+    const st = fs.statSync(at.abs, { throwIfNoEntry: false });
+    return { ...at, exists: Boolean(st), dir: Boolean(st?.isDirectory()), size: st?.size ?? 0, mtime: st?.mtimeMs ?? 0 };
+  },
+  read({ cwd, path: p }) {
+    const at = inFolder(cwd, p);
+    const st = fs.statSync(at.abs);
+    if (st.isDirectory()) throw new Error(`${p} is a directory`);
+    if (st.size > 20 * 1024 * 1024) throw new Error(`the file is ${Math.round(st.size / 1048576)} MB (at most 20 MB)`);
+    return { ...at, size: st.size, data: fs.readFileSync(at.abs).toString('base64') };
+  },
+  write({ cwd, path: p, content }) {
+    const at = inFolder(cwd, p);
+    const existed = fs.existsSync(at.abs);
+    fs.mkdirSync(path.dirname(at.abs), { recursive: true });
+    fs.writeFileSync(at.abs, String(content ?? ''));
+    return { ...at, existed };
+  },
+  walk({ cwd, path: p, limit = 2000 }) {
+    const at = inFolder(cwd, p);
+    const files = [];
+    let seen = 0;
+    const walk = (dir, rel) => {
+      if (seen > 50_000 || files.length >= limit) return;
+      let entries;
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const e of entries) {
+        seen++;
+        const r = rel ? `${rel}/${e.name}` : e.name;
+        if (e.isDirectory()) {
+          if (!WALK_SKIP.has(e.name)) walk(path.join(dir, e.name), r);
+        } else if (files.length < limit) files.push([r, fs.statSync(path.join(dir, e.name), { throwIfNoEntry: false })?.mtimeMs || 0]);
+      }
+    };
+    walk(at.abs, '');
+    return { rel: at.rel, files };
+  },
+  dirs({ path: p }) {
+    const dir = path.resolve(String(p || os.homedir()).replace(/^~(?=$|[\\/])/, os.homedir()));
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    return {
+      path: dir,
+      parent: path.dirname(dir) !== dir ? path.dirname(dir) : null,
+      home: os.homedir(),
+      dirs: entries.filter((e) => e.isDirectory() && !e.name.startsWith('.')).map((e) => e.name).sort((a, b) => a.localeCompare(b)).slice(0, 300),
+    };
+  },
+  // A command in the folder; its output streams to the hub as it comes.
+  run({ cwd, command, timeoutMs, id }) {
+    const dir = fs.realpathSync(path.resolve(String(cwd || '')));
+    const ms = Math.min(Math.max(Number(timeoutMs) || 120_000, 1000), 600_000);
+    return new Promise((resolve) => {
+      const child = spawn(IS_WIN ? 'cmd.exe' : 'bash', IS_WIN ? ['/d', '/s', '/c', String(command)] : ['-c', String(command)], {
+        cwd: dir,
+        detached: !IS_WIN,
+        env: { ...process.env, TERM: 'dumb', CI: process.env.CI ?? '1' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+      let out = '';
+      let pending = '';
+      let flush = null;
+      let killedBy = null;
+      const kill = (why) => {
+        killedBy = why;
+        try {
+          if (IS_WIN) child.kill();
+          else process.kill(-child.pid, 'SIGKILL');
+        } catch {}
+      };
+      shells.set(id, kill);
+      const timer = setTimeout(() => kill('timeout'), ms);
+      const collect = (chunk) => {
+        const t = chunk.toString();
+        if (out.length < 120_000) out += t;
+        pending += t;
+        flush ??= setTimeout(() => {
+          hub.send({ t: 'sh.data', id, chunk: pending.slice(0, 20_000) });
+          pending = '';
+          flush = null;
+        }, 150);
+      };
+      child.stdout.on('data', collect);
+      child.stderr.on('data', collect);
+      const done = (exitCode) => {
+        clearTimeout(timer);
+        clearTimeout(flush);
+        shells.delete(id);
+        resolve({ output: out, exitCode, killedBy });
+      };
+      child.on('error', (err) => ((out += err.message), done(-1)));
+      child.on('close', (code) => done(code ?? -1));
+    });
+  },
+};
+
 // ------------------------------------------------------------- the hub
 
 const hub = {
@@ -1552,6 +1676,21 @@ const hub = {
       }
       case 'kimi.tui.input':
         return tui.input(String(args.sessionId || ''), args);
+      case 'fs.stat':
+        return tools.stat(args);
+      case 'fs.read':
+        return tools.read(args);
+      case 'fs.write':
+        return tools.write(args);
+      case 'fs.walk':
+        return tools.walk(args);
+      case 'fs.dirs':
+        return tools.dirs(args);
+      case 'sh.run':
+        return tools.run(args);
+      case 'sh.kill':
+        shells.get(String(args.id || ''))?.('interrupted');
+        return { ok: true };
       case 'workspace.create': {
         const slug = String(args.name || 'workspace').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32) || 'workspace';
         let dir = path.join(WORKSPACES, `${new Date().toISOString().slice(0, 10)}-${slug}`);

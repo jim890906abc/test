@@ -164,6 +164,12 @@ app.put('/api/settings', wrap((req) => {
 app.get('/api/fs/dirs', wrap(async (req) => {
   if (req.query.machine) {
     const mid = String(req.query.machine);
+    // The bridge lists folders itself (0.4+); older ones through Kimi's server.
+    try {
+      return { ...(await machines.rpc(mid, 'fs.dirs', { path: req.query.path ? String(req.query.path) : '' })), git: false };
+    } catch (err) {
+      if (!/未知的操作/.test(err.message)) throw err;
+    }
     let p = req.query.path ? String(req.query.path) : '';
     if (!p) p = (await machines.kimiApi(mid, 'GET', '/api/v1/fs:home')).home;
     const r = await machines.kimiApi(mid, 'GET', `/api/v1/fs:browse?path=${encodeURIComponent(p)}`);
@@ -265,10 +271,11 @@ app.get('/api/sessions', wrap(() =>
 app.post('/api/sessions', wrap(async (req) => {
   const { agentId, machineId, agent, prompt, cwd, permissionMode, images, model, effort, permission, planMode } = req.body || {};
   const claude = agent === 'claude' || agentId === 'claude';
-  const remote = !claude && (machineId || String(agentId || '').startsWith('kimi@'));
+  const remote = machineId || (!claude && String(agentId || '').startsWith('kimi@'));
   const dir = cwd ? (remote ? String(cwd) : workspace.validateDir(cwd)) : undefined;
   const s = await runner.newSession({
     agentId: claude ? 'claude' : machineId ? `kimi@${machineId}` : agentId,
+    machineId: claude ? machineId || undefined : undefined,
     cwd: dir,
     permissionMode,
     nameHint: prompt,
@@ -420,18 +427,23 @@ app.post('/api/sessions/:id/config', wrap(async (req) => {
 }));
 
 const kimiRemote = ADAPTERS['kimi-remote'];
+// A Claude conversation on a connected computer reads its folder there.
+const remoteClaude = (s) => s.agentId === 'claude' && s.machineId;
 app.get('/api/sessions/:id/files', wrap((req) => {
   const s = mustSession(req.params.id);
   const rel = String(req.query.path || '.');
+  if (remoteClaude(s)) return ADAPTERS.claude.listFiles(s, rel);
   return s.kimiSessionId ? kimiRemote.listFiles(s, rel) : workspace.listDir(s.cwd, rel);
 }));
 app.get('/api/sessions/:id/file', wrap((req) => {
   const s = mustSession(req.params.id);
   const rel = String(req.query.path || '');
+  if (remoteClaude(s)) return ADAPTERS.claude.readFile(s, rel);
   return s.kimiSessionId ? kimiRemote.readFile(s, rel) : workspace.readFile(s.cwd, rel);
 }));
 app.get('/api/sessions/:id/changes', wrap((req) => {
   const s = mustSession(req.params.id);
+  if (remoteClaude(s)) return ADAPTERS.claude.getChanges(s, workspace.summarizeDiff);
   return s.kimiSessionId ? kimiRemote.getChanges(s, workspace.summarizeDiff) : workspace.getChanges(s.cwd);
 }));
 

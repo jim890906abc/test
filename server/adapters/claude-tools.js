@@ -1,14 +1,16 @@
-// The tools Claude gets in a Claude API conversation, run by the hub in the
-// conversation's folder on this computer. Named and shaped like Claude
-// Code's (Bash, Read, Edit…), so the conversation view draws them the same
-// way. File tools stay inside the folder; Bash runs there and is gated by
-// the permission mode. TodoWrite, AskUserQuestion, ExitPlanMode and Task are
+// The tools Claude gets in a Claude API conversation, run in the
+// conversation's folder — on the hub's computer (localHost) or on a
+// connected one through its bridge (remoteHost). Named and shaped like
+// Claude Code's (Bash, Read, Edit…), so the conversation view draws them the
+// same way. File tools stay inside the folder; Bash runs there and is gated
+// by the permission mode. TodoWrite, AskUserQuestion, ExitPlanMode and Task are
 // handled by the conversation itself (adapters/claude.js).
 import fs from 'node:fs/promises';
 import fssync from 'node:fs';
 import path from 'node:path';
-import { spawn, spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import { runCommand, resolveInWorkspace } from '../tools.js';
+import * as machines from '../machines.js';
 
 const MAX_OUTPUT = 30_000;
 const MAX_READ_LINES = 2000;
@@ -248,48 +250,130 @@ function truncate(text, max = MAX_OUTPUT) {
   return `${head}\n\n… [${text.length - head.length - tail.length} characters cut] …\n\n${tail}`;
 }
 
-const target = (cwd, p) => resolveInWorkspace(cwd, typeof p === 'string' && p ? p : '.');
-const relTo = (cwd, abs) => path.relative(fssync.realpathSync(cwd), abs) || '.';
+// ----------------------------------------------------------------- hosts
+// What the tools need from the computer they run on. Paths are resolved
+// inside `cwd` there; { abs, rel } come back.
 
-// Runs one tool. Resolves to { content, output, isError }: `content` goes
-// back to Claude (text, or blocks for an image), `output` is shown on the
-// card.
-export async function execute(name, input, { cwd, signal, onData } = {}) {
+export const localHost = {
+  name: 'local',
+  at(cwd, p) {
+    const abs = resolveInWorkspace(cwd, typeof p === 'string' && p ? p : '.');
+    return { abs, rel: path.relative(fssync.realpathSync(cwd), abs).split(path.sep).join('/') || '.' };
+  },
+  async stat(cwd, p) {
+    const at = this.at(cwd, p);
+    const st = await fs.stat(at.abs).catch(() => null);
+    return { ...at, exists: Boolean(st), dir: Boolean(st?.isDirectory()), size: st?.size ?? 0, mtime: st?.mtimeMs ?? 0 };
+  },
+  async read(cwd, p) {
+    const at = this.at(cwd, p);
+    const st = await fs.stat(at.abs);
+    if (st.isDirectory()) throw new Error(`${p} is a directory`);
+    if (st.size > 20 * 1024 * 1024) throw new Error(`the file is ${Math.round(st.size / 1048576)} MB (at most 20 MB)`);
+    return { ...at, size: st.size, buf: await fs.readFile(at.abs) };
+  },
+  async write(cwd, p, content) {
+    const at = this.at(cwd, p);
+    const existed = fssync.existsSync(at.abs);
+    await fs.mkdir(path.dirname(at.abs), { recursive: true });
+    await fs.writeFile(at.abs, content);
+    return { ...at, existed };
+  },
+  async walk(cwd, p, limit = 2000) {
+    const at = this.at(cwd, p);
+    const files = [];
+    let seen = 0;
+    const walk = async (dir, rel) => {
+      if (seen > 50_000 || files.length >= limit) return;
+      let entries;
+      try {
+        entries = await fs.readdir(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const e of entries) {
+        seen++;
+        const r = rel ? `${rel}/${e.name}` : e.name;
+        if (e.isDirectory()) {
+          if (!IGNORED.has(e.name)) await walk(path.join(dir, e.name), r);
+        } else if (files.length < limit) files.push([r, (await fs.stat(path.join(dir, e.name)).catch(() => null))?.mtimeMs || 0]);
+      }
+    };
+    await walk(at.abs, '');
+    return { rel: at.rel, files };
+  },
+  async run(cwd, command, { signal, timeoutMs, onData } = {}) {
+    const r = await runCommand(command, { cwd, signal, timeoutMs, onData });
+    return { output: r.output, exitCode: r.exitCode };
+  },
+};
+
+// A connected computer: the same, asked of its bridge.
+export function remoteHost(machineId) {
+  const call = (op, args, timeoutMs) => machines.rpc(machineId, op, args, timeoutMs).catch((err) => Promise.reject(machines.tooOld(err, machines.getMachine(machineId))));
+  return {
+    name: machineId,
+    stat: (cwd, p) => call('fs.stat', { cwd, path: p || '.' }),
+    async read(cwd, p) {
+      const r = await call('fs.read', { cwd, path: p }, 120_000);
+      return { ...r, buf: Buffer.from(r.data, 'base64') };
+    },
+    write: (cwd, p, content) => call('fs.write', { cwd, path: p, content }, 120_000),
+    walk: (cwd, p, limit = 2000) => call('fs.walk', { cwd, path: p || '.', limit }),
+    async run(cwd, command, { signal, timeoutMs, onData } = {}) {
+      const id = crypto.randomBytes(6).toString('hex');
+      const ms = Math.min(Math.max(Number(timeoutMs) || 120_000, 1000), 600_000);
+      const stop = () => machines.rpc(machineId, 'sh.kill', { id }).catch(() => {});
+      signal?.addEventListener('abort', stop, { once: true });
+      try {
+        const r = await machines.rpcStream(machineId, 'sh.run', { cwd, command, timeoutMs: ms, id }, onData, ms + 30_000).catch((err) => Promise.reject(machines.tooOld(err, machines.getMachine(machineId))));
+        let output = truncate(String(r.output || '').trimEnd());
+        if (r.killedBy === 'timeout') output += `\n[command timed out after ${ms} ms]`;
+        if (r.killedBy === 'interrupted') output += '\n[interrupted by user]';
+        return { output: output || '(no output)', exitCode: r.exitCode };
+      } finally {
+        signal?.removeEventListener('abort', stop);
+      }
+    },
+  };
+}
+
+// --------------------------------------------------------------- running
+
+// Runs one tool on `host`. Resolves to { content, output, isError }:
+// `content` goes back to Claude (text, or blocks for an image), `output` is
+// shown on the card.
+export async function execute(name, input, { host = localHost, cwd, signal, onData } = {}) {
   try {
     switch (name) {
       case 'Bash': {
-        const r = await runCommand(input.command, { cwd, signal, timeoutMs: input.timeout, onData });
-        const text = `${r.output}\n[exit code ${r.exitCode}]`;
-        return { content: text, output: r.output, isError: r.isError };
+        const r = await host.run(cwd, input.command, { signal, timeoutMs: input.timeout, onData });
+        return { content: `${r.output}\n[exit code ${r.exitCode}]`, output: r.output, isError: r.exitCode !== 0 };
       }
       case 'Read':
-        return await read(cwd, input);
+        return await read(host, cwd, input);
       case 'Write': {
-        const file = target(cwd, input.file_path);
-        const existed = fssync.existsSync(file);
-        await fs.mkdir(path.dirname(file), { recursive: true });
-        await fs.writeFile(file, input.content);
-        const lines = input.content.split('\n').length;
-        const text = `${existed ? 'Updated' : 'Created'} ${relTo(cwd, file)} (${lines} lines)`;
+        const r = await host.write(cwd, input.file_path, input.content);
+        const text = `${r.existed ? 'Updated' : 'Created'} ${r.rel} (${input.content.split('\n').length} lines)`;
         return { content: text, output: text, isError: false };
       }
       case 'Edit': {
-        const file = target(cwd, input.file_path);
-        if (!fssync.existsSync(file)) return fail(`File does not exist: ${input.file_path}. Use Write to create it.`);
+        const st = await host.stat(cwd, input.file_path);
+        if (!st.exists) return fail(`File does not exist: ${input.file_path}. Use Write to create it.`);
         if (input.old_string === input.new_string) return fail('old_string and new_string are the same; nothing to change.');
-        const text = await fs.readFile(file, 'utf8');
+        const text = (await host.read(cwd, input.file_path)).buf.toString('utf8');
         const count = input.old_string ? text.split(input.old_string).length - 1 : 0;
         if (!count) return fail('old_string was not found in the file. Read the file again and copy the exact text, whitespace included.');
         if (count > 1 && !input.replace_all) return fail(`old_string occurs ${count} times. Include more surrounding lines to make it unique, or set replace_all.`);
         const next = input.replace_all ? text.split(input.old_string).join(input.new_string) : text.replace(input.old_string, () => input.new_string);
-        await fs.writeFile(file, next);
-        const msg = `Edited ${relTo(cwd, file)} (${input.replace_all ? `${count} replacements` : '1 replacement'})`;
+        await host.write(cwd, input.file_path, next);
+        const msg = `Edited ${st.rel} (${input.replace_all ? `${count} replacements` : '1 replacement'})`;
         return { content: msg, output: msg, isError: false };
       }
       case 'Glob':
-        return await glob(cwd, input, signal);
+        return await glob(host, cwd, input);
       case 'Grep':
-        return await grep(cwd, input, signal);
+        return await grep(host, cwd, input, signal);
       default:
         return fail(`Unknown tool "${name}"`);
     }
@@ -300,20 +384,15 @@ export async function execute(name, input, { cwd, signal, onData } = {}) {
 
 const fail = (text) => ({ content: text, output: text, isError: true });
 
-async function read(cwd, input) {
-  const file = target(cwd, input.file_path);
-  const st = await fs.stat(file);
-  if (st.isDirectory()) return fail(`${input.file_path} is a directory. Use Glob or Bash (ls) to list it.`);
-  const type = IMAGE_TYPES[path.extname(file).toLowerCase()];
+async function read(host, cwd, input) {
+  const type = IMAGE_TYPES[path.extname(String(input.file_path)).toLowerCase()];
+  const f = await host.read(cwd, input.file_path);
   if (type) {
-    if (st.size > 3_750_000) return fail(`The image is too large to read (${Math.round(st.size / 1024)} KB, the limit is about 3.7 MB).`);
-    const data = (await fs.readFile(file)).toString('base64');
-    return { content: [{ type: 'image', source: { type: 'base64', media_type: type, data } }], output: `（圖片，${Math.round(st.size / 1024)} KB）`, isError: false };
+    if (f.size > 3_750_000) return fail(`The image is too large to read (${Math.round(f.size / 1024)} KB, the limit is about 3.7 MB).`);
+    return { content: [{ type: 'image', source: { type: 'base64', media_type: type, data: f.buf.toString('base64') } }], output: `（圖片，${Math.round(f.size / 1024)} KB）`, isError: false };
   }
-  if (st.size > 20 * 1024 * 1024) return fail(`The file is ${Math.round(st.size / 1048576)} MB. Read it in parts with Bash (head, sed -n) or search it with Grep.`);
-  const buf = await fs.readFile(file);
-  if (buf.subarray(0, 8000).includes(0)) return fail(`${input.file_path} is a binary file (${st.size} bytes).`);
-  const all = buf.toString('utf8').split('\n');
+  if (f.buf.subarray(0, 8000).includes(0)) return fail(`${input.file_path} is a binary file (${f.size} bytes).`);
+  const all = f.buf.toString('utf8').split('\n');
   if (all.length > 1 && all.at(-1) === '') all.pop();
   const start = Math.max((input.offset ?? 1) - 1, 0);
   const slice = all.slice(start, start + Math.max(1, input.limit ?? MAX_READ_LINES));
@@ -344,7 +423,7 @@ export function globToRegExp(pattern) {
       const end = p.indexOf('}', i);
       if (end === -1) re += '\\{';
       else {
-        re += `(?:${p.slice(i + 1, end).split(',').map((s) => s.replace(/[.+^$()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*').replace(/\?/g, '[^/]')).join('|')})`;
+        re += `(?:${p.slice(i + 1, end).split(',').map((x) => x.replace(/[.+^$()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*').replace(/\?/g, '[^/]')).join('|')})`;
         i = end;
       }
     } else if (c === '[') {
@@ -360,91 +439,31 @@ export function globToRegExp(pattern) {
   return new RegExp(`^${re}$`);
 }
 
-async function glob(cwd, input, signal) {
-  const root = target(cwd, input.path);
+async function glob(host, cwd, input) {
   const re = globToRegExp(input.pattern);
-  const found = [];
-  let seen = 0;
-  const walk = async (dir, rel) => {
-    if (signal?.aborted || seen > 50_000 || found.length >= 2000) return;
-    let entries;
-    try {
-      entries = await fs.readdir(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const e of entries) {
-      seen++;
-      const r = rel ? `${rel}/${e.name}` : e.name;
-      if (e.isDirectory()) {
-        if (!IGNORED.has(e.name)) await walk(path.join(dir, e.name), r);
-      } else if (re.test(r)) found.push(r);
-    }
-  };
-  await walk(root, '');
-  const withTime = await Promise.all(found.map(async (r) => ({ r, t: (await fs.stat(path.join(root, r)).catch(() => null))?.mtimeMs || 0 })));
-  withTime.sort((a, b) => b.t - a.t);
-  const base = relTo(cwd, root);
-  const list = withTime.slice(0, 200).map(({ r }) => (base === '.' ? r : `${base}/${r}`));
-  const more = withTime.length > 200 ? `\n… and ${withTime.length - 200} more (narrow the pattern)` : '';
+  const { rel, files } = await host.walk(cwd, input.path, 20_000);
+  const hits = files.filter(([r]) => re.test(r)).sort((a, b) => b[1] - a[1]);
+  const list = hits.slice(0, 200).map(([r]) => (rel === '.' ? r : `${rel}/${r}`));
+  const more = hits.length > 200 ? `\n… and ${hits.length - 200} more (narrow the pattern)` : '';
   const text = list.length ? list.join('\n') + more : 'No files found.';
   return { content: text, output: list.length ? text : '', isError: false };
 }
 
-let hasRg = null;
-function spawnCollect(cmd, args, { cwd, signal, timeoutMs = 30_000 }) {
-  return new Promise((resolve) => {
-    const child = spawn(cmd, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
-    let out = '';
-    let err = '';
-    const kill = () => child.kill('SIGKILL');
-    const timer = setTimeout(kill, timeoutMs);
-    signal?.addEventListener('abort', kill, { once: true });
-    child.stdout.on('data', (d) => out.length < 2_000_000 && (out += d));
-    child.stderr.on('data', (d) => (err = (err + d).slice(-4000)));
-    child.on('error', (e) => resolve({ code: -1, out, err: e.message }));
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      signal?.removeEventListener('abort', kill);
-      resolve({ code, out, err });
-    });
-  });
-}
+const q = (x) => `'${String(x).replace(/'/g, `'\\''`)}'`;
 
-async function grep(cwd, input, signal) {
-  const root = target(cwd, input.path);
-  const where = relTo(cwd, root);
+// ripgrep when the computer has it, grep otherwise.
+async function grep(host, cwd, input, signal) {
+  const where = (await host.stat(cwd, input.path)).rel;
   const mode = input.output_mode || 'files_with_matches';
-  hasRg ??= spawnSync('rg', ['--version'], { stdio: 'ignore' }).status === 0;
-  let args;
-  let cmd;
-  if (hasRg) {
-    cmd = 'rg';
-    args = ['--color', 'never', '--no-heading', '-M', '400', '--glob', '!.git', '--glob', '!node_modules'];
-    if (mode === 'files_with_matches') args.push('-l');
-    else if (mode === 'count') args.push('-c');
-    else args.push('-n');
-    if (mode === 'content' && input.context) args.push('-C', String(Math.min(input.context, 20)));
-    if (input.case_insensitive) args.push('-i');
-    if (input.glob) args.push('--glob', input.glob);
-    args.push('-e', input.pattern, '--', where);
-  } else {
-    cmd = 'grep';
-    args = ['-rE', '--exclude-dir=.git', '--exclude-dir=node_modules', '-I'];
-    if (mode === 'files_with_matches') args.push('-l');
-    else if (mode === 'count') args.push('-c');
-    else args.push('-n');
-    if (mode === 'content' && input.context) args.push('-C', String(Math.min(input.context, 20)));
-    if (input.case_insensitive) args.push('-i');
-    if (input.glob) args.push(`--include=${input.glob}`);
-    args.push('-e', input.pattern, '--', where);
-  }
-  const r = await spawnCollect(cmd, args, { cwd, signal });
-  if (r.code > 1 || r.code === -1) return fail(`Search failed: ${r.err.trim() || `exit ${r.code}`}`);
-  let lines = r.out.split('\n').filter(Boolean);
+  const ctx = mode === 'content' && input.context ? Math.min(input.context, 20) : 0;
+  const rg = ['rg --color never --no-heading -M 400 --glob \'!.git\' --glob \'!node_modules\'', mode === 'files_with_matches' ? '-l' : mode === 'count' ? '-c' : '-n', ctx ? `-C ${ctx}` : '', input.case_insensitive ? '-i' : '', input.glob ? `--glob ${q(input.glob)}` : '', `-e ${q(input.pattern)} -- ${q(where)}`];
+  const gr = ['grep -rEI --exclude-dir=.git --exclude-dir=node_modules', mode === 'files_with_matches' ? '-l' : mode === 'count' ? '-c' : '-n', ctx ? `-C ${ctx}` : '', input.case_insensitive ? '-i' : '', input.glob ? `--include=${q(input.glob)}` : '', `-e ${q(input.pattern)} -- ${q(where)}`];
+  const cmd = `if command -v rg >/dev/null 2>&1; then ${rg.filter(Boolean).join(' ')}; else ${gr.filter(Boolean).join(' ')}; fi`;
+  const r = await host.run(cwd, cmd, { signal, timeoutMs: 30_000 });
+  if (r.exitCode > 1 || r.exitCode === -1) return fail(`Search failed: ${r.output.trim() || `exit ${r.exitCode}`}`);
+  let lines = r.output === '(no output)' ? [] : r.output.split('\n').filter(Boolean);
   if (mode === 'count') lines = lines.filter((l) => !/:0$/.test(l));
-  const strip = (l) => l.replace(/^\.\//, '');
-  const shown = lines.slice(0, 250).map(strip);
+  const shown = lines.slice(0, 250).map((l) => l.replace(/^\.\//, ''));
   const more = lines.length > 250 ? `\n… ${lines.length - 250} more lines (narrow the search)` : '';
   const text = shown.length ? truncate(shown.join('\n') + more) : 'No matches.';
   return { content: text, output: shown.length ? text : '', isError: false };

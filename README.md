@@ -37,7 +37,7 @@ cd agent-hub; powershell -ExecutionPolicy Bypass -File scripts\start-public.ps1
 1. 到 [Claude Console → API Keys](https://console.anthropic.com/settings/keys) 建立一把 key。
 2. 左下角「⋯」→「Claude API…」貼上 key 後儲存（中控台會先向 Anthropic 確認 key 有效；key 只存在 `data/claude.json`，不會傳回瀏覽器）。也可以改用環境變數 `ANTHROPIC_API_KEY`。
 
-Claude 由中控台在**這台電腦**上執行：工具（Bash、Read、Write、Edit、Glob、Grep、網路搜尋）在你選的資料夾裡跑，權限有「每次詢問／自動接受編輯／全部自動」和計畫模式。也支援待辦、提問、子代理、插隊、/compact、/undo、/fork、定時送出；輸入框旁顯示這個對話的估計花費，`/cost` 看明細與速率限制，`/budget 5` 設定花費上限（花到就先停）。預設模型 Claude Opus 5.5。
+Claude 的對話由中控台執行，工具（Bash、Read、Write、Edit、Glob、Grep、網路搜尋）在你選的電腦和資料夾裡跑：中控台這台電腦，或任何已連接的電腦（透過那台的連接器；API key 只留在中控台，不會送到那台電腦。連接器要 0.4 以上，舊的請在那台電腦重新執行連接指令）。權限有「每次詢問／自動接受編輯／全部自動」和計畫模式。也支援待辦、提問、子代理、插隊、/compact、/undo、/fork、定時送出；輸入框旁顯示這個對話的估計花費，`/cost` 看明細與速率限制，`/budget 5` 設定花費上限（花到就先停）。預設模型 Claude Opus 5.5。
 
 ## 連接其他電腦
 

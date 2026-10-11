@@ -513,7 +513,7 @@ export function disposeSession(session) {
 
 // ------------------------------------------------------- session creation
 
-export async function newSession({ agentId, cwd, prompt, nameHint, permissionMode = 'ask', branch, title, config }) {
+export async function newSession({ agentId, machineId, cwd, prompt, nameHint, permissionMode = 'ask', branch, title, config }) {
   const agent = agentFor(agentId);
   if (!agent) throw Object.assign(new Error(`找不到 agent：${agentId}`), { status: 400 });
   let session;
@@ -528,12 +528,19 @@ export async function newSession({ agentId, cwd, prompt, nameHint, permissionMod
     await kimi.attach(session);
     if (config && Object.values(config).some((v) => v !== undefined && v !== '')) await kimi.configure(session, config).catch((err) => console.warn(`[kimi] configure: ${err.message}`));
   } else if (agent.type === 'claude') {
+    // On this computer, or on a connected one (`machineId`): only the tools
+    // run there; the conversation and the API key stay on the hub.
     const claude = ADAPTERS.claude;
-    const why = claude.cannotSend();
+    const why = claude.cannotSend({ machineId });
     if (why) throw Object.assign(new Error(why), { status: 409 });
-    const dir = cwd || (await createWorkspace(nameHint || prompt || 'claude'));
-    session = store.createSession({ agentId, cwd: dir, permissionMode, title: title || '新對話' });
-    claude.setup(session, config);
+    let dir = cwd;
+    if (machineId) {
+      if (!dir) dir = (await machines.rpc(machineId, 'workspace.create', { name: nameHint || prompt || 'claude' })).path;
+      const st = await claude.hostFor({ machineId }).stat(dir, '.');
+      if (!st.dir) throw Object.assign(new Error(`資料夾不存在：${dir}`), { status: 400 });
+    } else dir ||= await createWorkspace(nameHint || prompt || 'claude');
+    session = store.createSession({ agentId, cwd: dir, permissionMode, title: title || '新對話', ...(machineId ? { machineId } : {}) });
+    await claude.setup(session, config);
   } else {
     const dir = cwd || (await createWorkspace(nameHint || prompt || agent.name));
     session = store.createSession({ agentId, cwd: dir, permissionMode, branch, title: title || '新對話' });

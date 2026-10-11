@@ -262,3 +262,44 @@ test('sessions show in the list and the files panel reads their folder', async (
   const changes = await api('GET', `/sessions/${s.id}/changes`);
   assert.ok(changes.files.some((f) => f.path === 'hi.txt'));
 });
+
+test('on a connected computer: the tools run there, through its bridge', async () => {
+  const home = path.join(TMP, 'box-home');
+  const folder = path.join(TMP, 'box-folder');
+  fs.mkdirSync(folder, { recursive: true });
+  fs.writeFileSync(path.join(folder, 'CLAUDE.md'), '在這個專案裡用繁體中文回答。\n');
+  const keyFile = JSON.parse(fs.readFileSync(path.join(TMP, 'data', 'hub.json'), 'utf8')).bridgeKey;
+  const bridge = spawn(process.execPath, ['bridge/agent-hub-bridge.mjs', '--hub', `http://127.0.0.1:${PORT}`, '--key', keyFile, '--name', 'box', '--no-skill'], {
+    cwd: ROOT,
+    env: { ...process.env, HOME: home, USERPROFILE: home, KIMI_CODE_HOME: path.join(home, '.kimi-code'), PATH: process.env.PATH },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  try {
+    const m = await until(async () => (await api('GET', '/machines')).find((x) => x.name === 'box' && x.online));
+    const dirs = await api('GET', `/fs/dirs?machine=${m.id}&path=${encodeURIComponent(TMP)}`);
+    assert.ok(dirs.dirs.includes('box-folder'));
+    const n0 = messagesSent().length;
+    const s = await api('POST', '/sessions', { agent: 'claude', machineId: m.id, cwd: folder, prompt: 'WRITE', permission: 'auto' });
+    assert.equal(s.machineId, m.id);
+    assert.equal(s.meta.machineName, 'box');
+    const done = await idle(s.id);
+    assert.equal(fs.readFileSync(path.join(folder, 'hi.txt'), 'utf8'), 'hello from claude\n');
+    const system = messagesSent()[n0].body.system[0].text;
+    assert.match(system, /Computer: box/);
+    assert.match(system, /用繁體中文回答/);
+    assert.match(done.events.at(-2).text, /Created hi\.txt/);
+    // Commands too, their output streaming back.
+    await api('POST', `/sessions/${s.id}/messages`, { text: 'BASH' });
+    const bashed = await until(async () => {
+      const x = await snap(s.id);
+      return x.events.filter((e) => e.type === 'turn_end').length === 2 && x.status === 'idle' && x;
+    });
+    assert.match(bashed.events.find((e) => e.name === 'Bash').output, /bash-ran/);
+    const files = await api('GET', `/sessions/${s.id}/files`);
+    assert.ok(files.some((f) => f.name === 'hi.txt'));
+    const f = await api('GET', `/sessions/${s.id}/file?path=hi.txt`);
+    assert.equal(f.content, 'hello from claude\n');
+  } finally {
+    bridge.kill();
+  }
+});

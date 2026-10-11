@@ -11,6 +11,7 @@ const machines = new Map(); // id -> machine
 const listeners = new Set(); // (machineId, frame) => void   for Kimi events
 const onlineListeners = new Set(); // (machineId) => void
 const sessionListeners = new Set(); // (machineId, entry) => void
+const streams = new Map(); // stream id -> (chunk) => void   (a command's output as it comes)
 let broadcast = () => {};
 
 export function setBroadcast(fn) {
@@ -170,6 +171,8 @@ export function attachBridge(ws) {
       clearTimeout(p.timer);
       if (msg.ok) p.resolve(msg.data);
       else p.reject(new Error(msg.error || '連接器回報錯誤'));
+    } else if (msg.t === 'sh.data') {
+      streams.get(msg.id)?.(String(msg.chunk || ''));
     } else if (msg.t === 'kimi.event') {
       trackSession(m, msg.frame);
       for (const fn of listeners) fn(m.id, msg.frame);
@@ -221,6 +224,23 @@ export function rpc(machineId, op, args = {}, timeoutMs = 60_000) {
     m.pending.set(id, { resolve, reject, timer });
     m.ws.send(JSON.stringify({ t: 'req', id, op, args }));
   });
+}
+
+// An rpc whose progress arrives on the way (a command's output): `onData`
+// gets each chunk the bridge sends for `args.id`.
+export async function rpcStream(machineId, op, args, onData, timeoutMs) {
+  if (onData) streams.set(args.id, onData);
+  try {
+    return await rpc(machineId, op, args, timeoutMs);
+  } finally {
+    streams.delete(args.id);
+  }
+}
+
+// An older bridge does not know an op: say what to do about it.
+export function tooOld(err, m) {
+  if (/未知的操作/.test(err?.message || '')) return Object.assign(new Error(`「${m?.name || '這台電腦'}」的連接器太舊，不支援 Claude。在那台電腦重新執行連接指令（左下角「連接電腦…」）後再試。`), { status: 409 });
+  return err;
 }
 
 // Calls the Kimi Server API on a machine and unwraps its envelope.

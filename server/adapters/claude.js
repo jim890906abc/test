@@ -2,9 +2,10 @@
 // No Claude Code and no Claude subscription are involved. The hub runs the
 // agent loop itself: it streams each response from api.anthropic.com
 // (official SDK, `x-api-key` only — see claude-account.js), runs the tools
-// Claude calls in the conversation's folder on this computer (asking first,
-// as the permission mode says), sends the results back, and repeats until
-// Claude answers without a tool.
+// Claude calls in the conversation's folder (asking first, as the permission
+// mode says) — on this computer, or on a connected one through its bridge
+// (session.machineId) — sends the results back, and repeats until Claude
+// answers without a tool. The key never leaves the hub.
 //
 // The adapter is *live* like Kimi's: messages sent while Claude works wait
 // in the queue (or slip into the running turn: 插隊), approvals and questions
@@ -15,12 +16,11 @@
 // conversation starts, the tool set never changes, and plan-mode changes are
 // told to Claude as a note after the user's message.
 import os from 'node:os';
-import fs from 'node:fs';
-import path from 'node:path';
 import crypto from 'node:crypto';
 import * as store from '../store.js';
+import * as machines from '../machines.js';
 import * as account from '../claude-account.js';
-import { apiTools, toolKind, validate, titleOf, execute } from './claude-tools.js';
+import { apiTools, toolKind, validate, titleOf, execute, localHost, remoteHost } from './claude-tools.js';
 
 export const live = true;
 export const AGENT = { id: 'claude', name: 'Claude', type: 'claude', enabled: true };
@@ -56,10 +56,16 @@ export function available() {
 }
 
 // Refuse up front what cannot be sent.
-export function cannotSend() {
+export function cannotSend(session) {
   if (!account.apiKey()) return '還沒有設定 Claude API key：在左下角「⋯」→「Claude API…」貼上 Claude Console 的 API key（sk-ant-…）。';
+  const m = session?.machineId && machines.getMachine(session.machineId);
+  if (session?.machineId && !m?.online) return `「${m?.name || '那台電腦'}」目前離線。在那台電腦上執行連接器後再試。`;
   return null;
 }
+
+// Where the conversation's tools run: this computer, or a connected one.
+export const hostFor = (session) => (session.machineId ? remoteHost(session.machineId) : localHost);
+const machineName = (session) => (session.machineId ? machines.getMachine(session.machineId)?.name || '那台電腦' : os.hostname());
 
 // ---------------------------------------------------------------- state
 
@@ -74,17 +80,20 @@ const fmtUsd = (n) => (n >= 1 ? n.toFixed(2) : n >= 0.01 ? n.toFixed(3) : n.toFi
 
 // A new conversation: settings from what was picked (or Claude's defaults
 // in 設定), and the system prompt, fixed from now on.
-export function setup(session, config = {}) {
+export async function setup(session, config = {}) {
   const { defaults: d, webTools } = account.settings();
   const c = st(session);
-  c.system = systemPrompt(session.cwd);
-  c.subSystem = subSystemPrompt(session.cwd);
+  const host = hostFor(session);
+  const platform = session.machineId ? machines.getMachine(session.machineId)?.platform || 'unknown' : `${os.platform()} ${os.release()}`;
+  const [notes, git] = await Promise.all([projectNotes(host, session.cwd), host.stat(session.cwd, '.git').then((x) => x.exists, () => false)]);
+  c.system = systemPrompt(session.cwd, { platform, notes, git, computer: machineName(session) });
+  c.subSystem = subSystemPrompt(session.cwd, platform);
   c.web = webTools;
   const model = typeof config.model === 'string' && config.model ? config.model : d.model;
   session.meta = {
     ...(session.meta || {}),
     agent: 'claude',
-    machineName: os.hostname(),
+    machineName: machineName(session),
     model,
     effort: typeof config.effort === 'string' && config.effort ? config.effort : d.effort,
     permission: PERMISSIONS.includes(config.permission) ? config.permission : d.permission,
@@ -96,26 +105,25 @@ export function setup(session, config = {}) {
   refreshModels(session, true);
 }
 
-function projectNotes(cwd) {
+async function projectNotes(host, cwd) {
   for (const file of ['CLAUDE.md', 'AGENTS.md']) {
     try {
-      const text = fs.readFileSync(path.join(cwd, file), 'utf8').trim();
+      const text = (await host.read(cwd, file)).buf.toString('utf8').trim();
       if (text) return { file, text: text.length > 40_000 ? `${text.slice(0, 40_000)}\n… (cut; Read the file for the rest)` : text };
     } catch {}
   }
   return null;
 }
 
-function systemPrompt(cwd) {
-  const notes = projectNotes(cwd);
+function systemPrompt(cwd, { platform, notes, git, computer }) {
   return [
     'You are Claude, working as a coding agent for the user through Agent Hub, a control center they open in a browser or on their phone. You act on their computer only through your tools, which run in the working directory below.',
     '',
     '# Environment',
     `- Working directory: ${cwd}`,
-    `- Platform: ${os.platform()} ${os.release()}; shell: bash`,
+    `- Computer: ${computer} (${platform}); shell: bash`,
     `- This conversation started on ${new Date().toISOString().slice(0, 10)}.`,
-    fs.existsSync(path.join(cwd, '.git')) ? '- The working directory is a git repository.' : '- The working directory is not a git repository.',
+    git ? '- The working directory is a git repository.' : '- The working directory is not a git repository.',
     '',
     '# How to work',
     '- Look before you change anything: Read files before editing them, and find your way with Grep and Glob rather than guessing paths.',
@@ -136,9 +144,9 @@ function systemPrompt(cwd) {
     .trim();
 }
 
-function subSystemPrompt(cwd) {
+function subSystemPrompt(cwd, platform = os.platform()) {
   return [
-    `You are a subagent of Claude, doing one self-contained task in the working directory ${cwd} (${os.platform()}, bash).`,
+    `You are a subagent of Claude, doing one self-contained task in the working directory ${cwd} (${platform}, bash).`,
     'The main agent gave you a brief and sees only your final message, so end with a complete report of what you found or did: paths, names, commands, results.',
     "You can read and search files, run commands with Bash and edit files; some calls wait for the user's approval, and a rejected call should not be retried unchanged. Do only what the brief asks.",
   ].join('\n');
@@ -190,7 +198,7 @@ class Run {
 // or (while Claude works) the queue — `steer` (插隊) has Claude read it at
 // its next step instead of after the turn.
 export async function send(session, text, { images = [], note, steer } = {}) {
-  const why = cannotSend();
+  const why = cannotSend(session);
   if (why) throw Object.assign(new Error(why), { status: 409 });
   const promptId = `p_${crypto.randomBytes(6).toString('hex')}`;
   const thumbs = images.map((i) => i.thumb || `data:${i.mimeType};base64,${i.data}`);
@@ -645,6 +653,7 @@ async function runTool(run, u, ev, opts) {
   let pending = '';
   let timer = null;
   const r = await execute(u.name, u.input, {
+    host: hostFor(session),
     cwd: session.cwd,
     signal: run.ac.signal,
     onData: (chunk) => {
@@ -837,6 +846,7 @@ export async function command(session, name, args = '') {
       const copy = store.createSession({
         agentId: AGENT.id,
         cwd: session.cwd,
+        ...(session.machineId ? { machineId: session.machineId } : {}),
         permissionMode: session.permissionMode,
         title: args || `${session.title}（複製）`,
         titled: true,
@@ -871,7 +881,7 @@ export async function command(session, name, args = '') {
 // history (the conversation shown stays as it is).
 async function compact(session, instruction) {
   if (runs.has(session.id)) throw busyError();
-  const why = cannotSend();
+  const why = cannotSend(session);
   if (why) throw Object.assign(new Error(why), { status: 409 });
   const c = st(session);
   repair(c);
@@ -917,6 +927,39 @@ async function compact(session, instruction) {
 }
 
 export const isRunning = (session) => runs.has(session.id);
+
+// --- files and changes panels for a conversation on a connected computer
+
+export async function listFiles(session, rel = '.') {
+  const host = hostFor(session);
+  const { files } = await host.walk(session.cwd, rel, 2000);
+  const base = rel === '.' ? '' : `${rel.replace(/\/$/, '')}/`;
+  const seen = new Map();
+  for (const [r] of files) {
+    const [first, ...more] = r.split('/');
+    if (!seen.has(first)) seen.set(first, { name: first, path: `${base}${first}`, dir: more.length > 0 });
+  }
+  return [...seen.values()].sort((a, b) => Number(b.dir) - Number(a.dir) || a.name.localeCompare(b.name));
+}
+
+export async function readFile(session, rel) {
+  const f = await hostFor(session).read(session.cwd, rel);
+  if (f.size > 2 * 1024 * 1024) return { path: rel, size: f.size, tooLarge: true };
+  const binary = f.buf.subarray(0, 8000).includes(0);
+  return { path: rel, size: f.size, binary, content: binary ? '' : f.buf.toString('utf8') };
+}
+
+export async function getChanges(session, summarize) {
+  const host = hostFor(session);
+  const r = await host.run(
+    session.cwd,
+    'git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo __NOGIT__; exit 0; }; git diff HEAD --no-color --no-ext-diff 2>/dev/null; git ls-files --others --exclude-standard -z | head -z -n 100 | xargs -0 -r -I{} git diff --no-color --no-index -- /dev/null {}; exit 0',
+    { timeoutMs: 60_000 },
+  );
+  if (r.output.includes('__NOGIT__')) return { git: false, files: [], diff: '' };
+  const diff = r.output === '(no output)' ? '' : `${r.output.replace(/\n\[[^\]]*\]$/, '')}\n`;
+  return { git: true, files: summarize(diff), diff };
+}
 
 // At startup: whatever was in progress when the hub stopped is over.
 export function restore(session) {
