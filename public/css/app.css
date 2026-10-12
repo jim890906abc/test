@@ -3337,12 +3337,3 @@ pre.tail {
   color: var(--ink-secondary);
   overflow-wrap: anywhere;
 }
-a.chip.repo-chip {
-  text-decoration: none;
-  max-width: 100%;
-}
-a.chip.repo-chip span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}

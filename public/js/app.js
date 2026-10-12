@@ -1114,7 +1114,6 @@ function updateComposer() {
     turnModel: meta.turnModel,
     turnEffort: meta.turnEffort,
     servedModel: meta.servedModel || null,
-    repo: s.repo || null,
     context: meta.context,
     skills: meta.skills || [],
     terminal: meta.owner === 'tui',
