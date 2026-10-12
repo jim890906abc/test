@@ -52,6 +52,7 @@ export const COMMANDS = [
   { name: 'status', description: '目前的模型、權限、context、帳號與電腦' },
   { name: 'autopause', description: '自動暫停：5 小時額度用到設定的 % 送出「優雅暫停」，恢復後送出「繼續」', args: true, hint: '[% | off]' },
   { name: 'later', description: '定時送出：幾分鐘後、指定時間，或 5 小時額度恢復後送出訊息', args: true, hint: '[30 | 15:30 | reset] [訊息]' },
+  { name: 'backup', description: '把這個專案的資料夾備份到你的 Google Drive（中控台自己做，不花 token）' },
 ];
 const HOME_COMMANDS = ['model', 'effort', 'plan', 'permission', 'yolo', 'auto', 'manual', 'usage', 'status'];
 // Claude through the Claude API: the hub runs it, so these are the hub's.
@@ -74,6 +75,7 @@ export const CLAUDE_COMMANDS = [
   { name: 'budget', description: '花費上限：這個對話花到這個金額就先停下', args: true, hint: '<美元> | off' },
   { name: 'status', description: '目前的模型、權限、context、API key 與資料夾' },
   { name: 'later', description: '定時送出：幾分鐘後或指定時間送出訊息', args: true, hint: '[30 | 15:30] [訊息]' },
+  { name: 'backup', description: '把這個專案的資料夾備份到你的 Google Drive（中控台自己做，不花 token）' },
 ];
 const CLAUDE_HOME_COMMANDS = ['model', 'effort', 'plan', 'permission', 'manual', 'edits', 'auto', 'status'];
 // A Kimi running in a terminal runs its own slash commands; these are the
@@ -97,6 +99,7 @@ const TERMINAL_COMMANDS = [
   { name: 'copy', description: '複製 Kimi 最後一則回覆' },
   { name: 'autopause', description: '自動暫停：5 小時額度用到設定的 % 送出「優雅暫停」，恢復後送出「繼續」', args: true, hint: '[% | off]' },
   { name: 'later', description: '定時送出：幾分鐘後、指定時間，或 5 小時額度恢復後送出訊息', args: true, hint: '[30 | 15:30 | reset] [訊息]' },
+  { name: 'backup', description: '把這個專案的資料夾備份到你的 Google Drive（中控台自己做，不花 token）' },
 ];
 
 // "15:42（2 小時 13 分後）", or just the time once it has passed.

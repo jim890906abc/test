@@ -70,6 +70,17 @@ Kimi 也一樣：Kimi 首頁的資料夾選單選「綁定一個 GitHub repo…�
 - 已經開著的對話：資料夾不是那個 repo 的話，repo 會 clone 到對話資料夾裡的子資料夾（Kimi 的對話不能換資料夾），綁定後馬上傳一則訊息請 Kimi 把檔案搬進去並 push（會用掉一輪）。
 - 推到其他分支、force push、改 remote 的指令：Kimi 先問你要不要執行時會自動拒絕；全部自動（yolo）模式下 Kimi 不會先問，這一項就擋不了。
 
+## Google Drive 備份（/backup）
+
+在 Claude 或 Kimi 對話裡輸入 `/backup`（或對話右上「⋯」→「備份到 Google Drive」），中控台就用 [rclone](https://rclone.org) 把那個對話的專案資料夾備份到你的 Google Drive：
+
+- `Agent Hub 備份/<電腦>/<資料夾>/最新/`：跟本機一樣的一份（本機刪掉的檔案這裡也會刪）；
+- `Agent Hub 備份/<電腦>/<資料夾>/每日快照/<日期>.tar.gz`：每天一個壓縮檔，保留最近 30 天。
+
+.gitignore 排除的檔案、`.git`、`node_modules`、虛擬環境和快取不會備份。備份是中控台自己在那台電腦上執行的，不經過 Claude 或 Kimi，不花 token。
+
+每台電腦要先裝 rclone（Kali／Debian：`sudo apt install rclone`），再到左下角「⋯」→「Google Drive 備份…」登入 Google 一次：「用瀏覽器登入」的網址要在那台電腦上的瀏覽器打開；不在那台電腦前面的話，在任何有瀏覽器的電腦執行 `rclone authorize "drive"`，把印出的 token 貼進去。登入資料只存在那台電腦的 rclone 設定裡。
+
 ## 連接其他電腦
 
 在那台電腦執行中控台印出的連接指令（左下角「連接電腦…」也看得到）。之後那台電腦的 Kimi 對話會自動出現。

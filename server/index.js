@@ -19,6 +19,8 @@ import { createScheduler, scheduleTimings } from './schedule.js';
 import { mergeQuota, countsOf } from './quota.js';
 import * as claudeAccount from './claude-account.js';
 import * as github from './github.js';
+import * as gdrive from './gdrive.js';
+import { localHost, remoteHost } from './adapters/claude-tools.js';
 import { parseRepo, validBranch, newBranch } from './adapters/claude-repo.js';
 
 const PORT = Number(process.env.PORT || 8787);
@@ -515,6 +517,55 @@ app.post('/api/github/:target/:action', wrap(async (req) => {
   const { target, action } = req.params;
   if (!['status', 'login', 'web', 'cancel', 'logout', 'repos'].includes(action)) throw Object.assign(new Error('不支援的操作'), { status: 404 });
   return githubTarget(target).call(action, action === 'login' ? { token: String(req.body?.token || '') } : {});
+}));
+
+// Google Drive backups (server/gdrive.js), computer by computer like GitHub:
+// run through the computer's shell (bridge 0.5+ for a connected one).
+function driveHost(target) {
+  if (target === 'local') return localHost;
+  const m = machines.getMachine(target);
+  if (!m) throw Object.assign(new Error('找不到這台電腦'), { status: 404 });
+  if (!m.online) throw Object.assign(new Error(`「${m.name}」目前離線`), { status: 409 });
+  if (/^0\.[0-4]\./.test(m.bridgeVersion || '0.0.0')) throw Object.assign(new Error(`「${m.name}」的連接器太舊，在那台電腦重新執行連接指令（左下角「連接電腦…」）後再試。`), { status: 409 });
+  return remoteHost(target);
+}
+app.get('/api/gdrive', wrap(async () => {
+  const all = machines.listMachines().map((m) => ({ ...m, hostname: machines.getMachine(m.id)?.hostname }));
+  const here = os.hostname();
+  const computers = [
+    ...(all.some((m) => m.online && m.hostname === here) ? [] : [{ id: 'local', name: here, hub: true }]),
+    ...all.map((m) => ({ id: m.id, name: m.name, platform: m.platform, online: m.online, hub: m.hostname === here })),
+  ];
+  return Promise.all(
+    computers.map(async (c) => {
+      if (c.id !== 'local' && !c.online) return { ...c, offline: true };
+      try {
+        return { ...c, ...(await gdrive.status(driveHost(c.id))) };
+      } catch (err) {
+        return { ...c, error: err.message };
+      }
+    }),
+  );
+}));
+app.post('/api/gdrive/:target/:action', wrap(async (req) => {
+  const host = driveHost(req.params.target);
+  const ops = { status: () => gdrive.status(host), web: () => gdrive.loginWeb(host), login: () => gdrive.loginToken(host, req.body?.token), cancel: () => gdrive.cancel(host), logout: () => gdrive.logout(host) };
+  if (!ops[req.params.action]) throw Object.assign(new Error('不支援的操作'), { status: 404 });
+  return ops[req.params.action]();
+}));
+// /backup: the conversation's folder to Google Drive, on its computer.
+app.post('/api/sessions/:id/backup', wrap(async (req) => {
+  const s = mustSession(req.params.id);
+  if (!s.cwd) throw Object.assign(new Error('這個對話沒有資料夾'), { status: 400 });
+  const kimi = Boolean(s.kimiSessionId);
+  if (s.agentId !== 'claude' && !kimi) throw Object.assign(new Error('只有 Claude 和 Kimi 對話可以備份'), { status: 400 });
+  const host = s.machineId ? driveHost(s.machineId) : localHost;
+  const computer = s.machineId ? machines.getMachine(s.machineId)?.name || s.meta?.machineName : os.hostname();
+  const r = await gdrive.backup(host, s.cwd, computer);
+  s.lastBackup = r;
+  store.saveSession(s);
+  broadcast({ t: 'session', session: runner.summarize(s) });
+  return r;
 }));
 
 app.get('/api/machines', wrap(() => machines.listMachines()));

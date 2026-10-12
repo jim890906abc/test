@@ -13,6 +13,11 @@ import path from 'node:path';
 
 const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-hub-claude-'));
+// rclone for the Google Drive backups: a fake, whose "Drive" is a folder.
+const RCLONE = path.join(TMP, 'rclone');
+fs.mkdirSync(path.join(TMP, 'bin'), { recursive: true });
+fs.mkdirSync(RCLONE, { recursive: true });
+fs.writeFileSync(path.join(TMP, 'bin', 'rclone'), `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(path.join(path.dirname(new URL(import.meta.url).pathname), 'fixtures', 'fake-rclone.mjs'))} "$@"\n`, { mode: 0o755 });
 const PORT = 22000 + Math.floor(Math.random() * 2000);
 const KEY = `sk-ant-api03-${'k'.repeat(40)}-test`;
 let fake;
@@ -34,6 +39,8 @@ async function startHub(env = hubEnv) {
       AGENT_HUB_WORKSPACES: path.join(TMP, 'ws'),
       AGENT_HUB_CLAUDE_TEST_URL: fake.url,
       AGENT_HUB_GITHUB_TEST_URL: path.join(TMP, 'github'),
+      PATH: `${path.join(TMP, 'bin')}${path.delimiter}${env.PATH}`,
+      FAKE_RCLONE: RCLONE,
       // What a machine with Claude Code signed in might have around. None of
       // it may reach the request.
       ANTHROPIC_AUTH_TOKEN: 'sk-ant-oat01-should-never-be-sent',
@@ -678,6 +685,61 @@ test('a connected computer: its Claude conversations the hub does not know are t
       process.kill(JSON.parse(fs.readFileSync(path.join(home, '.agent-hub', 'claude', 'daemon.json'), 'utf8')).pid, 'SIGTERM');
     } catch {}
   }
+});
+
+test('/backup: the folder to Google Drive with rclone, after signing in once (latest copy + daily snapshots)', async () => {
+  const drive = (...p) => path.join(RCLONE, 'drive', 'Agent Hub 備份', os.hostname(), ...p);
+  const list = await api('GET', '/gdrive');
+  assert.ok(list.length >= 1);
+  const c0 = await api('POST', '/gdrive/local/status');
+  assert.equal(c0.rclone, '1.68.0');
+  assert.equal(c0.signedIn, false);
+
+  const folder = path.join(TMP, 'backup-me');
+  fs.mkdirSync(path.join(folder, 'src'), { recursive: true });
+  fs.mkdirSync(path.join(folder, 'node_modules', 'x'), { recursive: true });
+  fs.writeFileSync(path.join(folder, 'src', 'a.py'), 'print(1)\n');
+  fs.writeFileSync(path.join(folder, 'data.csv'), 'a,b\n1,2\n');
+  fs.writeFileSync(path.join(folder, 'secret.env'), 'KEY=1\n');
+  fs.writeFileSync(path.join(folder, '.gitignore'), 'secret.env\n');
+  fs.writeFileSync(path.join(folder, 'node_modules', 'x', 'i.js'), '1\n');
+  execFileSync('git', ['init', '-q'], { cwd: folder });
+  const s = await api('POST', '/sessions', { agent: 'claude', cwd: folder, permission: 'auto' });
+  await assert.rejects(api('POST', `/sessions/${s.id}/backup`), (err) => err.status === 409 && /還沒登入 Google Drive/.test(err.message));
+
+  // Signing in: rclone's link, opened on that computer; done once allowed.
+  const w = await api('POST', '/gdrive/local/web');
+  assert.equal(w.url, 'http://127.0.0.1:53682/auth?state=fake123');
+  assert.ok((await api('POST', '/gdrive/local/status')).pending);
+  fs.writeFileSync(path.join(RCLONE, 'authorized'), '');
+  const signed = await until(async () => {
+    const x = await api('POST', '/gdrive/local/status');
+    return x.signedIn && x;
+  }, 15000);
+  assert.deepEqual(signed.quota, { used: 1e9, total: 15e9 });
+
+  // Old snapshots beyond 30 days go.
+  fs.mkdirSync(drive('backup-me', '每日快照'), { recursive: true });
+  for (let i = 1; i <= 31; i++) fs.writeFileSync(drive('backup-me', '每日快照', `2020-01-${String(i).padStart(2, '0')}.tar.gz`), '');
+  const r = await api('POST', `/sessions/${s.id}/backup`);
+  assert.equal(r.files, 3); // .gitignore, data.csv, src/a.py
+  assert.equal(r.dest, `Agent Hub 備份/${os.hostname()}/backup-me`);
+  assert.equal(fs.readFileSync(drive('backup-me', '最新', 'src', 'a.py'), 'utf8'), 'print(1)\n');
+  assert.ok(fs.existsSync(drive('backup-me', '最新', 'data.csv')));
+  assert.equal(fs.existsSync(drive('backup-me', '最新', 'secret.env')), false);
+  assert.equal(fs.existsSync(drive('backup-me', '最新', 'node_modules')), false);
+  const snaps = fs.readdirSync(drive('backup-me', '每日快照')).sort();
+  assert.equal(snaps.length, 30);
+  assert.equal(snaps.at(-1), `${new Date().toLocaleDateString('sv')}.tar.gz`);
+  assert.match(execFileSync('tar', ['-tzf', drive('backup-me', '每日快照', snaps.at(-1))], { encoding: 'utf8' }), /src\/a\.py/);
+  assert.equal((await snap(s.id)).lastBackup.files, 3);
+
+  // The latest copy follows the folder: a file gone here goes there.
+  fs.rmSync(path.join(folder, 'data.csv'));
+  await api('POST', `/sessions/${s.id}/backup`);
+  assert.equal(fs.existsSync(drive('backup-me', '最新', 'data.csv')), false);
+
+  assert.equal((await api('POST', '/gdrive/local/logout')).signedIn, false);
 });
 
 test('the daemon bundle the bridges download is built from the current code', async (t) => {

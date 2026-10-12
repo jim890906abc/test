@@ -40,6 +40,7 @@ export function summarize(s) {
     meta: s.meta,
     usage: s.usage,
     autoPause: s.autoPause || null,
+    lastBackup: s.lastBackup || null,
     scheduled: s.scheduled || [],
     createdAt: s.createdAt,
     updatedAt: s.updatedAt,

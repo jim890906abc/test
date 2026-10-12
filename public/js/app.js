@@ -424,6 +424,7 @@ function settingsMenu(anchor) {
       canNotify ? { label: '開啟通知', description: 'Kimi 或 Claude 需要你的時候通知你', onSelect: () => Notification.requestPermission().then(() => toast('已開啟通知')) } : null,
       { label: '設定…', description: 'Kimi 新對話預設的模型、思考強度、權限', onSelect: openSettings },
       { label: 'Claude API…', description: 'API key 與 Claude 新對話的預設', onSelect: claudeDialog },
+      { label: 'Google Drive 備份…', description: '/backup 把專案資料夾備份到你的 Google Drive', onSelect: gdriveDialog },
       { label: 'GitHub…', description: '讓 Claude 和 Kimi 用你的 GitHub 帳號', onSelect: githubDialog },
       { label: '連接電腦…', onSelect: openMachines },
       { label: '登出', destructive: true, onSelect: logout },
@@ -1179,6 +1180,7 @@ function sessionMenu(anchor) {
       { label: '壓縮對話', hint: '/compact', onSelect: () => sessionCommand('compact', '') },
       { label: '自動暫停…', hint: s.autoPause?.enabled ? `${s.autoPause.threshold}%` : '關', onSelect: autoPauseDialog },
       { label: '定時送出…', hint: s.scheduled?.length ? `${s.scheduled.length} 則` : '/later', onSelect: () => scheduleDialog() },
+      backupItem(s),
       s.kimiSessionId
         ? s.repo
           ? { label: `GitHub：${s.repo.full}`, description: `分支 ${s.repo.branch}（已綁定）`, onSelect: () => window.open(s.repo.url, '_blank', 'noopener') }
@@ -1203,6 +1205,7 @@ function claudeSessionMenu(s, anchor) {
       { label: '用量與花費', hint: '/cost', onSelect: claudeCostDialog },
       { label: '花費上限…', hint: s.meta?.budget ? fmtUsd(s.meta.budget) : '關', onSelect: budgetDialog },
       { label: '定時送出…', hint: s.scheduled?.length ? `${s.scheduled.length} 則` : '/later', onSelect: () => scheduleDialog() },
+      backupItem(s),
       s.repo
         ? { label: `GitHub：${s.repo.full}`, description: `分支 ${s.repo.branch}（已綁定）`, onSelect: () => window.open(s.repo.url, '_blank', 'noopener') }
         : { label: '綁定 GitHub repo…', description: '之後的程式碼都 commit 並 push 到那裡', onSelect: () => repoDialog(s.machineId ? machineById(s.machineId) || { id: s.machineId, name: s.meta?.machineName || '那台電腦' } : { id: null, name: hostName() }, s) },
@@ -1212,6 +1215,27 @@ function claudeSessionMenu(s, anchor) {
     ],
     { align: 'end', width: 220 },
   );
+}
+
+// /backup: the conversation's folder to Google Drive (server/gdrive.js).
+const fmtBytes = (n) => (n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : n >= 1e3 ? `${Math.round(n / 1e3)} KB` : `${n} B`);
+const backupItem = (s) => ({ label: '備份到 Google Drive', hint: '/backup', description: s.lastBackup ? `上次備份：${relTime(s.lastBackup.at)}` : '這個專案的資料夾，最新一份＋每日快照', onSelect: () => backupSession(s) });
+let backingUp = false;
+async function backupSession(s) {
+  if (backingUp) return toast('正在備份中…');
+  backingUp = true;
+  toast('備份到 Google Drive 中…');
+  try {
+    const r = await post(`/sessions/${s.id}/backup`);
+    toast(`已備份到 Google Drive：${r.files} 個檔案（${fmtBytes(r.bytes)}）→ ${r.dest}`);
+  } catch (err) {
+    if (err.status === 409) {
+      fail(err);
+      gdriveDialog();
+    } else fail(err);
+  } finally {
+    backingUp = false;
+  }
 }
 
 async function renameSession() {
@@ -1271,6 +1295,7 @@ async function respond(ev, optionId, extra = {}) {
 async function sessionCommand(name, args) {
   const s = S.cur?.summary;
   if (!s) return;
+  if (name === 'backup') return backupSession(s);
   if (isClaude(s)) return claudeCommand(s, name, args);
   const meta = s.meta || {};
   switch (name) {
@@ -2470,6 +2495,147 @@ async function githubDialog() {
   try {
     const computers = await get('/github');
     if (open) draw(computers);
+  } catch (err) {
+    fill(list, h('div', { class: 'claude-test bad' }, err.message));
+  }
+}
+
+// Google Drive backups, one computer at a time: rclone there, signed in to
+// Google once from here (the sign-in stays in rclone on that computer).
+async function gdriveDialog() {
+  const list = h('div', { class: 'gh-list' }, h('div', { class: 'claude-test' }, h('span', { class: 'spinner' }), ' 檢查各台電腦的 Google Drive 登入狀態…'));
+  let timer = null;
+  let open = true;
+  const d = dialog(
+    h(
+      'div',
+      { class: 'settings' },
+      h('div', { class: 'dialog-title' }, 'Google Drive 備份'),
+      h(
+        'p',
+        { class: 'dialog-text settings-lead' },
+        '在對話裡輸入 /backup（或對話右上「⋯」→「備份到 Google Drive」），中控台就用 rclone 把那個對話的專案資料夾備份到你的 Google Drive：「Agent Hub 備份／電腦／資料夾」底下有一份「最新」，加上每天一個壓縮檔快照（保留 30 天）。.gitignore 排除的檔案、.git、node_modules、虛擬環境和快取不會備份。這是中控台自己做的，不經過 Claude 或 Kimi，不花 token。每台電腦登入 Google 一次就好，登入資料只存在那台電腦的 rclone 裡。',
+      ),
+      list,
+      h('div', { class: 'dialog-actions' }, h('button', { class: 'om-btn om-btn--primary', type: 'button', onclick: () => d.close() }, '完成')),
+    ),
+    { onClose: () => ((open = false), clearTimeout(timer)) },
+  );
+  const call = (c, action, body) => post(`/gdrive/${encodeURIComponent(c.id)}/${action}`, body);
+  const card = (c) => {
+    const box = h('div', { class: 'gh-card' });
+    const out = h('div', { class: 'claude-test', role: 'status' });
+    const busy = (text) => {
+      out.className = 'claude-test';
+      fill(out, h('span', { class: 'spinner' }), ` ${text}`);
+    };
+    const redraw = (next) => {
+      Object.assign(c, next);
+      box.replaceWith(card(c));
+    };
+    const act = async (label, action, body) => {
+      busy(label);
+      try {
+        redraw(action === 'web' ? { pending: await call(c, 'web') } : await call(c, action, body));
+      } catch (err) {
+        out.className = 'claude-test bad';
+        fill(out, err.message);
+      }
+    };
+    const state = c.offline ? '離線' : c.error ? '無法檢查' : c.rclone === null ? '沒有 rclone' : c.signedIn ? '已登入' : c.pending ? '等你登入' : '未登入';
+    const head = h('div', { class: 'gh-card__head' }, h('span', { class: 'gh-card__name' }, c.name, c.hub ? h('span', { class: 'gh-card__tag' }, '中控台這台') : null), h('span', { class: `gh-card__state${c.signedIn ? ' ok' : ''}` }, state));
+    const body = [];
+    if (c.offline) body.push(h('div', { class: 'om-field__help' }, '這台電腦的連接器沒有連上。連上後再回來這裡登入。'));
+    else if (c.error) body.push(h('div', { class: 'om-field__help warn' }, c.error));
+    else if (c.rclone === null)
+      body.push(
+        h('div', { class: 'om-field__help' }, '這台電腦還沒有安裝 rclone（開源的雲端同步工具，官方支援 Google Drive）。在那台電腦的終端機執行：'),
+        h('div', { class: 'gh-cmd' }, h('code', null, c.install), h('button', { class: 'om-btn om-btn--sm', type: 'button', onclick: () => copyText(c.install).then(() => toast('已複製')) }, '複製')),
+        h('div', { class: 'claude-key-actions' }, h('button', { class: 'om-btn om-btn--sm', type: 'button', onclick: () => act('重新檢查…', 'status') }, '裝好了，重新檢查'), h('a', { class: 'om-btn om-btn--sm', href: 'https://rclone.org/install/', target: '_blank', rel: 'noopener' }, '其他安裝方式')),
+      );
+    else if (c.signedIn)
+      body.push(
+        h('div', { class: 'om-field__help' }, `已登入 Google Drive${c.quota?.total ? `（已用 ${fmtBytes(c.quota.used || 0)} / ${fmtBytes(c.quota.total)}）` : ''}。在這台電腦上跑的對話都可以用 /backup。`),
+        h(
+          'div',
+          { class: 'claude-key-actions' },
+          h(
+            'button',
+            {
+              class: 'om-btn om-btn--sm om-btn--destructive',
+              type: 'button',
+              onclick: async () => {
+                const ok = await confirmDialog({ title: `讓「${c.name}」登出 Google Drive？`, body: '那台電腦上的對話之後就不能 /backup，直到你再登入。已經備份的檔案還在 Drive 上。這不會撤銷 Google 帳號裡的授權，要撤銷請到 Google 帳戶的「第三方應用程式和服務」。', action: '登出', destructive: true });
+                if (ok) {
+                  try {
+                    await call(c, 'logout');
+                    toast(`「${c.name}」已登出 Google Drive`);
+                  } catch (err) {
+                    fail(err);
+                  }
+                }
+                gdriveDialog();
+              },
+            },
+            '登出',
+          ),
+        ),
+      );
+    else if (c.pending) {
+      body.push(
+        h('div', { class: 'om-field__help warn' }, `這個登入網址只能在「${c.name}」這台電腦上的瀏覽器打開（它最後會回到那台電腦的 127.0.0.1）。在那台電腦上打開、選你的 Google 帳號、按「允許」，完成後這裡會自動更新。`),
+        h('div', { class: 'gh-cmd' }, h('code', null, c.pending.url), h('button', { class: 'om-btn om-btn--sm', type: 'button', onclick: () => copyText(c.pending.url).then(() => toast('已複製網址')) }, '複製')),
+        h(
+          'div',
+          { class: 'claude-key-actions' },
+          h('a', { class: 'om-btn om-btn--sm om-btn--primary', href: c.pending.url, target: '_blank', rel: 'noopener' }, '打開（我就在這台電腦上）'),
+          h('button', { class: 'om-btn om-btn--sm', type: 'button', onclick: () => act('取消中…', 'cancel') }, '取消'),
+        ),
+      );
+      const poll = async () => {
+        if (!open || !box.isConnected) return;
+        try {
+          const next = await call(c, 'status');
+          if (!next.pending) {
+            c.pending = null;
+            redraw(next);
+            if (next.signedIn) toast(`「${c.name}」已登入 Google Drive`);
+            return;
+          }
+        } catch {}
+        timer = setTimeout(poll, 2500);
+      };
+      timer = setTimeout(poll, 2500);
+    } else {
+      const tokenInput = h('textarea', { class: 'om-input', rows: 3, autocomplete: 'off', spellcheck: false, placeholder: '{"access_token":"…","token_type":"Bearer","refresh_token":"…","expiry":"…"}', 'aria-label': 'rclone token' });
+      const tokenForm = h(
+        'form',
+        { class: 'gh-token', hidden: true },
+        h('div', { class: 'om-field__help' }, '在任何一台有瀏覽器、裝了 rclone 的電腦執行 rclone authorize "drive"，登入後把它印出的那一段 {…} 貼在這裡。'),
+        tokenInput,
+        h('div', { class: 'claude-key-actions' }, h('button', { class: 'om-btn om-btn--sm om-btn--primary', type: 'submit' }, '登入')),
+      );
+      tokenForm.addEventListener('submit', (e) => {
+        e.preventDefault();
+        if (tokenInput.value.trim()) act('向 Google 確認…', 'login', { token: tokenInput.value.trim() });
+      });
+      if (c.problem) body.push(h('div', { class: 'om-field__help warn' }, c.problem));
+      body.push(
+        h(
+          'div',
+          { class: 'claude-key-actions' },
+          h('button', { class: 'om-btn om-btn--sm om-btn--primary', type: 'button', onclick: () => act('向 rclone 要登入網址…', 'web') }, '用瀏覽器登入'),
+          h('button', { class: 'om-btn om-btn--sm', type: 'button', onclick: () => ((tokenForm.hidden = !tokenForm.hidden), tokenForm.hidden || tokenInput.focus()) }, '用其他電腦登入'),
+        ),
+        tokenForm,
+      );
+    }
+    fill(box, head, ...body, out);
+    return box;
+  };
+  try {
+    const computers = await get('/gdrive');
+    if (open) fill(list, ...(computers.length ? computers.map(card) : [h('div', { class: 'om-field__help' }, '沒有可以設定的電腦。')]));
   } catch (err) {
     fill(list, h('div', { class: 'claude-test bad' }, err.message));
   }
