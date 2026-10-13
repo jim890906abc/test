@@ -18471,6 +18471,7 @@ __export(claude_exports, {
   restore: () => restore,
   send: () => send,
   setup: () => setup,
+  steerAll: () => steerAll,
   steerQueued: () => steerQueued,
   view: () => view
 });
@@ -18653,6 +18654,7 @@ async function turn(run, { text, images = [], thumbs, note, promptId, resume }) 
     content.unshift({ type: "text", text: `<system-reminder>${c.bindNote}</system-reminder>` });
     c.bindNote = null;
   }
+  if (!resume) content.push(...takeSteered(run));
   if (!content.length) content.push({ type: "text", text: "Continue." });
   const note2 = planNote(session, c);
   const sysNote = note2 && supportsSystemMessages(model) ? { role: "system", content: note2 } : null;
@@ -18663,8 +18665,13 @@ async function turn(run, { text, images = [], thumbs, note, promptId, resume }) 
   try {
     const opts = { messages: c.messages, model, effort, main: true, system: c.system, tools: mainTools(session, model) };
     let r = await loop(run, opts);
+    const ended = (x) => !x.aborted && !x.halted && !x.budget && !run.aborted && !run.halted;
+    for (let blocks; ended(r) && (blocks = takeSteered(run)).length; ) {
+      c.messages.push({ role: "user", content: blocks });
+      r = await loop(run, opts);
+    }
     const repo = session.meta?.repo;
-    const finished = (x) => !x.aborted && !x.halted && !x.budget && !run.aborted && !run.halted && !session.meta?.planMode;
+    const finished = (x) => ended(x) && !session.meta?.planMode;
     if (repo && finished(r)) {
       let left = await check2(hostFor(session), session.cwd, repo);
       for (let i = 0; left && i < 2 && finished(r); i++) {
@@ -19235,6 +19242,11 @@ async function interrupt(session) {
   run.ac.abort();
   for (const resolve2 of [...run.waits.values()]) resolve2(null);
 }
+function steerAll(session) {
+  const waiting = queue(session).filter((q3) => !q3.steered);
+  if (waiting.length) liveContext(session).setMeta({ queue: queue(session).map((x) => ({ ...x, steered: true })) });
+  return { count: waiting.length };
+}
 function steerQueued(session, promptId) {
   const q3 = queue(session).find((x) => x.promptId === promptId);
   if (!q3 || q3.steered) return;
@@ -19688,6 +19700,7 @@ var OPS = {
     return r;
   },
   steerQueued: ({ id, promptId }) => claude.steerQueued(must(id), promptId),
+  steerAll: ({ id }) => claude.steerAll(must(id)),
   cancelQueued: ({ id, promptId }) => claude.cancelQueued(must(id), promptId),
   title({ id, title }) {
     liveContext2(must(id)).setTitle(String(title || "").slice(0, 120));

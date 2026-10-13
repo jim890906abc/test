@@ -490,6 +490,7 @@ app.delete('/api/sessions/:id/schedule/:item', wrap((req) => {
 }));
 
 // 插隊: slip a queued message into the running turn (Kimi's Ctrl-S).
+app.post('/api/sessions/:id/queue/steer-all', wrap((req) => runner.steerAll(mustSession(req.params.id))));
 app.post('/api/sessions/:id/queue/:promptId/steer', wrap(async (req) => {
   await runner.steerQueued(mustSession(req.params.id), req.params.promptId);
 }));

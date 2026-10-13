@@ -508,6 +508,17 @@ export async function command(session, name, args) {
 }
 
 // 插隊 for a message waiting in the queue.
+// /steer: every message still waiting (排隊中 or 等待插隊) slipped into the
+// running turn at once.
+export async function steerAll(session) {
+  const adapter = adapterFor(session);
+  if (adapter?.steerAll) return adapter.steerAll(session);
+  if (!adapter?.steerQueued) throw Object.assign(new Error('這個對話不支援插隊'), { status: 400 });
+  const waiting = (session.meta?.queue || []).filter((q) => !q.steered);
+  for (const q of waiting) await adapter.steerQueued(session, q.promptId);
+  return { count: waiting.length };
+}
+
 export async function steerQueued(session, promptId) {
   const adapter = adapterFor(session);
   if (!adapter?.steerQueued) throw Object.assign(new Error('這個對話不支援插隊'), { status: 400 });

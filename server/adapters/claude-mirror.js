@@ -260,6 +260,8 @@ export const interrupt = (session) => call(session, 'interrupt');
 export const respond = (session, eventId, optionId, extra) => call(session, 'respond', { eventId, optionId, extra });
 export const configure = (session, change) => call(session, 'configure', { change });
 export const steerQueued = (session, promptId) => call(session, 'steerQueued', { promptId });
+// In the daemon, whose queue is the one that counts (the hub's copy may lag).
+export const steerAll = (session) => call(session, 'steerAll');
 export const cancelQueued = (session, promptId) => call(session, 'cancelQueued', { promptId });
 export const setTitle = (session, title) => call(session, 'title', { title });
 

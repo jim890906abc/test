@@ -104,7 +104,16 @@ function startFakeModel() {
       if (lastUser.includes('子代理')) return send(call('我派一個子代理去看。', 'Agent', { description: '檢查專案檔案', prompt: 'SUBAGENT_TASK：列出專案檔案' }));
       if (lastUser.includes('待辦')) return send(call('先列待辦。', 'TodoList', { todos: [{ title: '讀取設定', status: 'done' }, { title: '修改程式', status: 'in_progress' }, { title: '跑測試', status: 'pending' }] }));
       if (lastUser.includes('慢工具')) return send(call('先跑一個慢指令。', 'Bash', { command: 'sleep 1.5 && echo slow-done' }));
+      // A background command; when it is done, Kimi's own turn runs a long one.
+      if (users[0]?.includes('背景工作') && !users.some((u) => /聊天|慢聊/.test(u))) {
+        const args = (m) => m?.tool_calls?.[0]?.function?.arguments || '';
+        if (last.role === 'tool') return send(text(args(msgs.at(-2)).includes('run_in_background') ? '背景開始了。' : '自己的回合做完了。'));
+        if (!msgs.some((m) => m.role === 'tool')) return send(call('開一個背景工作。', 'Bash', { command: 'sleep 2 && echo bg-done', run_in_background: true, description: 'bg' }));
+        return send(call('背景好了，接著跑長指令。', 'Bash', { command: 'sleep 6 && echo own-done' }));
+      }
+      if (lastUser.includes('長工作') && last.role !== 'tool') return send(call('跑一個長指令。', 'Bash', { command: 'sleep 6 && echo long-done' }));
       if (lastUser.includes('聊天')) return send(text(`收到：${lastUser}`));
+      if (lastUser.includes('慢聊')) return send([...text(`收到：${lastUser}`).slice(0, 1), { delta: { content: '。' } }, { delta: { content: '。' } }, { delta: {}, finish_reason: 'stop' }], 500);
       return send(call('我來執行指令。', 'Bash', { command: 'echo hello-from-kimi' }));
     });
   });
@@ -538,6 +547,37 @@ test('files attached to a Kimi message are saved on its computer through the bri
   const user = done.events.filter((e) => e.type === 'user').at(-1);
   assert.match(user.text, /\[附件\] 2 個已存到工作資料夾/);
   assert.doesNotMatch(user.text, /hello zip/);
+});
+
+test('messages waiting to cut in while Kimi runs a turn of its own all go in together when the next turn starts', { skip: SKIP }, async () => {
+  const s = await api('POST', '/sessions', { machineId, cwd: PROJECT, prompt: '背景工作 開始', permission: 'auto' });
+  // Kimi's own turn (after the background command), which takes no message in.
+  await until(async () => (await session(s.id)).events.some((e) => e.type === 'tool_use' && /sleep 6/.test(JSON.stringify(e.input || '')) && e.status === 'running'), 30000, 'own turn');
+  for (const t of ['慢聊 一', '慢聊 二', '慢聊 三']) await api('POST', `/sessions/${s.id}/messages`, { text: t, steer: true });
+  await until(async () => (await session(s.id)).meta.queue?.length === 3 && (await session(s.id)).meta.queue.every((q) => q.cutIn && !q.steered), 10000, 'waiting to cut in');
+  const done = await until(async () => {
+    const x = await session(s.id);
+    return x.status === 'idle' && !(x.meta.queue || []).length && x.events.filter((e) => e.type === 'user').length === 4 && x;
+  }, 40000, 'all read');
+  const users = done.events.filter((e) => e.type === 'user').map((e) => [e.text, Boolean(e.steered)]);
+  // The first starts the turn; the other two go into it, not turns of their own.
+  assert.deepEqual(users.slice(1), [['慢聊 一', false], ['慢聊 二', true], ['慢聊 三', true]]);
+  const after = done.events.slice(done.events.findIndex((e) => e.text === '慢聊 一'));
+  assert.equal(after.filter((e) => e.type === 'turn_end').length, 1);
+});
+
+test('/steer: every queued message into the running turn at once', { skip: SKIP }, async () => {
+  const s = await api('POST', '/sessions', { machineId, cwd: PROJECT, prompt: '長工作 開始', permission: 'auto' });
+  await until(async () => (await session(s.id)).events.some((e) => e.type === 'tool_use' && e.status === 'running'), 20000, 'running');
+  for (const t of ['聊天 甲', '聊天 乙']) await api('POST', `/sessions/${s.id}/messages`, { text: t });
+  await until(async () => (await session(s.id)).meta.queue?.length === 2, 10000, 'queued');
+  assert.deepEqual(await api('POST', `/sessions/${s.id}/queue/steer-all`), { count: 2 });
+  const done = await until(async () => {
+    const x = await session(s.id);
+    return x.status === 'idle' && x.events.filter((e) => e.type === 'user').length === 3 && x;
+  }, 30000, 'read');
+  assert.deepEqual(done.events.filter((e) => e.type === 'user').slice(1).map((e) => [e.text, Boolean(e.steered)]), [['聊天 甲', true], ['聊天 乙', true]]);
+  assert.equal(done.events.filter((e) => e.type === 'turn_end').length, 1);
 });
 
 test('when the Kimi server goes away, the bridge starts a new one on the next message', { skip: SKIP }, async () => {

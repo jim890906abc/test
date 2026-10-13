@@ -305,6 +305,8 @@ async function turn(run, { text, images = [], thumbs, note, promptId, resume }) 
     content.unshift({ type: 'text', text: `<system-reminder>${c.bindNote}</system-reminder>` });
     c.bindNote = null;
   }
+  // Other messages slipped in (插隊) that are still waiting come with it.
+  if (!resume) content.push(...takeSteered(run));
   if (!content.length) content.push({ type: 'text', text: 'Continue.' });
   const note2 = planNote(session, c);
   const sysNote = note2 && account.supportsSystemMessages(model) ? { role: 'system', content: note2 } : null;
@@ -316,10 +318,17 @@ async function turn(run, { text, images = [], thumbs, note, promptId, resume }) 
   try {
     const opts = { messages: c.messages, model, effort, main: true, system: c.system, tools: mainTools(session, model) };
     let r = await loop(run, opts);
+    const ended = (x) => !x.aborted && !x.halted && !x.budget && !run.aborted && !run.halted;
+    // Messages slipped in (插隊) while Claude wrote its last answer had no
+    // next step to go into: all of them are read now, in this turn.
+    for (let blocks; ended(r) && (blocks = takeSteered(run)).length; ) {
+      c.messages.push({ role: 'user', content: blocks });
+      r = await loop(run, opts);
+    }
     // Bound to a repository: nothing may stay behind uncommitted or unpushed.
     // Claude is told (twice at most), then Agent Hub saves it itself.
     const repo = session.meta?.repo;
-    const finished = (x) => !x.aborted && !x.halted && !x.budget && !run.aborted && !run.halted && !session.meta?.planMode;
+    const finished = (x) => ended(x) && !session.meta?.planMode;
     if (repo && finished(r)) {
       let left = await repoBind.check(hostFor(session), session.cwd, repo);
       for (let i = 0; left && i < 2 && finished(r); i++) {
@@ -979,6 +988,13 @@ export async function interrupt(session) {
   if (!run) return;
   run.ac.abort();
   for (const resolve of [...run.waits.values()]) resolve(null);
+}
+
+// /steer: every message still waiting goes in at the next step.
+export function steerAll(session) {
+  const waiting = queue(session).filter((q) => !q.steered);
+  if (waiting.length) liveContext(session).setMeta({ queue: queue(session).map((x) => ({ ...x, steered: true })) });
+  return { count: waiting.length };
 }
 
 export function steerQueued(session, promptId) {

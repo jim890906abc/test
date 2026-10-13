@@ -777,6 +777,26 @@ test('files attached to a message are saved on its computer (a .zip unpacked), a
   await assert.rejects(api('POST', `/sessions/${s.id}/messages`, { text: 'x', files: Array.from({ length: 16 }, (_, i) => ({ name: `${i}.md`, content: 'x' })) }), /最多附 15 個/);
 });
 
+test('messages cut in while Claude writes its last answer are all read together, in the same turn; /steer takes the queued ones', async () => {
+  for (const [how, steer] of [['插隊', true], ['/steer', false]]) {
+    const s = await api('POST', '/sessions', { agent: 'claude', prompt: 'SLOW', permission: 'auto' });
+    await until(async () => (await snap(s.id)).events.some((e) => e.type === 'text' && e.text), 10000);
+    const n0 = messagesSent().length;
+    await api('POST', `/sessions/${s.id}/messages`, { text: `${how} 甲`, steer });
+    await api('POST', `/sessions/${s.id}/messages`, { text: `${how} 乙`, steer });
+    if (!steer) assert.deepEqual(await api('POST', `/sessions/${s.id}/queue/steer-all`), { count: 2 });
+    const done = await until(async () => {
+      const x = await snap(s.id);
+      return x.status === 'idle' && x.events.some((e) => e.type === 'turn_end') && x;
+    }, 20000);
+    assert.equal(done.events.filter((e) => e.type === 'turn_end').length, 1, how);
+    assert.deepEqual(done.events.filter((e) => e.type === 'user').map((e) => [e.text, Boolean(e.steered)]), [['SLOW', false], [`${how} 甲`, true], [`${how} 乙`, true]]);
+    // Both in one message, read at once.
+    const next = messagesSent().slice(n0).map((r) => JSON.stringify(r.body.messages.at(-1)));
+    assert.ok(next.some((m) => m.includes(`${how} 甲`) && m.includes(`${how} 乙`)), next.join('\n'));
+  }
+});
+
 test('the daemon bundle the bridges download is built from the current code', async (t) => {
   let esbuild;
   try {

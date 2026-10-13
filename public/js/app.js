@@ -1319,6 +1319,14 @@ async function sessionCommand(name, args) {
   const s = S.cur?.summary;
   if (!s) return;
   if (name === 'backup') return backupSession(s);
+  if (name === 'steer') {
+    try {
+      const r = await post(`/sessions/${s.id}/queue/steer-all`);
+      return toast(r.count ? `${r.count} 則訊息插隊：下一步一起讀到${isClaude(s) ? '' : '（Kimi 自己開的這一輪不收插隊的話，下一輪一開始就一起送進去）'}` : '沒有在排隊的訊息');
+    } catch (err) {
+      return fail(err);
+    }
+  }
   if (isClaude(s)) return claudeCommand(s, name, args);
   const meta = s.meta || {};
   switch (name) {

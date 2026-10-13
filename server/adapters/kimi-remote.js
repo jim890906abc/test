@@ -651,8 +651,10 @@ class Mirror {
     switch (type) {
       case 'turn.started': {
         if (!main) return;
-        // A new turn may be one Kimi lets a waiting message into.
-        if (!this.batch && this.cutInTimer) setTimeout(() => this.tryCutIns(), 300);
+        // A new turn may be one Kimi lets the waiting messages into: all of
+        // them go in now (when Kimi's own turn refused them, the turn it
+        // starts for the first one takes the others).
+        if (!this.batch && this.queue().some((q) => q.cutIn && !q.steered && !q.terminal)) setTimeout(() => this.tryCutIns(), 300);
         this.closeBlock();
         this.turn = { started: now(), input: 0, output: 0, id: p.turnId };
         // Kimi fixes the model and thinking for the whole turn when it

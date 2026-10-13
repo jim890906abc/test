@@ -183,6 +183,7 @@ const OPS = {
     return r;
   },
   steerQueued: ({ id, promptId }) => claude.steerQueued(must(id), promptId),
+  steerAll: ({ id }) => claude.steerAll(must(id)),
   cancelQueued: ({ id, promptId }) => claude.cancelQueued(must(id), promptId),
   title({ id, title }) {
     liveContext(must(id)).setTitle(String(title || '').slice(0, 120));

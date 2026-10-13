@@ -63,6 +63,7 @@ export const COMMANDS = [
   { name: 'autopause', description: '自動暫停：5 小時額度用到設定的 % 送出「優雅暫停」，恢復後送出「繼續」', args: true, hint: '[% | off]' },
   { name: 'later', description: '定時送出：幾分鐘後、指定時間，或 5 小時額度恢復後送出訊息', args: true, hint: '[30 | 15:30 | reset] [訊息]' },
   { name: 'backup', description: '把這個專案的資料夾備份到你的 Google Drive（中控台自己做，不花 token）' },
+  { name: 'steer', description: '全部插隊：排隊中、等待插隊的訊息一次全部送進正在跑的這一輪，下一步一起讀到', aliases: ['steerall', 'flush'] },
 ];
 const HOME_COMMANDS = ['model', 'effort', 'plan', 'permission', 'yolo', 'auto', 'manual', 'usage', 'status'];
 // Claude through the Claude API: the hub runs it, so these are the hub's.
@@ -86,6 +87,7 @@ export const CLAUDE_COMMANDS = [
   { name: 'status', description: '目前的模型、權限、context、API key 與資料夾' },
   { name: 'later', description: '定時送出：幾分鐘後或指定時間送出訊息', args: true, hint: '[30 | 15:30] [訊息]' },
   { name: 'backup', description: '把這個專案的資料夾備份到你的 Google Drive（中控台自己做，不花 token）' },
+  { name: 'steer', description: '全部插隊：排隊中、等待插隊的訊息一次全部送進正在跑的這一輪，下一步一起讀到', aliases: ['steerall', 'flush'] },
 ];
 const CLAUDE_HOME_COMMANDS = ['model', 'effort', 'plan', 'permission', 'manual', 'edits', 'auto', 'status'];
 // A Kimi running in a terminal runs its own slash commands; these are the
@@ -110,6 +112,7 @@ const TERMINAL_COMMANDS = [
   { name: 'autopause', description: '自動暫停：5 小時額度用到設定的 % 送出「優雅暫停」，恢復後送出「繼續」', args: true, hint: '[% | off]' },
   { name: 'later', description: '定時送出：幾分鐘後、指定時間，或 5 小時額度恢復後送出訊息', args: true, hint: '[30 | 15:30 | reset] [訊息]' },
   { name: 'backup', description: '把這個專案的資料夾備份到你的 Google Drive（中控台自己做，不花 token）' },
+  { name: 'steer', description: '全部插隊：排隊中、等待插隊的訊息一次全部送進正在跑的這一輪，下一步一起讀到', aliases: ['steerall', 'flush'] },
 ];
 
 // "15:42（2 小時 13 分後）", or just the time once it has passed.
@@ -401,14 +404,15 @@ export class Composer {
         ? h('button', { class: `cost-chip${s.budget && s.cost >= s.budget ? ' over' : ''}`, type: 'button', title: `這個對話到目前約花了 ${fmtUsd(s.cost)}（依 Claude API 公開價格估計）${s.budget ? `，上限 ${fmtUsd(s.budget)}` : ''}。點一下看明細`, onclick: () => this.opts.onCommand('cost', '') }, fmtUsd(s.cost))
         : null,
       ring,
-      // While the agent works: Enter queues the message for after this
-      // turn; 插隊 (Ctrl+S, like Kimi's CLI) slips it into the running turn.
-      busy && this.hasContent() ? h('button', { class: 'om-btn om-btn--sm steer-btn', type: 'button', title: `插隊：讓 ${name} 在下一步就讀到，不會中斷它（Ctrl+S）`, onclick: () => this.submit({ steer: true }) }, '插隊') : null,
+      // While the agent works: Enter slips the message into the running turn
+      // (插隊, read at its next step with any others waiting); 排隊 keeps it
+      // for after the turn.
+      busy && this.hasContent() ? h('button', { class: 'om-btn om-btn--sm steer-btn', type: 'button', title: `排隊：等 ${name} 這一輪做完才送出`, onclick: () => this.submit({ steer: false }) }, '排隊') : null,
       // Kimi waiting on a subagent or a command in the foreground.
       stop && s.foreground && !claude ? h('button', { class: 'om-btn om-btn--sm bg-btn', type: 'button', title: BG_DESCRIPTION, onclick: () => this.opts.onBackground?.() }, '移到背景') : null,
       stop
         ? h('button', { class: 'send stop', type: 'button', title: '停止（Esc）', 'aria-label': '停止', onclick: () => this.opts.onStop() }, icon('stop'))
-        : h('button', { class: 'send', type: 'button', title: busy ? '排隊：這一輪結束後送出（Enter）' : '送出（Enter）', 'aria-label': busy ? '排隊送出' : '送出', disabled: !this.hasContent(), onclick: () => this.submit() }, icon('up')),
+        : h('button', { class: 'send', type: 'button', title: busy ? `插隊：${name} 下一步就讀到，不會中斷它（Enter）` : '送出（Enter）', 'aria-label': busy ? '插隊送出' : '送出', disabled: !this.hasContent(), onclick: () => this.submit() }, icon('up')),
     );
   }
 
@@ -447,6 +451,16 @@ export class Composer {
         ),
       );
     }
+    // More than one waiting: all of them into the turn at once (/steer).
+    if (queue.filter((q) => !q.steered).length > 1 && this.opts.onCommand && !this.opts.home)
+      items.push(
+        h(
+          'div',
+          { class: 'queued queued-all' },
+          h('span', { class: 'queued-text muted' }, `${queue.filter((q) => !q.steered).length} 則訊息還沒進這一輪`),
+          h('button', { class: 'om-btn om-btn--sm', type: 'button', title: `全部插隊：${agentName(this.agent())} 下一步一起讀到，不會中斷它（/steer）`, onclick: () => this.opts.onCommand('steer', '') }, '全部插隊'),
+        ),
+      );
     for (const q of queue) {
       items.push(
         h(
@@ -533,7 +547,11 @@ export class Composer {
     }
   }
 
-  submit({ steer = false } = {}) {
+  // While the agent works, a message cuts in (插隊) by default: it and any
+  // others waiting go into the running turn together at its next step.
+  // `steer: false` (排隊) waits for the turn to end instead.
+  submit({ steer } = {}) {
+    if (steer === undefined) steer = Boolean(this.state.running || this.state.awaiting) && !this.opts.home;
     const raw = this.input.value;
     const text = raw.trim();
     if (!text && !this.images.length && !this.docs.length) return;
