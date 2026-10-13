@@ -234,16 +234,22 @@ class Mirror {
   // The first time the hub opens a conversation, it gets the model,
   // thinking and permission from 設定 (plan mode is left as it was).
   // Changed afterwards in the conversation, it stays changed.
+  // Every time the hub opens a conversation: what was not chosen in it from
+  // the hub (model, thinking, permission) is set as 設定 says, whatever Kimi
+  // started it with or fell back to. What was chosen in it stays.
   async applyDefaults() {
-    if (this.session.state.defaultsApplied || this.inTerminal()) return;
+    if (this.inTerminal()) return;
     const d = store.readSettings().defaults || {};
     const meta = this.session.meta || {};
+    const chosen = this.session.state.userSet || {};
     const change = {};
-    const model = d.model && (meta.models || []).find((x) => x.id === d.model);
-    if (model && meta.model !== d.model) change.model = d.model;
+    // Sent even when it looks set already: what the hub has may be behind
+    // Kimi (it journals a change with its next turn).
+    const model = d.model && !chosen.model && (meta.models || []).find((x) => x.id === d.model);
+    if (model) change.model = d.model;
     const efforts = (model || (meta.models || []).find((x) => x.id === meta.model))?.efforts || [];
-    if (d.effort && efforts.includes(d.effort) && meta.effort !== d.effort) change.effort = d.effort;
-    if (PERMISSIONS.includes(d.permission) && meta.permission !== d.permission) change.permission = d.permission;
+    if (d.effort && !chosen.effort && efforts.includes(d.effort)) change.effort = d.effort;
+    if (PERMISSIONS.includes(d.permission) && !chosen.permission) change.permission = d.permission;
     this.session.state.defaultsApplied = true;
     store.saveSession(this.session);
     if (!Object.keys(change).length) return;
@@ -1330,7 +1336,16 @@ const followed = async (session) => {
   await m.ensureLive();
   return m;
 };
-export const configure = async (session, change) => (await followed(session)).configure(change);
+// Chosen in the conversation from the hub: kept from then on (applyDefaults).
+export const configure = async (session, change) => {
+  const m = await followed(session);
+  await m.configure(change);
+  const keys = ['model', 'effort', 'permission'].filter((k) => change?.[k] != null && change[k] !== '');
+  if (keys.length) {
+    session.state.userSet = { ...(session.state.userSet || {}), ...Object.fromEntries(keys.map((k) => [k, true])) };
+    store.saveSession(session);
+  }
+};
 export const command = async (session, name, args) => (await followed(session)).command(name, args);
 export const cancelQueued = (session, promptId) => mirrorFor(session).cancelQueued(promptId);
 export const loadEarlier = (session) => mirrorFor(session).loadEarlier();

@@ -426,7 +426,7 @@ test('a conversation from a terminal Kimi that was closed is continued from the 
   assert.ok(done.events.some((e) => e.type === 'text' && e.text.includes('收到：聊天 關掉之前')), 'earlier turns are there');
 });
 
-test('opening an existing conversation applies the defaults from 設定 once', { skip: SKIP }, async () => {
+test('opening a conversation applies the defaults from 設定 each time, except what was chosen in it', { skip: SKIP }, async () => {
   await api('PUT', '/settings', { defaults: { permission: 'auto' } });
   try {
     const ks = await kimiApi('POST', '/sessions', { metadata: { cwd: PROJECT } });
@@ -434,11 +434,21 @@ test('opening an existing conversation applies the defaults from 設定 once', {
     await listed((s) => s.id === ks.id && !s.busy && s.title, 'conversation started in Kimi');
     const s = await api('POST', `/machines/${machineId}/kimi/${ks.id}/attach`);
     await until(async () => (await session(s.id)).meta.permission === 'auto', 15000, 'permission from the defaults');
-    // Changed in the conversation afterwards, it stays changed.
-    await api('POST', `/sessions/${s.id}/config`, { permission: 'yolo' });
+    // Kimi falls back to something else (its own default, say): opened
+    // again, the conversation gets the default again.
+    await kimiApi('POST', `/sessions/${ks.id}/profile`, { agent_config: { permission_mode: 'yolo' } });
+    await api('POST', `/machines/${machineId}/kimi/${ks.id}/attach`);
+    await until(async () => (await session(s.id)).meta.permission === 'auto', 15000, 'the default again');
+    // Kimi itself is back on auto (it tells its model so).
+    const n0 = seen.length;
+    await api('POST', `/sessions/${s.id}/messages`, { text: '聊天 再一次' });
+    await until(async () => (await session(s.id)).status === 'idle' && seen.length > n0, 20000, 'answered');
+    assert.match(JSON.stringify(seen.at(-1).messages), /Auto permission mode/);
+    // Chosen in the conversation from the hub: it stays.
+    await api('POST', `/sessions/${s.id}/config`, { permission: 'manual' });
     await api('POST', `/machines/${machineId}/kimi/${ks.id}/attach`);
     await new Promise((r) => setTimeout(r, 1500));
-    assert.equal((await session(s.id)).meta.permission, 'yolo');
+    assert.equal((await session(s.id)).meta.permission, 'manual');
   } finally {
     await api('PUT', '/settings', { defaults: {} });
   }

@@ -14,6 +14,7 @@ const ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..')
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-hub-journal-'));
 const KIMI_HOME = path.join(TMP, 'kimi');
 const SID = 'session_journal1';
+const SID2 = 'session_journal2';
 let bridge;
 let wss;
 
@@ -33,6 +34,21 @@ test('thinking changed after the conversation started is what the bridge reports
     { type: 'config.update', agentId: 'main', thinkingEffort: 'max', time: 3 },
   ];
   fs.writeFileSync(path.join(dir, 'agents', 'main', 'wire.jsonl'), lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+  // A long conversation: changed to max and auto in the middle of a journal
+  // much bigger than the start and the end the bridge reads whole.
+  const dir2 = path.join(KIMI_HOME, 'sessions', 'ws1', SID2);
+  fs.mkdirSync(path.join(dir2, 'agents', 'main'), { recursive: true });
+  fs.writeFileSync(path.join(dir2, 'state.json'), JSON.stringify({ title: '長日誌', cwd: TMP }));
+  const filler = (n, at) => Array.from({ length: n }, (_, i) => ({ type: 'context.append', agentId: 'main', text: 'x'.repeat(1000), time: at + i }));
+  const long = [
+    { type: 'profile.bind', agentId: 'main', modelAlias: 'kimi/k3-256k', profileName: 'default', thinkingEffort: 'high', systemPrompt: 'x', disallowedTools: [], time: 1 },
+    { type: 'permission.set_mode', agentId: 'main', mode: 'yolo', time: 2 },
+    ...filler(300, 10),
+    { type: 'config.update', agentId: 'main', thinkingEffort: 'max', time: 400 },
+    { type: 'permission.set_mode', agentId: 'main', mode: 'auto', time: 401 },
+    ...filler(800, 500),
+  ];
+  fs.writeFileSync(path.join(dir2, 'agents', 'main', 'wire.jsonl'), long.map((l) => JSON.stringify(l)).join('\n') + '\n');
 
   // A hub that asks the bridge about the conversation.
   wss = new WebSocketServer({ port: 0, path: '/bridge' });
@@ -45,10 +61,11 @@ test('thinking changed after the conversation started is what the bridge reports
         if (m.t === 'hello') {
           ws.send(JSON.stringify({ t: 'req', id: 'info', op: 'kimi.info', args: { sessionId: SID } }));
           ws.send(JSON.stringify({ t: 'req', id: 'history', op: 'kimi.history', args: { sessionId: SID, turns: 10 } }));
+          ws.send(JSON.stringify({ t: 'req', id: 'long', op: 'kimi.info', args: { sessionId: SID2 } }));
         }
         if (m.t === 'res') {
           answers.set(m.id, m);
-          if (answers.size === 2) resolve();
+          if (answers.size === 3) resolve();
         }
       });
     });
@@ -65,4 +82,8 @@ test('thinking changed after the conversation started is what the bridge reports
   assert.equal(info.data.model, 'kimi/k3-256k');
   const frames = answers.get('history').data.frames.filter((f) => f.type === 'agent.status.updated' && f.payload.thinkingEffort);
   assert.deepEqual(frames.map((f) => f.payload.thinkingEffort).slice(-2), ['high', 'max'], 'replayed in order, ending on max');
+  const longInfo = answers.get('long');
+  assert.ok(fs.statSync(path.join(KIMI_HOME, 'sessions', 'ws1', SID2, 'agents', 'main', 'wire.jsonl')).size > 1_000_000);
+  assert.equal(longInfo.data.effort, 'max');
+  assert.equal(longInfo.data.permission, 'auto');
 });

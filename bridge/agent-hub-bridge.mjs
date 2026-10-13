@@ -904,12 +904,41 @@ class DiskSession {
       const size = w.size();
       if (size < 0) continue;
       const tag = (r) => (r && !r.agentId ? Object.assign(r, { agentId: agent }) : r);
-      if (agent === 'main') for (const line of Wire.slice(w.file, 0, Math.min(size, 96 * 1024)).lines) this.apply(tag(record(line)));
-      const { lines } = Wire.slice(w.file, Math.max(0, size - 512 * 1024), size);
+      const HEAD = 96 * 1024;
+      const TAIL = 512 * 1024;
+      if (agent === 'main') {
+        for (const line of Wire.slice(w.file, 0, Math.min(size, HEAD)).lines) this.apply(tag(record(line)));
+        // A long conversation: the model, thinking and permission set in
+        // between, or it would show what it started with.
+        if (size > HEAD + TAIL) this.scanSettings(w.file, HEAD, size - TAIL, tag);
+      }
+      const { lines } = Wire.slice(w.file, Math.max(0, size - TAIL), size);
       for (const line of lines) this.apply(tag(record(line)));
       w.offset = size;
     }
     this.readState();
+  }
+
+  // Only the settings records of a stretch of a journal, read in chunks.
+  scanSettings(file, from, to, tag) {
+    const CHUNK = 4 * 1024 * 1024;
+    let rest = '';
+    let first = from > 0;
+    for (let at = from; at < to; at += CHUNK) {
+      const len = Math.min(CHUNK, to - at);
+      const buf = Buffer.alloc(len);
+      const fd = fs.openSync(file, 'r');
+      try {
+        fs.readSync(fd, buf, 0, len, at);
+      } finally {
+        fs.closeSync(fd);
+      }
+      const lines = (rest + buf.toString('utf8')).split('\n');
+      rest = lines.pop();
+      if (first) lines.shift(); // the cut line before it
+      first = false;
+      for (const line of lines) if (/set_mode|config\.update|profile\.bind/.test(line)) this.apply(tag(record(line)));
+    }
   }
 
   readState() {
