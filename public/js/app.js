@@ -599,6 +599,7 @@ async function showHome() {
     placeholder: '要讓 Kimi 做什麼？輸入 / 看指令',
     onSend: startSession,
     onCommand: homeCommand,
+    onPickUploadDir: (anchor, cur, set) => homeMachine() && uploadDirMenu(anchor, homeMachine(), null, cur, set),
     onStop: () => {},
     onConfig: (c) => {
       if (c.model) S.home.model = c.model;
@@ -732,6 +733,7 @@ function showClaudeHome() {
     placeholder: '要讓 Claude 做什麼？輸入 / 看指令',
     onSend: startClaudeSession,
     onCommand: claudeHomeCommand,
+    onPickUploadDir: (anchor, cur, set) => uploadDirMenu(anchor, claudeHomeMachine(), null, cur, set),
     onStop: () => {},
     onConfig: (c) => {
       const x = (S.home.claude ??= {});
@@ -890,7 +892,7 @@ function claudeFolderMenu(anchor) {
   );
 }
 
-async function startClaudeSession({ text, images }) {
+async function startClaudeSession({ text, images, files, uploadDir }) {
   if (!S.claude?.hasKey) {
     claudeHomeComposer.setText(text);
     return claudeDialog();
@@ -904,7 +906,7 @@ async function startClaudeSession({ text, images }) {
   try {
     const m = claudeHomeMachine();
     const repo = claudeRepo(m);
-    const s = await post('/sessions', { agent: 'claude', machineId: m.id || undefined, cwd: repo ? undefined : claudeCwd(m) || undefined, repo: repo?.full, branch: repo?.branch || undefined, prompt: text, images, model, effort, permission: x.permission, planMode: x.planMode || undefined });
+    const s = await post('/sessions', { agent: 'claude', machineId: m.id || undefined, cwd: repo ? undefined : claudeCwd(m) || undefined, files, uploadDir, repo: repo?.full, branch: repo?.branch || undefined, prompt: text, images, model, effort, permission: x.permission, planMode: x.planMode || undefined });
     S.sessions.set(s.id, s);
     resetHomeChoices();
     go(`#/s/${s.id}`);
@@ -916,7 +918,7 @@ async function startClaudeSession({ text, images }) {
   }
 }
 
-async function startSession({ text, images }) {
+async function startSession({ text, images, files, uploadDir }) {
   const m = homeMachine();
   if (!m) return openMachines();
   const repo = kimiRepo(m);
@@ -929,7 +931,7 @@ async function startSession({ text, images }) {
   const effort = S.home.effort && used?.efforts?.includes(S.home.effort) ? S.home.effort : undefined;
   homeComposer.el.classList.add('sending');
   try {
-    const s = await post('/sessions', { machineId: m.id, cwd, repo: repo?.full, branch: repo?.branch || undefined, prompt: text, images, model, effort, permission: S.home.permission, planMode: S.home.planMode || undefined });
+    const s = await post('/sessions', { machineId: m.id, cwd, files, uploadDir, repo: repo?.full, branch: repo?.branch || undefined, prompt: text, images, model, effort, permission: S.home.permission, planMode: S.home.planMode || undefined });
     S.sessions.set(s.id, s);
     resetHomeChoices(); // the next new conversation starts from the defaults again
     go(`#/s/${s.id}`);
@@ -1016,6 +1018,10 @@ async function openSession(id) {
   composer ??= new Composer({
     onSend: sendMessage,
     onCommand: sessionCommand,
+    onPickUploadDir: (anchor, cur, set) => {
+      const s = S.cur?.summary;
+      if (s) uploadDirMenu(anchor, s.machineId ? machineById(s.machineId) || { id: s.machineId, name: s.meta?.machineName || '那台電腦' } : { id: null, name: hostName(), home: S.config?.home }, s.cwd, cur, set);
+    },
     onStop: interrupt,
     onConfig: configure,
     onCancelQueued: (pid) => S.cur && del(`/sessions/${S.cur.id}/queue/${pid}`).catch(fail),
@@ -1217,6 +1223,23 @@ function claudeSessionMenu(s, anchor) {
   );
 }
 
+// Where the files attached to a message are saved, on the conversation's
+// computer: its folder's .agent-hub/attachments (default), the folder
+// itself, or any folder picked there.
+function uploadDirMenu(anchor, m, cwd, cur, set) {
+  openMenu(
+    anchor,
+    [
+      { label: '對話資料夾（預設）', description: '.agent-hub/attachments/時間/，不會進 git 和備份', checked: !cur, onSelect: () => set(null) },
+      cwd ? { label: '對話資料夾本身', description: shortPath(cwd, m.home || S.config?.home, 4), checked: cur === cwd, onSelect: () => set(cwd) } : null,
+      cur && cur !== cwd ? { label: baseName(cur), description: shortPath(cur, m.home || S.config?.home, 4), checked: true, onSelect: () => set(cur) } : null,
+      { separator: true },
+      { label: '選擇資料夾…', description: `「${m.name}」上的任何資料夾`, onSelect: () => browseFolders(m, (dir) => set(dir), cur || cwd || undefined) },
+    ].filter(Boolean),
+    { width: 300 },
+  );
+}
+
 // /backup: the conversation's folder to Google Drive (server/gdrive.js).
 const fmtBytes = (n) => (n >= 1e9 ? `${(n / 1e9).toFixed(1)} GB` : n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : n >= 1e3 ? `${Math.round(n / 1e3)} KB` : `${n} B`);
 const backupItem = (s) => ({ label: '備份到 Google Drive', hint: '/backup', description: s.lastBackup ? `上次備份：${relTime(s.lastBackup.at)}` : '這個專案的資料夾，最新一份＋每日快照', onSelect: () => backupSession(s) });
@@ -1244,13 +1267,13 @@ async function renameSession() {
   if (title?.trim()) sessionCommand('title', title.trim());
 }
 
-async function sendMessage({ text, images, steer }, from) {
+async function sendMessage({ text, images, files, uploadDir, steer }, from) {
   const s = S.cur?.summary;
   if (!s) return;
   // What you send is what you want to see: back to the newest message.
   if (!from) S.cur.transcript.toEnd();
   try {
-    await post(`/sessions/${s.id}/messages`, { text, images, from, steer: Boolean(steer) });
+    await post(`/sessions/${s.id}/messages`, { text, images, files, uploadDir, from, steer: Boolean(steer) });
   } catch (err) {
     if (!from) composer.setText(text);
     fail(err);

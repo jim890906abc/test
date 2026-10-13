@@ -31,9 +31,11 @@ const MAX_IMAGES = 8;
 const MAX_DOCS = 15;
 const MAX_DOC_BYTES = 1_000_000;
 const DOC_EXT = /\.(md|markdown|mdx|txt|text|html?|xhtml|css|js|mjs|cjs|jsx|ts|tsx|json|jsonl|ya?ml|toml|ini|cfg|conf|env\.example|csv|tsv|log|xml|svg|py|rb|go|rs|java|kt|c|h|cc|cpp|hpp|cs|php|sh|bash|zsh|ps1|sql|r|lua|swift|vue|svelte|tex|rst|org|diff|patch)$/i;
-const isDoc = (f) => DOC_EXT.test(f.name || '') || /^text\//.test(f.type || '') || /json|xml|javascript/.test(f.type || '');
+const MAX_ZIP_BYTES = 20_000_000;
+const isZip = (f) => /\.zip$/i.test(f.name || '') || /zip/.test(f.type || '');
+const isDoc = (f) => isZip(f) || DOC_EXT.test(f.name || '') || /^text\//.test(f.type || '') || /json|xml|javascript/.test(f.type || '');
 const isImage = (f) => /^image\//.test(f.type || '') && !/svg/.test(f.type || '');
-const DOC_ACCEPT = '.md,.markdown,.mdx,.txt,.html,.htm,.css,.js,.mjs,.jsx,.ts,.tsx,.json,.jsonl,.yaml,.yml,.toml,.ini,.cfg,.conf,.csv,.tsv,.log,.xml,.svg,.py,.rb,.go,.rs,.java,.kt,.c,.h,.cpp,.hpp,.cs,.php,.sh,.ps1,.sql,.lua,.swift,.vue,.svelte,.tex,.rst,.diff,.patch';
+const DOC_ACCEPT = '.zip,.md,.markdown,.mdx,.txt,.html,.htm,.css,.js,.mjs,.jsx,.ts,.tsx,.json,.jsonl,.yaml,.yml,.toml,.ini,.cfg,.conf,.csv,.tsv,.log,.xml,.svg,.py,.rb,.go,.rs,.java,.kt,.c,.h,.cpp,.hpp,.cs,.php,.sh,.ps1,.sql,.lua,.swift,.vue,.svelte,.tex,.rst,.diff,.patch';
 
 // Built-in commands; Kimi skills are appended from the session.
 const BG_DESCRIPTION = '移到背景（Ctrl+B）：Kimi 正在等的子代理或指令改到背景繼續跑，Kimi 不用再等它';
@@ -217,6 +219,7 @@ export class Composer {
     this.input.value = this.drafts.get(key) || '';
     this.images = [];
     this.docs = [];
+    this.uploadDir = null; // each conversation starts with its own folder
     this.renderImages();
     this.grow();
     this.renderActions();
@@ -542,12 +545,11 @@ export class Composer {
       return;
     }
     const images = this.images.map(({ mimeType, data, thumb }) => ({ mimeType, data, thumb }));
-    const docs = this.docs;
-    const body = docs.length
-      ? [text || `請看附件：${docs.map((d) => d.name).join('、')}`, ...docs.map((d) => `<file name="${d.name.replace(/"/g, "'")}">\n${d.content}\n</file>`)].join('\n\n')
-      : text;
+    // Saved in the conversation's folder by the hub; the message says where.
+    const files = this.docs.map(({ name, content, data }) => (data ? { name, data } : { name, content }));
+    const uploadDir = files.length ? this.uploadDir || undefined : undefined;
     this.clear();
-    this.opts.onSend({ text: body, images, steer });
+    this.opts.onSend({ text, images, files, uploadDir, steer });
   }
 
   clear() {
@@ -655,12 +657,15 @@ export class Composer {
     for (const f of all) if (!docs.includes(f) && !images.includes(f)) this.opts.onError?.(`沒辦法讀取「${f.name}」：支援圖片（PNG、JPEG…）和文字檔（.md、.html、.txt、程式碼…）`);
     if (docs.length > MAX_DOCS - this.docs.length) this.opts.onError?.(`一次最多附 ${MAX_DOCS} 個檔案，多的沒有加入`);
     for (const f of docs.slice(0, Math.max(0, MAX_DOCS - this.docs.length))) {
-      if (f.size > MAX_DOC_BYTES) {
-        this.opts.onError?.(`「${f.name}」超過 1 MB，沒有加入`);
+      const zip = isZip(f);
+      if (f.size > (zip ? MAX_ZIP_BYTES : MAX_DOC_BYTES)) {
+        this.opts.onError?.(`「${f.name}」超過 ${zip ? '20' : '1'} MB，沒有加入`);
         continue;
       }
       try {
-        this.docs.push({ name: f.name, content: await f.text(), size: f.size });
+        // A .zip goes as base64 and is unpacked on the conversation's computer.
+        if (zip) this.docs.push({ name: f.name, data: await base64Of(f), size: f.size, zip: true });
+        else this.docs.push({ name: f.name, content: await f.text(), size: f.size });
       } catch {
         this.opts.onError?.(`沒辦法讀取「${f.name}」`);
       }
@@ -698,6 +703,26 @@ export class Composer {
         ),
       ),
     );
+    // Where the files go: picked here (the conversation's folder by default).
+    if (this.docs.length && this.opts.onPickUploadDir)
+      this.thumbs.append(
+        h(
+          'button',
+          {
+            class: 'upload-dir',
+            type: 'button',
+            title: this.uploadDir || '對話資料夾裡的 .agent-hub/attachments（不會進 git）',
+            onclick: (e) =>
+              this.opts.onPickUploadDir(e.currentTarget, this.uploadDir, (dir) => {
+                this.uploadDir = dir;
+                this.renderImages();
+              }),
+          },
+          icon('folder'),
+          h('span', null, `上傳到：${this.uploadDir ? this.uploadDir.split('/').filter(Boolean).slice(-2).join('/') || '/' : '對話資料夾（預設）'}`),
+          icon('down', 'caret'),
+        ),
+      );
     this.thumbs.hidden = !this.images.length && !this.docs.length;
     const model = this.currentModel();
     if (this.images.length && model && !model.image) this.opts.onError?.(`${model.name} 可能看不懂圖片`);
@@ -713,6 +738,14 @@ function servedChip(s) {
   const title = `Anthropic 回報最近一次回應（${clockTime(x.at)}）是由 ${x.id} 產生的。每次回應都會更新；跟你選的模型不同時，這一輪會立刻停下。`;
   return h('span', { class: `chip static served${bad ? ' bad' : ''}`, title }, h('span', { class: 'served-dot', 'aria-hidden': 'true' }), h('span', null, `實際 ${x.name || x.id}`));
 }
+
+const base64Of = (file) =>
+  new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).replace(/^data:[^,]*,/, ''));
+    r.onerror = reject;
+    r.readAsDataURL(file);
+  });
 
 // Downscale to at most 2000px (and a small thumbnail for the transcript).
 async function readImage(file) {

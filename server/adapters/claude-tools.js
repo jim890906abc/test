@@ -363,7 +363,7 @@ export function remoteHost(machineId) {
       const r = await call('fs.read', { cwd, path: p }, 120_000);
       return { ...r, buf: Buffer.from(r.data, 'base64') };
     },
-    write: (cwd, p, content) => call('fs.write', { cwd, path: p, content }, 120_000),
+    write: (cwd, p, content) => call('fs.write', Buffer.isBuffer(content) ? { cwd, path: p, content: content.toString('base64'), encoding: 'base64' } : { cwd, path: p, content }, 120_000),
     walk: (cwd, p, limit = 2000) => call('fs.walk', { cwd, path: p || '.', limit }),
     async run(cwd, command, { signal, timeoutMs, onData } = {}) {
       const id = crypto.randomBytes(6).toString('hex');

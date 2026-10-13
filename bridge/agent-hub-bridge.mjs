@@ -35,7 +35,7 @@ import { StringDecoder } from 'node:string_decoder';
 import { spawn, execFile, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '0.6.0';
+const VERSION = '0.7.0';
 const SCRIPT = fileURLToPath(import.meta.url);
 
 // ------------------------------------------------------------------ args
@@ -1675,11 +1675,12 @@ const tools = {
     if (st.size > 20 * 1024 * 1024) throw new Error(`the file is ${Math.round(st.size / 1048576)} MB (at most 20 MB)`);
     return { ...at, size: st.size, data: fs.readFileSync(at.abs).toString('base64') };
   },
-  write({ cwd, path: p, content }) {
+  // `encoding: 'base64'`: a binary file (an attached .zip).
+  write({ cwd, path: p, content, encoding }) {
     const at = inFolder(cwd, p);
     const existed = fs.existsSync(at.abs);
     fs.mkdirSync(path.dirname(at.abs), { recursive: true });
-    fs.writeFileSync(at.abs, String(content ?? ''));
+    fs.writeFileSync(at.abs, encoding === 'base64' ? Buffer.from(String(content ?? ''), 'base64') : String(content ?? ''));
     return { ...at, existed };
   },
   walk({ cwd, path: p, limit = 2000 }) {

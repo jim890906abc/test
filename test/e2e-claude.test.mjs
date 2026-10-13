@@ -742,6 +742,41 @@ test('/backup: the folder to Google Drive with rclone, after signing in once (la
   assert.equal((await api('POST', '/gdrive/local/logout')).signedIn, false);
 });
 
+test('files attached to a message are saved on its computer (a .zip unpacked), and the message says where', async () => {
+  const folder = path.join(TMP, 'attach-here');
+  fs.mkdirSync(folder, { recursive: true });
+  const s = await api('POST', '/sessions', { agent: 'claude', cwd: folder, permission: 'auto' });
+  const zip = execFileSync('python3', ['-c', "import io, zipfile, base64, sys; b = io.BytesIO(); z = zipfile.ZipFile(b, 'w'); z.writestr('docs/a.md', '# A\\n'); z.writestr('b.html', '<p>b</p>'); z.writestr('../evil.txt', 'x'); z.close(); sys.stdout.write(base64.b64encode(b.getvalue()).decode())"], { encoding: 'utf8' });
+  const n0 = messagesSent().length;
+  await api('POST', `/sessions/${s.id}/messages`, { text: '看附件', files: [{ name: 'notes.md', content: '# 筆記\n' }, { name: 'page.html', content: '<p>x</p>' }, { name: 'pack.zip', data: zip }] });
+  await until(async () => (await snap(s.id)).events.some((e) => e.type === 'turn_end'), 15000);
+  const [stamp] = fs.readdirSync(path.join(folder, '.agent-hub', 'attachments'));
+  const dir = path.join(folder, '.agent-hub', 'attachments', stamp);
+  assert.equal(fs.readFileSync(path.join(dir, 'notes.md'), 'utf8'), '# 筆記\n');
+  assert.equal(fs.readFileSync(path.join(dir, 'page.html'), 'utf8'), '<p>x</p>');
+  assert.equal(fs.readFileSync(path.join(dir, 'pack', 'docs', 'a.md'), 'utf8'), '# A\n');
+  assert.equal(fs.existsSync(path.join(dir, 'pack.zip')), false);
+  // ../ in the zip stays inside its folder.
+  assert.equal(fs.existsSync(path.join(dir, 'evil.txt')), false);
+  assert.equal(fs.readFileSync(path.join(dir, 'pack', 'evil.txt'), 'utf8'), 'x');
+  assert.equal(fs.readFileSync(path.join(folder, '.agent-hub', '.gitignore'), 'utf8'), '*\n');
+  const sent = JSON.stringify(messagesSent()[n0].body.messages.at(-1));
+  assert.match(sent, /看附件/);
+  assert.match(sent, new RegExp(`\\.agent-hub/attachments/${stamp}/notes\\.md`));
+  assert.match(sent, /pack\.zip（[^）]+）已解壓到 \.agent-hub\/attachments\/[^/]+\/pack\/，共 3 個檔案/);
+  assert.doesNotMatch(sent, /# 筆記/); // the content stays in the file
+  assert.equal((await snap(s.id)).title, '看附件');
+
+  // A folder picked for them.
+  const picked = path.join(TMP, 'picked');
+  fs.mkdirSync(picked, { recursive: true });
+  await api('POST', `/sessions/${s.id}/messages`, { text: '再一個', files: [{ name: 'c.md', content: 'c' }], uploadDir: picked });
+  await until(async () => (await snap(s.id)).events.filter((e) => e.type === 'turn_end').length === 2, 15000);
+  assert.equal(fs.readFileSync(path.join(picked, 'c.md'), 'utf8'), 'c');
+  assert.match(JSON.stringify(messagesSent().at(-1).body.messages.at(-1)), new RegExp(`${picked.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/c\\.md`));
+  await assert.rejects(api('POST', `/sessions/${s.id}/messages`, { text: 'x', files: Array.from({ length: 16 }, (_, i) => ({ name: `${i}.md`, content: 'x' })) }), /最多附 15 個/);
+});
+
 test('the daemon bundle the bridges download is built from the current code', async (t) => {
   let esbuild;
   try {

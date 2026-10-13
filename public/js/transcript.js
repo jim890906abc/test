@@ -1269,9 +1269,14 @@ export function todoList(todos) {
 function userText(text) {
   if (!text) return [];
   const files = [];
-  const rest = text.replace(/\n*<file name="([^"]*)">\n([\s\S]*?)\n<\/file>/g, (_, name, content) => (files.push({ name, content }), '')).trim();
+  let rest = text.replace(/\n*<file name="([^"]*)">\n([\s\S]*?)\n<\/file>/g, (_, name, content) => (files.push({ name, content }), '')).trim();
+  // Files saved in the folder: the list the hub added, set apart.
+  const i = rest.search(/\n*\[附件\] /);
+  const saved = i === -1 ? '' : rest.slice(i).trim();
+  if (i !== -1) rest = rest.slice(0, i).trim();
   return [
     rest ? h('div', { class: 'user-text' }, rest) : null,
+    saved ? h('div', { class: 'user-attach' }, icon('attach'), h('span', null, saved.replace(/^\[附件\] /, ''))) : null,
     files.length
       ? h(
           'div',

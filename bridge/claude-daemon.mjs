@@ -17924,7 +17924,7 @@ function remoteHost(machineId) {
       const r = await call("fs.read", { cwd, path: p }, 12e4);
       return { ...r, buf: Buffer.from(r.data, "base64") };
     },
-    write: (cwd, p, content) => call("fs.write", { cwd, path: p, content }, 12e4),
+    write: (cwd, p, content) => call("fs.write", Buffer.isBuffer(content) ? { cwd, path: p, content: content.toString("base64"), encoding: "base64" } : { cwd, path: p, content }, 12e4),
     walk: (cwd, p, limit2 = 2e3) => call("fs.walk", { cwd, path: p || ".", limit: limit2 }),
     async run(cwd, command2, { signal, timeoutMs, onData } = {}) {
       const id = crypto5.randomBytes(6).toString("hex");
@@ -18636,7 +18636,7 @@ async function turn(run, { text, images = [], thumbs, note, promptId, resume }) 
   repair(c);
   const userEv = resume ? ctx.emit({ type: "info", text: "\u4E2D\u63A7\u53F0\u91CD\u65B0\u555F\u52D5\u4E86\uFF1AClaude \u63A5\u8457\u525B\u624D\u88AB\u4E2D\u65B7\u7684\u5DE5\u4F5C\u7E7C\u7E8C" }) : ctx.emit({ type: "user", text, images: thumbs || [], promptId, source: "hub", ...note ? { note } : {} });
   c.turns = [...c.turns, { msg: c.messages.length, event: userEv.id, toldPlan: c.toldPlan ?? null }].slice(-50);
-  if (!session.titled && !resume) ctx.setTitle(text.replace(/<file name="[^"]*">[\s\S]*?<\/file>/g, "").replace(/\s+/g, " ").trim().slice(0, 80) || "\u65B0\u5C0D\u8A71");
+  if (!session.titled && !resume) ctx.setTitle(text.replace(/<file name="[^"]*">[\s\S]*?<\/file>/g, "").replace(/\n*\[附件\][\s\S]*$/, "").replace(/\s+/g, " ").trim().slice(0, 80) || "\u65B0\u5C0D\u8A71");
   c.active = { since: Date.now() };
   ctx.setStatus("running");
   saveSession(session, { immediate: true });

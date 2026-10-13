@@ -54,7 +54,7 @@ store.migrateSettings('effort-max', (d) => {
 });
 
 const app = express();
-app.use(express.json({ limit: '25mb' }));
+app.use(express.json({ limit: '80mb' }));
 
 function secretEq(provided, expected) {
   const a = Buffer.from(String(provided || ''));
@@ -296,7 +296,9 @@ app.post('/api/sessions', wrap(async (req) => {
     nameHint: prompt,
     config: remote || claude ? { model, effort, permission, planMode, ...(repo ? { repo } : {}) } : undefined,
   });
-  if (prompt?.trim() || images?.length) runner.startTurn(s, prompt || '', { images });
+  const files = req.body?.files || [];
+  const attached = await saveAttachments(s, files, req.body?.uploadDir);
+  if (prompt?.trim() || images?.length || files.length) runner.startTurn(s, `${prompt?.trim() || (files.length ? '請看附件。' : '')}${attached}`, { images });
   return runner.summarize(s);
 }));
 
@@ -351,13 +353,80 @@ app.delete('/api/sessions/:id', wrap((req) => {
   broadcast({ t: 'deleted', sid: s.id });
 }));
 
-app.post('/api/sessions/:id/messages', wrap((req) => {
+// Files attached to a message (text files: .md, .html, code…): saved in the
+// conversation's folder on its computer, and the message says where, so the
+// agent reads them with its file tools when it needs them (sent inline they
+// would fill the message, and Kimi refuses large ones).
+const MAX_ATTACHMENTS = 15;
+// `uploadDir`: a folder picked for them (absolute, on that computer); else
+// .agent-hub/attachments/<time> in the conversation's folder.
+async function saveAttachments(s, files, uploadDir) {
+  if (!Array.isArray(files) || !files.length) return '';
+  if (files.length > MAX_ATTACHMENTS) throw Object.assign(new Error(`一次最多附 ${MAX_ATTACHMENTS} 個檔案`), { status: 400 });
+  if (!s.cwd) throw Object.assign(new Error('這個對話沒有資料夾，沒辦法放附件'), { status: 400 });
+  const host = s.machineId ? remoteHost(s.machineId) : localHost;
+  const picked = typeof uploadDir === 'string' && uploadDir.trim() ? uploadDir.trim().replace(/\/+$/, '') || '/' : null;
+  if (picked && !picked.startsWith('/') && !/^[A-Za-z]:[\\/]/.test(picked)) throw Object.assign(new Error('上傳位置要是完整路徑'), { status: 400 });
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
+  // Files are written inside `base`, at `dir/…`.
+  const base = picked || s.cwd;
+  const dir = picked ? '' : `.agent-hub/attachments/${stamp}`;
+  const at = (p) => (dir ? `${dir}/${p}` : p);
+  const shown = (p) => (picked ? `${picked === '/' ? '' : picked}/${p}` : at(p));
+  // Not part of the project: git (and the backups, the GitHub auto-save) leave them out.
+  if (!picked) await host.write(s.cwd, '.agent-hub/.gitignore', '*\n');
+  const m = s.machineId && machines.getMachine(s.machineId);
+  if (m && files.some((f) => f?.data) && /^0\.[0-6]\./.test(m.bridgeVersion || '0.0.0')) throw Object.assign(new Error(`「${m.name}」的連接器太舊，收不了 .zip：在那台電腦重新執行連接指令（左下角「連接電腦…」）後再試`), { status: 409 });
+  const size = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : n >= 1000 ? `${Math.round(n / 1000)} KB` : `${n} B`);
+  const used = new Set();
+  const lines = [];
+  for (const f of files) {
+    // A .zip comes as base64 and is unpacked there; text files as text.
+    const zip = Boolean(f?.data);
+    const content = zip ? Buffer.from(String(f.data), 'base64') : String(f?.content ?? '');
+    const bytes = zip ? content.length : Buffer.byteLength(content);
+    if (bytes > (zip ? 20_000_000 : 1_000_000)) throw Object.assign(new Error(`「${f?.name}」超過 ${zip ? '20' : '1'} MB`), { status: 400 });
+    let name = String(f?.name || 'file.txt').replace(/[\\/:*?"<>|\x00-\x1f]+/g, '-').replace(/^\.+/, '').slice(0, 120) || 'file.txt';
+    for (let i = 2; used.has(name); i++) name = name.replace(/(\.[^.]*)?$/, (ext) => `-${i}${ext}`);
+    used.add(name);
+    await host.write(base, at(name), content);
+    if (!zip) {
+      lines.push(`- ${shown(name)}（${size(bytes)}）`);
+      continue;
+    }
+    let folder = name.replace(/\.zip$/i, '') || 'zip';
+    // Picked folder: next to what is there, never into it.
+    if (picked) {
+      const taken = await host.stat(base, folder).then((x) => x.exists, () => false);
+      if (taken) folder = `${folder}-${stamp}`;
+    }
+    const into = at(folder);
+    const q = (x) => `'${String(x).replace(/'/g, "'\\''")}'`;
+    // Python's zipfile keeps everything inside the folder (no ../, no absolute paths).
+    const r = await host.run(base, [
+      `mkdir -p ${q(into)}`,
+      `if command -v python3 >/dev/null; then python3 -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' ${q(at(name))} ${q(into)}; else unzip -q -o ${q(at(name))} -d ${q(into)}; fi`,
+      `rm -f ${q(at(name))}`,
+      `cd ${q(into)} && find . -type f | sed 's|^\\./||' | sort | head -200; echo "AGENT_HUB_FILES=$(find . -type f | wc -l)"`,
+    ].join(' && '), { timeoutMs: 120_000 });
+    const out = String(r.output || '');
+    const count = out.match(/AGENT_HUB_FILES=\s*(\d+)/)?.[1];
+    if (r.exitCode !== 0 || count == null) throw Object.assign(new Error(`沒辦法解壓縮「${f.name}」：${out.trim().split('\n').slice(-2).join(' ').slice(0, 300)}`), { status: 400 });
+    const inside = out.split('\n').filter((l) => l && !l.startsWith('AGENT_HUB_FILES=')).slice(0, 50);
+    lines.push(`- ${f.name}（${size(bytes)}）已解壓到 ${shown(folder)}/，共 ${count} 個檔案${Number(count) > inside.length ? `（列出前 ${inside.length} 個）` : ''}：`, ...inside.map((p) => `  - ${shown(folder)}/${p}`));
+  }
+  return `\n\n[附件] ${files.length} 個已存到${picked ? ` ${picked}` : '工作資料夾'}，需要時用讀檔工具讀取：\n${lines.join('\n')}`;
+}
+
+app.post('/api/sessions/:id/messages', wrap(async (req) => {
   const s = mustSession(req.params.id);
+  const files = req.body?.files || [];
   const text = String(req.body?.text ?? '');
   const images = (req.body?.images || []).slice(0, 10);
-  if (!text.trim() && !images.length) throw Object.assign(new Error('訊息是空的'), { status: 400 });
+  if (!text.trim() && !images.length && !files.length) throw Object.assign(new Error('訊息是空的'), { status: 400 });
   const note = req.body?.from === 'artifact' ? '從 Artifact 送出' : undefined;
-  runner.startTurn(s, text, { images, note, steer: Boolean(req.body?.steer) });
+  const attached = await saveAttachments(s, files, req.body?.uploadDir);
+  runner.startTurn(s, `${text.trim() || (files.length ? '請看附件。' : '')}${attached}`, { images, note, steer: Boolean(req.body?.steer) });
 }));
 
 // An existing Claude conversation bound to a GitHub repository, for good.

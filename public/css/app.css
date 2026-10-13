@@ -3399,3 +3399,48 @@ pre.tail {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+/* Where attached files will be saved (picked before sending). */
+.upload-dir {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 36px;
+  padding: 0 10px;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--ink-secondary);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  max-width: 260px;
+}
+.upload-dir span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.upload-dir .om-icon {
+  flex: none;
+  width: 14px;
+  height: 14px;
+}
+.upload-dir:hover {
+  background: var(--fill-hover);
+}
+.user-attach {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+  color: var(--ink-secondary);
+  font-size: 12px;
+  line-height: 18px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.user-attach .om-icon {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin-top: 2px;
+}

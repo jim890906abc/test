@@ -525,6 +525,21 @@ test('an existing Kimi conversation bound to a repository: cloned inside its fol
   assert.match(gitIn(origin, 'log', '-1', '--format=%s', 'feature/k'), /Agent Hub auto-save/);
 });
 
+test('files attached to a Kimi message are saved on its computer through the bridge (a .zip unpacked)', { skip: SKIP }, async () => {
+  const s = await api('POST', '/sessions', { machineId, cwd: PROJECT, prompt: '聊天 開始', permission: 'auto' });
+  await turnsOf(s.id, 1);
+  const zip = execFileSync('python3', ['-c', "import io, zipfile, base64, sys; b = io.BytesIO(); z = zipfile.ZipFile(b, 'w'); z.writestr('x/y.md', 'hello zip'); z.close(); sys.stdout.write(base64.b64encode(b.getvalue()).decode())"], { encoding: 'utf8' });
+  await api('POST', `/sessions/${s.id}/messages`, { text: '聊天 看附件', files: [{ name: 'n.md', content: 'note' }, { name: 'p.zip', data: zip }] });
+  const done = await turnsOf(s.id, 2);
+  const stamps = fs.readdirSync(path.join(PROJECT, '.agent-hub', 'attachments'));
+  const dir = path.join(PROJECT, '.agent-hub', 'attachments', stamps.at(-1));
+  assert.equal(fs.readFileSync(path.join(dir, 'n.md'), 'utf8'), 'note');
+  assert.equal(fs.readFileSync(path.join(dir, 'p', 'x', 'y.md'), 'utf8'), 'hello zip');
+  const user = done.events.filter((e) => e.type === 'user').at(-1);
+  assert.match(user.text, /\[附件\] 2 個已存到工作資料夾/);
+  assert.doesNotMatch(user.text, /hello zip/);
+});
+
 test('when the Kimi server goes away, the bridge starts a new one on the next message', { skip: SKIP }, async () => {
   const s = await api('POST', '/sessions', { machineId, prompt: '聊天 伺服器在', permission: 'auto' });
   await idle(s.id);
