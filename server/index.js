@@ -499,7 +499,7 @@ app.post('/api/sessions/:id/queue/:promptId/steer', wrap(async (req) => {
 app.post('/api/sessions/:id/background', wrap(async (req) => {
   const s = mustSession(req.params.id);
   if (!s.kimiSessionId) throw Object.assign(new Error('這個對話不支援移到背景'), { status: 400 });
-  return ADAPTERS['kimi-remote'].moveToBackground(s);
+  return ADAPTERS['kimi-remote'].moveToBackground(s, { interruptSwarm: Boolean(req.body?.interruptSwarm) });
 }));
 
 app.post('/api/sessions/:id/unlock', wrap(async (req) => {

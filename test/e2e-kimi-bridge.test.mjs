@@ -80,7 +80,10 @@ function startFakeModel() {
         { delta: { tool_calls: [{ index: 0, id: `call_${Math.random().toString(36).slice(2, 8)}`, type: 'function', function: { name, arguments: JSON.stringify(args) } }] } },
         { delta: {}, finish_reason: 'tool_calls' },
       ];
+      if (sub && users.some((u) => u.includes('SLOWSUB'))) return send(last.role === 'tool' ? text('慢子代理做完了。') : call('子代理：跑很久的指令。', 'Bash', { command: 'sleep 20 && echo sub-done' }));
       if (sub) return send(last.role === 'tool' ? text('子代理結論：專案裡有 a.txt。') : call('子代理：先看看檔案。', 'Bash', { command: 'ls' }));
+      if (lastUser.includes('子代理群') && last.role !== 'tool') return send(call('開一群子代理。', 'AgentSwarm', { description: '測試群', prompt_template: 'SUBAGENT_TASK SLOWSUB {{item}}', items: ['甲', '乙'] }));
+      if (lastUser.includes('慢子代理') && last.role !== 'tool') return send(call('開一個慢子代理。', 'Agent', { description: '慢的', prompt: 'SUBAGENT_TASK SLOWSUB x' }));
       // Bound to a GitHub repository: Agent Hub's end-of-turn reminder, done
       // (REPOGOOD) or not; work left uncommitted; a forced push.
       const bound = lastUser.match(/bound to `([^`]+)`/);
@@ -588,6 +591,59 @@ test('/steer: every queued message into the running turn at once', { skip: SKIP 
   }, 30000, 'read');
   assert.deepEqual(done.events.filter((e) => e.type === 'user').slice(1).map((e) => [e.text, Boolean(e.steered)]), [['聊天 甲', true], ['聊天 乙', true]]);
   assert.equal(done.events.filter((e) => e.type === 'turn_end').length, 1);
+});
+
+test('移到背景: a foreground subagent and a foreground command go to the background, and Kimi carries on', { skip: SKIP }, async () => {
+  for (const [what, running] of [['慢子代理 開始', (e) => e.type === 'tool_use' && e.parent && e.status === 'running'], ['長工作 開始', (e) => e.type === 'tool_use' && e.name === 'Bash' && e.status === 'running']]) {
+    const s = await api('POST', '/sessions', { machineId, cwd: PROJECT, prompt: what, permission: 'auto' });
+    await until(async () => (await session(s.id)).events.some(running), 30000, `${what} running`);
+    await new Promise((r) => setTimeout(r, 800));
+    const r = await api('POST', `/sessions/${s.id}/background`);
+    assert.equal(r.moved, 1, what);
+    // Kimi does not wait for it any more: the turn ends long before it would.
+    await idle(s.id);
+    const tasks = (await kimiApi('GET', `/sessions/${s.kimiSessionId}/tasks`)).items || [];
+    assert.ok(tasks.some((t) => t.run_in_background === true || t.detached === true || t.status !== 'running'), JSON.stringify(tasks));
+  }
+});
+
+test('移到背景 with a subagent swarm: it cannot go there, so it is stopped and the waiting message sent again', { skip: SKIP }, async () => {
+  const s = await api('POST', '/sessions', { machineId, cwd: PROJECT, prompt: '子代理群 開始', permission: 'auto' });
+  await until(async () => (await session(s.id)).events.some((e) => e.type === 'tool_use' && e.parent && e.status === 'running'), 30000, 'swarm running');
+  await api('POST', `/sessions/${s.id}/messages`, { text: '聊天 先看這個', steer: true });
+  await until(async () => (await session(s.id)).meta.queue?.length === 1, 10000, 'waiting');
+  const r = await api('POST', `/sessions/${s.id}/background`);
+  assert.equal(r.moved, 0);
+  assert.equal(r.swarm.description, '測試群');
+  assert.equal(r.swarm.waiting, 1);
+  const n0 = seen.length;
+  const x = await api('POST', `/sessions/${s.id}/background`, { interruptSwarm: true });
+  assert.deepEqual(x, { interrupted: true, sent: 1 });
+  const done = await until(async () => {
+    const y = await session(s.id);
+    return y.status === 'idle' && y.events.some((e) => e.type === 'text' && e.text.includes('收到：聊天 先看這個')) && y;
+  }, 30000, 'read');
+  // Once: not also run by Kimi on its own after the stop.
+  await new Promise((r) => setTimeout(r, 2000));
+  const users = (await session(s.id)).events.filter((e) => e.type === 'user' && e.text === '聊天 先看這個');
+  assert.equal(users.length, 1, JSON.stringify(users));
+  assert.equal(users[0].note, '中斷子代理群後送出');
+  assert.ok(done.events.some((e) => e.type === 'info' && /已中斷子代理群「測試群」/.test(e.text)));
+  // Kimi is told it can resume them.
+  assert.match(JSON.stringify(seen.slice(n0).map((j) => j.messages.at(-1))), /resume_agent_ids/);
+});
+
+test('stopping Kimi: a message it took in but had not read yet is read right after', { skip: SKIP }, async () => {
+  const s = await api('POST', '/sessions', { machineId, cwd: PROJECT, prompt: '子代理群 開始', permission: 'auto' });
+  await until(async () => (await session(s.id)).events.some((e) => e.type === 'tool_use' && e.parent && e.status === 'running'), 30000, 'swarm running');
+  await api('POST', `/sessions/${s.id}/messages`, { text: '聊天 停下前送的', steer: true });
+  await until(async () => (await session(s.id)).meta.queue?.[0]?.steered, 10000, 'taken in');
+  await api('POST', `/sessions/${s.id}/interrupt`);
+  const done = await until(async () => {
+    const y = await session(s.id);
+    return y.status === 'idle' && y.events.some((e) => e.type === 'text' && e.text.includes('收到：聊天 停下前送的')) && y;
+  }, 30000, 'read after the stop');
+  assert.equal(done.events.filter((e) => e.type === 'user' && e.text === '聊天 停下前送的').length, 1);
 });
 
 test('when the Kimi server goes away, the bridge starts a new one on the next message', { skip: SKIP }, async () => {

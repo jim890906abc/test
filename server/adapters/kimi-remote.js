@@ -25,6 +25,9 @@ const APPROVAL_OPTIONS = [
   { optionId: 'rejected', name: '拒絕', kind: 'reject_once' },
 ];
 const PERMISSIONS = ['manual', 'yolo', 'auto'];
+// What can be moved to the background: Kimi's server calls them subagent
+// and bash (its terminal, agent and process).
+const DETACHABLE = new Set(['subagent', 'bash', 'agent', 'process']);
 // The note on Agent Hub's own reminders to commit and push (see checkRepo).
 const REPO_CHECK_NOTE = 'Agent Hub 檢查：還有沒上傳到 GitHub 的工作';
 // Turns loaded when a conversation is opened, and per 「載入更早的對話」.
@@ -949,7 +952,8 @@ class Mirror {
   // conversation) when Kimi did not take the message.
   // `urgent` (「優雅暫停」): once Kimi has taken it in, foreground work that
   // keeps it from being read is moved to the background (watchUrgent).
-  async send(text, images = [], { note, steer, urgent } = {}) {
+  // `hidden`: a note for Kimi only, sent with the message (not shown here).
+  async send(text, images = [], { note, steer, urgent, hidden } = {}) {
     if (this.inTerminal()) return this.sendToTerminal(text, images, note, steer);
     await ensureServer(this.machineId);
     const ctx = this.ctx;
@@ -963,6 +967,7 @@ class Mirror {
       ctx.setStatus('running');
     }
     const body = { prompt_id: promptId, content: this.content(text, images) };
+    if (hidden) body.content.push({ type: 'text', text: `<system-reminder>${hidden}</system-reminder>` });
     // Bound to a GitHub repository: the rules go with the first message (and
     // with every reminder after).
     const repo = this.session.repo;
@@ -1041,7 +1046,7 @@ class Mirror {
   async detachForeground({ all = false } = {}) {
     const r = await this.api('GET', this.path('/tasks'));
     const mine = new Set([...this.tools.keys()].filter((k) => k.startsWith('main:')).map((k) => k.slice(5)));
-    const fg = (r?.items || []).filter((t) => t.run_in_background === false && t.status === 'running' && ['agent', 'process'].includes(t.kind) && (all || mine.has(t.parent_tool_call_id)));
+    const fg = (r?.items || []).filter((t) => (t.run_in_background === false || t.detached === false) && t.status === 'running' && DETACHABLE.has(t.kind) && (all || mine.has(t.parent_tool_call_id)));
     let moved = 0;
     for (const t of fg) {
       try {
@@ -1063,14 +1068,51 @@ class Mirror {
 
   // 移到背景 (Ctrl+B) from the hub: what Kimi runs in the foreground goes
   // on in the background, and Kimi carries on without waiting for it.
-  async moveToBackground() {
+  // A subagent swarm (AgentSwarm) cannot be moved there: Kimi has no way to
+  // (its own Ctrl+B skips it too). It is said, with how many messages wait
+  // for it, so the user can have it stopped instead (`interruptSwarm`).
+  async moveToBackground({ interruptSwarm = false } = {}) {
     if (this.inTerminal()) {
       await this.tui({ action: 'background' });
       return { terminal: true };
     }
+    if (interruptSwarm) return this.interruptSwarm();
     const moved = await this.detachForeground({ all: true });
     if (moved) this.ctx.emit({ type: 'info', text: `已把 ${moved} 個前景工作移到背景（工作會繼續跑，Kimi 不用再等它）` });
-    return { moved };
+    const swarm = this.foregroundSwarm();
+    return { moved, ...(swarm ? { swarm: { description: swarm.description, agents: swarm.ids.length, waiting: this.queue().filter((q) => !q.terminal).length } } : {}) };
+  }
+
+  // The AgentSwarm call the main agent waits on, with its subagents' ids.
+  foregroundSwarm() {
+    const ev = [...this.tools.values()].find((e) => e.name === 'AgentSwarm' && !e.parent && ['pending', 'running', 'awaiting'].includes(e.status));
+    if (!ev) return null;
+    const ids = new Set();
+    for (const e of [ev, ...this.events().filter((x) => x.parent === ev.id)]) if (e.subagent?.id) ids.add(e.subagent.id);
+    for (const [id, a] of this.agents) if (a.parent === ev.id) ids.add(id);
+    return { ev, ids: [...ids], description: ev.input?.description || ev.title || '子代理群' };
+  }
+
+  // Stop the swarm so Kimi reads the messages waiting for it now. They are
+  // withdrawn from Kimi first (it would run them after the stop on its
+  // own), then the turn is stopped, and they go again as one, telling Kimi
+  // which subagents it can resume.
+  async interruptSwarm() {
+    const swarm = this.foregroundSwarm();
+    const waiting = this.queue().filter((q) => !q.terminal);
+    for (const q of waiting) await this.api('POST', this.path(`/prompts/${q.promptId}:abort`), {}).catch(() => {});
+    await this.api('POST', this.path(':abort'), {});
+    for (let i = 0; i < 75 && ['running', 'awaiting_permission'].includes(this.session.status); i++) await new Promise((r) => setTimeout(r, 200));
+    for (const q of waiting) this.dequeue(q.promptId);
+    const desc = swarm?.description || '子代理群';
+    const ids = swarm?.ids || [];
+    this.ctx.emit({ type: 'info', text: `已中斷子代理群「${desc}」，讓 Kimi 先讀你的訊息${ids.length ? `；Kimi 之後可以接續那 ${ids.length} 個子代理` : ''}` });
+    const text = waiting.map((q) => q.text).filter(Boolean).join('\n\n');
+    const images = waiting.flatMap((q) => q.images || []).map((url) => url.match(/^data:([^;]+);base64,(.*)$/)).filter(Boolean).map(([, mimeType, data]) => ({ mimeType, data }));
+    if (!text && !images.length) return { interrupted: true, sent: 0 };
+    const hidden = `The user stopped the AgentSwarm "${desc}" so that you read the message above now. Its subagents stopped where they were${ids.length ? ` (agent ids: ${ids.join(', ')})` : ''}. Deal with the message first. If their work is still needed afterwards, continue them with AgentSwarm's resume_agent_ids (map each id to "continue") instead of starting over.`;
+    await this.send(text || '（圖片）', images, { note: '中斷子代理群後送出', hidden });
+    return { interrupted: true, sent: waiting.length };
   }
 
   async tryCutIns() {
@@ -1311,10 +1353,10 @@ export async function send(session, text, { images = [], note, steer, urgent } =
 // hub's status for it is current.
 export const isLive = (session) => Boolean(mirrors.get(session.id)?.live);
 export const steerQueued = (session, promptId) => mirrorFor(session).steerQueued(promptId);
-export async function moveToBackground(session) {
+export async function moveToBackground(session, opts) {
   const m = mirrorFor(session);
   await m.ensureLive();
-  return m.moveToBackground();
+  return m.moveToBackground(opts);
 }
 // Take a conversation locked only because a terminal Kimi runs in its folder.
 export const unlock = (session) => machines.rpc(session.machineId, 'kimi.unlock', { sessionId: session.kimiSessionId });

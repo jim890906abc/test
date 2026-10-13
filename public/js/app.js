@@ -2931,7 +2931,21 @@ async function moveToBackground() {
   if (!s) return;
   try {
     const r = await post(`/sessions/${s.id}/background`);
-    toast(r?.terminal ? '已在終端機的 Kimi 按下 Ctrl+B' : r?.moved ? `已把 ${r.moved} 個工作移到背景，會繼續跑` : '目前沒有在前景跑的子代理或指令');
+    if (r?.terminal) return toast('已在終端機的 Kimi 按下 Ctrl+B');
+    if (r?.moved) return toast(`已把 ${r.moved} 個工作移到背景，會繼續跑`);
+    if (!r?.swarm) return toast('目前沒有在前景跑的子代理或指令');
+    // A subagent swarm: Kimi cannot move it to the background.
+    const sw = r.swarm;
+    if (!sw.waiting) return toast(`「${sw.description}」是子代理群，Kimi 不支援把它移到背景（Kimi 自己的 Ctrl+B 也不行）。先送出要插隊的訊息，再按一次「移到背景」，可以中斷它讓 Kimi 先讀你的訊息`);
+    const ok = await confirmDialog({
+      title: '子代理群沒辦法移到背景',
+      body: `「${sw.description}」是一個子代理群${sw.agents ? `（${sw.agents} 個子代理）` : ''}，Kimi 不支援把它移到背景（Kimi 自己的 Ctrl+B 也不行），所以你那 ${sw.waiting} 則插隊訊息要等它全部做完才會被讀到。要讓 Kimi 現在就讀到，只能中斷它：中斷後你的訊息會重新送出，並告訴 Kimi 哪些子代理被中斷、之後可以接續（resume），不用從頭來。`,
+      action: '中斷並送出訊息',
+      destructive: true,
+    });
+    if (!ok) return;
+    const x = await post(`/sessions/${s.id}/background`, { interruptSwarm: true });
+    toast(x.sent ? `已中斷子代理群，${x.sent} 則訊息重新送出` : '已中斷子代理群');
   } catch (err) {
     fail(err);
   }
