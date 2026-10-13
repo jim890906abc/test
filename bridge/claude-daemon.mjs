@@ -18636,7 +18636,7 @@ async function turn(run, { text, images = [], thumbs, note, promptId, resume }) 
   repair(c);
   const userEv = resume ? ctx.emit({ type: "info", text: "\u4E2D\u63A7\u53F0\u91CD\u65B0\u555F\u52D5\u4E86\uFF1AClaude \u63A5\u8457\u525B\u624D\u88AB\u4E2D\u65B7\u7684\u5DE5\u4F5C\u7E7C\u7E8C" }) : ctx.emit({ type: "user", text, images: thumbs || [], promptId, source: "hub", ...note ? { note } : {} });
   c.turns = [...c.turns, { msg: c.messages.length, event: userEv.id, toldPlan: c.toldPlan ?? null }].slice(-50);
-  if (!session.titled && !resume) ctx.setTitle(text.replace(/\s+/g, " ").trim().slice(0, 80) || "\u65B0\u5C0D\u8A71");
+  if (!session.titled && !resume) ctx.setTitle(text.replace(/<file name="[^"]*">[\s\S]*?<\/file>/g, "").replace(/\s+/g, " ").trim().slice(0, 80) || "\u65B0\u5C0D\u8A71");
   c.active = { since: Date.now() };
   ctx.setStatus("running");
   saveSession(session, { immediate: true });

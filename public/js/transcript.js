@@ -692,7 +692,7 @@ export class Transcript {
     const note = [ev.note, ev.steered ? `在 ${this.name()} 工作時插入` : null].filter(Boolean).join(' · ');
     fill(
       node.el,
-      h('div', { class: 'bubble' }, images.length ? h('div', { class: 'user-imgs' }, images) : null, ev.text ? h('div', { class: 'user-text' }, ev.text) : null),
+      h('div', { class: 'bubble' }, images.length ? h('div', { class: 'user-imgs' }, images) : null, ...userText(ev.text)),
       note ? h('div', { class: 'bubble-note' }, note) : null,
     );
   }
@@ -1263,3 +1263,21 @@ export function todoList(todos) {
   );
 }
 
+
+// A message's text, with the files attached to it (<file name="…">…</file>)
+// as cards that open to show what was sent.
+function userText(text) {
+  if (!text) return [];
+  const files = [];
+  const rest = text.replace(/\n*<file name="([^"]*)">\n([\s\S]*?)\n<\/file>/g, (_, name, content) => (files.push({ name, content }), '')).trim();
+  return [
+    rest ? h('div', { class: 'user-text' }, rest) : null,
+    files.length
+      ? h(
+          'div',
+          { class: 'user-files' },
+          ...files.map((f) => h('details', { class: 'user-file' }, h('summary', null, icon('document'), h('span', null, f.name), h('span', { class: 'user-file__size' }, `${f.content.split('\n').length} 行`)), h('pre', null, f.content))),
+        )
+      : null,
+  ];
+}

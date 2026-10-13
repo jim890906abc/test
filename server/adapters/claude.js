@@ -279,7 +279,8 @@ async function turn(run, { text, images = [], thumbs, note, promptId, resume }) 
     ? ctx.emit({ type: 'info', text: '中控台重新啟動了：Claude 接著剛才被中斷的工作繼續' })
     : ctx.emit({ type: 'user', text, images: thumbs || [], promptId, source: 'hub', ...(note ? { note } : {}) });
   c.turns = [...c.turns, { msg: c.messages.length, event: userEv.id, toldPlan: c.toldPlan ?? null }].slice(-50);
-  if (!session.titled && !resume) ctx.setTitle(text.replace(/\s+/g, ' ').trim().slice(0, 80) || '新對話');
+  // The title: what was said, without the files attached to it.
+  if (!session.titled && !resume) ctx.setTitle(text.replace(/<file name="[^"]*">[\s\S]*?<\/file>/g, '').replace(/\s+/g, ' ').trim().slice(0, 80) || '新對話');
   // Kept until the turn ends, so a restart in between knows to go on.
   c.active = { since: Date.now() };
   ctx.setStatus('running');

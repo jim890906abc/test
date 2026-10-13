@@ -3337,3 +3337,65 @@ pre.tail {
   color: var(--ink-secondary);
   overflow-wrap: anywhere;
 }
+
+/* A text file attached to the message (sent as text). */
+.doc-chip {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 220px;
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+}
+.doc-chip .om-icon {
+  flex: none;
+  width: 16px;
+  height: 16px;
+}
+.doc-chip__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.doc-chip .thumb-x .om-icon {
+  width: 12px;
+  height: 12px;
+}
+.user-files {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+}
+.user-file summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.user-file summary .om-icon {
+  width: 14px;
+  height: 14px;
+  flex: none;
+}
+.user-file__size {
+  color: var(--ink-secondary);
+  font-size: 12px;
+}
+.user-file pre {
+  max-height: 320px;
+  overflow: auto;
+  margin: 6px 0 0;
+  padding: 8px;
+  border-radius: var(--radius-xs);
+  background: var(--fill-hover);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

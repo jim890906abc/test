@@ -26,6 +26,14 @@ export const agentName = (agent) => (agent === 'claude' ? 'Claude' : 'Kimi');
 // US$, with more digits while it is small.
 export const fmtUsd = (n) => `US$${n >= 1 ? n.toFixed(2) : n >= 0.01 ? n.toFixed(3) : (n || 0).toFixed(4)}`;
 const MAX_IMAGES = 8;
+// Text files (Markdown, HTML, code, logs…): read here and sent with the
+// message as text, so Claude and Kimi both get them.
+const MAX_DOCS = 15;
+const MAX_DOC_BYTES = 1_000_000;
+const DOC_EXT = /\.(md|markdown|mdx|txt|text|html?|xhtml|css|js|mjs|cjs|jsx|ts|tsx|json|jsonl|ya?ml|toml|ini|cfg|conf|env\.example|csv|tsv|log|xml|svg|py|rb|go|rs|java|kt|c|h|cc|cpp|hpp|cs|php|sh|bash|zsh|ps1|sql|r|lua|swift|vue|svelte|tex|rst|org|diff|patch)$/i;
+const isDoc = (f) => DOC_EXT.test(f.name || '') || /^text\//.test(f.type || '') || /json|xml|javascript/.test(f.type || '');
+const isImage = (f) => /^image\//.test(f.type || '') && !/svg/.test(f.type || '');
+const DOC_ACCEPT = '.md,.markdown,.mdx,.txt,.html,.htm,.css,.js,.mjs,.jsx,.ts,.tsx,.json,.jsonl,.yaml,.yml,.toml,.ini,.cfg,.conf,.csv,.tsv,.log,.xml,.svg,.py,.rb,.go,.rs,.java,.kt,.c,.h,.cpp,.hpp,.cs,.php,.sh,.ps1,.sql,.lua,.swift,.vue,.svelte,.tex,.rst,.diff,.patch';
 
 // Built-in commands; Kimi skills are appended from the session.
 const BG_DESCRIPTION = '移到背景（Ctrl+B）：Kimi 正在等的子代理或指令改到背景繼續跑，Kimi 不用再等它';
@@ -148,13 +156,14 @@ export class Composer {
     this.opts = opts;
     this.state = {};
     this.images = [];
+    this.docs = [];
     this.drafts = new Map();
     this.key = null;
     this.input = h('textarea', { class: 'composer-input', rows: 1, placeholder: opts.placeholder || `回覆 ${agentName(opts.agent)}…`, 'aria-label': '訊息' });
     this.thumbs = h('div', { class: 'composer-images', hidden: true });
     this.left = h('div', { class: 'composer-tools' });
     this.right = h('div', { class: 'composer-actions' });
-    this.file = h('input', { type: 'file', accept: 'image/*', multiple: true, hidden: true, onchange: () => (this.addFiles(this.file.files), (this.file.value = '')) });
+    this.file = h('input', { type: 'file', accept: `image/*,${DOC_ACCEPT}`, multiple: true, hidden: true, onchange: () => (this.addFiles(this.file.files), (this.file.value = '')) });
     this.box = h('div', { class: 'composer-box' }, this.thumbs, this.input, h('div', { class: 'composer-bar' }, this.left, this.right), this.file);
     this.tray = h('div', { class: 'composer-tray' });
     this.slash = null;
@@ -175,7 +184,7 @@ export class Composer {
     });
     input.addEventListener('keydown', (e) => this.onKey(e));
     input.addEventListener('paste', (e) => {
-      const files = [...(e.clipboardData?.files || [])].filter((f) => f.type.startsWith('image/'));
+      const files = [...(e.clipboardData?.files || [])].filter((f) => isImage(f) || isDoc(f));
       if (files.length) {
         e.preventDefault();
         this.addFiles(files);
@@ -190,7 +199,7 @@ export class Composer {
     this.box.addEventListener('dragleave', () => this.box.classList.remove('drop'));
     this.box.addEventListener('drop', (e) => {
       this.box.classList.remove('drop');
-      const files = [...(e.dataTransfer?.files || [])].filter((f) => f.type.startsWith('image/'));
+      const files = [...(e.dataTransfer?.files || [])].filter((f) => isImage(f) || isDoc(f));
       if (files.length) {
         e.preventDefault();
         this.addFiles(files);
@@ -207,6 +216,7 @@ export class Composer {
     this.key = key;
     this.input.value = this.drafts.get(key) || '';
     this.images = [];
+    this.docs = [];
     this.renderImages();
     this.grow();
     this.renderActions();
@@ -368,7 +378,7 @@ export class Composer {
   // ----------------------------------------------------------- actions
 
   hasContent() {
-    return Boolean(this.input.value.trim() || this.images.length);
+    return Boolean(this.input.value.trim() || this.images.length || this.docs.length);
   }
 
   renderActions() {
@@ -523,22 +533,27 @@ export class Composer {
   submit({ steer = false } = {}) {
     const raw = this.input.value;
     const text = raw.trim();
-    if (!text && !this.images.length) return;
+    if (!text && !this.images.length && !this.docs.length) return;
     const m = text.match(/^\/([\w.:-]+)(?:\s+([\s\S]*))?$/);
-    if (m && !this.images.length && this.commands().some((c) => c.name === m[1] || c.aliases?.includes(m[1]))) {
+    if (m && !this.images.length && !this.docs.length && this.commands().some((c) => c.name === m[1] || c.aliases?.includes(m[1]))) {
       const cmd = this.commands().find((c) => c.name === m[1] || c.aliases?.includes(m[1]));
       this.clear();
       this.opts.onCommand(cmd.name, (m[2] || '').trim());
       return;
     }
     const images = this.images.map(({ mimeType, data, thumb }) => ({ mimeType, data, thumb }));
+    const docs = this.docs;
+    const body = docs.length
+      ? [text || `請看附件：${docs.map((d) => d.name).join('、')}`, ...docs.map((d) => `<file name="${d.name.replace(/"/g, "'")}">\n${d.content}\n</file>`)].join('\n\n')
+      : text;
     this.clear();
-    this.opts.onSend({ text, images, steer });
+    this.opts.onSend({ text: body, images, steer });
   }
 
   clear() {
     this.input.value = '';
     this.images = [];
+    this.docs = [];
     if (this.key) this.drafts.delete(this.key);
     this.renderImages();
     this.grow();
@@ -634,7 +649,23 @@ export class Composer {
   // ------------------------------------------------------------ images
 
   async addFiles(files) {
-    for (const f of [...files].slice(0, MAX_IMAGES - this.images.length)) {
+    const all = [...files];
+    const docs = all.filter((f) => !isImage(f) && isDoc(f));
+    const images = all.filter((f) => isImage(f));
+    for (const f of all) if (!docs.includes(f) && !images.includes(f)) this.opts.onError?.(`沒辦法讀取「${f.name}」：支援圖片（PNG、JPEG…）和文字檔（.md、.html、.txt、程式碼…）`);
+    if (docs.length > MAX_DOCS - this.docs.length) this.opts.onError?.(`一次最多附 ${MAX_DOCS} 個檔案，多的沒有加入`);
+    for (const f of docs.slice(0, Math.max(0, MAX_DOCS - this.docs.length))) {
+      if (f.size > MAX_DOC_BYTES) {
+        this.opts.onError?.(`「${f.name}」超過 1 MB，沒有加入`);
+        continue;
+      }
+      try {
+        this.docs.push({ name: f.name, content: await f.text(), size: f.size });
+      } catch {
+        this.opts.onError?.(`沒辦法讀取「${f.name}」`);
+      }
+    }
+    for (const f of images.slice(0, MAX_IMAGES - this.images.length)) {
       try {
         this.images.push(await readImage(f));
       } catch {
@@ -657,8 +688,17 @@ export class Composer {
           h('button', { class: 'thumb-x', type: 'button', title: '移除', 'aria-label': '移除圖片', onclick: () => (this.images.splice(i, 1), this.renderImages(), this.renderActions()) }, icon('x')),
         ),
       ),
+      ...this.docs.map((d, i) =>
+        h(
+          'div',
+          { class: 'doc-chip', title: `${d.name}（${d.size >= 1000 ? `${Math.round(d.size / 1000)} KB` : `${d.size} B`}）` },
+          icon('document'),
+          h('span', { class: 'doc-chip__name' }, d.name),
+          h('button', { class: 'thumb-x', type: 'button', title: '移除', 'aria-label': `移除 ${d.name}`, onclick: () => (this.docs.splice(i, 1), this.renderImages(), this.renderActions()) }, icon('x')),
+        ),
+      ),
     );
-    this.thumbs.hidden = !this.images.length;
+    this.thumbs.hidden = !this.images.length && !this.docs.length;
     const model = this.currentModel();
     if (this.images.length && model && !model.image) this.opts.onError?.(`${model.name} 可能看不懂圖片`);
   }
