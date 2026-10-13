@@ -35,7 +35,7 @@ import { StringDecoder } from 'node:string_decoder';
 import { spawn, execFile, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '0.7.0';
+const VERSION = '0.7.1';
 const SCRIPT = fileURLToPath(import.meta.url);
 
 // ------------------------------------------------------------------ args
@@ -306,6 +306,7 @@ async function runBridge() {
   setInterval(() => disk.scan(), 2000);
   setInterval(() => disk.poll(), 150);
   setInterval(() => procs.scan(), 2000);
+  setInterval(() => procs.tuis.length && procs.webbed.length && procs.check(), 3000);
   setInterval(() => hub.pushSessions(true), 30_000);
   // The Claude daemon is left running: it is not ours to stop.
   for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => process.exit(0));
@@ -412,6 +413,19 @@ const server = {
 
   base() {
     return `http://${this.instance.host}:${this.instance.port}`;
+  },
+
+  // Whether the server at `base` has the conversation loaded (its model is
+  // only reported then; asking does not load it) and is running a turn in it.
+  async holds(base, sid) {
+    try {
+      const token = fs.readFileSync(path.join(KIMI_HOME, 'server.token'), 'utf8').trim();
+      const res = await fetch(`${base}/api/v1/sessions/${sid}`, { headers: { authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(1500) });
+      const d = (await res.json())?.data;
+      return d ? { live: Boolean(d.agent_config?.model) || Boolean(d.busy), busy: Boolean(d.busy) } : null;
+    } catch {
+      return null;
+    }
   },
 
   async request(method, p, body, retried = false) {
@@ -1182,11 +1196,12 @@ const disk = {
   // A terminal Kimi does not say which conversation it has open. The one in
   // its folder it wrote since it started is surely it; any other in that
   // folder might be (opened with /resume or -c and not written yet), so it
-  // is locked too unless the hub drove it through the server since then.
+  // is locked too unless the hub drove it through the server since then, or
+  // a terminal Kimi handed it over with /web (procs.serverHolds).
   owner(id) {
     const pid = this.best.get(id);
     if (pid) return { kind: 'tui', pid, exact: true };
-    if (!this.tuis.length) return null;
+    if (!this.tuis.length || procs.serverHolds(id)) return null;
     const cwd = (this.sessions.get(id) || this.get(id))?.realCwd();
     const mine = server.mine.get(id) || 0;
     const p = cwd && this.tuis.find((t) => t.cwd === cwd && mine < t.started);
@@ -1205,17 +1220,73 @@ const disk = {
 
 const procs = {
   last: '',
+  tuis: [],
+  picks: new Map(), // terminal Kimi pid -> { id, webAt }: the conversation it surely has open, when it ran /web
+  webbed: [], // servers that were a terminal Kimi until it ran /web: base urls
+  held: new Map(), // session id -> its journal's time when it was surely a server's
+  busyAt: new Map(), // session id -> when such a server was last seen running a turn in it
+  checked: '', // what `held` was last worked out with
+  checking: null,
+
+  // /web turns a terminal Kimi into a server, which lets go of the
+  // conversation it had open (it is loaded again when it is opened in the
+  // web page). That conversation is then the hub's to drive, not another
+  // terminal Kimi's that happens to be in the same folder: until something
+  // writes to it while no server runs it, which is a terminal Kimi that
+  // opened it.
+  serverHolds(id) {
+    const at = this.held.get(id);
+    const s = disk.sessions.get(id);
+    return at !== undefined && Boolean(s) && s.mtime <= at;
+  },
+
+  // While a server that was a terminal Kimi has the conversation loaded (the
+  // Kimi web page opened it) and runs turns in it, its writes are its own.
+  check() {
+    if (this.checking) return this.checking;
+    const { tuis, webbed } = this;
+    this.checking = (async () => {
+      const cwds = new Set(tuis.map((p) => p.cwd));
+      const near = webbed.length ? [...disk.sessions.values()].filter((s) => cwds.has(s.realCwd())).sort((a, b) => b.mtime - a.mtime).slice(0, 40) : [];
+      await Promise.all(
+        near.map(async (s) => {
+          const seen = (await Promise.all(webbed.map((b) => server.holds(b, s.id)))).filter(Boolean);
+          if (!seen.some((x) => x.live)) return;
+          const now = Date.now();
+          if (seen.some((x) => x.busy) || server.busy.has(s.id)) this.busyAt.set(s.id, now);
+          const quiet = [this.busyAt.get(s.id), server.seen.get(s.id), server.mine.get(s.id)].every((t) => now - (t || 0) > 6000);
+          if (!this.held.has(s.id) || !quiet) this.held.set(s.id, s.mtime);
+        }),
+      ).catch(() => {});
+      this.checked = JSON.stringify([tuis.map((p) => p.pid), webbed]);
+    })().finally(() => (this.checking = null));
+    return this.checking;
+  },
+
+  // The conversation a terminal Kimi surely has open: the newest in its
+  // folder written since it started.
+  pick(p) {
+    let pick = null;
+    for (const s of disk.sessions.values()) {
+      if (s.realCwd() !== p.cwd || s.mtime < p.started - 2000) continue;
+      if ((server.mine.get(s.id) || 0) >= p.started || this.serverHolds(s.id)) continue;
+      if (!pick || s.mtime > pick.mtime) pick = s;
+    }
+    return pick;
+  },
+
   scan() {
     let list = [];
     try {
       if (process.platform === 'linux') list = this.linux();
       else if (process.platform === 'darwin') list = this.mac();
     } catch {}
-    const servers = new Set();
+    const servers = new Map(); // pid -> base url
     try {
       for (const f of fs.readdirSync(path.join(KIMI_HOME, 'server', 'instances'))) {
         try {
-          servers.add(JSON.parse(fs.readFileSync(path.join(KIMI_HOME, 'server', 'instances', f), 'utf8')).pid);
+          const inst = JSON.parse(fs.readFileSync(path.join(KIMI_HOME, 'server', 'instances', f), 'utf8'));
+          servers.set(inst.pid, `http://${inst.host === '0.0.0.0' ? '127.0.0.1' : inst.host || '127.0.0.1'}:${inst.port}`);
         } catch {}
       }
     } catch {}
@@ -1227,17 +1298,38 @@ const procs = {
       }
     };
     const tuis = list.filter((p) => !servers.has(p.pid) && p.pid !== process.pid).map((p) => ({ ...p, cwd: real(p.cwd) }));
+    // A terminal Kimi that is a server now ran /web: its conversation is handed over.
+    const now = Date.now();
+    for (const [pid, pick] of this.picks) {
+      if (servers.has(pid) && !pick.webAt) {
+        pick.webAt = now;
+        log(`… 終端機的 Kimi（pid ${pid}）輸入了 /web：它的對話交給中控台`);
+      }
+      // Its last writes land as it stops.
+      const s = pick.webAt && disk.sessions.get(pick.id);
+      if (s && now - pick.webAt < 8000) this.held.set(pick.id, s.mtime);
+      if (!servers.has(pid) && !tuis.some((p) => p.pid === pid)) this.picks.delete(pid);
+    }
+    const webbed = [...this.picks].filter(([pid, x]) => x.webAt && servers.has(pid)).map(([pid]) => servers.get(pid)).sort();
+    this.tuis = tuis;
+    this.webbed = webbed;
+    if (webbed.length && tuis.length && JSON.stringify([tuis.map((p) => p.pid), webbed]) !== this.checked && !this.checking) this.check().then(() => this.scan());
+    for (const id of this.held.keys()) if (!disk.sessions.has(id)) this.held.delete(id);
     const best = new Map();
     for (const p of tuis) {
-      let pick = null;
-      for (const s of disk.sessions.values()) {
-        if (s.realCwd() !== p.cwd || s.mtime < p.started - 2000) continue;
-        if ((server.mine.get(s.id) || 0) >= p.started) continue;
-        if (!pick || s.mtime > pick.mtime) pick = s;
+      const pick = this.pick(p);
+      if (!pick) {
+        this.picks.delete(p.pid);
+        continue;
       }
-      if (pick) best.set(pick.id, p.pid);
+      this.picks.set(p.pid, { id: pick.id });
+      // Two terminal Kimis in one folder: the one that started it, or else the newest.
+      const other = tuis.find((q) => q.pid === best.get(pick.id));
+      const made = (q) => Date.parse(pick.state?.created_at || '') >= q.started - 2000;
+      if (!other || (made(p) && !made(other)) || (made(p) === made(other) && p.started > other.started)) best.set(pick.id, p.pid);
     }
-    const key = JSON.stringify([tuis.map((p) => [p.pid, p.cwd]), [...best], [...server.mine.keys()]]);
+    const held = [...this.held.keys()].filter((id) => this.serverHolds(id));
+    const key = JSON.stringify([tuis.map((p) => [p.pid, p.cwd]), [...best], [...server.mine.keys()], held]);
     if (key !== this.last) {
       disk.tuis = tuis;
       disk.best = best;
@@ -2138,7 +2230,7 @@ const hub = {
       }
       case 'kimi.unlock': {
         const sid = String(args.sessionId || '');
-        if (disk.best.has(sid)) throw new Error('終端機的 Kimi 正開著這個對話，不能解除唯讀');
+        // Also one a terminal Kimi surely had open: the user says it is not open any more.
         server.mine.set(sid, Date.now());
         procs.scan();
         return { ok: true };

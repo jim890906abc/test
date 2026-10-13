@@ -157,10 +157,10 @@ while True:
         for line in data.decode().splitlines():
             os.write(fd, line.encode()); time.sleep(0.3); os.write(fd, b'\\r'); time.sleep(0.2)
 `;
-function terminalKimi(argv) {
+function terminalKimi(argv, cwd = PROJECT) {
   const p = spawn(PYTHON, ['-c', TTY_PY, ...argv], {
-    cwd: PROJECT,
-    env: { ...process.env, KIMI_CODE_HOME: KIMI_HOME, HOME, TERM: 'xterm-256color', COLUMNS: '100', LINES: '30', PATH: `${path.dirname(KIMI)}${path.delimiter}${process.env.PATH}` },
+    cwd,
+    env: { ...process.env, KIMI_CODE_HOME: KIMI_HOME, HOME, TERM: 'xterm-256color', COLUMNS: '100', LINES: '30', PATH: `${path.dirname(KIMI)}${path.delimiter}${process.env.PATH}`, BROWSER: 'true' },
     stdio: ['pipe', 'ignore', 'ignore'],
   });
   procs.push(p);
@@ -335,6 +335,9 @@ test('a conversation running in a terminal Kimi is followed live, read-only', { 
     assert.ok(done.events.some((e) => e.type === 'tool_use' && e.name === 'Bash' && /slow-done/.test(e.output || '')));
     assert.equal(done.meta.owner, 'tui');
     await assert.rejects(api('POST', `/sessions/${s.id}/messages`, { text: 'hi' }), (e) => e.status === 409);
+    // Unlocked when the user says that Kimi does not have it open any more.
+    await api('POST', `/sessions/${s.id}/unlock`);
+    await until(async () => (await session(s.id)).meta.owner !== 'tui', 8000, 'unlocked');
   } finally {
     tty.stop();
   }
@@ -644,6 +647,42 @@ test('stopping Kimi: a message it took in but had not read yet is read right aft
     return y.status === 'idle' && y.events.some((e) => e.type === 'text' && e.text.includes('收到：聊天 停下前送的')) && y;
   }, 30000, 'read after the stop');
   assert.equal(done.events.filter((e) => e.type === 'user' && e.text === '聊天 停下前送的').length, 1);
+});
+
+test('a conversation a terminal Kimi hands over with /web is the hub\'s, even with another terminal Kimi in its folder', { skip: SKIP_TTY }, async () => {
+  const dir = path.join(TMP, 'webproj');
+  fs.mkdirSync(dir, { recursive: true });
+  const start = async () => {
+    const t = terminalKimi([KIMI, '--auto'], dir);
+    await new Promise((r) => setTimeout(r, 4000));
+    t.type(''); // accept "Trust this folder?" if Kimi asks
+    await new Promise((r) => setTimeout(r, 1000));
+    return t;
+  };
+  // One terminal Kimi sits in the folder; another one there starts a conversation.
+  const other = await start();
+  const a = await start();
+  const servers = () => new Set(fs.readdirSync(path.join(KIMI_HOME, 'server', 'instances')).map((f) => JSON.parse(fs.readFileSync(path.join(KIMI_HOME, 'server', 'instances', f), 'utf8')).pid));
+  const before = servers();
+  try {
+    a.type('聊天 交給中控台');
+    const k = await listed((x) => x.title === '聊天 交給中控台' && x.owner === 'tui', 'terminal conversation');
+    await new Promise((r) => setTimeout(r, 1500));
+    a.type('/web');
+    const s = await api('POST', `/machines/${machineId}/kimi/${k.id}/attach`);
+    await until(async () => (await session(s.id)).meta.owner !== 'tui', 20000, 'handed over, not locked by the other terminal Kimi');
+    await api('POST', `/sessions/${s.id}/messages`, { text: '聊天 從中控台接手' });
+    await until(async () => (await session(s.id)).events.some((e) => e.type === 'text' && e.text.includes('收到：聊天 從中控台接手')), 30000, 'answered from the hub');
+    // The other terminal Kimi's own conversation is still its own.
+    other.type('聊天 另一個終端機');
+    await listed((x) => x.title === '聊天 另一個終端機' && x.owner === 'tui' && !x.guess, 'the other terminal conversation');
+    await new Promise((r) => setTimeout(r, 3000));
+    assert.notEqual((await session(s.id)).meta.owner, 'tui');
+  } finally {
+    other.stop();
+    a.stop();
+    for (const pid of servers()) if (!before.has(pid)) try { process.kill(pid, 'SIGKILL'); } catch {}
+  }
 });
 
 test('when the Kimi server goes away, the bridge starts a new one on the next message', { skip: SKIP }, async () => {

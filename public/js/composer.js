@@ -258,7 +258,10 @@ export class Composer {
       // A terminal Kimi in the same folder might have it open: two Kimis on
       // one conversation would overwrite each other, so only on request.
       const unlock = () => {
-        if (confirm('確定終端機的 Kimi 沒有開著這個對話嗎？\n\n如果它開著，兩邊會各自寫入同一個對話、互相覆蓋。')) this.opts.onUnlock?.();
+        const ask = this.state.guess
+          ? '確定終端機的 Kimi 沒有開著這個對話嗎？\n\n如果它開著，兩邊會各自寫入同一個對話、互相覆蓋。'
+          : '終端機的 Kimi 剛寫過這個對話。確定它已經沒有開著（已經輸入 /web、換了對話或關掉）嗎？\n\n如果它還開著，兩邊會各自寫入同一個對話、互相覆蓋。';
+        if (confirm(ask)) this.opts.onUnlock?.();
       };
       fill(
         this.note,
@@ -266,11 +269,12 @@ export class Composer {
         this.state.guess
           ? h('div', { class: 'composer-note-text' }, h('div', { class: 'composer-note-title' }, '這個資料夾有終端機的 Kimi 開著'), h('div', null, '看不出它開的是不是這個對話，為了避免兩邊互相覆蓋，這裡先只能看。關掉那個 Kimi 就會解除。'))
           : h('div', { class: 'composer-note-text' }, h('div', { class: 'composer-note-title' }, '這個對話正在終端機的 Kimi 裡執行'), h('div', null, '這裡會即時同步。要從這裡操作，在那個 Kimi 裡輸入 /web，或之後用 kimi-hub 啟動 Kimi。')),
-        this.state.guess && this.opts.onUnlock
-          ? h('button', { class: 'om-btn om-btn--sm', type: 'button', onclick: unlock }, '仍要從這裡操作')
-          : this.opts.onHelp
-            ? h('button', { class: 'om-btn om-btn--sm', type: 'button', onclick: () => this.opts.onHelp() }, '說明…')
-            : null,
+        h(
+          'div',
+          { class: 'composer-note-actions' },
+          !this.state.guess && this.opts.onHelp ? h('button', { class: 'om-btn om-btn--sm om-btn--plain', type: 'button', onclick: () => this.opts.onHelp() }, '說明…') : null,
+          this.opts.onUnlock ? h('button', { class: 'om-btn om-btn--sm', type: 'button', onclick: unlock }, '仍要從這裡操作') : null,
+        ),
       );
       if (!this.note.isConnected) this.el.append(this.note);
     } else this.note?.remove();
