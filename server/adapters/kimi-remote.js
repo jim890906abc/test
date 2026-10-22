@@ -7,6 +7,7 @@ import crypto from 'node:crypto';
 import * as machines from '../machines.js';
 import * as store from '../store.js';
 import * as repoBind from './claude-repo.js';
+import * as deepseek from '../deepseek-account.js';
 import { remoteHost } from './claude-tools.js';
 
 export const live = true;
@@ -69,14 +70,17 @@ async function machineModels(machineId) {
   const v = { at: Date.now(), defaultModel: config.default_model || '', models: (list.items || []).map(modelInfo) };
   modelCache.set(machineId, v);
   // K3-256k is the default model in 設定 unless one was chosen (once).
+  // Kimi's models only: the DeepSeek ones are not Kimi's to default to.
   store.migrateSettings('model-k3-256k', (d) => {
-    const k3 = v.models.find((m) => /k3[-_ ]?256k/i.test(`${m.id} ${m.name}`));
+    const k3 = v.models.filter((m) => !m.deepseek).find((m) => /k3[-_ ]?256k/i.test(`${m.id} ${m.name}`));
     if (!k3) return false;
     if (!d.model) d.model = k3.id;
   });
   return v;
 }
 export const modelsFor = (machineId) => machineModels(machineId).then(({ models, defaultModel }) => ({ models, defaultModel }));
+// The machine's Kimi got (or lost) the DeepSeek provider: list its models again.
+export const forgetModels = (machineId) => modelCache.delete(machineId);
 
 // --------------------------------------------------------------- helpers
 
@@ -129,14 +133,20 @@ function effortsFor(model) {
   return [];
 }
 
-export const modelInfo = (m) => ({
-  id: m.model,
-  name: m.display_name || m.model.split('/').pop(),
-  efforts: effortsFor(m),
-  defaultEffort: m.default_effort || null,
-  image: (m.capabilities || []).includes('image_in'),
-  context: m.max_context_size || null,
-});
+// `deepseek`: one of the DeepSeek provider's models (server/deepseek-account.js),
+// which only DeepSeek conversations offer; DeepSeek thinks at max unless told.
+export const modelInfo = (m) => {
+  const ds = deepseek.isDeepseekModel(m.model);
+  return {
+    id: m.model,
+    name: m.display_name || m.model.split('/').pop(),
+    efforts: effortsFor(m),
+    defaultEffort: ds ? deepseek.DEFAULT_EFFORT : m.default_effort || null,
+    image: (m.capabilities || []).includes('image_in'),
+    context: m.max_context_size || null,
+    ...(ds ? { deepseek: true } : {}),
+  };
+};
 
 // Text a user typed (or a slash command) for a turn Kimi started.
 function promptLabel(p) {
@@ -242,13 +252,16 @@ class Mirror {
   // started it with or fell back to. What was chosen in it stays.
   async applyDefaults() {
     if (this.inTerminal()) return;
-    const d = store.readSettings().defaults || {};
+    // A DeepSeek conversation has its own defaults (DeepSeek 設定) and keeps
+    // its model: the Kimi defaults must never move it onto a Kimi model.
+    const ds = deepseek.isDeepseek(this.session);
+    const d = (ds ? deepseek.settings().defaults : store.readSettings().defaults) || {};
     const meta = this.session.meta || {};
     const chosen = this.session.state.userSet || {};
     const change = {};
     // Sent even when it looks set already: what the hub has may be behind
     // Kimi (it journals a change with its next turn).
-    const model = d.model && !chosen.model && (meta.models || []).find((x) => x.id === d.model);
+    const model = !ds && d.model && !chosen.model && (meta.models || []).find((x) => x.id === d.model && !x.deepseek);
     if (model) change.model = d.model;
     const efforts = (model || (meta.models || []).find((x) => x.id === meta.model))?.efforts || [];
     if (d.effort && !chosen.effort && efforts.includes(d.effort)) change.effort = d.effort;
@@ -978,7 +991,20 @@ class Mirror {
     }
     if (note !== REPO_CHECK_NOTE) this.repoNudges = 0;
     if (this.defaultModel === undefined) await this.loadModels().catch(() => {});
-    if (!this.session.meta?.model && this.defaultModel) body.model = this.defaultModel;
+    if (!this.session.meta?.model) {
+      // A DeepSeek conversation that has no model yet must not fall back to
+      // Kimi's default (the subscription's): it gets its own, or nothing.
+      const dsModel = this.session.mode === 'deepseek' ? this.session.state.deepseek?.model : null;
+      if (this.session.mode === 'deepseek' && !dsModel) {
+        this.dequeue(promptId);
+        const text = '這個 DeepSeek 對話還沒有模型，為了不誤用 Kimi 訂閱的模型，沒有送出。請在輸入框選一個 DeepSeek 模型。';
+        ctx.emit({ type: 'error', text });
+        if (!busy) ctx.setStatus('idle');
+        return { ok: false, error: text };
+      }
+      if (dsModel) body.model = dsModel;
+      else if (this.defaultModel) body.model = this.defaultModel;
+    }
     // 插隊 from the tray can come before Kimi has the prompt: it waits.
     const post = this.api('POST', this.path('/prompts'), body);
     (this.inflight ??= new Map()).set(promptId, post);

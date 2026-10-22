@@ -7,6 +7,7 @@ import { TOOL_DEFS, toolKind, validateInput, executeTool } from './tools.js';
 import { ADAPTERS } from './adapters/index.js';
 import { createWorkspace } from './workspace.js';
 import * as machines from './machines.js';
+import * as deepseek from './deepseek-account.js';
 import * as repoBind from './adapters/claude-repo.js';
 import { remoteHost } from './adapters/claude-tools.js';
 
@@ -35,6 +36,9 @@ export function summarize(s) {
     permissionMode: s.permissionMode,
     machineId: s.machineId,
     kimiSessionId: s.kimiSessionId,
+    // 'deepseek': runs a DeepSeek model in the computer's Kimi (billed to the
+    // gateway's API key, not the Kimi subscription).
+    mode: deepseek.isDeepseek(s) ? 'deepseek' : null,
     // Bound to a GitHub repository (Claude keeps it in meta, Kimi beside it).
     repo: s.meta?.repo || (s.repo ? { full: s.repo.full, branch: s.repo.branch, url: s.repo.url, dir: s.repo.dir } : null),
     meta: s.meta,
@@ -486,6 +490,12 @@ export async function resolvePermission(sid, eventId, optionId, extra = {}) {
 export async function configure(session, change) {
   const adapter = adapterFor(session);
   if (!adapter?.configure) throw Object.assign(new Error('這個對話不支援切換設定'), { status: 400 });
+  // DeepSeek models only in DeepSeek conversations, and nothing else there:
+  // a Kimi model would run on the subscription.
+  if (session.kimiSessionId && typeof change?.model === 'string' && change.model) {
+    const ds = deepseek.isDeepseek(session);
+    if (ds !== deepseek.isDeepseekModel(change.model)) throw Object.assign(new Error(ds ? 'DeepSeek 對話只能用 DeepSeek 的模型' : 'DeepSeek 的模型只能在 DeepSeek 對話裡用'), { status: 400 });
+  }
   const meta = await adapter.configure(session, change);
   if (meta) {
     session.meta = { ...(session.meta || {}), ...meta };
@@ -538,7 +548,7 @@ export function disposeSession(session) {
 
 // ------------------------------------------------------- session creation
 
-export async function newSession({ agentId, machineId, cwd, prompt, nameHint, permissionMode = 'ask', branch, title, config }) {
+export async function newSession({ agentId, machineId, cwd, prompt, nameHint, permissionMode = 'ask', branch, title, config, mode }) {
   const agent = agentFor(agentId);
   if (!agent) throw Object.assign(new Error(`找不到 agent：${agentId}`), { status: 400 });
   let session;
@@ -546,6 +556,13 @@ export async function newSession({ agentId, machineId, cwd, prompt, nameHint, pe
     const kimi = ADAPTERS['kimi-remote'];
     const availability = kimi.available(agent);
     if (!availability.ok) throw Object.assign(new Error(availability.reason), { status: 409 });
+    // A DeepSeek conversation: Kimi has the DeepSeek provider first (the
+    // bridge creates it, never touching the subscription or Kimi's default).
+    const ds = mode === 'deepseek';
+    if (ds) {
+      await kimi.ensureServer(agent.machineId);
+      if (!(await deepseek.ensureProvider(agent.machineId)).cached) kimi.forgetModels(agent.machineId);
+    }
     // Bound to a GitHub repository: cloned on that computer first, and the
     // conversation starts in the clone.
     const { repo, ...settings } = config || {};
@@ -555,12 +572,24 @@ export async function newSession({ agentId, machineId, cwd, prompt, nameHint, pe
       dir = await repoBind.clone(remoteHost(agent.machineId), `${String(m?.home || '~').replace(/\/+$/, '')}/agent-hub-workspaces`, repo);
     }
     const r = await kimi.createRemote({ machineId: agent.machineId, cwd: dir, nameHint: nameHint || prompt });
-    session = store.createSession({ agentId, cwd: r.cwd, machineId: agent.machineId, kimiSessionId: r.kimiSessionId, permissionMode, title: title || '新對話', ...(repo ? { repo: { ...repo, url: `https://github.com/${repo.full}/tree/${repo.branch}`, dir: r.cwd } } : {}) });
+    session = store.createSession({ agentId, cwd: r.cwd, machineId: agent.machineId, kimiSessionId: r.kimiSessionId, permissionMode, title: title || '新對話', ...(ds ? { mode: 'deepseek' } : {}), ...(repo ? { repo: { ...repo, url: `https://github.com/${repo.full}/tree/${repo.branch}`, dir: r.cwd } } : {}) });
     config = Object.keys(settings).length ? settings : undefined;
     session.state.defaultsApplied = true; // started with what was picked on the home screen
+    if (ds) session.state.deepseek = { gateway: deepseek.gateway(), model: config?.model };
     kimi.restore(session);
-    await kimi.attach(session);
-    if (config && Object.values(config).some((v) => v !== undefined && v !== '')) await kimi.configure(session, config).catch((err) => console.warn(`[kimi] configure: ${err.message}`));
+    try {
+      await kimi.attach(session);
+      if (ds) await configureDeepseek(kimi, session, config);
+      else if (config && Object.values(config).some((v) => v !== undefined && v !== '')) await kimi.configure(session, config).catch((err) => console.warn(`[kimi] configure: ${err.message}`));
+    } catch (err) {
+      // Never leave a DeepSeek conversation that would answer on Kimi's own
+      // (the subscription's) model.
+      if (!ds) throw err;
+      kimi.dispose(session);
+      store.deleteSession(session.id);
+      machines.kimiApi(agent.machineId, 'POST', `/api/v1/sessions/${r.kimiSessionId}:archive`, {}).catch(() => {});
+      throw err;
+    }
   } else if (agent.type === 'claude') {
     // Run by the Claude daemon of this computer, or of a connected one
     // (`machineId`), which keeps going while the hub is closed.
@@ -590,6 +619,22 @@ export async function newSession({ agentId, machineId, cwd, prompt, nameHint, pe
   broadcast({ t: 'session', session: summarize(session) });
   if (prompt) startTurn(session, prompt);
   return session;
+}
+
+// The model, thinking and permission a DeepSeek conversation starts with.
+// It must get its model: if Kimi does not know it (the provider was lost
+// since it was provisioned), the provider is made again and it is retried.
+async function configureDeepseek(kimi, session, config) {
+  if (!deepseek.isDeepseekModel(config?.model)) throw Object.assign(new Error('DeepSeek 對話需要選一個 DeepSeek 模型'), { status: 400 });
+  try {
+    await kimi.configure(session, config);
+  } catch (err) {
+    console.warn(`[deepseek] configure failed (${err.message}); provisioning again`);
+    deepseek.forgetProvider(session.machineId);
+    await deepseek.ensureProvider(session.machineId);
+    kimi.forgetModels(session.machineId);
+    await kimi.configure(session, config);
+  }
 }
 
 // Take over a Kimi session that already exists on a machine (e.g. one handed

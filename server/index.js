@@ -18,6 +18,7 @@ import { createAutoPause, activityOf, timings, isActive } from './autopause.js';
 import { createScheduler, scheduleTimings } from './schedule.js';
 import { mergeQuota, countsOf } from './quota.js';
 import * as claudeAccount from './claude-account.js';
+import * as deepseekAccount from './deepseek-account.js';
 import * as github from './github.js';
 import * as gdrive from './gdrive.js';
 import { localHost, remoteHost } from './adapters/claude-tools.js';
@@ -112,6 +113,7 @@ app.get('/api/config', wrap(() => ({
   host: HOST,
   settings: readSettings(),
   claude: claudeAccount.publicAccount(),
+  deepseek: deepseekAccount.publicAccount(),
 })));
 
 // ------------------------------------------------------------ Claude API
@@ -151,11 +153,68 @@ app.post('/api/claude/test', wrap(async () => {
 
 app.get('/api/claude/models', wrap(async () => ({ defaultModel: claudeAccount.DEFAULT_MODEL, models: await claudeAccount.models() })));
 
+// -------------------------------------------------------------- DeepSeek
+
+// DeepSeek mode runs DeepSeek models inside the Kimi Code of a connected
+// computer (server/deepseek-account.js). Here: the gateway keys (only ever
+// sent here, never back) and the defaults for new DeepSeek conversations.
+app.get('/api/deepseek', wrap(() => deepseekAccount.publicAccount()));
+
+app.put('/api/deepseek', wrap(async (req) => {
+  const { gateway: chosen, apiKey, clearKey, defaults } = req.body || {};
+  if (chosen !== undefined && !deepseekAccount.isGateway(chosen)) throw Object.assign(new Error('不支援的閘道'), { status: 400 });
+  const gw = chosen ?? deepseekAccount.gateway();
+  let removed = false;
+  if (clearKey) {
+    removed = Boolean(deepseekAccount.apiKey(gw));
+    deepseekAccount.clearKey(gw);
+  } else if (typeof apiKey === 'string' && apiKey.trim()) {
+    const why = deepseekAccount.checkKey(apiKey);
+    if (why) throw Object.assign(new Error(why), { status: 400 });
+    // Saved only once the gateway accepts it (its models list is read with it).
+    const r = await deepseekAccount.refreshModels(gw, apiKey.trim());
+    deepseekAccount.setKey(gw, apiKey);
+    if (r.note) console.warn(`[deepseek] ${r.note}`);
+  }
+  deepseekAccount.setSettings({ gateway: chosen, defaults });
+  // A key removed leaves the computers' Kimi too (it sits in its config there);
+  // a new key or gateway goes to the ones that have the provider already.
+  if (removed && !deepseekAccount.apiKey()) deepseekAccount.removeProviders().catch(() => {});
+  else deepseekAccount.reprovision().then((ids) => ids.forEach((id) => kimiRemote.forgetModels(id))).catch(() => {});
+  const account = deepseekAccount.publicAccount();
+  broadcast({ t: 'deepseek', account });
+  return account;
+}));
+
+app.post('/api/deepseek/test', wrap(async (req) => {
+  const gw = req.body?.gateway ?? deepseekAccount.gateway();
+  if (!deepseekAccount.isGateway(gw)) throw Object.assign(new Error('不支援的閘道'), { status: 400 });
+  const key = deepseekAccount.apiKey(gw);
+  if (!key) return { ok: false, message: '這個閘道還沒有設定 API key' };
+  try {
+    const r = await deepseekAccount.refreshModels(gw, key);
+    const models = deepseekAccount.models(gw);
+    return { ok: true, message: r.live ? `連線成功：這把 API key 可以使用 ${r.ids.length} 個 DeepSeek 模型` : `金鑰沒有被拒絕。${r.note}`, ...models };
+  } catch (err) {
+    return { ok: false, message: err.message };
+  }
+}));
+
+app.get('/api/deepseek/models', wrap((req) => {
+  const gw = req.query.gateway ? String(req.query.gateway) : deepseekAccount.gateway();
+  if (!deepseekAccount.isGateway(gw)) throw Object.assign(new Error('不支援的閘道'), { status: 400 });
+  return deepseekAccount.models(gw);
+}));
+
+// Computers whose Kimi has a [secondary_model] (subagents may run on it).
+app.get('/api/deepseek/secondary', wrap(async () => deepseekAccount.secondaryModels()));
+
 app.put('/api/settings', wrap((req) => {
   const d = req.body?.defaults || {};
   const str = (v) => (typeof v === 'string' && v.length <= 200 ? v : '');
   const defaults = {
-    model: str(d.model),
+    // Kimi's own models: a DeepSeek one has no place in the Kimi defaults.
+    model: deepseekAccount.isDeepseekModel(d.model) ? '' : str(d.model),
     effort: str(d.effort),
     permission: ['manual', 'yolo', 'auto'].includes(d.permission) ? d.permission : 'manual',
     planMode: Boolean(d.planMode),
@@ -273,8 +332,23 @@ app.get('/api/sessions', wrap(() =>
 // { agent: 'claude', cwd } starts a Claude API conversation in a folder on
 // this computer.
 app.post('/api/sessions', wrap(async (req) => {
-  const { agentId, machineId, agent, prompt, cwd, permissionMode, images, model, effort, permission, planMode } = req.body || {};
+  const { agentId, machineId, agent, prompt, cwd, permissionMode, images } = req.body || {};
+  let { model, effort, permission, planMode } = req.body || {};
   const claude = agent === 'claude' || agentId === 'claude';
+  // { agent: 'deepseek', machineId, … }: a Kimi conversation on that computer
+  // that runs a DeepSeek model of the gateway in use.
+  const ds = agent === 'deepseek';
+  if (ds) {
+    if (!machineId) throw Object.assign(new Error('DeepSeek 對話在一台電腦的 Kimi 裡執行：請選一台電腦'), { status: 400 });
+    if (!deepseekAccount.apiKey()) throw Object.assign(new Error('還沒有設定 DeepSeek 的 API key。在「設定」→「DeepSeek…」貼上閘道的 API key。'), { status: 409 });
+    const d = deepseekAccount.settings().defaults;
+    const ids = deepseekAccount.modelIds();
+    if (model && !ids.includes(model)) throw Object.assign(new Error(`${deepseekAccount.GATEWAYS[deepseekAccount.gateway()].label} 沒有 ${String(model).slice(0, 60)} 這個模型`), { status: 400 });
+    model = deepseekAccount.aliasFor(model || d.model);
+    effort = deepseekAccount.EFFORTS.includes(effort) ? effort : d.effort;
+    permission = ['manual', 'yolo', 'auto'].includes(permission) ? permission : d.permission;
+    planMode ??= d.planMode || undefined;
+  }
   // A Claude conversation bound to a GitHub repository (cloned on its
   // computer, on `branch`: an existing one, or a new one made from the
   // default branch).
@@ -294,6 +368,7 @@ app.post('/api/sessions', wrap(async (req) => {
     cwd: dir,
     permissionMode,
     nameHint: prompt,
+    mode: ds ? 'deepseek' : undefined,
     config: remote || claude ? { model, effort, permission, planMode, ...(repo ? { repo } : {}) } : undefined,
   });
   const files = req.body?.files || [];
@@ -469,6 +544,9 @@ app.post('/api/sessions/:id/earlier', wrap(async (req) => {
 app.post('/api/sessions/:id/autopause', wrap(async (req) => {
   const s = mustSession(req.params.id);
   if (!s.kimiSessionId) throw Object.assign(new Error('只有 Kimi 對話可以自動暫停'), { status: 400 });
+  // It watches the Kimi subscription's 5-hour quota, which a DeepSeek
+  // conversation does not use.
+  if (deepseekAccount.isDeepseek(s)) throw Object.assign(new Error('DeepSeek 對話不用 Kimi 訂閱，沒有 5 小時額度，不能自動暫停，也不能設定「額度恢復後送出」。要延後送出訊息，請用 /later 30 繼續 或「定時送出…」。'), { status: 400 });
   const { enabled, threshold, cancelResume, resumeAfterReset, text } = req.body || {};
   if (cancelResume) autoPause.cancelResume(s);
   else if (resumeAfterReset) await autoPause.armResume(s, { text });
@@ -856,7 +934,7 @@ const persist = (s, { immediate }) => {
   broadcast({ t: 'session', session: runner.summarize(s) });
 };
 const autoPause = createAutoPause({
-  sessions: () => store.listSessions().filter((s) => s.kimiSessionId && isActive(s.autoPause)),
+  sessions: () => store.listSessions().filter((s) => s.kimiSessionId && isActive(s.autoPause) && !deepseekAccount.isDeepseek(s)),
   activity: (s) => activityOf(s, machines.getMachine(s.machineId), kimiRemote.isLive(s)),
   readUsage: (mid) => readQuota(mid),
   send: (s, text, opts) => runner.deliver(s, text, opts),

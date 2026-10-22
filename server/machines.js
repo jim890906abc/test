@@ -94,6 +94,9 @@ const sessionEntry = (s) => ({
   controllable: s.controllable ?? null,
   // Locked only because a terminal Kimi runs in the same folder.
   guess: Boolean(s.guess),
+  // The model it last ran on (the bridge reads it from the journal), so the
+  // sidebar can tell DeepSeek conversations apart without opening them.
+  model: s.model || '',
 });
 
 function sessionChanged(m, entry) {
