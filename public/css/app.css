@@ -131,52 +131,67 @@
   --row-active: #262624;
 }
 
-/* DeepSeek mode (the DeepSeek home, a DeepSeek conversation): a deep blue
-   family derived from DeepSeek's blue (#4d6bfe) with white text and lighter
-   blues for buttons, links and focus. White on #4d6bfe itself is 4.3:1, so the
-   surfaces are the deeper blues; body text is >= 4.5:1 on every surface
-   here (ink 8.1 to 17:1, secondary 5.5 to 9:1), UI parts >= 3:1. Whatever
-   the theme, like Claude's. */
+/* DeepSeek mode (the DeepSeek home, a DeepSeek conversation): blue and white,
+   whatever the theme (like Claude's look it ignores the dark theme): white
+   surfaces, a very pale blue-white sidebar, DeepSeek's blue (#4d6bfe) as the
+   one accent and near-black ink with a blue tint. The component details are
+   at the end of this file.
+   White on #4d6bfe is only 4.3:1, so #4d6bfe is for marks and fills that
+   carry an icon (send button, switch, radio, focus ring, progress, 3:1 or
+   more) and a button with white TEXT uses --accent-strong (#3451e6, 6.1:1;
+   pressed #2b44cf 7.4:1). Checked with WCAG contrast, text >= 4.5:1 and
+   UI parts >= 3:1:
+     ink #1b1f33 on white 16.3, on #f5f8ff 15.3, on #f7f9ff 15.5, on #e6edff 13.9
+     ink-secondary #596079 on white 6.2, on #f7f9ff 5.9, on #eef3ff 5.6, on #e6edff 5.3
+     link #3352e5 on white 6.0 (on #edf1ff 5.4); active row #1f3bd0 on #e6edff 6.9
+     active segment / tag #2c47d6 on white 7.05, on #e3e9ff 5.8; inline code #2b45c9 on #eef2ff 6.7
+     white on the DeepSeek tag in the other looks (#3550e6) 6.1
+     danger #c92f35 on white 5.3, on #fdeeee 4.7; warning #9a6000 on white 5.2,
+     on #fff6e5 4.8; success #117556 on white 5.7, on #e8f6ef 5.1
+     control-border #818dbd on white 3.24, on #f5f8ff 3.05, on #f7f9ff 3.08;
+     icon-ink #6f7794 on white 4.4, on #f7f9ff 4.2; #4d6bfe on white 4.3, on #f3f6ff 4.0 */
 :root[data-agent='deepseek'] {
-  color-scheme: dark;
-  --desktop: #0a1250;
-  --window: #1c2fa8;
-  --window-raised: #2a40c0;
-  --titlebar: #1c2fa8;
-  --sidebar: #121f80;
-  --material-sidebar: #121f80;
-  --material-popover: #2a40c0f5;
-  --control: #2a40c0;
-  --control-pressed: #3650d4;
-  --track: #121f80;
-  --fill-hover: #ffffff17;
-  --line: #3b52c9;
-  --control-border: #8ea0ff;
-  --ink: #ffffff;
-  --ink-secondary: #c9d2ff;
-  --ink-disabled: #8a99e8;
-  --icon-ink: #aab8ff;
-  --accent: #a9b9ff;
-  --accent-pressed: #8fa3ff;
-  --on-accent: #0a1250;
-  --accent-soft: #26398f;
-  --link: #bccaff;
-  --danger: #ffb4ac;
-  --danger-soft: #4a1c46;
-  --on-danger: #0a1250;
-  --warning: #ffd685;
-  --warning-soft: #43391f;
-  --success: #a8e6c8;
-  --success-soft: #14456a;
-  --scrim: #050a30b3;
-  --shadow-control: 0 1px 2px #05093866;
-  --shadow-card: 0 1px 2px #05093859;
-  --shadow-popover: 0 0 0 0.5px #ffffff26, 0 12px 32px #050938a6;
+  color-scheme: light;
+  accent-color: #4d6bfe;
+  --desktop: #ffffff;
+  --window: #ffffff;
+  --window-raised: #f5f8ff;
+  --titlebar: #ffffff;
+  --sidebar: #f7f9ff;
+  --material-sidebar: #f7f9ff;
+  --material-popover: #fffffffa;
+  --control: #ffffff;
+  --control-pressed: #eaf0ff;
+  --track: #eef2fd;
+  --fill-hover: #4d6bfe0f;
+  --line: #e3e9f8;
+  --control-border: #818dbd;
+  --ink: #1b1f33;
+  --ink-secondary: #596079;
+  --ink-disabled: #a4aac0;
+  --icon-ink: #6f7794;
+  --accent: #4d6bfe;
+  --accent-strong: #3451e6;
+  --accent-pressed: #2b44cf;
+  --on-accent: #ffffff;
+  --accent-soft: #edf1ff;
+  --link: #3352e5;
+  --danger: #c92f35;
+  --danger-soft: #fdeeee;
+  --on-danger: #ffffff;
+  --warning: #9a6000;
+  --warning-soft: #fff6e5;
+  --success: #117556;
+  --success-soft: #e8f6ef;
+  --scrim: #1b1f3366;
+  --shadow-control: 0 1px 2px #1b2a6b14;
+  --shadow-card: 0 1px 2px #1b2a6b0f, 0 1px 1px #1b2a6b08;
+  --shadow-popover: 0 0 0 1px #1b2a6b12, 0 12px 32px #1b2a6b1f;
   --shadow-window: none;
-  --shadow-inset: inset 0 1px 1px #05093859;
-  --focus-ring: 0 0 0 2px #1c2fa8, 0 0 0 4px #bccaff;
-  --user-bubble: #142194;
-  --row-active: #2a40c0;
+  --shadow-inset: inset 0 1px 1px #1b2a6b0a;
+  --focus-ring: 0 0 0 2px #ffffff, 0 0 0 4px #4d6bfe;
+  --user-bubble: #eef3ff;
+  --row-active: #e6edff;
 }
 
 :root {
@@ -2712,16 +2727,14 @@ pre.tail {
 :root[data-theme='dark'] .composer-box {
   border-radius: 18px;
 }
-:root[data-agent='claude'] .om-btn--plain,
-:root[data-agent='deepseek'] .om-btn--plain {
+/* (DeepSeek's blue-and-white look is at the end of this file.) */
+:root[data-agent='claude'] .om-btn--plain {
   color: var(--link);
 }
-:root[data-agent='claude'] .side-row[aria-current='page'],
-:root[data-agent='deepseek'] .side-row[aria-current='page'] {
+:root[data-agent='claude'] .side-row[aria-current='page'] {
   color: var(--ink);
 }
-:root[data-agent='claude'] .composer-box,
-:root[data-agent='deepseek'] .composer-box {
+:root[data-agent='claude'] .composer-box {
   border-radius: 18px;
 }
 
@@ -3217,13 +3230,11 @@ pre.tail {
   font-weight: 600;
   letter-spacing: 0.02em;
 }
+/* In the Kimi and Claude looks: DeepSeek blue dark enough for 10px white text
+   (6.1:1). In DeepSeek's own look it is a soft tag (end of this file). */
 .row-tag.ds {
-  background: #3f5bf0;
+  background: #3550e6;
   color: #fff;
-}
-:root[data-agent='deepseek'] .row-tag.ds {
-  background: var(--accent);
-  color: var(--on-accent);
 }
 .gw-list {
   display: flex;
@@ -3559,4 +3570,638 @@ pre.tail {
   width: 14px;
   height: 14px;
   margin-top: 2px;
+}
+
+/* ------------------------------------------------- DeepSeek: blue and white */
+
+/* DeepSeek mode (data-agent="deepseek", set by app.js setLook; tokens near the
+   top of this file). Only colors, shape and type here: no logo or artwork.
+   Everything is scoped to the look, after every other rule, so it wins over
+   them, and nothing of the Kimi or Claude looks changes. */
+
+/* the page: air, and a faint blue haze at the top of the home */
+/* (the composer on the home page carries .home too: no haze or clipping there) */
+:root[data-agent='deepseek'] .home:not(.composer) {
+  background: radial-gradient(ellipse 75% 46% at 50% 0%, #e9efff 0%, #ffffff 74%);
+}
+:root[data-agent='deepseek'] .composer.home {
+  padding-left: 0;
+  padding-right: 0;
+  overflow: visible;
+}
+:root[data-agent='deepseek'] .large-title {
+  font-family: var(--font-sans);
+  font-size: 28px;
+  line-height: 36px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  margin-bottom: var(--space-3);
+}
+:root[data-agent='deepseek'] .om-toolbar__title {
+  font-weight: 600;
+}
+:root[data-agent='deepseek'] ::selection {
+  background: #4d6bfe33;
+}
+:root[data-agent='deepseek'] * {
+  scrollbar-color: #d5ddf5 transparent;
+}
+:root[data-agent='deepseek'] ::-webkit-scrollbar-thumb {
+  background-color: #d5ddf5;
+}
+:root[data-agent='deepseek'] ::-webkit-scrollbar-thumb:hover {
+  background-color: #bcc8f0;
+}
+
+/* sidebar: pale blue-white, rounded rows, a soft "新對話" */
+:root[data-agent='deepseek'] .om-sidebar__section {
+  padding-top: var(--space-4);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+}
+:root[data-agent='deepseek'] .om-sidebar__item {
+  border-radius: 10px;
+}
+:root[data-agent='deepseek'] .new-item[href='#/'] {
+  height: 36px;
+  background: var(--accent-soft);
+  color: #2c47d6;
+  font-weight: 600;
+}
+:root[data-agent='deepseek'] .new-item[href='#/']:hover {
+  background: #e3eaff;
+}
+:root[data-agent='deepseek'] .side-search .om-input {
+  border-radius: 10px;
+}
+:root[data-agent='deepseek'] .side-row {
+  border-radius: 10px;
+}
+:root[data-agent='deepseek'] .side-row:hover {
+  background: #4d6bfe0d;
+}
+:root[data-agent='deepseek'] .side-row[aria-current='page'] {
+  background: var(--row-active);
+  color: #1f3bd0;
+}
+:root[data-agent='deepseek'] .side-row[aria-current='page'] .row-title {
+  font-weight: 600;
+}
+:root[data-agent='deepseek'] .side-row[aria-current='page'] .row-sub {
+  color: var(--ink-secondary);
+  opacity: 1;
+}
+:root[data-agent='deepseek'] .side-row[aria-current='page'].offline .row-title {
+  color: var(--ink-secondary);
+}
+:root[data-agent='deepseek'] .side-row[aria-current='page'] .spinner {
+  border-color: #c7d3fb;
+  border-top-color: var(--accent);
+}
+:root[data-agent='deepseek'] .row-more:hover {
+  background: #4d6bfe14;
+}
+:root[data-agent='deepseek'] .row-tag.ds {
+  background: #e3e9ff;
+  color: #2c47d6;
+}
+:root[data-agent='deepseek'] .side-row[aria-current='page'] .row-tag.ds {
+  background: #ffffff;
+}
+:root[data-agent='deepseek'] .side-foot {
+  border-top-color: var(--line);
+}
+
+/* mode switch: a pill track, the chosen mode a white pill */
+:root[data-agent='deepseek'] .om-seg {
+  gap: 2px;
+  padding: 3px;
+  background: var(--track);
+  border-color: transparent;
+  border-radius: 999px;
+}
+:root[data-agent='deepseek'] .om-seg__item {
+  border-radius: 999px;
+  transition: background-color 0.12s ease, color 0.12s ease;
+}
+:root[data-agent='deepseek'] .om-seg__item[aria-pressed='true'] {
+  background: #ffffff;
+  color: #2c47d6;
+  box-shadow: 0 1px 3px #1b2a6b1f, 0 0 0 1px #1b2a6b0a;
+}
+:root[data-agent='deepseek'] .om-seg__item:focus-visible {
+  box-shadow: var(--focus-ring);
+}
+:root[data-agent='deepseek'] .home-agent {
+  margin-bottom: var(--space-2);
+}
+:root[data-agent='deepseek'] .home-agent .om-seg__item {
+  height: 28px;
+  padding: 0 16px;
+  font-size: 13px;
+}
+
+/* composer: a white card with a blue glow while you type */
+:root[data-agent='deepseek'] .composer-box {
+  padding: 14px 16px 10px 18px;
+  background: #ffffff;
+  border-color: #dfe6fb;
+  border-radius: 24px;
+  box-shadow: 0 6px 28px #3b5bdb12;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+:root[data-agent='deepseek'] .composer-box:focus-within {
+  border-color: #4d6bfe;
+  box-shadow: 0 0 0 4px #4d6bfe1f, 0 6px 28px #3b5bdb12;
+}
+:root[data-agent='deepseek'] .composer-box.drop {
+  border-style: dashed;
+  border-color: #4d6bfe;
+  background: #f3f6ff;
+}
+:root[data-agent='deepseek'] .composer-input {
+  min-height: 48px;
+  font-size: 15px;
+  line-height: 24px;
+}
+:root[data-agent='deepseek'] .composer.home .composer-input {
+  min-height: 72px;
+}
+:root[data-agent='deepseek'] .composer-input::placeholder {
+  color: var(--ink-secondary);
+}
+:root[data-agent='deepseek'] .composer-bar {
+  margin-top: 8px;
+}
+:root[data-agent='deepseek'] .composer-tools {
+  gap: 4px;
+  margin: -4px;
+  padding: 4px;
+}
+:root[data-agent='deepseek'] .chip {
+  height: 30px;
+  padding: 0 9px;
+  border: 1px solid #e3e9f8;
+  border-radius: 999px;
+  background: #ffffff;
+  font-size: 12.5px;
+}
+:root[data-agent='deepseek'] .chip:hover {
+  background: #4d6bfe0f;
+  border-color: #cfd9fa;
+}
+:root[data-agent='deepseek'] .chip[aria-expanded='true'] {
+  background: var(--accent-soft);
+  border-color: #c3d0fb;
+  color: #2c47d6;
+}
+:root[data-agent='deepseek'] .chip.active {
+  background: var(--accent-soft);
+  border-color: #c3d0fb;
+  color: #2c47d6;
+}
+:root[data-agent='deepseek'] .chip.icon-only {
+  width: 30px;
+  padding: 0;
+}
+:root[data-agent='deepseek'] .chip.static:hover {
+  background: #ffffff;
+  border-color: #e3e9f8;
+  color: var(--ink-secondary);
+}
+:root[data-agent='deepseek'] .chip.served.bad,
+:root[data-agent='deepseek'] .chip.served.bad:hover {
+  color: var(--danger);
+}
+:root[data-agent='deepseek'] .chip .caret {
+  opacity: 0.6;
+}
+:root[data-agent='deepseek'] .send {
+  width: 36px;
+  height: 36px;
+  border-color: var(--accent);
+  border-radius: 50%;
+  background: var(--accent);
+  color: #ffffff;
+  box-shadow: 0 2px 8px #4d6bfe40;
+}
+:root[data-agent='deepseek'] .send:hover {
+  background: #4163fb;
+  border-color: #4163fb;
+}
+:root[data-agent='deepseek'] .send:active {
+  background: var(--accent-pressed);
+  border-color: var(--accent-pressed);
+}
+:root[data-agent='deepseek'] .send:disabled {
+  background: #c9d3fd;
+  border-color: #c9d3fd;
+  color: #ffffff;
+  box-shadow: none;
+}
+:root[data-agent='deepseek'] .send.stop {
+  background: #ffffff;
+  border-color: var(--accent);
+  color: var(--accent);
+  box-shadow: none;
+}
+:root[data-agent='deepseek'] .ctx-ring:hover {
+  background: #4d6bfe0f;
+}
+:root[data-agent='deepseek'] .ctx-ring .track {
+  stroke: #dbe3f8;
+}
+:root[data-agent='deepseek'] .ctx-ring .bar {
+  stroke: var(--accent);
+}
+:root[data-agent='deepseek'] .ctx-ring.warning .bar {
+  stroke: var(--warning);
+}
+:root[data-agent='deepseek'] .ctx-ring.danger .bar {
+  stroke: var(--danger);
+}
+:root[data-agent='deepseek'] .cost-chip:hover,
+:root[data-agent='deepseek'] .row-more:hover {
+  background: #4d6bfe14;
+}
+
+/* the conversation */
+:root[data-agent='deepseek'] .bubble {
+  border-color: transparent;
+  border-radius: 18px 18px 6px 18px;
+  padding: 10px 16px;
+}
+:root[data-agent='deepseek'] .md a {
+  text-underline-offset: 2px;
+}
+:root[data-agent='deepseek'] .md code {
+  background: #eef2ff;
+  color: #2b45c9;
+}
+:root[data-agent='deepseek'] .md pre {
+  padding: 12px 16px;
+  background: #f6f8fe;
+  border-color: #e6ecfa;
+  border-radius: 12px;
+}
+:root[data-agent='deepseek'] .md pre code {
+  background: none;
+  color: var(--ink);
+}
+:root[data-agent='deepseek'] .md blockquote {
+  border-left-color: #c9d4fb;
+}
+:root[data-agent='deepseek'] .md th {
+  background: #f3f6ff;
+}
+:root[data-agent='deepseek'] .md th,
+:root[data-agent='deepseek'] .md td {
+  border-color: #e6ecfa;
+}
+:root[data-agent='deepseek'] .code-copy {
+  border-color: #e6ecfa;
+}
+:root[data-agent='deepseek'] .fold {
+  color: var(--ink-secondary);
+}
+:root[data-agent='deepseek'] .thinking-text {
+  border-left-color: #dfe6fb;
+}
+:root[data-agent='deepseek'] .tool-row {
+  border-radius: 8px;
+}
+:root[data-agent='deepseek'] .tool-icon {
+  color: var(--icon-ink);
+}
+:root[data-agent='deepseek'] .tool-row .chev {
+  color: var(--icon-ink);
+}
+:root[data-agent='deepseek'] .result,
+:root[data-agent='deepseek'] pre.result-out {
+  border-left-color: #dfe6fb;
+}
+:root[data-agent='deepseek'] .tool-group:not(.solo) > .group-body,
+:root[data-agent='deepseek'] .tool-children {
+  border-left-color: #dfe6fb;
+}
+:root[data-agent='deepseek'] .spinner {
+  border-color: #dbe3f8;
+  border-top-color: var(--accent);
+}
+:root[data-agent='deepseek'] .jump-end {
+  background: #ffffff;
+  border-color: #e3e9f8;
+}
+:root[data-agent='deepseek'] .jump-end.new {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+/* cards: white, a hairline of blue-gray, 12px corners */
+:root[data-agent='deepseek'] pre.out,
+:root[data-agent='deepseek'] .diff,
+:root[data-agent='deepseek'] .web-links,
+:root[data-agent='deepseek'] .md.plan,
+:root[data-agent='deepseek'] .ask,
+:root[data-agent='deepseek'] .artifact-card,
+:root[data-agent='deepseek'] .artifact-tile,
+:root[data-agent='deepseek'] .agent-tray,
+:root[data-agent='deepseek'] .todo-tray,
+:root[data-agent='deepseek'] .queued,
+:root[data-agent='deepseek'] .composer-note {
+  background: #ffffff;
+  border-color: #e6ecfa;
+  border-radius: 12px;
+}
+:root[data-agent='deepseek'] .queued {
+  border-color: #cfd9fa;
+}
+:root[data-agent='deepseek'] .artifact-card:hover,
+:root[data-agent='deepseek'] .artifact-card.active,
+:root[data-agent='deepseek'] .artifact-tile:hover {
+  border-color: #b9c6f5;
+}
+:root[data-agent='deepseek'] .tool.agent {
+  padding: 0;
+  overflow: hidden;
+  background: #ffffff;
+  border-color: #e6ecfa;
+  border-radius: 12px;
+  box-shadow: var(--shadow-card);
+}
+:root[data-agent='deepseek'] .tool.agent > .tool-head .tool-row {
+  width: 100%;
+  min-height: 38px;
+  margin: 0;
+  padding: 6px 14px;
+  border-radius: 0;
+  background: #f7f9ff;
+}
+:root[data-agent='deepseek'] .tool.agent > .tool-head .tool-row:hover {
+  background: #f0f4ff;
+}
+:root[data-agent='deepseek'] .tool.agent > .tool-body {
+  margin: 0;
+  padding: 0 14px;
+}
+:root[data-agent='deepseek'] .tool.agent > .tool-body:not(:empty) {
+  padding: 8px 14px 10px;
+}
+:root[data-agent='deepseek'] .tool.agent > .tool-children {
+  margin: 0;
+  padding: 10px 14px 12px;
+  border-left: 0;
+  border-top: 1px solid #e6ecfa;
+}
+:root[data-agent='deepseek'] .tool.agent > .tool-children .agent-summary {
+  margin: 0;
+  padding: 0;
+  border-top: 0;
+}
+:root[data-agent='deepseek'] .agent-sec {
+  background: #f7f9ff;
+  border-color: #e6ecfa;
+}
+:root[data-agent='deepseek'] .artifact-card-icon {
+  border-radius: 10px;
+}
+
+/* dialogs, menus, buttons, fields */
+:root[data-agent='deepseek'] .dialog {
+  padding: 24px;
+  background: #ffffff;
+  border-radius: 16px;
+}
+:root[data-agent='deepseek'] .dialog.lightbox {
+  padding: 0;
+  background: transparent;
+  border-radius: 0;
+}
+:root[data-agent='deepseek'] .dialog-title {
+  font-size: 17px;
+  line-height: 24px;
+  font-weight: 600;
+}
+:root[data-agent='deepseek'] .dialog-subtitle {
+  font-weight: 600;
+}
+:root[data-agent='deepseek'] .tree {
+  border-color: #e6ecfa;
+  border-radius: 12px;
+}
+:root[data-agent='deepseek'] .tree-row[aria-selected='true'] {
+  background: var(--row-active);
+  color: #1f3bd0;
+  font-weight: 600;
+}
+:root[data-agent='deepseek'] .om-menu {
+  padding: 6px;
+  background: #ffffff;
+  border-radius: 14px;
+}
+:root[data-agent='deepseek'] .om-menu__item {
+  padding-left: 8px;
+  border-radius: 8px;
+}
+:root[data-agent='deepseek'] .om-menu__item:not(.has-desc):not(.slash-item) {
+  height: 32px;
+}
+:root[data-agent='deepseek'] .om-menu__item:not([aria-disabled='true']):hover,
+:root[data-agent='deepseek'] .om-menu__item[aria-selected='true'],
+:root[data-agent='deepseek'] .om-menu__item:not([aria-disabled='true']):focus-visible {
+  background: #eef2ff;
+  color: var(--ink);
+}
+:root[data-agent='deepseek'] .om-menu__item:not([aria-disabled='true']):hover .om-menu__shortcut,
+:root[data-agent='deepseek'] .om-menu__item[aria-selected='true'] .om-menu__shortcut {
+  color: var(--ink-secondary);
+}
+:root[data-agent='deepseek'] .om-menu__item:hover .menu-desc,
+:root[data-agent='deepseek'] .om-menu__item:focus-visible .menu-desc,
+:root[data-agent='deepseek'] .om-menu__item[aria-selected='true'] .menu-desc,
+:root[data-agent='deepseek'] .slash-item[aria-selected='true'] .slash-desc {
+  color: var(--ink-secondary);
+  opacity: 1;
+}
+:root[data-agent='deepseek'] .om-menu__item--destructive,
+:root[data-agent='deepseek'] .om-menu__item--destructive:hover,
+:root[data-agent='deepseek'] .om-menu__item--destructive:focus-visible {
+  color: var(--danger);
+}
+:root[data-agent='deepseek'] .om-menu__item[aria-disabled='true'] {
+  color: var(--ink-disabled);
+}
+:root[data-agent='deepseek'] .om-menu__check {
+  color: var(--link);
+  font-weight: 700;
+}
+:root[data-agent='deepseek'] .om-menu__sep {
+  background: #e6ecfa;
+}
+:root[data-agent='deepseek'] .menu-section {
+  letter-spacing: 0.04em;
+}
+
+:root[data-agent='deepseek'] .om-btn {
+  border-radius: 10px;
+  font-weight: 500;
+}
+:root[data-agent='deepseek'] .om-btn:not(.om-btn--sm):not(.om-btn--toolbar):not(.om-btn--lg) {
+  height: 32px;
+}
+:root[data-agent='deepseek'] .om-btn:not(.om-btn--plain):not(.om-btn--toolbar):not(.om-btn--primary):not(:disabled) {
+  border-color: var(--control-border);
+}
+:root[data-agent='deepseek'] .om-btn:not(.om-btn--plain):not(.om-btn--toolbar):not(.om-btn--primary):not(:disabled):hover {
+  background: #f3f6ff;
+}
+:root[data-agent='deepseek'] .om-btn--sm {
+  border-radius: 8px;
+}
+:root[data-agent='deepseek'] .om-btn--lg {
+  border-radius: 12px;
+}
+:root[data-agent='deepseek'] .om-btn--toolbar {
+  border-radius: 8px;
+}
+:root[data-agent='deepseek'] .om-btn--primary:not(:disabled) {
+  background: var(--accent-strong);
+  border-color: var(--accent-strong);
+  color: #ffffff;
+}
+:root[data-agent='deepseek'] .om-btn--primary:not(:disabled):hover {
+  background: #2e4ae0;
+  border-color: #2e4ae0;
+}
+:root[data-agent='deepseek'] .om-btn--primary:not(:disabled):active {
+  background: var(--accent-pressed);
+  border-color: var(--accent-pressed);
+}
+:root[data-agent='deepseek'] .om-btn--plain {
+  color: var(--link);
+}
+:root[data-agent='deepseek'] .om-btn--plain:hover {
+  background: #4d6bfe0f;
+}
+:root[data-agent='deepseek'] .om-btn--destructive {
+  color: var(--danger);
+}
+:root[data-agent='deepseek'] .om-btn:disabled,
+:root[data-agent='deepseek'] .om-btn[aria-disabled='true'] {
+  background: #f7f9ff;
+  border-color: var(--line);
+  color: var(--ink-disabled);
+}
+:root[data-agent='deepseek'] .om-badge--accent {
+  color: var(--link);
+}
+:root[data-agent='deepseek'] .dialog input.om-input,
+:root[data-agent='deepseek'] .dialog select.om-input {
+  height: 34px;
+  padding: 0 10px;
+}
+:root[data-agent='deepseek'] .om-input {
+  border-radius: 10px;
+}
+/* a menu that is only a box without a chevron does not look like one */
+:root[data-agent='deepseek'] select.om-input {
+  padding-right: 32px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16' fill='none' stroke='%236f7794' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 6.5l4 4 4-4'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+}
+:root[data-agent='deepseek'] .om-switch {
+  background: #e6ebfb;
+}
+:root[data-agent='deepseek'] .om-switch:checked {
+  background: var(--accent);
+}
+
+/* the gateway cards in DeepSeek 設定 */
+:root[data-agent='deepseek'] .gw-list {
+  gap: 8px;
+}
+:root[data-agent='deepseek'] .gw-item {
+  gap: 10px;
+  padding: 10px 14px;
+  border-color: #e3e9f8;
+  border-radius: 12px;
+  background: #ffffff;
+  transition: border-color 0.12s ease, background-color 0.12s ease, box-shadow 0.12s ease;
+}
+:root[data-agent='deepseek'] .gw-item:hover {
+  background: #f7f9ff;
+}
+:root[data-agent='deepseek'] .gw-item.on {
+  border-color: #4d6bfe;
+  background: #f3f6ff;
+  box-shadow: 0 0 0 3px #4d6bfe14;
+}
+:root[data-agent='deepseek'] .gw-item:has(input:focus-visible) {
+  box-shadow: var(--focus-ring);
+}
+:root[data-agent='deepseek'] .gw-item input[type='radio'] {
+  appearance: none;
+  flex: none;
+  display: grid;
+  place-content: center;
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  border: 1.5px solid var(--control-border);
+  border-radius: 50%;
+  background: #ffffff;
+}
+:root[data-agent='deepseek'] .gw-item input[type='radio']::after {
+  content: '';
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  transform: scale(0);
+  transition: transform 0.12s ease;
+}
+:root[data-agent='deepseek'] .gw-item input[type='radio']:checked {
+  border-color: var(--accent);
+}
+:root[data-agent='deepseek'] .gw-item input[type='radio']:checked::after {
+  transform: scale(1);
+}
+:root[data-agent='deepseek'] .gw-item input[type='radio']:focus-visible {
+  outline: none;
+}
+:root[data-agent='deepseek'] .gw-name {
+  font-weight: 500;
+}
+
+/* callouts: the missing-key note is a blue note, not a warning */
+:root[data-agent='deepseek'] .callout.deepseek-key {
+  padding: 10px 14px;
+  background: #f3f6ff;
+  color: var(--ink);
+  border: 1px solid #dfe6fb;
+  border-radius: 12px;
+}
+:root[data-agent='deepseek'] .callout.deepseek-key > .om-icon {
+  color: var(--accent);
+}
+:root[data-agent='deepseek'] .quota-bar {
+  background: #e6ebfb;
+}
+
+@media (max-width: 760px) {
+  :root[data-agent='deepseek'] .large-title {
+    font-size: 24px;
+    line-height: 32px;
+  }
+  :root[data-agent='deepseek'] .composer-box {
+    padding: 12px 14px 8px 16px;
+    border-radius: 22px;
+  }
+  :root[data-agent='deepseek'] .home:not(.composer) {
+    background: radial-gradient(ellipse 120% 40% at 50% 0%, #e9efff 0%, #ffffff 74%);
+  }
+  :root[data-agent='deepseek'] .home-agent .om-seg__item {
+    padding: 0 13px;
+  }
 }

@@ -21,7 +21,7 @@
           document.documentElement.dataset.agent = look;
           for (const m of document.querySelectorAll('meta[name="theme-color"]')) {
             m.dataset.base = m.content;
-            m.content = look === 'claude' ? '#141413' : '#1c2fa8';
+            m.content = look === 'claude' ? '#141413' : '#ffffff';
           }
         }
       } catch {}

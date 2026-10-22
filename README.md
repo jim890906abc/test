@@ -41,7 +41,7 @@ Claude 的對話由一個獨立的 **Claude 背景程式** 執行（跟 Kimi 的
 
 ## DeepSeek 模式
 
-首頁上方切到「DeepSeek」，開出的對話用 DeepSeek 模型，費用算在你的 DeepSeek 閘道 API key 上，**不用 Kimi 訂閱**。它不是另一套 agent：DeepSeek 對話就是那台電腦上 Kimi Code 裡的一般 Kimi 對話，只是模型換成 DeepSeek，所以 Kimi 的自動壓縮（用到約 85% 的 context 時）、reasoning 回放、子代理、計畫模式、插隊、待辦都照常運作；中控台給它藍色的 DeepSeek 外觀、側欄上的「DeepSeek」標籤和自己的設定。
+首頁上方切到「DeepSeek」，開出的對話用 DeepSeek 模型，費用算在你的 DeepSeek 閘道 API key 上，**不用 Kimi 訂閱**。它不是另一套 agent：DeepSeek 對話就是那台電腦上 Kimi Code 裡的一般 Kimi 對話，只是模型換成 DeepSeek，所以 Kimi 的自動壓縮（用到約 85% 的 context 時）、reasoning 回放、子代理、計畫模式、插隊、待辦都照常運作；中控台給它藍白配色的 DeepSeek 外觀、側欄上的「DeepSeek」標籤和自己的設定。
 
 1. 左下角「⋯」→「DeepSeek…」選閘道、貼上 API key。中控台會先用這把 key 向閘道讀模型清單確認有效（只保留 DeepSeek 的模型；讀不到清單時用內建清單），key 只存在 `data/deepseek.json`，不會傳回瀏覽器。
 2. 閘道：**OpenCode Go**（訂閱）、**OpenCode**（按量計費，原本的 Zen）、**Command Code**（要有含 API 存取的方案；Go 方案會被拒絕，`upgrade_required`）。預設模型是各閘道的 DeepSeek V4.1 Flash（沒有的話用清單裡的第一個），思考強度 low／high／max，預設 max；每個模型 1M context、最多 384k 輸出。

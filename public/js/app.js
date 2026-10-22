@@ -188,9 +188,9 @@ function applyTheme(t, { save = true } = {}) {
 const theme = () => document.documentElement.dataset.theme || 'auto';
 
 // Claude mode (the Claude home, a Claude conversation) wears Claude's own
-// near-black look, and DeepSeek mode DeepSeek's blue (app.css, data-agent);
-// the theme above is for Kimi.
-const LOOK_COLORS = { claude: '#141413', deepseek: '#1c2fa8' };
+// near-black look, and DeepSeek mode DeepSeek's blue and white (app.css,
+// data-agent); the theme above is for Kimi.
+const LOOK_COLORS = { claude: '#141413', deepseek: '#ffffff' };
 function setLook(agent) {
   const look = LOOK_COLORS[agent] ? agent : 'kimi';
   const root = document.documentElement;
