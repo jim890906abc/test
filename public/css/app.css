@@ -1754,6 +1754,18 @@ pre.tail {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* A message waiting to cut in says why, in a line of its own. */
+.queued.has-why {
+  flex-wrap: wrap;
+  row-gap: 1px;
+}
+.queued-why {
+  flex: 0 0 100%;
+  padding-right: var(--space-2);
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--ink-secondary);
+}
 .agent-tray {
   display: flex;
   align-items: center;

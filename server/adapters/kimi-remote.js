@@ -38,10 +38,21 @@ const HISTORY_TURNS = 10;
 const IDLE_FOLLOW_MS = 15 * 60_000;
 const MAX_IMAGE_URL = 600_000; // history images larger than this become a placeholder
 // How often a message waiting to cut in (插隊) is offered to Kimi again.
-const CUT_IN_RETRY_MS = 2000;
+const CUT_IN_RETRY_MS = Number(process.env.AGENT_HUB_CUTIN_RETRY_MS) || 2000;
 // How long an urgent message Kimi has taken in may wait for foreground work
 // before that work is moved to the background (Ctrl+B).
 const URGENT_DETACH_MS = 10_000 * (Number(process.env.AGENT_HUB_AUTOPAUSE_SCALE) || 1);
+// Kimi starts turns of its own (after a background task finished, for a cron
+// job) and does not take a message into them. A message refused for that
+// reason waits this long for Kimi to end the turn or take it after all, then
+// the hub takes over at a safe point (handoff). 全部插隊 does not wait.
+const HANDOFF_GRACE_MS = Number(process.env.AGENT_HUB_HANDOFF_GRACE_MS) || 8000;
+// A turn opened by one of these was started by a message: it takes steers.
+const USER_ORIGINS = new Set(['user', 'skill_activation', 'plugin_command', 'shell_command']);
+const WORKING = ['running', 'awaiting_permission'];
+// A waiting message with nothing left to explain: taken in, or about to be.
+const NO_PLAN = { cutInWhy: undefined, cutInMsg: undefined, refusedAt: undefined, handoff: undefined, missing: undefined, now: undefined };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export function available(agent) {
   const m = machines.getMachine(agent.machineId);
@@ -162,6 +173,19 @@ const now = () => Date.now();
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 const newPromptId = () => `hub_${crypto.randomBytes(9).toString('hex')}`;
 
+// Why Kimi refused `:steer`. Kimi answers 40402 (prompt.not_found) with
+//   "no active prompt to steer into"      → 'kimi-turn': the running turn is not
+//       one a message started (a seeded turn after a background task, a cron job)
+//   "one or more prompts are not pending" → 'not-pending': Kimi has no such message
+//       queued (it ran already, or was lost)
+// and anything else (a lost connection, a failure inside Kimi) is 'other'.
+export function cutInReason(err) {
+  const msg = String(err?.kimiMsg ?? err?.message ?? '');
+  if (/no active prompt to steer into/i.test(msg)) return 'kimi-turn';
+  if (err?.kimiCode === 40402 || /(?:not|no longer) pending/i.test(msg)) return 'not-pending';
+  return 'other';
+}
+
 // ---------------------------------------------------------------- mirror
 
 class Mirror {
@@ -172,6 +196,8 @@ class Mirror {
     this.mine = new Set(session.state.mine || []); // prompt ids sent from the hub
     this.live = false; // subscribed to the machine and caught up
     this.viewedAt = 0; // last time someone had it open
+    this.bodies = new Map(); // prompt id -> { text, images } of a message waiting in the queue, as sent (full-size images)
+    this.withdrawing = new Set(); // prompt ids being taken back from Kimi's queue by a handoff
     this.reset();
   }
 
@@ -181,6 +207,7 @@ class Mirror {
     this.agents = new Map(); // subagent id -> { parent: event id, btw? }
     this.early = new Map(); // subagent id -> frames that arrived before subagent.spawned
     this.turn = null;
+    this.mark = null; // { boundaryAt, deltaAt }: the last step boundary, and the last time the main agent wrote
   }
 
   // While replaying history, events collect in a batch instead of being
@@ -612,6 +639,7 @@ class Mirror {
     if (!status) return;
     this.closeBlock(id);
     this.ctx.patch(parent, { subagent: { ...parent.subagent, status, summary: p.resultSummary ?? parent.subagent.summary, error: p.error } });
+    if (status !== 'running') this.kickHandoff(200);
   }
 
   flushEarly(agentId) {
@@ -627,6 +655,7 @@ class Mirror {
   dequeue(promptId) {
     const q = this.queue().find((x) => x.promptId === promptId);
     if (q) this.meta({ queue: this.queue().filter((x) => x.promptId !== promptId) });
+    this.bodies.delete(promptId);
     return q;
   }
 
@@ -675,14 +704,21 @@ class Mirror {
         if (!main) return;
         // A new turn may be one Kimi lets the waiting messages into: all of
         // them go in now (when Kimi's own turn refused them, the turn it
-        // starts for the first one takes the others).
-        if (!this.batch && this.queue().some((q) => q.cutIn && !q.steered && !q.terminal)) setTimeout(() => this.tryCutIns(), 300);
+        // starts for the first one takes the others). A new turn also starts
+        // the wait before a handoff over again.
+        if (!this.batch && this.queue().some((q) => q.cutIn && !q.steered && !q.terminal)) {
+          this.forgetPlan();
+          setTimeout(() => this.tryCutIns(), 300);
+        }
         this.closeBlock();
-        this.turn = { started: now(), input: 0, output: 0, id: p.turnId };
+        // `own`: Kimi started this turn itself (a background task finished, a
+        // cron job), so it takes no steer; null when the origin is unknown.
+        const kind = p.origin?.kind;
+        this.turn = { started: now(), input: 0, output: 0, id: p.turnId, promptId: p.promptId, kind, own: kind ? !USER_ORIGINS.has(kind) : null };
+        this.mark = { boundaryAt: now(), deltaAt: 0 };
         // Kimi fixes the model and thinking for the whole turn when it
         // starts: a change made during it applies from the next one.
         this.meta({ turnModel: this.session.meta?.model || '', turnEffort: this.session.meta?.effort || '' });
-        const kind = p.origin?.kind;
         const text = promptLabel(p);
         if (text != null) this.showPrompt(p.promptId, text, contentImages(p.promptAttachments));
         else if (kind === 'cron_job') this.ctx.emit({ type: 'info', text: '排程時間到了，Kimi 開始處理' });
@@ -702,18 +738,22 @@ class Mirror {
         }
         return;
       case 'prompt.steered':
-        if (main) this.meta({ queue: this.queue().map((q) => ((p.promptIds || []).includes(q.promptId) ? { ...q, steered: true } : q)) });
+        if (main) this.meta({ queue: this.queue().map((q) => ((p.promptIds || []).includes(q.promptId) ? { ...q, steered: true, ...NO_PLAN } : q)) });
         return;
       case 'prompt.aborted':
-        if (main) this.dequeue(p.promptId);
+        // Messages a handoff took back stay in the tray until they are sent again.
+        if (main && !this.withdrawing.has(p.promptId)) this.dequeue(p.promptId);
         return;
       case 'assistant.delta':
+        if (main && this.mark) this.mark.deltaAt = now();
         this.stream(agentId, 'text', p.delta, p.turnId, parent);
         return;
       case 'thinking.delta':
+        if (main && this.mark) this.mark.deltaAt = now();
         this.stream(agentId, 'thinking', p.delta, p.turnId, parent);
         return;
       case 'tool.call.delta': {
+        if (main && this.mark) this.mark.deltaAt = now();
         const ev = this.tool(agentId, p.toolCallId, { name: p.name || 'tool' }, parent);
         if (p.argumentsPart) this.ctx.delta(ev, p.argumentsPart, 'argsText');
         return;
@@ -746,6 +786,8 @@ class Mirror {
       case 'tool.result': {
         const ev = this.tool(agentId, p.toolCallId, {}, parent);
         this.ctx.patch(ev, { status: p.isError ? 'error' : 'done', isError: Boolean(p.isError), output: outputText(p.output) });
+        // A result is a step boundary for the main agent: the best moment to take over.
+        if (main) this.stepBoundary();
         return;
       }
       case 'event.approval.requested':
@@ -757,6 +799,7 @@ class Mirror {
           const chosen = p.decision === 'approved' ? 'approved' : p.decision === 'rejected' ? 'rejected' : 'cancelled';
           this.ctx.patch(ev, { status: chosen === 'approved' ? 'running' : 'pending', permission: { ...ev.permission, chosen } });
         }
+        this.kickHandoff(200);
         return;
       }
       case 'event.question.requested':
@@ -766,9 +809,11 @@ class Mirror {
       case 'event.question.dismissed': {
         const ev = this.findTool((e) => e.questionId === p.question_id);
         if (ev && !ev.permission?.chosen) this.ctx.patch(ev, { status: 'done', permission: { ...ev.permission, chosen: type.endsWith('dismissed') ? '__dismiss' : 'answered' } });
+        this.kickHandoff(200);
         return;
       }
       case 'turn.step.completed':
+        if (main) this.stepBoundary();
         if (main && this.turn && p.usage) {
           this.turn.input += (p.usage.inputOther || 0) + (p.usage.inputCacheRead || 0) + (p.usage.inputCacheCreation || 0);
           this.turn.output += p.usage.output || 0;
@@ -868,6 +913,9 @@ class Mirror {
       error: p.reason === 'failed',
     });
     this.turn = null;
+    this.mark = null;
+    // Kimi starts the waiting messages itself now: no handoff to plan.
+    this.forgetPlan();
     this.meta({ turnModel: null, turnEffort: null });
     for (const [key, ev] of this.tools) if (!lives(ev)) this.tools.delete(key);
     if (this.session.repo && !this.batch && p.reason !== 'cancelled' && p.reason !== 'failed') setTimeout(() => this.checkRepo().catch((err) => console.warn(`[kimi] repo check: ${err.message}`)), 300);
@@ -946,19 +994,34 @@ class Mirror {
     await this.tui({ action: 'send', text: next.text, mode: 'enter' }).catch(() => this.dequeue(next.promptId));
   }
 
-  async steerQueued(promptId) {
+  // 插隊 for one message. `now`: asked for by hand, so a Kimi-started turn
+  // that refuses it is taken over without waiting (see handoff). Resolves to
+  // 'steered', 'waiting' (Kimi refused; the hub keeps trying) or 'terminal'.
+  async steerQueued(promptId, { now: asked = true } = {}) {
     const q = this.queue().find((x) => x.promptId === promptId);
-    if (!q || q.steered) return;
+    if (!q || q.steered || this.withdrawing.has(promptId)) return null;
     if (q.terminal) {
       this.markQueued(promptId, { steered: true });
-      const busy = ['running', 'awaiting_permission'].includes(this.session.status);
+      const busy = WORKING.includes(this.session.status);
       await this.tui({ action: 'send', text: q.text, mode: busy ? 'steer' : 'enter' });
-    } else {
-      this.markQueued(promptId, { cutIn: true });
-      const post = this.inflight?.get(promptId);
-      if (post && (await post.catch(() => null))?.status !== 'queued') return;
-      await this.steer(promptId);
+      return 'terminal';
     }
+    this.markQueued(promptId, { cutIn: true, ...(asked ? { now: true } : {}) });
+    const post = this.inflight?.get(promptId);
+    if (post && (await post.catch(() => null))?.status !== 'queued') return null;
+    return (await this.steer(promptId)) ? 'steered' : 'waiting';
+  }
+
+  // 全部插隊: every message still waiting goes into the turn at once.
+  async steerAll() {
+    const waiting = this.queue().filter((q) => !q.steered);
+    const done = { steered: 0, waiting: 0 };
+    for (const q of waiting) {
+      const r = await this.steerQueued(q.promptId);
+      if (r === 'waiting') done.waiting++;
+      else if (r) done.steered++;
+    }
+    return { count: waiting.length, ...done };
   }
 
   // Resolves to { ok } — false (with the error, already shown in the
@@ -966,16 +1029,21 @@ class Mirror {
   // `urgent` (「優雅暫停」): once Kimi has taken it in, foreground work that
   // keeps it from being read is moved to the background (watchUrgent).
   // `hidden`: a note for Kimi only, sent with the message (not shown here).
-  async send(text, images = [], { note, steer, urgent, hidden } = {}) {
+  // `handoff`: the hub's own resend of messages Kimi's turn would not take
+  // (see handoff): they are not handed off again.
+  async send(text, images = [], { note, steer, urgent, hidden, handoff } = {}) {
     if (this.inTerminal()) return this.sendToTerminal(text, images, note, steer);
     await ensureServer(this.machineId);
     const ctx = this.ctx;
     const promptId = newPromptId();
     this.remember(promptId, note);
     const thumbs = images.map((i) => i.thumb || `data:${i.mimeType};base64,${i.data}`);
-    const busy = ['running', 'awaiting_permission'].includes(this.session.status);
-    if (busy) this.meta({ queue: [...this.queue(), { promptId, text, images: thumbs, note, ...(steer ? { cutIn: true } : {}), ...(steer && urgent ? { urgent: true } : {}) }] });
-    else {
+    const busy = WORKING.includes(this.session.status);
+    if (busy) {
+      // Kept as sent: a handoff sends the message again, full size.
+      this.bodies.set(promptId, { text, images });
+      this.meta({ queue: [...this.queue(), { promptId, text, images: thumbs, note, ...(steer ? { cutIn: true } : {}), ...(steer && urgent ? { urgent: true } : {}), ...(handoff ? { handedOff: true } : {}) }] });
+    } else {
       ctx.emit({ type: 'user', text, images: thumbs, promptId, source: 'hub', note });
       ctx.setStatus('running');
     }
@@ -1024,19 +1092,29 @@ class Mirror {
 
   // Kimi takes a message into the running turn only when a message started
   // that turn; a turn it started itself (to go on after a background
-  // subagent finished, say) refuses it. So a message asked to cut in waits
-  // as `cutIn` and is offered again every few seconds and whenever a turn
-  // starts, until Kimi takes it, it starts as a turn of its own (at the
-  // latest when this turn ends), or it is cancelled. Nothing is stopped.
+  // subagent finished, say) refuses it ("no active prompt to steer into").
+  // A message asked to cut in waits as `cutIn`, is offered again every few
+  // seconds and whenever a turn starts, and says why it waits (`cutInWhy`).
+  // For the turn Kimi started itself there is a way in after all: the hub
+  // takes over at a safe point (maybeHandoff).
   async steer(promptId) {
     try {
       await this.api('POST', this.path(`/prompts/${promptId}:steer`), {});
-      this.markQueued(promptId, { steered: true, cutIn: false });
+      this.markQueued(promptId, { steered: true, cutIn: false, ...NO_PLAN });
       if (this.queue().find((q) => q.promptId === promptId)?.urgent) this.watchUrgent(promptId);
       return true;
-    } catch {
-      this.markQueued(promptId, { cutIn: true });
+    } catch (err) {
+      if (this.withdrawing.has(promptId)) return false; // a handoff has taken it back
+      const q = this.queue().find((x) => x.promptId === promptId);
+      if (!q) return false;
+      const why = cutInReason(err);
+      const msg = String(err?.kimiMsg ?? err?.message ?? '').slice(0, 160);
+      // Said once per change, not at every retry.
+      if (q.cutInWhy !== why || q.cutInMsg !== msg) console.warn(`[kimi] cut-in refused (${this.session.id}, ${promptId}): ${why}${err?.kimiCode ? ` ${err.kimiCode}` : ''} "${msg}"`);
+      this.markQueued(promptId, { cutIn: true, cutInWhy: why, cutInMsg: msg, ...(why === 'kimi-turn' ? { refusedAt: q.refusedAt || now() } : { refusedAt: undefined, handoff: undefined }) });
       this.retryCutIns();
+      if (why === 'not-pending') await this.syncMissing(promptId).catch(() => {});
+      else this.kickHandoff();
       return false;
     }
   }
@@ -1049,6 +1127,236 @@ class Mirror {
     if (this.cutInTimer) return;
     this.cutInTimer = setInterval(() => this.tryCutIns(), CUT_IN_RETRY_MS);
     this.cutInTimer.unref?.();
+  }
+
+  // After `:abort`: until the hub has seen that turn end (or Kimi has gone straight on to another).
+  // Not by the session's status: Kimi keeps a session `busy` for as long as a background task
+  // runs, with no turn at all (busy: true, main_turn_active: false). Without a known turn: by status.
+  async waitTurnOver(turnId) {
+    const over = () => (turnId !== undefined ? this.turn?.id !== turnId : !WORKING.includes(this.session.status));
+    for (let i = 0; i < 75 && !over(); i++) await sleep(200);
+  }
+
+  agentName() {
+    return deepseek.isDeepseek(this.session) ? 'DeepSeek' : 'Kimi';
+  }
+
+  // Kimi says it has no such message ("not pending"): it ran already, or
+  // was lost (Kimi restarted). Asked twice, then it is let go, saying so,
+  // instead of waiting for ever.
+  async syncMissing(promptId) {
+    if (this.inflight?.has(promptId)) return;
+    const r = await this.api('GET', this.path('/prompts')).catch(() => null);
+    const q = this.queue().find((x) => x.promptId === promptId);
+    if (!r || !q) return;
+    if ((r.queued || []).some((p) => p.prompt_id === promptId)) return void this.markQueued(promptId, { missing: undefined });
+    const missing = (q.missing || 0) + 1;
+    if (missing < 2) return void this.markQueued(promptId, { missing });
+    this.dequeue(promptId);
+    console.warn(`[kimi] queued message gone from Kimi (${this.session.id}, ${promptId}): dropped from the tray`);
+    // Running now: it shows up in the conversation by itself.
+    if (r.active?.prompt_id !== promptId) {
+      this.ctx.emit({ type: 'info', text: `${this.agentName()} 那邊已經找不到這則排隊的訊息「${(q.text || '').slice(0, 60)}」（可能已經讀過，或在 ${this.agentName()} 重新啟動時遺失）。如果它沒有出現在對話裡，請再送一次` });
+    }
+  }
+
+  // ---------------------------------------------------------- handoff
+  //
+  // Kimi refuses a message at a turn it started itself (a background task
+  // finished while the main agent was idle, a cron job), and such a turn can
+  // run for hours. Left to Kimi, the message would wait until that turn ends.
+  // So the hub takes over, the way interruptSwarm does: it takes the waiting
+  // messages back from Kimi's queue, stops the turn, and sends them again as
+  // ONE new message (a turn a message started takes steers from then on),
+  // with a note for Kimi. Stopping a turn does not stop background tasks:
+  // Kimi starts them detached from the turn's abort signal (read in Kimi
+  // 2.1.1's source, and checked against a real server). It happens only at
+  // a safe point:
+  //   • the turn is Kimi's own (Kimi refused the steer, and the turn's origin
+  //     is not a message), and the session is not in a terminal Kimi;
+  //   • the grace period since the first refusal is over (not for 全部插隊);
+  //   • the main agent has no foreground tool call (pending, running or
+  //     awaiting), no foreground subagent or AgentSwarm, and nothing waits
+  //     for an approval or an answer.
+  // The best moment is a step boundary (a tool result, the end of a step);
+  // when the main agent is only writing, the unfinished part of that step is
+  // lost, which is accepted. A tool is never stopped: the hub waits for it,
+  // and moves foreground work Kimi can detach (Ctrl+B) to the background when
+  // asked to by hand (全部插隊) or when it holds the message for long.
+  // A message sent this way is never handed off a second time.
+
+  // The messages a handoff would carry.
+  handoffItems() {
+    return this.queue().filter((q) => q.cutIn && !q.steered && !q.terminal && !q.handedOff && q.cutInWhy === 'kimi-turn' && !this.inflight?.has(q.promptId) && !this.withdrawing.has(q.promptId));
+  }
+
+  kickHandoff(delay = 0) {
+    if (this.batch || this.inTerminal() || !this.handoffItems().length) return;
+    clearTimeout(this.handoffTimer);
+    this.handoffTimer = setTimeout(() => this.maybeHandoff().catch((err) => console.warn(`[kimi] handoff ${this.session.id}: ${err.message}`)), delay);
+    this.handoffTimer.unref?.();
+  }
+
+  // A tool result or the end of a step: nothing is half done, so the best
+  // moment to take over.
+  stepBoundary() {
+    if (this.mark) this.mark.boundaryAt = now();
+    this.kickHandoff(150);
+  }
+
+  // The turn started, or ended: what was planned for the last one is void.
+  forgetPlan() {
+    clearTimeout(this.handoffTimer);
+    this.blockedAt = null;
+    if (this.batch) return;
+    const stale = (q) => q.cutIn && !q.steered && !this.withdrawing.has(q.promptId);
+    if (this.queue().some((q) => stale(q) && (q.handoff || q.refusedAt))) this.meta({ queue: this.queue().map((q) => (stale(q) ? { ...q, handoff: undefined, refusedAt: undefined } : q)) });
+  }
+
+  setPlan(items, plan) {
+    if (items.every((q) => q.handoff === plan)) return;
+    const ids = new Set(items.map((q) => q.promptId));
+    this.meta({ queue: this.queue().map((q) => (ids.has(q.promptId) ? { ...q, handoff: plan } : q)) });
+  }
+
+  // What keeps the hub from stopping the turn now, or null at a safe point.
+  handoffBlocker() {
+    if (this.session.status === 'awaiting_permission' || [...this.tools.values()].some((ev) => ev.permission && !ev.permission.chosen)) return { kind: 'approval' };
+    if (this.foregroundSwarm()) return { kind: 'swarm' };
+    // A background subagent's card (made when attaching mid-run) and /btw are not work the turn waits on.
+    const open = [...this.tools.entries()].filter(([key, ev]) => key.startsWith('main:') && ['pending', 'running', 'awaiting'].includes(ev.status) && !ev.subagent?.background && ev.name !== 'btw');
+    return open.length ? { kind: 'tool' } : null;
+  }
+
+  async maybeHandoff() {
+    if (this.handingOff || this.batch || this.inTerminal()) return;
+    const items = this.handoffItems();
+    if (!items.length || !WORKING.includes(this.session.status)) return;
+    // A turn a message started takes steers: the retry goes on, nothing is stopped.
+    if (this.turn?.own === false) return this.setPlan(items, undefined);
+    const t = now();
+    const asked = items.some((q) => q.now);
+    const due = Math.min(...items.map((q) => q.refusedAt || t)) + (asked ? 0 : HANDOFF_GRACE_MS);
+    if (t < due) {
+      this.setPlan(items, 'grace');
+      return this.kickHandoff(due - t + 20);
+    }
+    const block = this.handoffBlocker();
+    if (!block) {
+      this.blockedAt = null;
+      return this.handoff(items);
+    }
+    this.setPlan(items, block.kind);
+    if (block.kind === 'tool') await this.freeForeground(asked);
+  }
+
+  // The hub never stops a tool. Foreground work Kimi can move to the
+  // background (what Ctrl+B does) is moved, and goes on there: at once when
+  // the user asked for it by hand, otherwise when it still holds the message
+  // after URGENT_DETACH_MS. A swarm cannot be moved (moveToBackground says so).
+  async freeForeground(asked) {
+    this.blockedAt ??= now();
+    const wait = this.blockedAt + URGENT_DETACH_MS - now();
+    if (!asked && wait > 0) return this.kickHandoff(wait + 20);
+    if (this.detaching || now() - (this.detachedAt || 0) < 3000) return;
+    this.detaching = true;
+    this.detachedAt = now();
+    try {
+      const moved = await this.detachForeground().catch(() => 0);
+      if (moved) this.ctx.emit({ type: 'info', text: `為了讓 ${this.agentName()} 讀到你的訊息，把它在前景等的 ${moved} 個工作移到背景（跟 Ctrl+B 一樣，工作會繼續跑，沒有被停止）` });
+      else this.detachedAt = now() + 2000; // nothing Kimi can move: look again later
+    } finally {
+      this.detaching = false;
+    }
+  }
+
+  async handoff(items) {
+    this.handingOff = true;
+    this.withdrawing = new Set(items.map((q) => q.promptId));
+    const name = this.agentName();
+    const kind = this.turn?.kind;
+    const turnId = this.turn?.id; // the turn to stop
+    const partial = Boolean(this.mark && this.mark.deltaAt > this.mark.boundaryAt);
+    const taken = [];
+    try {
+      this.setPlan(items, 'working');
+      // Kimi's latest word: still a turn of its own (no message's turn is
+      // active), and the messages still waiting in its queue?
+      const seen = await this.api('GET', this.path('/prompts')).catch(() => null);
+      if (!seen || seen.active) return;
+      const queued = new Set((seen.queued || []).map((p) => p.prompt_id));
+      const batch = items.filter((q) => queued.has(q.promptId));
+      if (!batch.length) return;
+      console.log(`[kimi] cut-in handoff (${this.session.id}): stopping ${name}'s own turn (${kind || 'unknown origin'}) ${partial ? 'mid-step' : 'at a step boundary'}; ${batch.length} message(s) go again as one`);
+      // Taken back from Kimi first: it would run them by itself after the stop.
+      for (const q of batch) {
+        try {
+          await this.api('POST', this.path(`/prompts/${q.promptId}:abort`), {});
+          taken.push(q);
+        } catch {
+          // Not there any more: it ran, or was lost.
+        }
+      }
+      if (!taken.length) return;
+      // The last look before stopping: never a turn a message started.
+      const last = await this.api('GET', this.path('/prompts')).catch(() => null);
+      let stopped = false;
+      // ... and not a turn that has ended by itself meanwhile.
+      const live = turnId !== undefined ? this.turn?.id === turnId : WORKING.includes(this.session.status);
+      if (!last?.active && live) {
+        try {
+          await this.api('POST', this.path(':abort'), {});
+          stopped = true;
+        } catch (err) {
+          console.warn(`[kimi] handoff ${this.session.id}: could not stop the turn: ${err.message}`);
+        }
+        await this.waitTurnOver(turnId);
+      }
+      // Cancelled by hand meanwhile: not sent.
+      const rows = taken.filter((q) => this.queue().some((x) => x.promptId === q.promptId));
+      if (!rows.length) return;
+      if (stopped) {
+        this.ctx.emit({ type: 'info', text: `${name} 正在自己接續的回合不收插隊；已在${partial ? '它思考或輸出的途中' : '步驟之間'}接手，讓它先讀你的訊息（${partial ? '那一步還沒寫完的內容沒有保留；' : ''}背景工作照常進行，沒有中斷任何工具）` });
+      }
+      const plural = rows.length > 1;
+      const cause = kind === 'cron_job' ? 'a scheduled job fired' : kind === 'task' || kind === 'background_task' ? 'a background task finished' : 'an automatic trigger fired';
+      const hidden = `The user's message${plural ? 's' : ''} above arrived while you were continuing on your own after ${cause}. ${stopped ? `Your turn was stopped ${partial ? 'in the middle of a step (the part of that step you had not finished writing was dropped)' : 'at a step boundary'} so that you would read ${plural ? 'them' : 'it'} now; no tool was interrupted and background tasks are still running. ` : ''}Handle ${plural ? 'the messages' : 'the message'} first, then continue the earlier work if it is still needed.`;
+      const text = rows.map((q) => q.text).filter(Boolean).join('\n\n');
+      const images = rows.flatMap((q) => this.fullImages(q));
+      const ap = this.session.autoPause;
+      if (ap?.pausePrompt && rows.some((q) => q.promptId === ap.pausePrompt)) {
+        ap.pausePrompt = null;
+        store.saveSession(this.session);
+      }
+      const r = await this.send(text || '（圖片）', images, { note: '插隊：在步驟之間接手後送出', steer: true, urgent: rows.some((q) => q.urgent), hidden, handoff: true });
+      for (const q of rows) this.dequeue(q.promptId);
+      if (r?.ok === false) this.ctx.emit({ type: 'error', text: `${name} 沒有收到接手後重新送出的訊息，請再送一次：${text.slice(0, 500)}` });
+    } catch (err) {
+      // Messages already taken back from Kimi must not be lost.
+      console.warn(`[kimi] handoff ${this.session.id}: ${err.message}`);
+      const left = taken.filter((q) => this.queue().some((x) => x.promptId === q.promptId));
+      if (left.length) {
+        for (const q of left) this.dequeue(q.promptId);
+        this.ctx.emit({ type: 'error', text: `${name} 沒有收到接手後重新送出的訊息，請再送一次：${left.map((q) => q.text).filter(Boolean).join('\n\n').slice(0, 500)}` });
+      }
+    } finally {
+      this.withdrawing = new Set();
+      this.handingOff = false;
+      this.blockedAt = null;
+      // Not carried after all (a message's turn took over, or Kimi ran them): back to waiting.
+      const idle = this.queue().filter((q) => q.handoff === 'working');
+      if (idle.length) this.setPlan(idle, undefined);
+      // Whatever is left waiting is looked at again.
+      if (this.handoffItems().length) this.kickHandoff(CUT_IN_RETRY_MS);
+    }
+  }
+
+  // The message as it was sent (images full size), or as the tray shows it
+  // when the hub has restarted since.
+  fullImages(q) {
+    const body = this.bodies.get(q.promptId);
+    if (body) return body.images;
+    return (q.images || []).map((url) => url.match(/^data:([^;]+);base64,(.*)$/)).filter(Boolean).map(([, mimeType, data]) => ({ mimeType, data }));
   }
 
   // Kimi reads a message it has taken in at its next step, and a step lasts
@@ -1126,15 +1434,17 @@ class Mirror {
   async interruptSwarm() {
     const swarm = this.foregroundSwarm();
     const waiting = this.queue().filter((q) => !q.terminal);
+    const pics = waiting.map((q) => this.fullImages(q));
+    const turnId = this.turn?.id;
     for (const q of waiting) await this.api('POST', this.path(`/prompts/${q.promptId}:abort`), {}).catch(() => {});
     await this.api('POST', this.path(':abort'), {});
-    for (let i = 0; i < 75 && ['running', 'awaiting_permission'].includes(this.session.status); i++) await new Promise((r) => setTimeout(r, 200));
+    await this.waitTurnOver(turnId);
     for (const q of waiting) this.dequeue(q.promptId);
     const desc = swarm?.description || '子代理群';
     const ids = swarm?.ids || [];
     this.ctx.emit({ type: 'info', text: `已中斷子代理群「${desc}」，讓 Kimi 先讀你的訊息${ids.length ? `；Kimi 之後可以接續那 ${ids.length} 個子代理` : ''}` });
     const text = waiting.map((q) => q.text).filter(Boolean).join('\n\n');
-    const images = waiting.flatMap((q) => q.images || []).map((url) => url.match(/^data:([^;]+);base64,(.*)$/)).filter(Boolean).map(([, mimeType, data]) => ({ mimeType, data }));
+    const images = pics.flat();
     if (!text && !images.length) return { interrupted: true, sent: 0 };
     const hidden = `The user stopped the AgentSwarm "${desc}" so that you read the message above now. Its subagents stopped where they were${ids.length ? ` (agent ids: ${ids.join(', ')})` : ''}. Deal with the message first. If their work is still needed afterwards, continue them with AgentSwarm's resume_agent_ids (map each id to "continue") instead of starting over.`;
     await this.send(text || '（圖片）', images, { note: '中斷子代理群後送出', hidden });
@@ -1144,15 +1454,17 @@ class Mirror {
   async tryCutIns() {
     const waiting = this.queue().filter((q) => q.cutIn && !q.steered && !q.terminal);
     // Kimi starts a waiting message itself once it stops.
-    if (!waiting.length || !['running', 'awaiting_permission'].includes(this.session.status)) {
+    if (!waiting.length || !WORKING.includes(this.session.status)) {
       clearInterval(this.cutInTimer);
       this.cutInTimer = null;
       return;
     }
-    if (this.cuttingIn) return;
+    if (this.cuttingIn || this.handingOff) return;
     this.cuttingIn = true;
     try {
-      for (const q of waiting) if (!this.inflight?.has(q.promptId)) await this.steer(q.promptId);
+      for (const q of waiting) if (!this.inflight?.has(q.promptId) && !this.withdrawing.has(q.promptId)) await this.steer(q.promptId);
+      // Still refused by a turn of Kimi's own: maybe time for the hub to take over.
+      await this.maybeHandoff();
     } finally {
       this.cuttingIn = false;
     }
@@ -1378,7 +1690,8 @@ export async function send(session, text, { images = [], note, steer, urgent } =
 // Followed right now (subscribed to the machine and caught up), so the
 // hub's status for it is current.
 export const isLive = (session) => Boolean(mirrors.get(session.id)?.live);
-export const steerQueued = (session, promptId) => mirrorFor(session).steerQueued(promptId);
+export const steerQueued = (session, promptId) => mirrorFor(session).steerQueued(promptId).then(() => {});
+export const steerAll = (session) => mirrorFor(session).steerAll();
 export async function moveToBackground(session, opts) {
   const m = mirrorFor(session);
   await m.ensureLive();
@@ -1452,6 +1765,7 @@ export async function bindRepo(session, { full, branch }) {
 
 export function dispose(session) {
   clearInterval(mirrors.get(session.id)?.cutInTimer);
+  clearTimeout(mirrors.get(session.id)?.handoffTimer);
   mirrors.delete(session.id);
   byKimi.delete(`${session.machineId}:${session.kimiSessionId}`);
   machines.rpc(session.machineId, 'kimi.unsubscribe', { sessionIds: [session.kimiSessionId] }).catch(() => {});

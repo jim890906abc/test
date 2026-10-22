@@ -266,6 +266,7 @@ export async function kimiApi(machineId, method, p, body, timeoutMs) {
   if (env?.code !== 0) {
     const err = new Error(kimiErrorText(env));
     err.kimiCode = env?.code;
+    err.kimiMsg = env?.msg; // Kimi's own words (kimiErrorText may replace them with a hint)
     err.status = 400;
     throw err;
   }

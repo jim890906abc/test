@@ -1501,7 +1501,11 @@ async function sessionCommand(name, args) {
   if (name === 'steer') {
     try {
       const r = await post(`/sessions/${s.id}/queue/steer-all`);
-      return toast(r.count ? `${r.count} 則訊息插隊：下一步一起讀到${isClaude(s) ? '' : `（${nameFor(s)} 自己開的這一輪不收插隊的話，下一輪一開始就一起送進去）`}` : '沒有在排隊的訊息');
+      if (!r.count) return toast('沒有在排隊的訊息');
+      // A turn the agent started itself (a background task finished) takes no
+      // steer: the hub stops it at the next safe point and sends the messages again.
+      if (r.waiting) return toast(`${nameFor(s)} 自己接續的回合不收插隊：${r.waiting} 則訊息會在下一個安全點接手，停下這一輪、重新送出（背景工作不受影響，也不會中斷正在跑的工具）`);
+      return toast(`${r.count} 則訊息插隊：下一步一起讀到`);
     } catch (err) {
       return fail(err);
     }
