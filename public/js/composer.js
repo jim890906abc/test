@@ -1,7 +1,8 @@
 // The message box: auto-growing input, / commands, images, and the
 // model / thinking / permission controls. Used on the home screen (new
 // conversation) and under every conversation, for Kimi and for Claude
-// (state.agent === 'claude': Claude through the Claude API, run by the hub).
+// (state.agent === 'claude': Claude through the Claude API, run by the hub;
+// 'deepseek': a DeepSeek model inside Kimi, billed to a gateway's API key).
 import { h, fill, icon, fmtTokens, clockTime, fmtCountdown } from './dom.js';
 import { openMenu, closeMenu, place } from './menu.js';
 import { todoList } from './transcript.js';
@@ -22,7 +23,7 @@ const CLAUDE_PERMISSION_DESC = {
   auto: '全部直接做，不會打斷你',
 };
 export const permissionLabels = (agent) => (agent === 'claude' ? CLAUDE_PERMISSION_LABELS : PERMISSION_LABELS);
-export const agentName = (agent) => (agent === 'claude' ? 'Claude' : 'Kimi');
+export const agentName = (agent) => (agent === 'claude' ? 'Claude' : agent === 'deepseek' ? 'DeepSeek' : 'Kimi');
 // US$, with more digits while it is small.
 export const fmtUsd = (n) => `US$${n >= 1 ? n.toFixed(2) : n >= 0.01 ? n.toFixed(3) : (n || 0).toFixed(4)}`;
 const MAX_IMAGES = 8;
@@ -66,6 +67,17 @@ export const COMMANDS = [
   { name: 'steer', description: '全部插隊：排隊中、等待插隊的訊息一次全部送進正在跑的這一輪，下一步一起讀到', aliases: ['steerall', 'flush'] },
 ];
 const HOME_COMMANDS = ['model', 'effort', 'plan', 'permission', 'yolo', 'auto', 'manual', 'usage', 'status'];
+// DeepSeek runs in Kimi, so Kimi's commands apply, except the ones about the
+// Kimi subscription's quota (it is not used); /later has times only.
+const DEEPSEEK_NO = ['autopause', 'usage'];
+const deepseekCommands = (list) =>
+  list
+    .filter((c) => !DEEPSEEK_NO.includes(c.name))
+    .map((c) => ({
+      ...c,
+      description: c.name === 'later' ? '定時送出：幾分鐘後或指定時間送出訊息' : c.description.replace(/Kimi/g, 'DeepSeek'),
+      ...(c.name === 'later' ? { hint: '[30 | 15:30] [訊息]' } : {}),
+    }));
 // Claude through the Claude API: the hub runs it, so these are the hub's.
 export const CLAUDE_COMMANDS = [
   { name: 'model', description: '切換模型' },
@@ -293,6 +305,11 @@ export class Composer {
     return this.agent() === 'claude';
   }
 
+  // DeepSeek models in the computer's Kimi: Kimi's controls, minus its quota.
+  deepseek() {
+    return this.agent() === 'deepseek';
+  }
+
   currentModel() {
     const s = this.state;
     const id = s.model || s.defaultModel;
@@ -397,8 +414,9 @@ export class Composer {
     const ctx = s.context;
     const claude = this.claude();
     const name = agentName(this.agent());
-    // 自動暫停 watches Kimi's plan quota; Claude's API key has none.
-    const ap = this.opts.onAutoPause && !claude ? { state: s.autoPause, open: this.opts.onAutoPause, arm: this.opts.onArmResume } : null;
+    // 自動暫停 watches Kimi's plan quota; Claude's API key and DeepSeek's
+    // gateway key have none.
+    const ap = this.opts.onAutoPause && !claude && !this.deepseek() ? { state: s.autoPause, open: this.opts.onAutoPause, arm: this.opts.onArmResume } : null;
     const ring = ctx?.size ? contextRing(ctx, () => this.opts.onCommand('compact', ''), this.opts.onQuotaNode, ap, claude ? '花費' : '方案用量') : null;
     const stop = busy && !this.hasContent();
     fill(
@@ -590,7 +608,8 @@ export class Composer {
   commands() {
     const skills = (this.state.skills || []).map((s) => ({ name: s.name, description: s.description, skill: true, args: true, source: s.source }));
     if (this.claude()) return this.opts.home ? CLAUDE_COMMANDS.filter((c) => CLAUDE_HOME_COMMANDS.includes(c.name)) : CLAUDE_COMMANDS;
-    const base = this.opts.home ? COMMANDS.filter((c) => HOME_COMMANDS.includes(c.name)) : this.state.terminal ? TERMINAL_COMMANDS : COMMANDS;
+    let base = this.opts.home ? COMMANDS.filter((c) => HOME_COMMANDS.includes(c.name)) : this.state.terminal ? TERMINAL_COMMANDS : COMMANDS;
+    if (this.deepseek()) base = deepseekCommands(base);
     const names = new Set(base.map((c) => c.name));
     return [...base, ...skills.filter((s) => !names.has(s.name))];
   }

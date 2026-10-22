@@ -39,6 +39,27 @@ cd agent-hub; powershell -ExecutionPolicy Bypass -File scripts\start-public.ps1
 
 Claude 的對話由一個獨立的 **Claude 背景程式** 執行（跟 Kimi 的 `kimi web` 一樣）：在中控台這台電腦上由中控台啟動，在已連接的電腦上由那台的連接器啟動（連接器要 0.5 以上，舊的請在那台電腦重新執行連接指令）。中控台只是看和操控它的介面：關掉中控台、甚至關掉連接器，Claude 都照常做完，中控台再開時會補上這段時間的進度。工具（Bash、Read、Write、Edit、Glob、Grep、網路搜尋）在那台電腦上你選的資料夾裡跑。為了在中控台關掉時也能呼叫 API，API key 也會存一份在執行 Claude 的那台電腦上（`~/.agent-hub/claude/`，只有你的帳號能讀）。權限有「每次詢問／自動接受編輯／全部自動」和計畫模式。也支援待辦、提問、子代理、插隊、/compact、/undo、/fork、定時送出；輸入框旁顯示這個對話的估計花費與每次回應實際的模型，`/cost` 看明細與速率限制，`/budget 5` 設定花費上限（花到就先停）。預設模型 Claude Opus 5.5。只用你選的模型：如果回覆來自別的模型（例如被降級），或模型拒絕回答，這一輪會立刻停下、不執行它要的工具，對話裡寫明原因並跳出通知。背景程式本身重新啟動（例如更新）時，被中斷的那一輪會自動接著做。
 
+## DeepSeek 模式
+
+首頁上方切到「DeepSeek」，開出的對話用 DeepSeek 模型，費用算在你的 DeepSeek 閘道 API key 上，**不用 Kimi 訂閱**。它不是另一套 agent：DeepSeek 對話就是那台電腦上 Kimi Code 裡的一般 Kimi 對話，只是模型換成 DeepSeek，所以 Kimi 的自動壓縮（用到約 85% 的 context 時）、reasoning 回放、子代理、計畫模式、插隊、待辦都照常運作；中控台給它藍色的 DeepSeek 外觀、側欄上的「DeepSeek」標籤和自己的設定。
+
+1. 左下角「⋯」→「DeepSeek…」選閘道、貼上 API key。中控台會先用這把 key 向閘道讀模型清單確認有效（只保留 DeepSeek 的模型；讀不到清單時用內建清單），key 只存在 `data/deepseek.json`，不會傳回瀏覽器。
+2. 閘道：**OpenCode Go**（訂閱）、**OpenCode**（按量計費，原本的 Zen）、**Command Code**（要有含 API 存取的方案；Go 方案會被拒絕，`upgrade_required`）。預設模型是各閘道的 DeepSeek V4.1 Flash（沒有的話用清單裡的第一個），思考強度 low／high／max，預設 max；每個模型 1M context、最多 384k 輸出。
+3. 在首頁選電腦和資料夾，和 Kimi 一樣；開第一個 DeepSeek 對話時，連接器（0.8 以上，舊的請重新執行連接指令）會在那台電腦的 Kimi 裡新增一個叫 `agent-hub-deepseek` 的模型來源，之後的對話直接用。
+
+**不會動到你的 Kimi 訂閱**
+
+- 一般的 Kimi 對話、Kimi 首頁和 Kimi「設定」的模型清單都看不到 DeepSeek 模型，也不會套用到 DeepSeek 對話；模型是每個對話自己的設定（`agent_config.model`），不是 Kimi 的全域預設。
+- 連接器對 Kimi 只做這幾件事：建立／替換／移除 `agent-hub-deepseek` 這一個模型來源（`kimi.deepseek.provision`／`.remove`，閘道和網址是連接器自己的固定對照表，中控台只能指定閘道名稱）。不碰 `managed:kimi-code`、`[thinking]`、`[secondary_model]`，不登出。中控台仍然不能透過 `kimi.request` 建立、改或刪任何模型來源。
+- Kimi 在「沒有全域預設模型」時，建立模型來源會把新模型設成全域預設（Kimi 2.1.1 的 createProvider）。所以建立前先讀 Kimi 的設定：預設是空的就先把訂閱帳號自己的模型釘成預設；找不到訂閱的模型就不建立。建立後再讀一次，預設被改動就還原並報錯。
+- DeepSeek 對話不會自動暫停，也沒有「額度恢復後送出」（它們看的是 Kimi 訂閱的 5 小時額度）；定時送出（幾分鐘後、指定時間）照常可用。
+
+**要知道的事**
+
+- 如果那台電腦的 Kimi 設了 `[secondary_model]`（子代理模型），DeepSeek 對話裡的子代理可能改用它，那可能是訂閱的模型。中控台不會改它，只在 DeepSeek 設定裡提醒；要避免就在那台電腦的 `config.toml` 拿掉它。
+- OpenCode 把 Kimi Code 列為沒有送 session 標頭、可能被限流的用戶端。連接器會請 Kimi 在 `agent-hub-deepseek` 這個模型來源加上固定的 `x-opencode-session`（Command Code 是 `x-session-id`）標頭，同一台電腦上都是同一個值；加不上時設定視窗會警告。
+- API key 會存在那台電腦 Kimi 的 `config.toml` 裡（Kimi 的模型來源就是這樣存的），移除 key 時中控台會一併從連到的電腦上移除。換閘道之後，舊的 DeepSeek 對話要重新選一次模型。
+
 ## GitHub
 
 Claude 和 Kimi 都用 git 與 GitHub CLI（`gh`）操作 GitHub：clone、開分支、push、開 Pull Request、看 Issue 和 Actions。每台電腦登入一次就好：左下角「⋯」→「GitHub…」，選「用瀏覽器登入」（顯示一組代碼，到 github.com/login/device 輸入），或貼上一個 token。登入資料只存在那台電腦的 `gh` 裡，中控台不保存；登入後 git 也會用這個帳號 push（`gh auth setup-git`），commit 沒有設定署名的話會用帳號名稱與 GitHub 的 noreply 信箱。

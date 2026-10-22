@@ -14,8 +14,16 @@
       try {
         const t = localStorage.getItem('hubTheme') || 'light';
         if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
-        // Claude's look last time (app.js setLook): no flash of the Kimi theme.
-        if (localStorage.getItem('hubLook') === 'claude' && !/^#\/(artifacts|k\/)/.test(location.hash)) document.documentElement.dataset.agent = 'claude';
+        // Claude's or DeepSeek's look last time (app.js setLook): no flash of
+        // the Kimi theme.
+        const look = localStorage.getItem('hubLook');
+        if ((look === 'claude' || look === 'deepseek') && !/^#\/(artifacts|k\/)/.test(location.hash)) {
+          document.documentElement.dataset.agent = look;
+          for (const m of document.querySelectorAll('meta[name="theme-color"]')) {
+            m.dataset.base = m.content;
+            m.content = look === 'claude' ? '#141413' : '#1c2fa8';
+          }
+        }
       } catch {}
     </script>
   </head>
