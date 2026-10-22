@@ -35,7 +35,7 @@ import { StringDecoder } from 'node:string_decoder';
 import { spawn, execFile, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '0.7.1';
+const VERSION = '0.8.0';
 const SCRIPT = fileURLToPath(import.meta.url);
 
 // ------------------------------------------------------------------ args
@@ -428,12 +428,15 @@ const server = {
     }
   },
 
-  async request(method, p, body, retried = false) {
+  // `internal`: a call the bridge makes itself, with a path it built (the
+  // DeepSeek provider below). Never set from what the hub sends: the hub's
+  // `kimi.request` always goes through ALLOW.
+  async request(method, p, body, { retried = false, internal = false } = {}) {
     // The server may have gone away (closed with the Kimi that ran /web):
     // start one in the background instead of failing.
     if (!this.instance || !(await this.healthy())) await this.start();
     await this.ready;
-    if (!allowed(method, p)) throw new Error(`連接器拒絕了這個請求：${method} ${p.split('?')[0]}`);
+    if (!internal && !allowed(method, p)) throw new Error(`連接器拒絕了這個請求：${method} ${p.split('?')[0]}`);
     // A conversation running in a terminal must not be loaded by the server
     // too: two processes would write the same session.
     const sid = p.match(/^\/api\/v1\/sessions\/(session_[\w-]+)/)?.[1];
@@ -442,7 +445,7 @@ const server = {
     if (sid && method === 'POST') await this.follow(sid);
     const res = await fetch(this.base() + p, {
       method,
-      headers: { authorization: `Bearer ${this.token}`, 'content-type': 'application/json' },
+      headers: { authorization: `Bearer ${this.token}`, ...(body === undefined ? {} : { 'content-type': 'application/json' }) },
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: AbortSignal.timeout(60_000),
     });
@@ -462,7 +465,7 @@ const server = {
           this.connect();
         }
         await new Promise((r) => setTimeout(r, 500));
-        return this.request(method, p, body, true);
+        return this.request(method, p, body, { retried: true, internal });
       }
       if (method === 'POST' && p.split('?')[0] === '/api/v1/sessions' && j?.data?.id) this.mine.set(j.data.id, Date.now());
       return j;
@@ -571,6 +574,250 @@ const server = {
       if (exited !== null && i > 4) throw new Error(`kimi web 啟動後馬上結束了（代碼 ${exited}）。在這台電腦執行 kimi web 看看錯誤訊息，也確認已經 kimi login`);
     }
     throw new Error('Kimi 伺服器沒有在 20 秒內啟動');
+  },
+};
+
+// ------------------------------------------------- DeepSeek in Kimi
+// DeepSeek conversations are ordinary Kimi conversations whose model comes
+// from one custom Kimi provider, `agent-hub-deepseek`, which the hub asks
+// for here. This is the only way the hub changes Kimi's providers: ALLOW
+// above still refuses every provider path, so the hub cannot create,
+// replace or delete just any provider through `kimi.request`.
+//
+// What it must never do is touch the Kimi subscription login: no logout, no
+// change to the `managed:kimi-code` provider, to [thinking] or to
+// [secondary_model], and no change to Kimi's global default model. The last
+// one is the dangerous one: creating a provider SEEDS default_model with the
+// new provider's model when none is set (Kimi's createProvider). So before
+// creating, an empty default is pinned to the subscription's own model, and
+// afterwards the default is read again and put back if it moved.
+const DS_PROVIDER = 'agent-hub-deepseek';
+const DS_MANAGED = 'managed:kimi-code';
+// The gateway → address table is the bridge's own: the hub names a gateway,
+// never a URL, so it cannot point the key anywhere else.
+// (server/deepseek-account.js has the same ids, with the models of each.)
+const DS_GATEWAYS = {
+  'opencode-go': 'https://opencode.ai/inference/go/openai/v1',
+  opencode: 'https://opencode.ai/inference/openai/v1',
+  commandcode: 'https://api.commandcode.ai/provider/v1',
+};
+// The header that tells a gateway which session a request belongs to. Kimi
+// sends none, and OpenCode Go lists Kimi Code among the clients that get
+// throttled for that: the provider gets one, the same for every request from
+// this computer (Command Code's own CLI sends x-session-id).
+const DS_SESSION_HEADERS = { 'opencode-go': 'x-opencode-session', opencode: 'x-opencode-session', commandcode: 'x-session-id' };
+const DS_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+// Kimi's capability names (kosong): thinking, always_thinking, tool_use, image_in.
+const DS_CAPABILITIES = ['thinking', 'always_thinking', 'tool_use', 'image_in'];
+
+const deepseek = {
+  // Everything the hub sent, checked and rebuilt field by field. Nothing
+  // else is passed on to Kimi.
+  clean({ gateway, apiKey, models } = {}) {
+    const bad = (m) => Object.assign(new Error(m), { status: 400 });
+    const base = Object.hasOwn(DS_GATEWAYS, gateway) ? DS_GATEWAYS[gateway] : null;
+    if (!base) throw bad(`不支援的閘道：${String(gateway).slice(0, 40)}`);
+    if (typeof apiKey !== 'string' || !apiKey || apiKey.length > 500 || /\s/.test(apiKey)) throw bad('API key 不能是空的、超過 500 字，或含有空白與換行');
+    if (!Array.isArray(models) || models.length < 1 || models.length > 20) throw bad('模型清單要有 1 到 20 個模型');
+    const seen = new Set();
+    const out = models.map((m) => {
+      const model = m?.model;
+      // Letters, digits and . / : - _ (a gateway's own ids): no empty, "." or ".." parts.
+      if (typeof model !== 'string' || !/^[\w.\/:-]{1,100}$/.test(model) || /(^|\/)\.{0,2}(\/|$)/.test(model)) throw bad(`模型名稱不合法：${String(model).slice(0, 40)}`);
+      if (seen.has(model)) throw bad(`模型重複：${model}`);
+      seen.add(model);
+      const size = (v, what, min, max) => {
+        if (!Number.isInteger(v) || v < min || v > max) throw bad(`${model} 的 ${what} 不合理：${String(v).slice(0, 20)}`);
+        return v;
+      };
+      const entry = { model, max_context_size: size(m.max_context_size, 'max_context_size', 1_000, 10_000_000) };
+      if (m.max_output_size !== undefined) entry.max_output_size = size(m.max_output_size, 'max_output_size', 1, 10_000_000);
+      if (m.display_name !== undefined) {
+        if (typeof m.display_name !== 'string' || !/^[^\x00-\x1f\x7f]{1,100}$/.test(m.display_name)) throw bad(`${model} 的顯示名稱不合法`);
+        entry.display_name = m.display_name;
+      }
+      for (const [field, allowed] of [['capabilities', DS_CAPABILITIES], ['support_efforts', DS_EFFORTS]]) {
+        if (m[field] === undefined) continue;
+        if (!Array.isArray(m[field]) || m[field].length > 10 || m[field].some((x) => !allowed.includes(x))) throw bad(`${model} 的 ${field} 不在允許的清單裡`);
+        entry[field] = [...new Set(m[field])];
+      }
+      return entry;
+    });
+    return { base, key: apiKey, models: out };
+  },
+
+  // One call to Kimi's server (the bridge's own paths: not through ALLOW).
+  // `secret` never appears in an error.
+  async call(method, p, body, secret) {
+    const j = await server.request(method, p, body, { internal: true });
+    if (j?.code === 0 || j?.code === 204) return j.data;
+    let msg = String(j?.msg || '');
+    if (secret) msg = msg.split(secret).join('***');
+    throw new Error(`Kimi 回報錯誤 ${j?.code ?? ''}：${msg.slice(0, 300)}`);
+  },
+
+  async snapshot() {
+    const cfg = (await this.call('GET', '/api/v1/config')) || {};
+    const providers = (await this.call('GET', '/api/v1/providers'))?.items || [];
+    const models = ((await this.call('GET', '/api/v1/models').catch(() => null))?.items || []).map((m) => m.model);
+    return {
+      defaultModel: typeof cfg.default_model === 'string' ? cfg.default_model.trim() : '',
+      // What must come out the same as it went in (apart from the default
+      // model, which is put back if it moved).
+      fixed: JSON.stringify([cfg.default_provider ?? null, cfg.thinking ?? null, cfg.secondary_model ?? null]),
+      secondary: this.secondary(cfg),
+      providers,
+      models,
+    };
+  },
+
+  // [secondary_model]: the model Kimi may run subagents on (the pool in
+  // resolveSubagentModelPool), if the computer's Kimi has one set.
+  secondary(cfg) {
+    const s = cfg?.secondary_model;
+    if (!s || typeof s !== 'object') return undefined;
+    const pick = (camel, snake) => s[camel] ?? s[snake];
+    const models = Object.keys(pick('models', 'models') && typeof pick('models', 'models') === 'object' ? pick('models', 'models') : {});
+    const model = pick('defaultModel', 'default_model') ?? pick('model', 'model') ?? models[0];
+    return model ? { model: String(model), models, force: pick('force', 'force') === true } : undefined;
+  },
+
+  // The subscription's own model, as the alias Kimi lists it under.
+  subscriptionModel(snap) {
+    const managed = snap.providers.find((p) => p.id === DS_MANAGED);
+    if (!managed) return null;
+    const d = managed.default_model;
+    const candidates = [d, d && `${DS_MANAGED}/${d}`, ...(managed.models || [])].filter(Boolean);
+    return candidates.find((a) => snap.models.includes(a)) || null;
+  },
+
+  async pin(alias) {
+    await this.call('POST', `/api/v1/models/${encodeURIComponent(alias)}:set_default`, {});
+  },
+
+  // After any write: the default model and the rest are as they were.
+  async check(before, expected) {
+    const now = await this.snapshot();
+    if (now.defaultModel !== expected) {
+      let restored = false;
+      if (expected) {
+        await this.pin(expected).catch(() => {});
+        restored = (await this.snapshot()).defaultModel === expected;
+      }
+      throw new Error(`Kimi 的全域預設模型被改動了（${expected || '（沒有設定）'} → ${now.defaultModel || '（沒有設定）'}）。${restored ? '已還原成原來的模型' : '沒辦法還原，請在這台電腦的 Kimi 用 /model 選回你的模型'}。DeepSeek 設定已中止。`);
+    }
+    if (now.fixed !== before.fixed) throw new Error('Kimi 的 default_provider、[thinking] 或 [secondary_model] 在設定 DeepSeek 時被改動了，已中止。請檢查這台電腦的 Kimi 設定。');
+    return now;
+  },
+
+  // This computer's session id for the gateways, made once and kept.
+  sessionId() {
+    if (!/^ses_agenthub_[0-9a-f]{16}$/.test(STATE.dsSession || '')) {
+      STATE.dsSession = `ses_agenthub_${crypto.randomBytes(8).toString('hex')}`;
+      saveState(STATE);
+    }
+    return STATE.dsSession;
+  },
+
+  // config.toml split into its tables, minus the DeepSeek provider's own
+  // ([providers.agent-hub-deepseek…] and its [models."agent-hub-deepseek/…"]):
+  // what must come out the same after the header is added.
+  others(text) {
+    const tables = new Map();
+    let head = '';
+    for (const line of String(text).split('\n')) {
+      const t = line.trim();
+      if (/^\[.*\]$/.test(t)) head = t.replace(/\s+/g, '');
+      if (/^\[(providers\.agent-hub-deepseek|models\."agent-hub-deepseek\/)/.test(head)) continue;
+      if (t) tables.set(head, [...(tables.get(head) || []), t].sort());
+    }
+    return JSON.stringify([...tables]);
+  },
+
+  // Put the session header on the provider (custom_headers in its table in
+  // config.toml). Kimi writes it itself, through its own config API (a merge
+  // into [providers] that leaves the other providers alone, serialized with
+  // Kimi's own writes, and picked up at once: no restart, and no hand edit
+  // of the file). Then config.toml is read again: the DeepSeek provider's
+  // tables are the only thing that may differ; if anything else does, the
+  // file is put back as it was. Returns null, or why it could not be done.
+  async sessionHeader(gateway) {
+    const name = DS_SESSION_HEADERS[gateway];
+    const file = path.join(KIMI_HOME, 'config.toml');
+    let before;
+    try {
+      before = fs.readFileSync(file, 'utf8');
+    } catch {
+      return '找不到這台電腦 Kimi 的 config.toml，沒辦法加上 session 標頭';
+    }
+    const backup = path.join(STATE_DIR, 'config.toml.before-deepseek');
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    fs.writeFileSync(backup, before, { mode: 0o600 });
+    const value = this.sessionId();
+    const restore = () => {
+      const tmp = `${file}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, before, { mode: 0o600 });
+      fs.renameSync(tmp, file);
+    };
+    try {
+      await this.call('POST', '/api/v1/config', { providers: { [DS_PROVIDER]: { custom_headers: { [name]: value } } } });
+      // Kimi writes the file just before it answers.
+      const after = fs.readFileSync(file, 'utf8');
+      const has = new RegExp(`\\[providers\\.agent-hub-deepseek\\.custom_headers\\][^\\[]*${name}\\s*=\\s*"${value}"|custom_headers\\s*=\\s*\\{[^}]*${name}\\s*=\\s*"${value}"`).test(after);
+      if (this.others(after) !== this.others(before) || !has) {
+        restore();
+        return 'Kimi 的 config.toml 在加上 session 標頭時出現了預期以外的變動，已還原';
+      }
+      fs.rmSync(backup, { force: true });
+      return null;
+    } catch (err) {
+      // Whatever went wrong, config.toml is as it was.
+      try {
+        if (fs.readFileSync(file, 'utf8') !== before) restore();
+        fs.rmSync(backup, { force: true });
+      } catch {}
+      return `加不上 session 標頭：${err.message}`;
+    }
+  },
+
+  async provision(args) {
+    const { base, key, models } = this.clean(args);
+    const before = await this.snapshot();
+    const had = before.providers.some((p) => p.id === DS_PROVIDER);
+    let expected = before.defaultModel;
+    // Creating a provider would make it Kimi's default when there is none:
+    // pin the subscription's model first, or do not create at all.
+    if (!had && !expected) {
+      expected = this.subscriptionModel(before);
+      if (!expected) throw new Error('這台電腦的 Kimi 沒有設定預設模型，也找不到訂閱帳號的模型。為了不讓 DeepSeek 變成 Kimi 的預設模型，沒有建立。請先在那台電腦執行 kimi login。');
+      await this.pin(expected);
+    }
+    // Never `default_model` in the body: that is Kimi's own pointer.
+    const body = { type: 'openai', api_key: key, base_url: base, models };
+    let failure = null;
+    try {
+      if (had) await this.call('PUT', `/api/v1/providers/${DS_PROVIDER}`, body, key);
+      else await this.call('POST', '/api/v1/providers', { id: DS_PROVIDER, ...body }, key);
+    } catch (err) {
+      failure = err;
+    }
+    const after = await this.check(before, expected);
+    if (failure) throw failure;
+    // The session header, which a gateway may want (see DS_SESSION_HEADERS).
+    // Without it the provider still works; the hub is told it is missing.
+    const noHeader = await this.sessionHeader(args.gateway);
+    await this.check(after, expected);
+    return { ok: true, created: !had, models: models.map((m) => `${DS_PROVIDER}/${m.model}`), sessionHeader: !noHeader, ...(noHeader ? { warning: noHeader } : {}), ...(after.secondary ? { secondaryModel: after.secondary } : {}) };
+  },
+
+  async remove() {
+    const before = await this.snapshot();
+    if (!before.providers.some((p) => p.id === DS_PROVIDER)) return { ok: true, removed: false };
+    // Deleting would leave Kimi's default pointing at a model that is gone.
+    if (before.defaultModel.startsWith(`${DS_PROVIDER}/`)) throw new Error('Kimi 的全域預設模型是 DeepSeek 模型：先在那台電腦的 Kimi 用 /model 換回你的模型，再移除。');
+    await this.call('DELETE', `/api/v1/providers/${DS_PROVIDER}`);
+    await this.check(before, before.defaultModel);
+    return { ok: true, removed: true };
   },
 };
 
@@ -1066,6 +1313,7 @@ class DiskSession {
       updated_at: new Date(this.mtime || st.updatedAt || Date.now()).toISOString(),
       archived: Boolean(st.archived),
       owner: o?.kind || (server.busy.has(this.id) ? 'server' : null),
+      model: s.model || '',
       controllable: o?.kind === 'tui' ? o.exact && Boolean(tui.byPid.get(o.pid)) : null,
       // Not sure the terminal Kimi has this one open; locked to be safe.
       guess: o?.kind === 'tui' && !o.exact ? true : undefined,
@@ -2167,6 +2415,11 @@ const hub = {
         return server.request(String(args.method || 'GET').toUpperCase(), String(args.path || ''), args.body);
       case 'kimi.usage':
         return quota.read({ expect: args.expect && typeof args.expect === 'object' ? args.expect : {} });
+      // DeepSeek models inside this computer's Kimi (see `deepseek` above).
+      case 'kimi.deepseek.provision':
+        return deepseek.provision(args);
+      case 'kimi.deepseek.remove':
+        return deepseek.remove();
       case 'kimi.subscribe':
         server.subscribe(args.sessionIds || []);
         for (const id of args.sessionIds || []) {
