@@ -8,6 +8,7 @@ import * as machines from '../machines.js';
 import * as store from '../store.js';
 import * as repoBind from './claude-repo.js';
 import * as deepseek from '../deepseek-account.js';
+import * as providers from '../providers.js';
 import { remoteHost } from './claude-tools.js';
 
 export const live = true;
@@ -78,20 +79,34 @@ async function machineModels(machineId) {
     machines.kimiApi(machineId, 'GET', '/api/v1/config').catch(() => ({})),
     machines.kimiApi(machineId, 'GET', '/api/v1/models'),
   ]);
-  const v = { at: Date.now(), defaultModel: config.default_model || '', models: (list.items || []).map(modelInfo) };
+  // `pool`: the models subagents may run on, as the computer's Kimi has them
+  // now (its [secondary_model]; null when it has none).
+  const secondary = deepseek.secondaryOf(config);
+  const v = { at: Date.now(), defaultModel: config.default_model || '', models: (list.items || []).map(modelInfo), pool: secondary ? { models: secondary.models, defaultModel: secondary.model, force: secondary.force } : null };
   modelCache.set(machineId, v);
   // K3-256k is the default model in 設定 unless one was chosen (once).
-  // Kimi's models only: the DeepSeek ones are not Kimi's to default to.
+  // Kimi's own models only: a DeepSeek or Claude model is not Kimi's to
+  // default to.
   store.migrateSettings('model-k3-256k', (d) => {
-    const k3 = v.models.filter((m) => !m.deepseek).find((m) => /k3[-_ ]?256k/i.test(`${m.id} ${m.name}`));
+    const k3 = v.models.filter((m) => m.family === 'kimi').find((m) => /k3[-_ ]?256k/i.test(`${m.id} ${m.name}`));
     if (!k3) return false;
     if (!d.model) d.model = k3.id;
   });
   return v;
 }
 export const modelsFor = (machineId) => machineModels(machineId).then(({ models, defaultModel }) => ({ models, defaultModel }));
-// The machine's Kimi got (or lost) the DeepSeek provider: list its models again.
-export const forgetModels = (machineId) => modelCache.delete(machineId);
+// The machine's Kimi got (or lost) a provider, or its subagent pool changed:
+// read its models and config again.
+export const forgetModels = (machineId) => {
+  modelCache.delete(machineId);
+  // The conversations of that computer that are followed show the new list.
+  setTimeout(() => {
+    for (const m of mirrors.values()) if (m.machineId === machineId && m.live) m.loadModels().catch(() => {});
+  }, 50).unref();
+};
+// The providers module reads the computer's models through here (it cannot
+// import this file: this one imports it).
+providers.init({ machineModels, forgetModels });
 
 // --------------------------------------------------------------- helpers
 
@@ -133,31 +148,10 @@ function contentImages(parts) {
     });
 }
 
-// The thinking-effort choices Kimi's own /effort picker offers for a model.
-function effortsFor(model) {
-  const caps = model.capabilities || [];
-  const efforts = model.support_efforts || [];
-  const always = caps.includes('always_thinking');
-  if (efforts.length) return always ? efforts : ['off', ...efforts];
-  if (always) return ['on'];
-  if (caps.includes('thinking') || model.adaptive_thinking) return ['off', 'on'];
-  return [];
-}
-
-// `deepseek`: one of the DeepSeek provider's models (server/deepseek-account.js),
-// which only DeepSeek conversations offer; DeepSeek thinks at max unless told.
-export const modelInfo = (m) => {
-  const ds = deepseek.isDeepseekModel(m.model);
-  return {
-    id: m.model,
-    name: m.display_name || m.model.split('/').pop(),
-    efforts: effortsFor(m),
-    defaultEffort: ds ? deepseek.DEFAULT_EFFORT : m.default_effort || null,
-    image: (m.capabilities || []).includes('image_in'),
-    context: m.max_context_size || null,
-    ...(ds ? { deepseek: true } : {}),
-  };
-};
+// One of the computer's models as the composer shows it (providers.modelInfo):
+// `family` says where it comes from, 'deepseek' and 'claude' being the
+// providers the hub made (server/providers.js), whose tokens go to an API key.
+export const modelInfo = (m) => providers.modelInfo(m);
 
 // Text a user typed (or a slash command) for a turn Kimi started.
 function promptLabel(p) {
@@ -279,16 +273,23 @@ class Mirror {
   // started it with or fell back to. What was chosen in it stays.
   async applyDefaults() {
     if (this.inTerminal()) return;
-    // A DeepSeek conversation has its own defaults (DeepSeek 設定) and keeps
-    // its model: the Kimi defaults must never move it onto a Kimi model.
-    const ds = deepseek.isDeepseek(this.session);
-    const d = (ds ? deepseek.settings().defaults : store.readSettings().defaults) || {};
+    // A DeepSeek or Claude conversation keeps its model: the defaults must
+    // never move it onto another one (a Kimi model would run on the
+    // subscription). The default model is chosen for a conversation when it
+    // is made from the hub (runner.newSession); here it is applied only to
+    // conversations on a Kimi model, and only when it is a Kimi model too:
+    // an API-key model is never put on a conversation that was not made for it.
+    // DeepSeek conversations made before the models were merged
+    // (mode: 'deepseek') keep their own defaults (DeepSeek 設定).
+    const family = providers.sessionFamily(this.session);
+    const legacy = this.session.mode === 'deepseek';
+    const d = (legacy ? deepseek.settings().defaults : store.readSettings().defaults) || {};
     const meta = this.session.meta || {};
     const chosen = this.session.state.userSet || {};
     const change = {};
     // Sent even when it looks set already: what the hub has may be behind
     // Kimi (it journals a change with its next turn).
-    const model = !ds && d.model && !chosen.model && (meta.models || []).find((x) => x.id === d.model && !x.deepseek);
+    const model = family === 'kimi' && !legacy && d.model && !chosen.model && providers.familyOf(d.model) === 'kimi' && (meta.models || []).find((x) => x.id === d.model);
     if (model) change.model = d.model;
     const efforts = (model || (meta.models || []).find((x) => x.id === meta.model))?.efforts || [];
     if (d.effort && !chosen.effort && efforts.includes(d.effort)) change.effort = d.effort;
@@ -628,7 +629,7 @@ class Mirror {
       // Attached mid-run: no tool card for the Agent call yet, so make one.
       if (!parent) parent = this.tool(parentAgent, p.parentToolCallId || `agent:${id}`, { name: 'Agent', title: p.description || p.subagentName, status: 'running' }, this.parentOf(parentAgent));
       this.agents.set(id, { ...known, parent: parent.id, background: Boolean(p.runInBackground) });
-      this.ctx.patch(parent, { subagent: { ...parent.subagent, id, name: known?.btw ? 'btw' : p.subagentName || 'subagent', description: p.description || parent.subagent?.description || '', status: 'running', background: Boolean(p.runInBackground) } });
+      this.ctx.patch(parent, { subagent: { ...parent.subagent, id, name: known?.btw ? 'btw' : p.subagentName || 'subagent', description: p.description || parent.subagent?.description || '', status: 'running', background: Boolean(p.runInBackground), ...this.subagentModel(p) } });
       this.flushEarly(id);
       return;
     }
@@ -640,6 +641,20 @@ class Mirror {
     this.closeBlock(id);
     this.ctx.patch(parent, { subagent: { ...parent.subagent, status, summary: p.resultSummary ?? parent.subagent.summary, error: p.error } });
     if (status !== 'running') this.kickHandoff(200);
+  }
+
+  // The model and thinking a subagent really runs on, as Kimi says in
+  // subagent.spawned and agent.status.updated (`model`, `thinkingEffort`):
+  // not what the conversation asked for. `onMain`: it runs on the main
+  // agent's own model (the subagent's model was "primary", or the same one).
+  subagentModel(p) {
+    const f = {};
+    if (p.model) {
+      const main = this.session.meta?.turnModel || this.session.meta?.model;
+      Object.assign(f, { model: p.model, family: providers.familyOf(p.model), ...(main ? { onMain: p.model === main } : {}) });
+    }
+    if (p.thinkingEffort) f.effort = p.thinkingEffort;
+    return f;
   }
 
   flushEarly(agentId) {
@@ -856,7 +871,7 @@ class Mirror {
           // A subagent's own model and thinking, shown with it.
           const a = this.agents.get(agentId);
           const card = a && this.events().find((e) => e.id === a.parent);
-          if (card?.subagent) this.ctx.patch(card, { subagent: { ...card.subagent, model: p.model || card.subagent.model, effort: p.thinkingEffort || card.subagent.effort } });
+          if (card?.subagent) this.ctx.patch(card, { subagent: { ...card.subagent, ...this.subagentModel(p) } });
         }
         return;
       case 'hub.todos':
@@ -1049,6 +1064,10 @@ class Mirror {
     }
     const body = { prompt_id: promptId, content: this.content(text, images) };
     if (hidden) body.content.push({ type: 'text', text: `<system-reminder>${hidden}</system-reminder>` });
+    // Which model this conversation's subagents use: said on the first
+    // prompt, and again whenever that or the main model changes.
+    const sub = await this.subagentNote().catch((err) => (console.warn(`[kimi] subagent note for ${this.session.id}: ${err.message}`), null));
+    if (sub) body.content.push({ type: 'text', text: `<system-reminder>${sub.text}</system-reminder>` });
     // Bound to a GitHub repository: the rules go with the first message (and
     // with every reminder after).
     const repo = this.session.repo;
@@ -1060,17 +1079,18 @@ class Mirror {
     if (note !== REPO_CHECK_NOTE) this.repoNudges = 0;
     if (this.defaultModel === undefined) await this.loadModels().catch(() => {});
     if (!this.session.meta?.model) {
-      // A DeepSeek conversation that has no model yet must not fall back to
-      // Kimi's default (the subscription's): it gets its own, or nothing.
-      const dsModel = this.session.mode === 'deepseek' ? this.session.state.deepseek?.model : null;
-      if (this.session.mode === 'deepseek' && !dsModel) {
+      // A DeepSeek or Claude conversation that has no model yet must not
+      // fall back to Kimi's default (the subscription's): it gets its own,
+      // or nothing.
+      const own = this.session.state.intendedModel || (this.session.mode === 'deepseek' ? this.session.state.deepseek?.model : null);
+      if (providers.sessionFamily(this.session) !== 'kimi' && !own) {
         this.dequeue(promptId);
-        const text = '這個 DeepSeek 對話還沒有模型，為了不誤用 Kimi 訂閱的模型，沒有送出。請在輸入框選一個 DeepSeek 模型。';
+        const text = `這個 ${this.agentName()} 對話還沒有模型，為了不誤用 Kimi 訂閱的模型，沒有送出。請在輸入框選一個 ${this.agentName()} 的模型。`;
         ctx.emit({ type: 'error', text });
         if (!busy) ctx.setStatus('idle');
         return { ok: false, error: text };
       }
-      if (dsModel) body.model = dsModel;
+      if (own) body.model = own;
       else if (this.defaultModel) body.model = this.defaultModel;
     }
     // 插隊 from the tray can come before Kimi has the prompt: it waits.
@@ -1078,6 +1098,10 @@ class Mirror {
     (this.inflight ??= new Map()).set(promptId, post);
     try {
       const r = await post;
+      if (sub) {
+        this.session.state.subagentTold = sub.told;
+        store.saveSession(this.session);
+      }
       if (r?.status === 'queued' && steer) await this.steer(promptId);
       return { ok: true, promptId };
     } catch (err) {
@@ -1088,6 +1112,54 @@ class Mirror {
     } finally {
       this.inflight.delete(promptId);
     }
+  }
+
+  // The hidden note that says which model this conversation's subagents use.
+  // Once the computer's Kimi has a pool of subagent models (its
+  // [secondary_model], kept by server/providers.js), an Agent call without
+  // `model` runs on the pool's default (the Kimi subscription's model), not on
+  // the main model: so the note always names the model, "primary" (the main
+  // model) or an alias. It goes with the first prompt and again when the
+  // setting or the main model changes (`state.subagentTold`). Never an alias
+  // the computer's pool does not have: that says so in the conversation, and
+  // the subagents use the main model instead. No pool, no note.
+  // Resolves to { text, told } or null.
+  async subagentNote() {
+    if (this.inTerminal()) return null;
+    // The pool is made sure of first (cached: nothing is asked unless the
+    // keys, the models or the computer changed), then read from the
+    // computer's Kimi itself.
+    await providers.ensureProviders(this.machineId).catch((err) => console.warn(`[kimi] providers on ${this.machineId}: ${err.message}`));
+    const want = this.session.subagent?.model || 'primary';
+    const { pool } = (await machineModels(this.machineId).catch(() => null)) || {};
+    const state = providers.poolState(this.machineId);
+    const names = pool?.models || [];
+    if (!state.available || pool?.force || !names.length) {
+      if (want !== 'primary') this.warnSubagent(`unavailable:${want}`, state.reason || (pool?.force ? providers.FORCED : `子代理模型 ${this.nameOf(want)} 還沒在這台電腦的 Kimi 設定好`));
+      return null;
+    }
+    let sub = want;
+    if (want !== 'primary' && !names.includes(want)) {
+      this.warnSubagent(`missing:${want}`, `子代理模型 ${this.nameOf(want)} 還沒在這台電腦的 Kimi 設定好，子代理先跟主模型一樣`);
+      sub = 'primary';
+    }
+    const main = this.session.meta?.model || this.session.state.intendedModel || this.defaultModel || '';
+    const told = this.session.state.subagentTold;
+    if (told && told.sub === sub && told.main === main) return null;
+    const pass = sub === 'primary' ? 'model: "primary" (the same model as you)' : `model: "${sub}"`;
+    return { told: { sub, main }, text: `When you launch subagents (Agent / AgentSwarm), pass ${pass} unless the user explicitly asks for another model. Always pass it: a call without \`model\` runs on this computer's default model, not on yours.` };
+  }
+
+  nameOf(alias) {
+    return (this.session.meta?.models || []).find((m) => m.id === alias)?.name || String(alias).split('/').pop();
+  }
+
+  // Said once per kind of problem in a conversation (until the hub restarts).
+  warnSubagent(key, text) {
+    this.warned ??= new Set();
+    if (this.warned.has(key) || this.batch) return;
+    this.warned.add(key);
+    this.ctx.emit({ type: 'info', text });
   }
 
   // Kimi takes a message into the running turn only when a message started
@@ -1138,7 +1210,7 @@ class Mirror {
   }
 
   agentName() {
-    return deepseek.isDeepseek(this.session) ? 'DeepSeek' : 'Kimi';
+    return providers.FAMILY_NAME[providers.sessionFamily(this.session)] || 'Kimi';
   }
 
   // Kimi says it has no such message ("not pending"): it ran already, or
