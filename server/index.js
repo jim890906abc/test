@@ -19,6 +19,7 @@ import { createScheduler, scheduleTimings } from './schedule.js';
 import { mergeQuota, countsOf } from './quota.js';
 import * as claudeAccount from './claude-account.js';
 import * as deepseekAccount from './deepseek-account.js';
+import * as providers from './providers.js';
 import * as github from './github.js';
 import * as gdrive from './gdrive.js';
 import { localHost, remoteHost } from './adapters/claude-tools.js';
@@ -104,6 +105,10 @@ const EDITABLE = ['name', 'enabled', 'color', 'command', 'args', 'env', 'login',
 // ------------------------------------------------------------------ meta
 
 const { readSettings } = store;
+// The defaults pages see: what 設定 holds, plus the subagent model every new
+// conversation starts with ('primary': the main model) and the efforts of
+// the subagent models (global, per model alias).
+const settingsView = (st = readSettings()) => ({ ...st, defaults: { ...(st.defaults || {}), subagentModel: st.defaults?.subagentModel || 'primary' }, subagentEfforts: providers.subagentEfforts(st) });
 
 app.get('/api/config', wrap(() => ({
   version: '0.3.0',
@@ -111,7 +116,7 @@ app.get('/api/config', wrap(() => ({
   home: os.homedir(),
   hostname: os.hostname(),
   host: HOST,
-  settings: readSettings(),
+  settings: settingsView(),
   claude: claudeAccount.publicAccount(),
   deepseek: deepseekAccount.publicAccount(),
 })));
@@ -137,6 +142,9 @@ app.put('/api/claude', wrap(async (req) => {
     claudeAccount.setKey(apiKey);
   }
   if (defaults || typeof webTools === 'boolean') claudeAccount.setSettings({ defaults, webTools });
+  // The key is also Claude's way into the computers' Kimi (a provider there):
+  // a new one goes to them, a removed one leaves them.
+  if (clearKey || (typeof apiKey === 'string' && apiKey.trim())) providers.refreshAll({ purge: clearKey ? ['claude'] : [] }).catch(() => {});
   const account = claudeAccount.publicAccount();
   broadcast({ t: 'claude', account });
   return account;
@@ -145,6 +153,7 @@ app.put('/api/claude', wrap(async (req) => {
 app.post('/api/claude/test', wrap(async () => {
   try {
     const models = await claudeAccount.models({ fresh: true });
+    providers.refreshAll().catch(() => {});
     return { ok: true, message: `連線成功：這把 API key 可以使用 ${models.length} 個模型`, models };
   } catch (err) {
     return { ok: false, message: claudeAccount.explain(err) };
@@ -178,9 +187,8 @@ app.put('/api/deepseek', wrap(async (req) => {
   }
   deepseekAccount.setSettings({ gateway: chosen, defaults });
   // A key removed leaves the computers' Kimi too (it sits in its config there);
-  // a new key or gateway goes to the ones that have the provider already.
-  if (removed && !deepseekAccount.apiKey()) deepseekAccount.removeProviders().catch(() => {});
-  else deepseekAccount.reprovision().then((ids) => ids.forEach((id) => kimiRemote.forgetModels(id))).catch(() => {});
+  // a new key or gateway goes to them.
+  providers.refreshAll({ purge: removed && !deepseekAccount.apiKey() ? ['deepseek'] : [] }).catch(() => {});
   const account = deepseekAccount.publicAccount();
   broadcast({ t: 'deepseek', account });
   return account;
@@ -194,6 +202,7 @@ app.post('/api/deepseek/test', wrap(async (req) => {
   try {
     const r = await deepseekAccount.refreshModels(gw, key);
     const models = deepseekAccount.models(gw);
+    providers.refreshAll().catch(() => {});
     return { ok: true, message: r.live ? `連線成功：這把 API key 可以使用 ${r.ids.length} 個 DeepSeek 模型` : `金鑰沒有被拒絕。${r.note}`, ...models };
   } catch (err) {
     return { ok: false, message: err.message };
@@ -209,20 +218,33 @@ app.get('/api/deepseek/models', wrap((req) => {
 // Computers whose Kimi has a [secondary_model] (subagents may run on it).
 app.get('/api/deepseek/secondary', wrap(async () => deepseekAccount.secondaryModels()));
 
+// Where 設定 defaults are kept: the main model for new conversations (any
+// source's alias: a DeepSeek or Claude one is chosen for a conversation when
+// it is made, never put on Kimi's global default), thinking, permission, plan
+// mode and the subagent model; and `subagentEfforts` ({ alias: effort },
+// global: Kimi keeps a subagent's effort per model), sent to every computer.
 app.put('/api/settings', wrap((req) => {
   const d = req.body?.defaults || {};
   const str = (v) => (typeof v === 'string' && v.length <= 200 ? v : '');
+  const prev = readSettings();
   const defaults = {
-    // Kimi's own models: a DeepSeek one has no place in the Kimi defaults.
-    model: deepseekAccount.isDeepseekModel(d.model) ? '' : str(d.model),
+    model: str(d.model),
     effort: str(d.effort),
     permission: ['manual', 'yolo', 'auto'].includes(d.permission) ? d.permission : 'manual',
     planMode: Boolean(d.planMode),
+    subagentModel: str(d.subagentModel) || prev.defaults?.subagentModel || 'primary',
   };
-  const settings = { ...readSettings(), defaults };
+  const settings = { ...prev, defaults };
+  const efforts = req.body?.subagentEfforts ?? d.subagentEfforts;
+  if (efforts && typeof efforts === 'object') settings.subagentEfforts = providers.cleanEfforts(efforts);
   store.writeSettings(settings);
-  return settings;
+  if (JSON.stringify(providers.subagentEfforts(prev)) !== JSON.stringify(providers.subagentEfforts(settings))) providers.refreshAll().catch(() => {});
+  return settingsView(settings);
 }));
+
+// Every model a new conversation on a computer can start on, by source, and
+// whether the computer takes subagent models (see providers.catalog).
+app.get('/api/models', wrap((req) => providers.catalog(req.query.machineId ? String(req.query.machineId) : '')));
 
 app.get('/api/fs/dirs', wrap(async (req) => {
   if (req.query.machine) {
@@ -327,28 +349,62 @@ app.get('/api/sessions', wrap(() =>
   store.listSessions().map(runner.summarize).sort((a, b) => b.updatedAt - a.updatedAt),
 ));
 
+// What a new conversation on a computer starts with. The main model is any
+// source's alias (Kimi's own, `agent-hub-deepseek/…`, `agent-hub-claude/…`);
+// one of the last two needs its key. DeepSeek and Claude models think as
+// they offer (the model's own default when the thinking asked for is not
+// one of theirs). `legacy`: { agent: 'deepseek' } as the old DeepSeek mode
+// sent it: the gateway's own model id, and the DeepSeek defaults of 設定.
+async function startOptions(body, { legacy = false } = {}) {
+  const d = readSettings().defaults || {};
+  const ds = legacy ? deepseekAccount.settings().defaults : {};
+  const perms = ['manual', 'yolo', 'auto'];
+  let model = typeof body.model === 'string' ? body.model.trim() : '';
+  if (legacy) model = model ? (deepseekAccount.isDeepseekModel(model) ? model : deepseekAccount.aliasFor(model)) : deepseekAccount.aliasFor(ds.model);
+  // The default main model of 設定, when it is one of the hub's own sources
+  // and its key is there (Kimi's own is applied with the conversation's
+  // defaults).
+  const hasKey = { deepseek: () => Boolean(deepseekAccount.apiKey()), claude: () => Boolean(claudeAccount.apiKey()) };
+  if (!model && d.model && providers.familyOf(d.model) !== 'kimi' && hasKey[providers.familyOf(d.model)]()) model = d.model;
+  const family = providers.familyOf(model);
+  let { effort, permission, planMode } = body;
+  if (family === 'deepseek') {
+    if (!hasKey.deepseek()) throw Object.assign(new Error('還沒有設定 DeepSeek 的 API key。在「設定」→「DeepSeek…」貼上閘道的 API key。'), { status: 409 });
+    const id = model.slice(providers.PROVIDER_IDS.deepseek.length + 1);
+    if (!deepseekAccount.modelIds().includes(id)) throw Object.assign(new Error(`${deepseekAccount.GATEWAYS[deepseekAccount.gateway()].label} 沒有 ${id.slice(0, 60)} 這個模型`), { status: 400 });
+  } else if (family === 'claude') {
+    if (!hasKey.claude()) throw Object.assign(new Error('還沒有設定 Claude API key。在「設定」→「Claude API…」貼上 Claude Console 的 API key。'), { status: 409 });
+    const id = model.slice(providers.PROVIDER_IDS.claude.length + 1);
+    if (!(await providers.claudeModelIds()).includes(id)) throw Object.assign(new Error(`Claude 沒有 ${id.slice(0, 60)} 這個模型，或這把 API key 不能用它`), { status: 400 });
+  }
+  if (family !== 'kimi') {
+    const info = providers.hubModelInfo(model);
+    effort = info.efforts.includes(effort) ? effort : legacy && info.efforts.includes(ds.effort) ? ds.effort : info.defaultEffort;
+  }
+  permission = perms.includes(permission) ? permission : legacy ? ds.permission : undefined;
+  planMode ??= legacy ? ds.planMode || undefined : undefined;
+  // The model of its subagents: asked for, else the default of 設定.
+  const asked = typeof body.subagent === 'string' ? body.subagent : body.subagent?.model;
+  const subagent = { model: typeof asked === 'string' && asked && asked.length <= 200 ? asked : d.subagentModel || 'primary' };
+  return { model: model || undefined, effort, permission, planMode, subagent };
+}
+
 // New conversation. On a connected machine ({ machineId, cwd }) the folder is
-// a path on that machine; otherwise a local agent ({ agentId }) is used.
-// { agent: 'claude', cwd } starts a Claude API conversation in a folder on
-// this computer.
+// a path on that machine: a Kimi conversation there, whatever its model
+// ({ model: alias, effort, permission, planMode, subagent: { model: alias |
+// 'primary' } }; `agent: 'kimi'` is the same). { agent: 'deepseek', machineId }
+// is accepted as before (the old DeepSeek mode). Otherwise a local agent
+// ({ agentId }) is used. { agent: 'claude', cwd } starts a conversation in the
+// Claude daemon, as before (a folder on this computer, or on `machineId`).
 app.post('/api/sessions', wrap(async (req) => {
   const { agentId, machineId, agent, prompt, cwd, permissionMode, images } = req.body || {};
   let { model, effort, permission, planMode } = req.body || {};
   const claude = agent === 'claude' || agentId === 'claude';
-  // { agent: 'deepseek', machineId, … }: a Kimi conversation on that computer
-  // that runs a DeepSeek model of the gateway in use.
   const ds = agent === 'deepseek';
-  if (ds) {
-    if (!machineId) throw Object.assign(new Error('DeepSeek 對話在一台電腦的 Kimi 裡執行：請選一台電腦'), { status: 400 });
-    if (!deepseekAccount.apiKey()) throw Object.assign(new Error('還沒有設定 DeepSeek 的 API key。在「設定」→「DeepSeek…」貼上閘道的 API key。'), { status: 409 });
-    const d = deepseekAccount.settings().defaults;
-    const ids = deepseekAccount.modelIds();
-    if (model && !ids.includes(model)) throw Object.assign(new Error(`${deepseekAccount.GATEWAYS[deepseekAccount.gateway()].label} 沒有 ${String(model).slice(0, 60)} 這個模型`), { status: 400 });
-    model = deepseekAccount.aliasFor(model || d.model);
-    effort = deepseekAccount.EFFORTS.includes(effort) ? effort : d.effort;
-    permission = ['manual', 'yolo', 'auto'].includes(permission) ? permission : d.permission;
-    planMode ??= d.planMode || undefined;
-  }
+  if (ds && !machineId) throw Object.assign(new Error('DeepSeek 對話在一台電腦的 Kimi 裡執行：請選一台電腦'), { status: 400 });
+  const remote = machineId || (!claude && String(agentId || '').startsWith('kimi@'));
+  let subagent;
+  if (remote && !claude) ({ model, effort, permission, planMode, subagent } = await startOptions(req.body || {}, { legacy: ds }));
   // A Claude conversation bound to a GitHub repository (cloned on its
   // computer, on `branch`: an existing one, or a new one made from the
   // default branch).
@@ -360,7 +416,6 @@ app.post('/api/sessions', wrap(async (req) => {
     if (!branch) throw Object.assign(new Error(`分支名稱不合法：${req.body.branch}`), { status: 400 });
     repo = { full, branch };
   }
-  const remote = machineId || (!claude && String(agentId || '').startsWith('kimi@'));
   const dir = cwd ? (remote ? String(cwd) : workspace.validateDir(cwd)) : undefined;
   const s = await runner.newSession({
     agentId: claude ? 'claude' : machineId ? `kimi@${machineId}` : agentId,
@@ -368,7 +423,7 @@ app.post('/api/sessions', wrap(async (req) => {
     cwd: dir,
     permissionMode,
     nameHint: prompt,
-    mode: ds ? 'deepseek' : undefined,
+    subagent,
     config: remote || claude ? { model, effort, permission, planMode, ...(repo ? { repo } : {}) } : undefined,
   });
   const files = req.body?.files || [];
@@ -544,10 +599,12 @@ app.post('/api/sessions/:id/earlier', wrap(async (req) => {
 app.post('/api/sessions/:id/autopause', wrap(async (req) => {
   const s = mustSession(req.params.id);
   if (!s.kimiSessionId) throw Object.assign(new Error('只有 Kimi 對話可以自動暫停'), { status: 400 });
-  // It watches the Kimi subscription's 5-hour quota, which a DeepSeek
-  // conversation does not use.
-  if (deepseekAccount.isDeepseek(s)) throw Object.assign(new Error('DeepSeek 對話不用 Kimi 訂閱，沒有 5 小時額度，不能自動暫停，也不能設定「額度恢復後送出」。要延後送出訊息，請用 /later 30 繼續 或「定時送出…」。'), { status: 400 });
   const { enabled, threshold, cancelResume, resumeAfterReset, text } = req.body || {};
+  // It watches the Kimi subscription's 5-hour quota, which a conversation on
+  // a DeepSeek or Claude model does not use: turning it off is all that can
+  // be done (it comes back when the model is Kimi's again).
+  const family = providers.sessionFamily(s);
+  if (family !== 'kimi' && !(cancelResume || enabled === false)) throw Object.assign(new Error(`這個對話現在用的是 ${providers.FAMILY_NAME[family] || '其他'} 的模型，算在 ${providers.billingOf(family)}，不用 Kimi 訂閱，沒有 5 小時額度，不能自動暫停，也不能設定「額度恢復後送出」。要延後送出訊息，請用 /later 30 繼續 或「定時送出…」。`), { status: 400 });
   if (cancelResume) autoPause.cancelResume(s);
   else if (resumeAfterReset) await autoPause.armResume(s, { text });
   else autoPause.configure(s, { enabled, threshold });
@@ -934,7 +991,7 @@ const persist = (s, { immediate }) => {
   broadcast({ t: 'session', session: runner.summarize(s) });
 };
 const autoPause = createAutoPause({
-  sessions: () => store.listSessions().filter((s) => s.kimiSessionId && isActive(s.autoPause) && !deepseekAccount.isDeepseek(s)),
+  sessions: () => store.listSessions().filter((s) => s.kimiSessionId && isActive(s.autoPause) && providers.sessionFamily(s) === 'kimi'),
   activity: (s) => activityOf(s, machines.getMachine(s.machineId), kimiRemote.isLive(s)),
   readUsage: (mid) => readQuota(mid),
   send: (s, text, opts) => runner.deliver(s, text, opts),

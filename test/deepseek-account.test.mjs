@@ -1,7 +1,6 @@
 // The DeepSeek account (server/deepseek-account.js): keys kept and masked,
 // the key check against a gateway (a fake one here), the DeepSeek models it
-// lists and the one new conversations start on, and asking the bridge for the
-// provider once per computer. No network or account needed.
+// lists and the one new conversations start on. No network or account needed.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -204,82 +203,8 @@ test('every DeepSeek model gets a 1M window, 384k output, always-thinking, low, 
   assert.equal(account.displayName('deepseek/deepseek-v4.1-flash-fast'), 'DeepSeek V4.1 Flash Fast');
 });
 
-test('Kimi gets the provider once per computer, gateway, key and model list', async () => {
-  const calls = [];
-  const rpc = async (machineId, op, args) => {
-    calls.push({ machineId, op, args });
-    if (machineId === 'down') throw new Error('機器「down」已離線');
-    return { ok: true, models: args.models.map((x) => `agent-hub-deepseek/${x.model}`) };
-  };
-  account.setKey('opencode-go', GOOD);
-  await account.refreshModels('opencode-go', GOOD);
-  const first = await account.ensureProvider('m1', { rpc });
-  assert.equal(first.ok, true);
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].op, 'kimi.deepseek.provision');
-  // The gateway is named, never an address; the key and the models go along.
-  assert.deepEqual(Object.keys(calls[0].args).sort(), ['apiKey', 'gateway', 'models']);
-  assert.equal(calls[0].args.gateway, 'opencode-go');
-  assert.equal(calls[0].args.apiKey, GOOD);
-  assert.ok(!JSON.stringify(calls[0].args).includes('http'));
-  assert.deepEqual(calls[0].args.models.map((x) => x.model), ['deepseek-v4-pro', 'deepseek-v4.1-flash', 'DeepSeek-V4-Flash']);
-  assert.deepEqual(calls[0].args.models[1], account.kimiModel('deepseek-v4.1-flash'));
-
-  assert.equal((await account.ensureProvider('m1', { rpc })).cached, true);
-  assert.equal(calls.length, 1, 'cached');
-  // At the same time: one request.
-  const [a, b] = await Promise.all([account.ensureProvider('m2', { rpc }), account.ensureProvider('m2', { rpc })]);
-  assert.equal(a, b);
-  assert.equal(calls.length, 2);
-
-  // Another key, another gateway, or the computer coming back: again.
-  account.setKey('opencode-go', 'sk-other-key-000000');
-  await account.ensureProvider('m1', { rpc });
-  assert.equal(calls.length, 3);
-  account.forgetProvider('m1');
-  await account.ensureProvider('m1', { rpc });
-  assert.equal(calls.length, 4);
-  account.setKey('opencode', GOOD);
-  account.setSettings({ gateway: 'opencode' });
-  await account.ensureProvider('m1', { rpc });
-  assert.equal(calls.at(-1).args.gateway, 'opencode');
-  assert.equal(calls.length, 5);
-  account.setSettings({ gateway: 'opencode-go' });
-
-  // An error is not remembered: the next try asks again.
-  await assert.rejects(account.ensureProvider('down', { rpc }), /離線/);
-  await assert.rejects(account.ensureProvider('down', { rpc }), /離線/);
-  assert.equal(calls.filter((c) => c.machineId === 'down').length, 2);
-  // An old bridge says what to do.
-  await assert.rejects(account.ensureProvider('old', { rpc: async () => { throw new Error('未知的操作：kimi.deepseek.provision'); } }), /連接器太舊/);
-});
-
-test('a new key or gateway goes to the computers that have the provider, and only to those', async () => {
-  account.reload();
-  account.setSettings({ gateway: 'opencode-go' });
-  account.setKey('opencode-go', GOOD);
-  const calls = [];
-  const rpc = async (id, op, args) => (calls.push([id, op, args.gateway, args.apiKey]), { ok: true, models: [] });
-  await account.ensureProvider('a', { rpc });
-  await account.ensureProvider('b', { rpc });
-  calls.length = 0;
-  assert.deepEqual(await account.reprovision({ rpc }), [], 'nothing changed, nothing asked');
-  account.setKey('opencode-go', 'sk-new-key-111111');
-  assert.deepEqual((await account.reprovision({ rpc })).sort(), ['a', 'b']);
-  assert.deepEqual(calls.map((c) => c.slice(1)).sort(), [['kimi.deepseek.provision', 'opencode-go', 'sk-new-key-111111'], ['kimi.deepseek.provision', 'opencode-go', 'sk-new-key-111111']]);
-  assert.deepEqual(await account.reprovision({ rpc }), []);
-  // The keys are taken off the computers when the last one is removed.
-  const removed = [];
-  await account.removeProviders({ rpc: async (id, op) => removed.push([id, op]) });
-  assert.deepEqual(removed.sort(), [['a', 'kimi.deepseek.remove'], ['b', 'kimi.deepseek.remove']]);
-  assert.deepEqual(await account.reprovision({ rpc }), [], 'none left');
-});
-
-test('no key, no provider', async () => {
-  account.clearKey('opencode');
-  account.clearKey('opencode-go');
-  await assert.rejects(account.ensureProvider('m9', { rpc: async () => ({}) }), (e) => e.status === 409 && e.code === 'no_key');
-});
+// Giving Kimi the provider (once per computer, gateway, key and model list)
+// and the pool of subagent models is test/providers.test.mjs.
 
 test('which conversations are DeepSeek ones; a computer\'s [secondary_model]', async () => {
   assert.equal(account.isDeepseek({ mode: 'deepseek' }), true);

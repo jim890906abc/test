@@ -1,7 +1,10 @@
-// DeepSeek mode end to end: the real hub, a fake gateway (the DeepSeek models
-// list and key check), and a scripted machine that speaks the bridge protocol
-// and plays Kimi (conversations, their model and thinking, the DeepSeek
-// provider the bridge would make). No Kimi, gateway or account needed.
+// DeepSeek on a computer whose connector is the old one (0.8.0, which only has
+// the DeepSeek op) and through the old way in ({ agent: 'deepseek' }): the real
+// hub, a fake gateway (the DeepSeek models list and key check), and a scripted
+// machine that speaks the bridge protocol and plays Kimi (conversations, their
+// model and thinking, the DeepSeek provider the bridge would make). No Kimi,
+// gateway or account needed. test/e2e-models.test.mjs is the same with the new
+// connector and every source of models.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -226,6 +229,7 @@ test('a DeepSeek conversation: Kimi gets the provider once, the conversation run
   const dir = '/tmp/project-ds';
   const s = await api('POST', '/sessions', { agent: 'deepseek', machineId: MID, cwd: dir, prompt: '你好' });
   assert.equal(s.mode, 'deepseek');
+  assert.equal(s.family, 'deepseek');
   assert.equal(s.agentId, `kimi@${MID}`, 'an ordinary Kimi conversation on that computer');
   assert.equal(s.cwd, dir);
 
@@ -245,10 +249,12 @@ test('a DeepSeek conversation: Kimi gets the provider once, the conversation run
   const sent = await until(async () => machine.prompts.find((x) => x.sid === s.kimiSessionId), 5000, 'prompt');
   assert.equal(sent.body.model, undefined, 'the conversation has its model; no default is slipped in');
 
-  // Marked in the summaries, on disk, and by its model.
+  // Marked in the summaries (by its model; `mode` is only kept for pages that
+  // still read it) and, until Kimi reports one, on disk by the model it was made for.
   const list = await api('GET', '/sessions');
+  assert.equal(list.find((x) => x.id === s.id).family, 'deepseek');
   assert.equal(list.find((x) => x.id === s.id).mode, 'deepseek');
-  await until(async () => JSON.parse(fs.readFileSync(path.join(DATA, 'sessions', `${s.id}.json`), 'utf8')).mode === 'deepseek', 5000, 'saved');
+  assert.equal(await until(async () => JSON.parse(fs.readFileSync(path.join(DATA, 'sessions', `${s.id}.json`), 'utf8')).state?.intendedModel, 5000, 'saved'), `${DS}/deepseek-v4.1-flash`);
   const snap = await api('GET', `/sessions/${s.id}`);
   assert.equal(snap.meta.model, `${DS}/deepseek-v4.1-flash`);
   assert.equal(snap.meta.effort, 'max');
@@ -265,24 +271,27 @@ test('a DeepSeek conversation: Kimi gets the provider once, the conversation run
   await assert.rejects(api('POST', '/sessions', { agent: 'deepseek', machineId: MID, model: 'gpt-5' }), (e) => e.status === 400 && /沒有 gpt-5/.test(e.message));
 });
 
-test('no auto-pause, and no 「額度恢復後送出」, in a DeepSeek conversation (they watch the Kimi subscription)', async () => {
+test('no auto-pause, and no 「額度恢復後送出」, while the model is a DeepSeek one (they watch the Kimi subscription)', async () => {
   machine.add('session_plain', { title: 'plain Kimi', model: SUB, thinking: 'high' });
   const kimi = await api('POST', `/machines/${MID}/kimi/session_plain/attach`);
   assert.equal(kimi.mode, null);
   const ds = (await api('GET', '/sessions')).find((x) => x.mode === 'deepseek');
-  for (const body of [{ enabled: true, threshold: 80 }, { resumeAfterReset: true, text: '繼續' }, { cancelResume: true }, { enabled: false }]) {
+  for (const body of [{ enabled: true, threshold: 80 }, { resumeAfterReset: true, text: '繼續' }]) {
     await assert.rejects(api('POST', `/sessions/${ds.id}/autopause`, body), (e) => e.status === 400 && /不用 Kimi 訂閱/.test(e.message), JSON.stringify(body));
   }
+  // Turning it off is all that can be done (calling off a waiting 「繼續」 is as for any conversation: nothing waits here).
+  assert.equal((await api('POST', `/sessions/${ds.id}/autopause`, { enabled: false })).id, ds.id);
+  await assert.rejects(api('POST', `/sessions/${ds.id}/autopause`, { cancelResume: true }), (e) => e.status === 409);
   // A Kimi conversation still can.
   const on = await api('POST', `/sessions/${kimi.id}/autopause`, { enabled: true, threshold: 80 });
   assert.equal(on.autoPause.enabled, true);
-  assert.equal((await api('GET', '/sessions')).find((x) => x.id === ds.id).autoPause, null);
+  assert.notEqual((await api('GET', '/sessions')).find((x) => x.id === ds.id).autoPause?.enabled, true);
   // 定時送出 with a time works in both.
   const at = Date.now() + 3600_000;
   assert.equal((await api('POST', `/sessions/${ds.id}/schedule`, { text: '繼續', at })).scheduled.length, 1);
 });
 
-test('DeepSeek models stay out of Kimi\'s defaults and migration, and the Kimi defaults do not move a DeepSeek conversation', async () => {
+test('DeepSeek models stay out of Kimi\'s migration and a Kimi conversation\'s defaults, and the Kimi defaults do not move a DeepSeek conversation', async () => {
   // The computer lists a DeepSeek model that looks like K3-256k (the fake names the first so):
   // the settings migration must not take it for Kimi's.
   const models = await api('GET', `/machines/${MID}/models`);
@@ -291,9 +300,9 @@ test('DeepSeek models stay out of Kimi\'s defaults and migration, and the Kimi d
   const st = JSON.parse(fs.readFileSync(path.join(DATA, 'settings.json'), 'utf8'));
   assert.ok(!st.defaults?.model, `no model chosen for Kimi's defaults: ${st.defaults?.model}`);
   assert.ok(!(st.migrated || []).includes('model-k3-256k'));
-  // And a DeepSeek model cannot be set as the Kimi default.
+  // A DeepSeek model may be the default for new conversations (chosen per conversation, never Kimi's own default).
   const saved = await api('PUT', '/settings', { defaults: { model: `${DS}/deepseek-v4-pro`, effort: 'max', permission: 'manual' } });
-  assert.equal(saved.defaults.model, '');
+  assert.equal(saved.defaults.model, `${DS}/deepseek-v4-pro`);
   await api('PUT', '/settings', { defaults: { model: SUB, effort: 'high', permission: 'manual' } });
 
   // Opening conversations applies the Kimi defaults to Kimi ones only.
@@ -309,21 +318,35 @@ test('DeepSeek models stay out of Kimi\'s defaults and migration, and the Kimi d
   assert.equal((await api('GET', `/sessions/${ds.id}`)).meta.model.startsWith(`${DS}/`), true);
 });
 
-test('a conversation is a DeepSeek one by its model too, and models do not cross over', async () => {
+test('a conversation is a DeepSeek one by its model too; the model can move to another source, saying where the bill goes', async () => {
   // Started in Kimi, then on a DeepSeek model (from a terminal, say): the model decides.
   machine.add('session_wander', { title: 'wanders', model: `${DS}/deepseek-v4-pro`, thinking: 'max' });
   const w = await api('POST', `/machines/${MID}/kimi/session_wander/attach`);
   assert.equal(w.mode, 'deepseek');
+  assert.equal(w.family, 'deepseek');
   const plain = (await api('GET', '/sessions')).find((x) => x.title === 'plain Kimi');
   assert.equal(plain.mode, null);
+  assert.equal(plain.family, 'kimi');
 
   const ds = (await api('GET', '/sessions')).find((x) => x.mode === 'deepseek' && x.cwd === '/tmp/project-ds');
-  await assert.rejects(api('POST', `/sessions/${ds.id}/config`, { model: SUB }), (e) => e.status === 400 && /只能用 DeepSeek/.test(e.message));
-  await assert.rejects(api('POST', `/sessions/${plain.id}/config`, { model: `${DS}/deepseek-v4-pro` }), (e) => e.status === 400 && /只能在 DeepSeek 對話/.test(e.message));
+  const infos = async (id) => (await api('GET', `/sessions/${id}`)).events.filter((e) => e.type === 'info').map((e) => e.text);
+  // DeepSeek to Kimi (it could not before): the bill is the subscription's now.
+  await api('POST', `/sessions/${ds.id}/config`, { model: SUB });
+  assert.equal(machine.profiles.filter((x) => x.sid === ds.kimiSessionId).at(-1).agent_config.model, SUB);
+  assert.equal((await api('GET', `/sessions/${ds.id}`)).family, 'kimi');
+  assert.equal((await infos(ds.id)).at(-1), '改用 kimi-for-coding：之後的回合算在 Kimi 訂閱');
+  // ... and back; Kimi to DeepSeek says whose key pays.
   await api('POST', `/sessions/${ds.id}/config`, { model: `${DS}/deepseek-v4-pro`, effort: 'low' });
   const last = machine.profiles.filter((x) => x.sid === ds.kimiSessionId).at(-1).agent_config;
   assert.deepEqual([last.model, last.thinking], [`${DS}/deepseek-v4-pro`, 'low']);
-  await api('POST', `/sessions/${plain.id}/config`, { effort: 'max' });
+  assert.equal((await infos(ds.id)).at(-1), '改用 DeepSeek V4 Pro：之後的回合算在 OpenCode Go 的 API key，不用 Kimi 訂閱');
+  await api('POST', `/sessions/${plain.id}/config`, { model: `${DS}/deepseek-v4-pro` });
+  assert.equal((await api('GET', `/sessions/${plain.id}`)).family, 'deepseek');
+  assert.match((await infos(plain.id)).at(-1), /不用 Kimi 訂閱/);
+  await api('POST', `/sessions/${plain.id}/config`, { model: SUB, effort: 'max' });
+  assert.equal((await api('GET', `/sessions/${plain.id}`)).family, 'kimi');
+  // A model of a source without a key is refused.
+  await assert.rejects(api('POST', `/sessions/${plain.id}/config`, { model: 'agent-hub-claude/claude-opus-5-5' }), (e) => e.status === 409 && /Claude API key/.test(e.message));
 });
 
 test('if Kimi has lost the provider, it is made again once; if the model still fails nothing is left running on Kimi\'s own model', async () => {

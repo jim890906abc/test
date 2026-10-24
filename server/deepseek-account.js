@@ -1,14 +1,16 @@
-// DeepSeek mode: DeepSeek models run inside the Kimi Code CLI of a connected
+// DeepSeek: DeepSeek models run inside the Kimi Code CLI of a connected
 // computer, so Kimi's own harness (context compaction, subagents, plan mode,
 // reasoning replay) does the work. The model comes from one custom Kimi
 // provider, `agent-hub-deepseek`, which the hub has the bridge create on
-// that computer (bridge op kimi.deepseek.provision), pointing at an
+// that computer (server/providers.js asks it to), pointing at an
 // OpenAI-compatible gateway that serves DeepSeek and billed to that
-// gateway's API key, never to the Kimi subscription.
+// gateway's API key, never to the Kimi subscription. A DeepSeek model can be
+// a conversation's main model, or a subagent's.
 //
-// This file is the hub's side of it: the gateway keys and the defaults for
-// new DeepSeek conversations, the DeepSeek models a key can use, and keeping
-// that provider provisioned on each computer.
+// This file is the hub's knowledge of DeepSeek: the gateway keys and the
+// defaults (kept for DeepSeek conversations started before models were
+// merged), and the DeepSeek models a key can use. Keeping the provider
+// provisioned on each computer is server/providers.js.
 //
 // Keys are kept in data/deepseek.json (readable by this user only) and never
 // sent to a browser; pages see only the last four characters. They do go to
@@ -16,7 +18,6 @@
 // config on that computer (Kimi keeps provider keys in its config.toml).
 import fs from 'node:fs';
 import path from 'node:path';
-import crypto from 'node:crypto';
 import { DATA_DIR } from './store.js';
 import * as machines from './machines.js';
 
@@ -106,7 +107,6 @@ function save() {
 // For the tests: read the file again.
 export function reload() {
   saved = load();
-  provisioned.clear();
 }
 
 export const isGateway = (id) => Object.hasOwn(GATEWAYS, id);
@@ -292,86 +292,16 @@ export async function refreshModels(gw, key) {
 
 // ------------------------------------------------- Kimi on the computers
 
-const provisioned = new Map(); // machine id -> { sig, at }
+// Computers where the provider could not be given its session header (the
+// bridge says why): the gateway may throttle those. Set by providers.js.
 const headerWarnings = new Map(); // machine id -> why the provider has no session header
-const provisioning = new Map(); // machine id -> Promise
-
-const sigOf = (gw, key, ids) => crypto.createHash('sha256').update(JSON.stringify([gw, key, ids])).digest('hex');
-
-// An older bridge does not know the op.
-const tooOld = (err, m) => (/未知的操作/.test(err?.message || '') ? Object.assign(new Error(`「${m?.name || '這台電腦'}」的連接器太舊，不支援 DeepSeek 模式。在那台電腦重新執行連接指令（左下角「連接電腦…」）後再試。`), { status: 409 }) : err);
-
-// Make sure `machineId`'s Kimi has the agent-hub-deepseek provider for the
-// gateway and key in use, with its models. Asked of the bridge once per
-// (computer, gateway, key, model list); again when any of those changes, when
-// the computer reconnects, or after an error. Resolves to the bridge's
-// answer ({ ok, models: [alias], secondaryModel? }), or { cached: true }.
-export async function ensureProvider(machineId, { rpc = machines.rpc } = {}) {
-  const gw = gateway();
-  const key = apiKey(gw);
-  if (!key) throw Object.assign(new Error('還沒有設定 DeepSeek 的 API key。在「設定」→「DeepSeek…」貼上閘道的 API key。'), { status: 409, code: 'no_key' });
-  const ids = modelIds(gw);
-  const sig = sigOf(gw, key, ids);
-  if (provisioned.get(machineId)?.sig === sig) return { ok: true, cached: true, models: ids.map(aliasFor) };
-  const pending = provisioning.get(machineId);
-  if (pending?.sig === sig) return pending.promise;
-  const promise = (async () => {
-    try {
-      const r = await rpc(machineId, 'kimi.deepseek.provision', { gateway: gw, apiKey: key, models: ids.map(kimiModel) }, 60_000);
-      provisioned.set(machineId, { sig, at: Date.now() });
-      if (r?.secondaryModel) secondary.set(machineId, r.secondaryModel);
-      else secondary.delete(machineId);
-      if (r?.sessionHeader === false) headerWarnings.set(machineId, r.warning || '沒有加上 session 標頭');
-      else headerWarnings.delete(machineId);
-      return r;
-    } catch (err) {
-      provisioned.delete(machineId);
-      throw tooOld(err, machines.getMachine(machineId));
-    } finally {
-      provisioning.delete(machineId);
-    }
-  })();
-  provisioning.set(machineId, { sig, promise });
-  return promise;
+export function setHeaderWarning(machineId, text) {
+  if (text) headerWarnings.set(machineId, text);
+  else headerWarnings.delete(machineId);
 }
 
-// The key or gateway changed: the computers that have the provider get the
-// new one now (best effort), so a revoked key does not linger in their Kimi.
-// Resolves to the ids of the computers it was changed on.
-export async function reprovision({ rpc = machines.rpc } = {}) {
-  const done = [];
-  if (!apiKey()) return done;
-  await Promise.all(
-    [...provisioned.keys()].map(async (id) => {
-      try {
-        const r = await ensureProvider(id, { rpc });
-        if (!r.cached) done.push(id);
-      } catch {}
-    }),
-  );
-  return done;
-}
-
-// The computer's Kimi may have lost the provider (its config was edited, or
-// it was reinstalled): ask for it again next time.
-export const forgetProvider = (machineId) => provisioned.delete(machineId);
-machines.onBridgeHello((id) => forgetProvider(id));
-
-// Take the provider (and the key in it) off the computers it was put on.
-export async function removeProviders({ rpc = machines.rpc } = {}) {
-  const ids = [...provisioned.keys()];
-  await Promise.all(ids.map((id) => rpc(id, 'kimi.deepseek.remove', {}, 30_000).catch(() => null)));
-  provisioned.clear();
-  headerWarnings.clear();
-}
-
-// A computer's [secondary_model], as the bridge last saw it (see
-// secondaryModels for asking).
-const secondary = new Map();
-
-// The computers whose Kimi has a [secondary_model]: subagents of a DeepSeek
-// conversation may run on it, and it may be a subscription model. The hub
-// never changes it; the settings dialog says so.
+// The computers whose Kimi has a [secondary_model] (the pool subagents may
+// run on; providers.js keeps it, see syncPool).
 export async function secondaryModels({ rpc = machines.rpc, list = machines.listMachines } = {}) {
   const out = [];
   await Promise.all(
