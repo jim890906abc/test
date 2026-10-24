@@ -1,6 +1,8 @@
-// Agent Hub — Kimi Code on all your machines, DeepSeek models inside that Kimi
-// (billed to a gateway's API key), and Claude through the Claude API (run by
-// the hub on this computer), in one window.
+// Agent Hub — Kimi Code on all your machines, in one window. One kind of
+// conversation: Kimi Code on a computer, with any model as the main model
+// (Kimi subscription, DeepSeek by a gateway's API key, Claude by an Anthropic
+// API key) and any model for its subagents. The color scheme (配色) is a
+// choice of its own, not something a model decides.
 import { h, fill, icon, relTime, dayGroup, shortPath, baseName, copyText, clockTime, fmtCountdown } from './dom.js';
 import { get, post, put, del, patch as apiPatch, connect, setToken } from './api.js';
 import { renderHunks, parseUnifiedDiff, renderMarkdown } from './markdown.js';
@@ -12,11 +14,9 @@ import { ArtifactView, downloadHtml, htmlTitle } from './artifacts.js';
 const S = {
   config: null,
   machines: [],
-  sessions: new Map(), // hub sessions: Kimi conversations taken over by the hub, and Claude conversations
-  claude: null, // the Claude API account: { hasKey, keyHint, keySource, defaults, webTools }
-  claudeModels: null, // { defaultModel, models } this key can use
-  deepseek: null, // the DeepSeek account: { gateway, hasKey, keyHint, gateways, defaults }
-  deepseekModels: null, // { gateway, defaultModel, models } of the gateway in use
+  sessions: new Map(), // hub sessions: Kimi conversations taken over by the hub (and old Claude API conversations)
+  claude: null, // the Claude API account: { hasKey, keyHint, keySource, webTools }
+  deepseek: null, // the DeepSeek account: { gateway, hasKey, keyHint, gateways }
   cur: null, // { id, summary, seq, transcript }
   route: null,
   panel: null, // { tab: 'artifact' | 'changes', path, version, wide }
@@ -37,7 +37,9 @@ const CLAUDE_INIT_PROMPT =
 
 function loadHome() {
   try {
-    return JSON.parse(localStorage.getItem('hubHome') || '{}');
+    // What the home screen kept for the three separate modes is not used any more.
+    const { agent, claude, deepseek, ...home } = JSON.parse(localStorage.getItem('hubHome') || '{}');
+    return home;
   } catch {
     return {};
   }
@@ -59,21 +61,14 @@ function togglePin(key) {
 }
 
 // New conversations start from the defaults in 設定; what is picked on the
-// home screen applies to that one conversation.
+// home screen applies to that one conversation. 子代理 model: 'primary' (the
+// conversation's own model) or a model alias.
 const defaults = () => S.config?.settings?.defaults || {};
 function resetHomeChoices() {
   const d = defaults();
-  Object.assign(S.home, { model: d.model || '', effort: d.effort || '', permission: d.permission || 'manual', planMode: Boolean(d.planMode) });
-  // Claude's own defaults (Claude API 設定); the folder stays.
-  const c = S.claude?.defaults || {};
-  S.home.claude = { ...(S.home.claude || {}), model: c.model || '', effort: c.effort || '', permission: c.permission || 'manual', planMode: Boolean(c.planMode) };
-  // And DeepSeek's (DeepSeek 設定).
-  const x = S.deepseek?.defaults || {};
-  S.home.deepseek = { model: x.model || '', effort: x.effort || '', permission: x.permission || 'manual', planMode: Boolean(x.planMode) };
+  Object.assign(S.home, { model: d.model || '', effort: d.effort || '', permission: d.permission || 'manual', planMode: Boolean(d.planMode), subagentModel: d.subagentModel || 'primary' });
   saveHome();
   updateHomeComposer();
-  updateClaudeHome();
-  updateDeepseekHome();
 }
 
 function saveHome() {
@@ -84,16 +79,20 @@ function saveHome() {
 
 const machineById = (id) => S.machines.find((m) => m.id === id);
 const busy = (status) => status === 'running' || status === 'awaiting_permission';
-// Claude through the Claude API (run by the hub), as opposed to Kimi.
-const isClaude = (s) => s?.agentId === 'claude';
-// A DeepSeek conversation: a Kimi one whose model is a DeepSeek model from
-// the hub's provider in Kimi (the hub says so in `mode`; the model decides
-// for conversations it has not seen start).
-const DEEPSEEK_PREFIX = 'agent-hub-deepseek/';
-const isDsModel = (id) => typeof id === 'string' && id.startsWith(DEEPSEEK_PREFIX);
-const isDeepseek = (s) => !isClaude(s) && (s?.mode === 'deepseek' || isDsModel(s?.meta?.model));
-const agentOf = (s) => (isClaude(s) ? 'claude' : isDeepseek(s) ? 'deepseek' : 'kimi');
-const nameFor = (s) => agentName(agentOf(s));
+// An old conversation the hub ran itself through the Claude API (before
+// Claude moved into Kimi Code); it still opens and works as it did.
+const isLegacyClaude = (s) => s?.agentId === 'claude';
+// What a model belongs to: Kimi's own, or one of the hub's providers in Kimi
+// (DeepSeek by a gateway key, Claude by an Anthropic key).
+const FAMILIES = ['kimi', 'deepseek', 'claude'];
+const modelFamily = (id) => (typeof id === 'string' && id.startsWith('agent-hub-deepseek/') ? 'deepseek' : typeof id === 'string' && id.startsWith('agent-hub-claude/') ? 'claude' : 'kimi');
+// The server says (`family`, from the conversation's current model); older
+// conversations are told apart by `mode` or by their model.
+const familyOf = (s) => (isLegacyClaude(s) ? 'claude' : FAMILIES.includes(s?.family) ? s.family : s?.mode === 'deepseek' ? 'deepseek' : modelFamily(s?.meta?.model));
+// DeepSeek and Claude models are paid per use, not from the Kimi plan: no
+// plan quota, no auto-pause.
+const isMetered = (s) => !isLegacyClaude(s) && familyOf(s) !== 'kimi';
+const nameFor = (s) => agentName(familyOf(s));
 const hostName = () => S.config?.hostname || '這台電腦';
 
 function toast(text, { action, onAction, kind = '' } = {}) {
@@ -187,23 +186,61 @@ function applyTheme(t, { save = true } = {}) {
 }
 const theme = () => document.documentElement.dataset.theme || 'auto';
 
-// Claude mode (the Claude home, a Claude conversation) wears Claude's own
-// near-black look, and DeepSeek mode DeepSeek's blue and white (app.css,
-// data-agent); the theme above is for Kimi.
-const LOOK_COLORS = { claude: '#141413', deepseek: '#ffffff' };
-function setLook(agent) {
-  const look = LOOK_COLORS[agent] ? agent : 'kimi';
+// 配色: the color scheme is the user's choice (設定 → 配色), the same on the
+// home screen, in every conversation and in every dialog; it does not follow
+// the model or the kind of conversation. Three looks that are tokens in
+// app.css: Kimi's Oatmeal (the default, with 淺色／深色／跟系統 above), Claude's
+// black and orange (data-look="claude") and DeepSeek's blue and white
+// (data-look="deepseek"); the last two are one fixed scheme, whatever the theme.
+// `swatch`: the colors of the little preview (fixed, not the live tokens).
+const LOOKS = {
+  kimi: { name: 'Kimi', desc: 'Oatmeal 米色，可以選淺色、深色或跟系統一樣', color: null, swatch: { bg: '#f6f0e4', side: '#ece3d2', raised: '#fdfaf4', ink: '#2b241b', accent: '#94501b' } },
+  claude: { name: 'Claude 黑橘', desc: '近黑底色配橘色', color: '#141413', swatch: { bg: '#141413', side: '#0f0f0e', raised: '#1f1e1c', ink: '#faf9f5', accent: '#d97757' } },
+  deepseek: { name: 'DeepSeek 藍白', desc: '白底配 DeepSeek 藍', color: '#ffffff', swatch: { bg: '#ffffff', side: '#f7f9ff', raised: '#f5f8ff', ink: '#1b1f33', accent: '#4d6bfe' } },
+};
+const LOOK_KEY = 'hubLookChoice';
+const savedLook = () => {
+  try {
+    const v = localStorage.getItem(LOOK_KEY);
+    return LOOKS[v] ? v : null;
+  } catch {
+    return null;
+  }
+};
+const look = () => document.documentElement.dataset.look || 'kimi';
+function applyLook(next, { save = true } = {}) {
+  const l = LOOKS[next] ? next : 'kimi';
   const root = document.documentElement;
-  if (look !== 'kimi') root.dataset.agent = look;
-  else delete root.dataset.agent;
+  if (l !== 'kimi') root.dataset.look = l;
+  else delete root.dataset.look;
+  // The browser's own bar follows (Kimi: light and dark as before).
   for (const m of document.querySelectorAll('meta[name="theme-color"]')) {
     m.dataset.base ??= m.content;
-    m.content = LOOK_COLORS[look] || m.dataset.base;
+    m.content = LOOKS[l].color || m.dataset.base;
   }
+  if (!save) return;
   // index.html puts it back on before the first paint of the next visit.
   try {
-    localStorage.setItem('hubLook', look);
+    localStorage.setItem(LOOK_KEY, l);
   } catch {}
+}
+
+// PUT /api/settings replaces the defaults it is sent: always send them whole.
+async function saveSettings(patch = {}) {
+  const cur = S.config?.settings || {};
+  const body = { ...cur, ...patch, defaults: { ...(cur.defaults || {}), ...(patch.defaults || {}) } };
+  const r = await put('/settings', body);
+  if (r && typeof r === 'object' && S.config) S.config.settings = r;
+  return S.config?.settings;
+}
+
+// A look chosen here is kept in this browser (it is what the page paints
+// first) and, when the hub keeps it too (settings.look), for other browsers
+// that have not chosen yet; a hub that ignores it changes nothing.
+function chooseLook(next) {
+  applyLook(next);
+  if (S.config?.settings) S.config.settings.look = next;
+  saveSettings({ look: next }).catch(() => {});
 }
 
 // ------------------------------------------------------------- sidebar
@@ -220,12 +257,12 @@ function rows() {
       const s = followed.get(key);
       followed.delete(key);
       const status = s ? s.status : k.busy ? (k.pending && k.pending !== 'none' ? 'awaiting_permission' : 'running') : k.lastTurn === 'failed' ? 'error' : 'idle';
-      out.push({ key, hub: s, kimi: k, machine: m, title: s?.title || k.title || '新對話', cwd: s?.cwd || k.cwd, status, deepseek: s ? isDeepseek(s) : isDsModel(k.model), updatedAt: Math.max(s?.updatedAt || 0, k.updatedAt || 0) });
+      out.push({ key, hub: s, kimi: k, machine: m, title: s?.title || k.title || '新對話', cwd: s?.cwd || k.cwd, status, family: s ? familyOf(s) : modelFamily(k.model), updatedAt: Math.max(s?.updatedAt || 0, k.updatedAt || 0) });
     }
   }
-  for (const [key, s] of followed) out.push({ key, hub: s, machine: machineById(s.machineId), title: s.title, cwd: s.cwd, status: s.status, deepseek: isDeepseek(s), updatedAt: s.updatedAt, offline: !machineById(s.machineId)?.online });
+  for (const [key, s] of followed) out.push({ key, hub: s, machine: machineById(s.machineId), title: s.title, cwd: s.cwd, status: s.status, family: familyOf(s), updatedAt: s.updatedAt, offline: !machineById(s.machineId)?.online });
   // Claude conversations live on the hub itself.
-  for (const s of S.sessions.values()) if (isClaude(s)) out.push({ key: `claude:${s.id}`, hub: s, claude: true, title: s.title || '新對話', cwd: s.cwd, status: s.status, updatedAt: s.updatedAt });
+  for (const s of S.sessions.values()) if (isLegacyClaude(s)) out.push({ key: `claude:${s.id}`, hub: s, claude: true, family: 'claude', title: s.title || '新對話', cwd: s.cwd, status: s.status, updatedAt: s.updatedAt });
   return out.sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
@@ -257,7 +294,7 @@ function drawSidebar() {
     multi,
     all.length,
     S.machines.some((m) => m.online),
-    [...groups].map(([g, rs]) => [g, rs.map((r) => [r.key, r.title, r.cwd, r.status, r.offline, r.claude, r.deepseek, r.kimi?.owner || r.hub?.meta?.owner, r.machine?.name, relTime(r.updatedAt)])]),
+    [...groups].map(([g, rs]) => [g, rs.map((r) => [r.key, r.title, r.cwd, r.status, r.offline, r.claude, r.family, r.kimi?.owner || r.hub?.meta?.owner, r.machine?.name, relTime(r.updatedAt)])]),
   ]);
   if (sig === lastSidebar) return;
   lastSidebar = sig;
@@ -268,7 +305,7 @@ function drawSidebar() {
       const href = r.hub ? `#/s/${r.hub.id}` : `#/k/${r.machine.id}/${r.kimi.id}`;
       const active = current && ((r.hub && r.hub.id === current.id) || (r.kimi && current.kimiSessionId === r.kimi.id && current.machineId === r.machine?.id));
       const owner = r.kimi?.owner || r.hub?.meta?.owner;
-      const sub = (r.claude ? ['Claude', r.hub.machineId ? r.hub.meta?.machineName || machineById(r.hub.machineId)?.name : null, r.cwd ? baseName(r.cwd) : null] : [owner === 'tui' ? '終端機' : null, multi && r.machine ? r.machine.name : null, r.cwd ? baseName(r.cwd) : null]).filter(Boolean).join(' · ');
+      const sub = (r.claude ? [r.hub.machineId ? r.hub.meta?.machineName || machineById(r.hub.machineId)?.name : null, r.cwd ? baseName(r.cwd) : null] : [owner === 'tui' ? '終端機' : null, multi && r.machine ? r.machine.name : null, r.cwd ? baseName(r.cwd) : null]).filter(Boolean).join(' · ');
       items.push(
         h(
           'a',
@@ -284,7 +321,7 @@ function drawSidebar() {
               rowMenu(r, pointAnchor(e.clientX, e.clientY));
             },
           },
-          h('span', { class: 'row-text' }, h('span', { class: 'row-title' }, r.title), h('span', { class: 'row-sub' }, r.deepseek ? h('span', { class: 'row-tag ds', title: '在 Kimi 裡執行 DeepSeek 模型，不用 Kimi 訂閱' }, 'DeepSeek') : null, sub || relTime(r.updatedAt))),
+          h('span', { class: 'row-text' }, h('span', { class: 'row-title' }, r.title), h('span', { class: 'row-sub' }, familyTag(r), sub || relTime(r.updatedAt))),
           r.status === 'awaiting_permission'
             ? h('span', { class: 'om-badge om-badge--warning' }, '需要你')
             : r.status === 'running'
@@ -313,12 +350,19 @@ function drawSidebar() {
     }
   }
   if (!all.length) {
-    items.push(h('div', { class: 'side-empty' }, S.machines.some((m) => m.online) ? '在任一台電腦的 Kimi 裡輸入 /web，或在這裡開一個新對話（Kimi 或 Claude）。' : '在這裡開一個 Claude 對話，或連接一台電腦使用 Kimi，對話會出現在這裡。'));
+    items.push(h('div', { class: 'side-empty' }, S.machines.some((m) => m.online) ? '在任一台電腦的 Kimi 裡輸入 /web，或在這裡開一個新對話。' : '連接一台電腦，對話會出現在這裡。'));
   }
   fill($list, ...items);
   $search.parentElement.hidden = all.length < 8 && !S.query;
   drawFoot();
   updateTitle();
+}
+
+// The tag on a conversation whose model is not Kimi's own.
+function familyTag(r) {
+  if (r.family === 'deepseek') return h('span', { class: 'row-tag ds', title: '用 DeepSeek 模型，費用算在閘道的 API key，不用 Kimi 訂閱' }, 'DeepSeek');
+  if (r.family === 'claude') return h('span', { class: 'row-tag cl', title: r.claude ? 'Claude API 對話（中控台直接執行），按用量計費' : '用 Claude 模型，費用算在 Anthropic 的 API key，不用 Kimi 訂閱' }, 'Claude');
+  return null;
 }
 
 // Right-click (or the … button) on a conversation in the sidebar.
@@ -429,19 +473,23 @@ function drawFoot() {
 
 function settingsMenu(anchor) {
   const t = theme();
+  // 淺色／深色 belong to the Kimi look; the other two looks are one scheme.
+  const kimi = look() === 'kimi';
   const canNotify = typeof Notification !== 'undefined' && Notification.permission === 'default';
   openMenu(
     anchor,
     [
       { section: '外觀' },
-      { label: '跟系統一樣', checked: t === 'auto', onSelect: () => applyTheme(null) },
-      { label: '淺色', checked: t === 'light', onSelect: () => applyTheme('light') },
-      { label: '深色', checked: t === 'dark', onSelect: () => applyTheme('dark') },
+      { label: '跟系統一樣', checked: t === 'auto', disabled: !kimi, onSelect: () => applyTheme(null) },
+      { label: '淺色', checked: t === 'light', disabled: !kimi, onSelect: () => applyTheme('light') },
+      { label: '深色', checked: t === 'dark', disabled: !kimi, onSelect: () => applyTheme('dark') },
+      kimi ? null : { node: h('div', { class: 'menu-note' }, `${LOOKS[look()].name} 配色固定一種明暗，淺色／深色只用在 Kimi 配色`) },
+      { label: '配色…', hint: LOOKS[look()].name, onSelect: openSettings },
       { separator: true },
-      canNotify ? { label: '開啟通知', description: 'Kimi 或 Claude 需要你的時候通知你', onSelect: () => Notification.requestPermission().then(() => toast('已開啟通知')) } : null,
-      { label: '設定…', description: 'Kimi 新對話預設的模型、思考強度、權限', onSelect: openSettings },
-      { label: 'Claude API…', description: 'API key 與 Claude 新對話的預設', onSelect: claudeDialog },
-      { label: 'DeepSeek…', description: '閘道、API key 與 DeepSeek 新對話的預設', onSelect: deepseekDialog },
+      canNotify ? { label: '開啟通知', description: 'Kimi 需要你的時候通知你', onSelect: () => Notification.requestPermission().then(() => toast('已開啟通知')) } : null,
+      { label: '設定…', description: '配色、模型來源、新對話的預設', onSelect: openSettings },
+      { label: 'Claude API…', description: 'API key（Claude 模型的來源）', onSelect: claudeDialog },
+      { label: 'DeepSeek…', description: '閘道與 API key（DeepSeek 模型的來源）', onSelect: deepseekDialog },
       { label: 'Google Drive 備份…', description: '/backup 把專案資料夾備份到你的 Google Drive', onSelect: gdriveDialog },
       { label: 'GitHub…', description: '讓 Claude 和 Kimi 用你的 GitHub 帳號', onSelect: githubDialog },
       { label: '連接電腦…', onSelect: openMachines },
@@ -476,7 +524,7 @@ function checkAttention(all) {
       continue;
     }
     if (!here) toast(`「${r.title}」需要你核准`, { action: '查看', onAction: open });
-    notify(`${r.claude ? 'Claude' : r.deepseek ? 'DeepSeek' : 'Kimi'} 需要你`, r.title, open);
+    notify(`${agentName(r.family)} 需要你`, r.title, open);
   }
 }
 
@@ -508,7 +556,6 @@ async function route() {
 
 // All pages Kimi made, across conversations, like Claude's Artifacts list.
 async function showArtifacts() {
-  setLook('kimi');
   leaveSession();
   hidePanel();
   S.route = 'artifacts';
@@ -545,8 +592,6 @@ async function showArtifacts() {
 }
 
 async function attachAndOpen(machineId, kimiSessionId) {
-  // The machine's list says which model it last ran on.
-  setLook(isDsModel(machineById(machineId)?.sessions?.find((x) => x.id === kimiSessionId)?.model) ? 'deepseek' : 'kimi');
   leaveSession();
   S.route = `k:${kimiSessionId}`;
   fill($toolbar, sidebarToggle(), h('div', { class: 'toolbar-titles' }, h('div', { class: 'om-toolbar__title' }, rows().find((r) => r.kimi?.id === kimiSessionId)?.title || '載入中…')));
@@ -563,39 +608,166 @@ async function attachAndOpen(machineId, kimiSessionId) {
 // ---------------------------------------------------------------- home
 
 let homeComposer = null;
+let homeEls = null; // { title, hint }: follow the main model chosen
 
 function homeMachine() {
   const ready = S.machines.filter((m) => m.online && m.kimi?.available);
   return machineById(S.home.machineId && ready.some((m) => m.id === S.home.machineId) ? S.home.machineId : ready[0]?.id) || null;
 }
 
-// Which agent a new conversation goes to: Kimi on a connected machine, a
-// DeepSeek model in that Kimi, or Claude through the Claude API, run here.
-const homeAgent = () => (['kimi', 'claude', 'deepseek'].includes(S.home.agent) ? S.home.agent : S.machines.length ? 'kimi' : 'claude');
+// ------------------------------------------------------- model sources
 
-function agentSwitch(cur) {
-  const pick = (a) => {
-    S.home.agent = a;
-    saveHome();
-    showHome();
-  };
-  return h(
-    'div',
-    { class: 'om-seg om-seg--sm home-agent', role: 'group', 'aria-label': '用哪個 agent' },
-    h('button', { class: 'om-seg__item', type: 'button', 'aria-pressed': String(cur === 'kimi'), title: '你電腦上的 Kimi Code（用那台電腦登入的 Kimi 帳號）', onclick: () => pick('kimi') }, 'Kimi Code'),
-    h('button', { class: 'om-seg__item', type: 'button', 'aria-pressed': String(cur === 'claude'), title: 'Claude API（Claude Console 的 API key，按用量計費）', onclick: () => pick('claude') }, 'Claude API'),
-    h('button', { class: 'om-seg__item', type: 'button', 'aria-pressed': String(cur === 'deepseek'), title: 'DeepSeek 模型，在你電腦上的 Kimi Code 裡執行（閘道的 API key，不用 Kimi 訂閱）', onclick: () => pick('deepseek') }, 'DeepSeek'),
-  );
+// The models a computer can run, by where they come from: Kimi's own
+// (subscription), DeepSeek (a gateway's API key) and Claude (an Anthropic API
+// key). GET /api/models?machineId= says which are set up (`ready`) and lists
+// their models; an older hub is read from the machine's own model list.
+const SOURCE_NAMES = { kimi: 'Kimi 訂閱', deepseek: 'DeepSeek', claude: 'Claude API' };
+const BILLING_TAGS = { subscription: '訂閱', plan: '訂閱', gateway: '閘道計費', metered: '按量計費', api: '按量計費', usage: '按量計費' };
+const billingTag = (b) => BILLING_TAGS[b] || (typeof b === 'string' ? b : '');
+const dsGateway = () => (S.deepseek?.gateways || []).find((g) => g.id === S.deepseek?.gateway) || null;
+const dsLabel = () => dsGateway()?.label || 'DeepSeek 閘道';
+function sourceTitle(src) {
+  const label = src.label || SOURCE_NAMES[src.id] || src.id;
+  if (src.id === 'deepseek' && !/[（(]/.test(label) && dsGateway()) return `${label}（${dsGateway().label}）`;
+  return label;
+}
+
+const catalogs = new Map(); // machine id -> { cat, p }
+const catalogOf = (machineId) => (machineId ? catalogs.get(machineId)?.cat || null : null);
+const allModels = (cat) => (cat?.sources || []).flatMap((x) => x.models);
+
+function normalizeCatalog(r, legacy) {
+  const fix = (m, family) => ({ ...m, name: m.name || String(m.id).split('/').pop(), efforts: Array.isArray(m.efforts) ? m.efforts : [], family: FAMILIES.includes(m.family) ? m.family : family });
+  let sources = Array.isArray(r?.sources) ? r.sources.filter((x) => x && typeof x.id === 'string').map((x) => ({ ...x, ready: x.ready !== false, models: (x.models || []).filter((m) => m?.id).map((m) => fix(m, x.id)) })) : null;
+  if (!sources) {
+    if (!Array.isArray(legacy?.models)) return null;
+    const own = [];
+    const ds = [];
+    for (const m of legacy.models) (m.deepseek ? ds : own).push(fix(m, m.deepseek ? 'deepseek' : 'kimi'));
+    sources = [{ id: 'kimi', billing: 'subscription', ready: true, models: own }, ...(ds.length ? [{ id: 'deepseek', billing: 'gateway', ready: true, models: ds }] : [])];
+  }
+  const has = (id) => id && sources.some((x) => x.models.some((m) => m.id === id));
+  const defaultModel = [r?.defaultModel, legacy?.defaultModel].find(has) || sources.find((x) => x.id === 'kimi')?.models[0]?.id || sources.flatMap((x) => x.models)[0]?.id || '';
+  return { sources, scope: r?.subagentEffortScope || 'none', defaultModel };
+}
+
+function loadCatalog(machineId, force = false) {
+  if (!machineId) return Promise.resolve(null);
+  const have = catalogs.get(machineId);
+  if (have && !force) return have.p;
+  const e = { cat: have?.cat || null };
+  const q = encodeURIComponent(machineId);
+  e.p = Promise.all([get(`/models?machineId=${q}`).catch(() => null), get(`/machines/${q}/models`).catch(() => null)]).then(([r, legacy]) => {
+    const cat = normalizeCatalog(r, legacy);
+    if (!cat) {
+      if (catalogs.get(machineId) === e) catalogs.delete(machineId); // try again next time
+      return e.cat;
+    }
+    e.cat = cat;
+    catalogChanged(machineId);
+    return cat;
+  });
+  catalogs.set(machineId, e);
+  return e.p;
+}
+
+// A key was set or removed (here or elsewhere): every list is read again.
+function refreshCatalogs() {
+  const ids = new Set([homeMachine()?.id, S.cur?.summary?.machineId].filter(Boolean));
+  catalogs.clear();
+  for (const id of ids) loadCatalog(id);
+}
+
+// New models on screen: the home composer, the open conversation's controls and
+// its subagent cards (which name their model).
+function catalogChanged(machineId) {
+  if (S.route === 'home') updateHomeComposer();
+  const cur = S.cur;
+  if (cur && cur.summary?.machineId === machineId) {
+    cur.composerSig = '';
+    updateComposer();
+    for (const id of cur.transcript.agentIds) cur.transcript.markDirty(id);
+  }
+}
+
+// The groups of the model menus: a header, a billing tag and, for a source
+// that is not set up, one 「設定…」 row.
+const menuSources = (cat) =>
+  (cat?.sources || []).map((src) => ({ id: src.id, title: sourceTitle(src), tag: billingTag(src.billing), ready: src.ready, setupLabel: src.ready ? null : src.id === 'kimi' ? '連接電腦…' : '設定…', models: src.models }));
+
+// A model's name, wherever it is known.
+function modelName(alias) {
+  if (!alias || alias === 'primary') return '';
+  for (const e of catalogs.values()) {
+    const m = allModels(e.cat).find((x) => x.id === alias);
+    if (m) return m.name;
+  }
+  return (S.cur?.summary?.meta?.models || []).find((x) => x.id === alias)?.name || String(alias).split('/').pop();
+}
+
+// 子代理: which model its subagents run on, and where their thinking comes
+// from. How hard a model thinks as a subagent is one setting per model, shared
+// by every conversation (設定); there is no per-conversation control for it.
+const subagentLabel = (sub) => (!sub || sub === 'primary' ? '跟主模型一樣' : modelName(sub));
+const subagentEffortOf = (alias, m) => defaults().subagentEfforts?.[alias] || m?.subagentDefaultEffort || m?.defaultEffort || '';
+function subagentNote(sub, cat) {
+  if (!sub || sub === 'primary') return '思考強度跟主模型';
+  const m = allModels(cat).find((x) => x.id === sub);
+  if ((m?.family || modelFamily(sub)) === 'kimi') return '思考強度由 Kimi 決定';
+  if (cat?.scope !== 'per-model') return '子代理用模型自己的預設思考強度';
+  const e = subagentEffortOf(sub, m);
+  return e ? `思考強度：${EFFORT_LABELS[e] || e}（依模型設定，在「設定」改）` : '思考強度依模型設定，在「設定」改';
+}
+
+// What a subagent card says about its model: 「模型 · 思考 強度」, and whether
+// that is the conversation's own model (子代理「跟主模型一樣」).
+function subagentInfo(sub) {
+  if (!sub) return null;
+  const s = S.cur?.summary;
+  const alias = sub.model || sub.served || '';
+  const primary = sub.primary === true || (s?.subagent?.model === 'primary' && (!alias || alias === s?.meta?.model));
+  const text = [modelName(alias), sub.effort ? `思考 ${EFFORT_LABELS[sub.effort] || sub.effort}` : ''].filter(Boolean).join(' · ');
+  return text || primary ? { text, primary } : null;
+}
+
+// A key (Claude, DeepSeek) or a computer to connect: where a source is set up.
+function setupSource(id) {
+  if (id === 'deepseek') return deepseekDialog();
+  if (id === 'claude') return claudeDialog();
+  return openMachines();
+}
+
+// ---------------------------------------------------------- the new conversation
+
+// What the home screen has chosen, resolved against what the computer offers.
+function homeSelection() {
+  const m = homeMachine();
+  const cat = m ? catalogOf(m.id) : null;
+  const models = allModels(cat);
+  const chosen = S.home.model && models.some((x) => x.id === S.home.model) ? S.home.model : '';
+  const used = models.find((x) => x.id === (chosen || cat?.defaultModel)) || null;
+  // The thinking chosen (or from 設定), when the model that will be used
+  // (the one picked, or the default) offers it.
+  const effort = S.home.effort && used?.efforts?.includes(S.home.effort) ? S.home.effort : '';
+  const sub = S.home.subagentModel && S.home.subagentModel !== 'primary' && models.some((x) => x.id === S.home.subagentModel) ? S.home.subagentModel : 'primary';
+  return { m, cat, models, chosen, used, effort, sub };
+}
+
+const homeFamily = (used) => used?.family || (used ? modelFamily(used.id) : 'kimi');
+
+function homeHint(m, family) {
+  if (!m) return '連接的電腦目前都沒有執行中的 Kimi。在那台電腦的 Kimi 裡輸入 /web，或執行 kimi web。';
+  if (family === 'deepseek') return `會在「${m.name}」上的 Kimi Code 用 DeepSeek 模型執行，費用算在 ${dsLabel()} 的 API key，不用 Kimi 訂閱。${(S.deepseek?.warnings || []).some((w) => w.machineId === m.id) ? `注意：那台電腦的 DeepSeek 模型來源沒能加上 session 標頭，${dsLabel()} 可能會限流。` : ''}`;
+  if (family === 'claude') return `會在「${m.name}」上的 Kimi Code 用 Claude 模型執行，費用按用量從 Claude Console 帳戶扣款，不用 Kimi 訂閱。`;
+  return `會在「${m.name}」上的 Kimi 執行，用那台電腦登入的帳號。`;
 }
 
 async function showHome() {
-  setLook(homeAgent());
   leaveSession();
   S.route = 'home';
   hidePanel();
   renderToolbar();
-  if (homeAgent() === 'claude') return showClaudeHome();
-  if (homeAgent() === 'deepseek') return showDeepseekHome();
+  homeEls = null;
   const m = homeMachine();
   if (!S.machines.length) {
     fill(
@@ -606,9 +778,8 @@ async function showHome() {
         h(
           'div',
           { class: 'home-inner empty' },
-          agentSwitch('kimi'),
           h('div', { class: 'large-title' }, '先連接一台電腦'),
-          h('p', { class: 'home-lead' }, '中控台透過你電腦上的連接器操作 Kimi Code。Kimi 只在你自己的電腦上登入，中控台不需要你的 Kimi 帳號。'),
+          h('p', { class: 'home-lead' }, '中控台透過你電腦上的連接器操作 Kimi Code。Kimi 只在你自己的電腦上登入，中控台不需要你的 Kimi 帳號。Claude 和 DeepSeek 模型也在那台電腦的 Kimi Code 裡執行。'),
           h('button', { class: 'om-btn om-btn--primary om-btn--lg', type: 'button', onclick: openMachines }, '連接電腦…'),
         ),
       ),
@@ -617,7 +788,7 @@ async function showHome() {
   }
   homeComposer ??= new Composer({
     home: true,
-    placeholder: '要讓 Kimi 做什麼？輸入 / 看指令',
+    homePlaceholder: (name) => `要讓 ${name} 做什麼？輸入 / 看指令`,
     onSend: startSession,
     onCommand: homeCommand,
     onPickUploadDir: (anchor, cur, set) => homeMachine() && uploadDirMenu(anchor, homeMachine(), null, cur, set),
@@ -627,69 +798,56 @@ async function showHome() {
       if (c.effort) S.home.effort = c.effort;
       if (c.permission) S.home.permission = c.permission;
       if ('planMode' in c) S.home.planMode = c.planMode;
+      if (c.subagent?.model) S.home.subagentModel = c.subagent.model;
       saveHome();
       updateHomeComposer();
     },
+    onSetupSource: setupSource,
     onPickMachine: machineMenu,
     onPickFolder: folderMenu,
     onError: (t) => toast(t),
   });
   homeComposer.setKey('home');
-  fill(
-    $view,
-    h(
-      'div',
-      { class: 'home' },
-      h(
-        'div',
-        { class: 'home-inner' },
-        agentSwitch('kimi'),
-        h('div', { class: 'large-title' }, '要讓 Kimi 做什麼？'),
-        homeComposer.el,
-        h('p', { class: 'home-hint' }, m ? `會在「${m.name}」上的 Kimi 執行，用那台電腦登入的帳號。` : '連接的電腦目前都沒有執行中的 Kimi。在那台電腦的 Kimi 裡輸入 /web，或執行 kimi web。'),
-      ),
-    ),
-  );
+  const title = h('div', { class: 'large-title' }, '要讓 Kimi 做什麼？');
+  const hint = h('p', { class: 'home-hint' });
+  homeEls = { title, hint };
+  fill($view, h('div', { class: 'home' }, h('div', { class: 'home-inner' }, title, homeComposer.el, hint)));
   updateHomeComposer();
   homeComposer.focus();
-  loadMachineModels(m);
-}
-
-const machineModels = new Map(); // machine id -> { models, defaultModel }
-async function loadMachineModels(m) {
-  if (!m || machineModels.has(m.id)) return;
-  try {
-    machineModels.set(m.id, await get(`/machines/${m.id}/models`));
-    updateHomeComposer();
-  } catch {}
+  loadCatalog(m?.id);
 }
 
 function updateHomeComposer() {
   if (!homeComposer) return;
-  const m = homeMachine();
-  const mm = m ? machineModels.get(m.id) : null;
+  const { m, cat, models, chosen, used, effort, sub } = homeSelection();
   const folder = S.home.cwdByMachine?.[m?.id];
+  const family = homeFamily(used);
   homeComposer.update({
     machineName: m?.name,
-    folderName: kimiRepo(m) ? kimiRepo(m).full : folder === null ? '新資料夾' : folder ? baseName(folder) : '新資料夾',
-    folderIcon: kimiRepo(m) ? 'branch' : 'folder',
+    folderName: homeRepo(m) ? homeRepo(m).full : folder === null ? '新資料夾' : folder ? baseName(folder) : '新資料夾',
+    folderIcon: homeRepo(m) ? 'branch' : 'folder',
     agent: 'kimi',
-    models: kimiModels(mm?.models),
-    defaultModel: mm?.defaultModel,
-    model: S.home.model && kimiModels(mm?.models).some((x) => x.id === S.home.model) ? S.home.model : '',
-    effort: S.home.effort,
+    family,
+    models,
+    sources: models.length ? menuSources(cat) : undefined,
+    defaultModel: cat?.defaultModel,
+    model: chosen,
+    effort,
     permission: S.home.permission || 'manual',
     planMode: Boolean(S.home.planMode),
+    subagent: models.length ? { model: sub } : null,
+    subagentLabel: subagentLabel(sub),
+    subagentNote: subagentNote(sub, cat),
   });
+  if (homeEls) {
+    homeEls.title.textContent = `要讓 ${agentName(family)} 做什麼？`;
+    homeEls.hint.textContent = homeHint(m, family);
+  }
 }
 
-// The models Kimi offers on its own: the DeepSeek provider's are for
-// DeepSeek conversations only.
-const kimiModels = (list) => (list || []).filter((x) => !x.deepseek);
-
 function homeCommand(name) {
-  if (name === 'usage' || name === 'status') return homeMachine() ? accountDialog(homeMachine().id) : openMachines();
-  if (['model', 'effort', 'permission'].includes(name)) return homeComposer.openControl(name) || toast('這台電腦的 Kimi 沒有提供這個選項');
+  if (name === 'usage' || name === 'status') return homeMachine() ? (homeFamily(homeSelection().used) === 'kimi' ? accountDialog(homeMachine().id) : openSettings()) : openMachines();
+  if (['model', 'effort', 'permission', 'subagent'].includes(name)) return homeComposer.openControl(name) || toast('這台電腦的 Kimi 沒有提供這個選項');
   if (name === 'plan') return homeComposer.opts.onConfig({ planMode: !S.home.planMode });
   if (['yolo', 'auto', 'manual'].includes(name)) return homeComposer.opts.onConfig({ permission: name });
 }
@@ -717,8 +875,8 @@ function machineMenu(anchor) {
   );
 }
 
-// A GitHub repository a new Kimi conversation on `m` is bound to.
-const kimiRepo = (m) => (m ? S.home.repoByMachine?.[m.id] || null : null);
+// A GitHub repository a new conversation on `m` is bound to.
+const homeRepo = (m) => (m ? S.home.repoByMachine?.[m.id] || null : null);
 
 function folderMenu(anchor) {
   const m = homeMachine();
@@ -730,12 +888,12 @@ function folderMenu(anchor) {
     saveHome();
     showHome();
   };
-  const repo = kimiRepo(m);
+  const repo = homeRepo(m);
   openMenu(
     anchor,
     [
       { section: 'GitHub' },
-      { label: repo ? `${repo.full}（${repo.branch || '新分支'}）` : '綁定一個 GitHub repo…', description: repo ? '換一個 repo 或分支' : 'clone 下來，所有程式碼都 commit 並 push 到那裡', checked: Boolean(repo), onSelect: () => repoDialog(m, null, homeAgent() === 'deepseek' ? 'deepseek' : 'kimi') },
+      { label: repo ? `${repo.full}（${repo.branch || '新分支'}）` : '綁定一個 GitHub repo…', description: repo ? '換一個 repo 或分支' : 'clone 下來，所有程式碼都 commit 並 push 到那裡', checked: Boolean(repo), onSelect: () => repoDialog(m, null) },
       { separator: true },
       recent.length ? { section: '最近使用' } : null,
       ...recent.map((p) => ({ label: baseName(p), description: shortPath(p, m.home, 4), onSelect: () => pick(p) })),
@@ -747,217 +905,30 @@ function folderMenu(anchor) {
   );
 }
 
-// ---------------------------------------------------------- Claude home
-
-let claudeHomeComposer = null;
-
-function showClaudeHome() {
-  const acc = S.claude || {};
-  claudeHomeComposer ??= new Composer({
-    home: true,
-    agent: 'claude',
-    placeholder: '要讓 Claude 做什麼？輸入 / 看指令',
-    onSend: startClaudeSession,
-    onCommand: claudeHomeCommand,
-    onPickUploadDir: (anchor, cur, set) => uploadDirMenu(anchor, claudeHomeMachine(), null, cur, set),
-    onStop: () => {},
-    onConfig: (c) => {
-      const x = (S.home.claude ??= {});
-      if (c.model) x.model = c.model;
-      if (c.effort) x.effort = c.effort;
-      if (c.permission) x.permission = c.permission;
-      if ('planMode' in c) x.planMode = c.planMode;
-      saveHome();
-      updateClaudeHome();
-    },
-    onPickMachine: claudeMachineMenu,
-    onPickFolder: claudeFolderMenu,
-    onError: (t) => toast(t),
-  });
-  claudeHomeComposer.setKey('home-claude');
-  const where = claudeHomeMachine();
-  fill(
-    $view,
-    h(
-      'div',
-      { class: 'home' },
-      h(
-        'div',
-        { class: 'home-inner' },
-        agentSwitch('claude'),
-        h('div', { class: 'large-title' }, '要讓 Claude 做什麼？'),
-        acc.hasKey
-          ? null
-          : h(
-              'div',
-              { class: 'callout claude-key' },
-              icon('alert'),
-              h('div', { class: 'callout-text' }, '還沒有設定 Claude API key。中控台用你在 Claude Console 建立的 API key 呼叫 Claude API，按用量從 Console 帳戶的額度扣款；不經過 Claude Code，也不用 Pro／Max 訂閱。'),
-              h('button', { class: 'om-btn om-btn--primary om-btn--sm', type: 'button', onclick: claudeDialog }, '設定 API key…'),
-            ),
-        claudeHomeComposer.el,
-        h(
-          'p',
-          { class: 'home-hint' },
-          claudeRepo(where)
-            ? `會把 ${claudeRepo(where).full} clone 到「${where.id ? where.name : hostName()}」上，在${claudeRepo(where).branch ? `分支 ${claudeRepo(where).branch}` : '一個新分支'}上工作，所有程式碼都 commit 並 push 到那裡。`
-            : where.id
-              ? `工具在「${where.name}」上執行，用中控台的 Claude API key 按用量計費。`
-              : `在中控台這台電腦（${hostName()}）上執行，用 Claude API key 按用量計費。`,
-          h('button', { class: 'linklike', type: 'button', onclick: claudeDialog }, 'Claude API 設定…'),
-        ),
-      ),
-    ),
-  );
-  updateClaudeHome();
-  claudeHomeComposer.focus();
-  loadClaudeModels();
-}
-
-async function loadClaudeModels(force = false) {
-  if (S.claudeModels && !force) return S.claudeModels;
-  try {
-    S.claudeModels = await get('/claude/models');
-    updateClaudeHome();
-  } catch {}
-  return S.claudeModels;
-}
-
-// Where a new Claude conversation's tools run: the hub's own computer
-// ({ id: null }), or a connected one (its bridge runs them).
-const bridgeReady = (m) => m.online && !/^0\.[0-4]\./.test(m.bridgeVersion || '0.0.0');
-function claudeHomeMachine() {
-  const id = S.home.claude?.machineId;
-  const m = id && machineById(id);
-  if (m && bridgeReady(m)) return m;
-  return { id: null, name: hostName(), home: S.config?.home };
-}
-const claudeCwd = (m) => S.home.claude?.cwdByMachine?.[m.id || 'hub'];
-// Or a GitHub repository ({ full, branch? }) to clone and bind to.
-const claudeRepo = (m) => S.home.claude?.repoByMachine?.[m.id || 'hub'] || null;
-
-function claudeMachineMenu(anchor) {
-  const cur = claudeHomeMachine();
-  const pick = (id) => {
-    S.home.claude = { ...(S.home.claude || {}), machineId: id };
-    saveHome();
-    showHome();
-  };
-  openMenu(
-    anchor,
-    [
-      { label: `中控台這台電腦（${hostName()}）`, description: '工具在中控台所在的電腦上執行', checked: !cur.id, onSelect: () => pick(null) },
-      ...(S.machines.length ? [{ section: '已連接的電腦' }] : []),
-      ...S.machines.map((m) => ({
-        label: m.name,
-        description: !m.online ? '離線' : !bridgeReady(m) ? '連接器太舊：在那台電腦重新執行連接指令' : m.platform,
-        checked: cur.id === m.id,
-        disabled: !bridgeReady(m),
-        onSelect: () => pick(m.id),
-      })),
-      { separator: true },
-      { label: '連接其他電腦…', onSelect: openMachines },
-    ],
-    { width: 280 },
-  );
-}
-
-function updateClaudeHome() {
-  if (!claudeHomeComposer) return;
-  const x = S.home.claude || {};
-  const models = S.claudeModels?.models || [];
-  const m = claudeHomeMachine();
-  const cwd = claudeCwd(m);
-  claudeHomeComposer.update({
-    agent: 'claude',
-    machineName: m.id ? m.name : hostName(),
-    folderName: claudeRepo(m) ? claudeRepo(m).full : cwd ? baseName(cwd) : '新資料夾',
-    folderIcon: claudeRepo(m) ? 'branch' : 'folder',
-    models,
-    defaultModel: S.claudeModels?.defaultModel,
-    model: x.model && models.some((m) => m.id === x.model) ? x.model : S.claudeModels?.defaultModel || '',
-    effort: x.effort,
-    permission: x.permission || 'manual',
-    planMode: Boolean(x.planMode),
-  });
-}
-
-function claudeHomeCommand(name) {
-  if (['model', 'effort', 'permission'].includes(name)) return claudeHomeComposer.openControl(name) || toast('這個模型沒有提供這個選項');
-  if (name === 'plan') return claudeHomeComposer.opts.onConfig({ planMode: !S.home.claude?.planMode });
-  if (['manual', 'edits', 'auto'].includes(name)) return claudeHomeComposer.opts.onConfig({ permission: name });
-  if (name === 'status') return claudeDialog();
-}
-
-// Folders on the computer Claude's tools will run on.
-function claudeFolderMenu(anchor) {
-  const m = claudeHomeMachine();
-  const recent = [...new Set([...S.sessions.values()].filter((s) => isClaude(s) && (s.machineId || null) === m.id).sort((a, b) => b.updatedAt - a.updatedAt).map((s) => s.cwd).filter(Boolean))].slice(0, 6);
-  const pick = (cwd) => {
-    const x = (S.home.claude ??= {});
-    x.cwdByMachine = { ...(x.cwdByMachine || {}), [m.id || 'hub']: cwd };
-    x.repoByMachine = { ...(x.repoByMachine || {}), [m.id || 'hub']: null };
-    saveHome();
-    showHome();
-  };
-  const home = m.home || S.config?.home;
-  const repo = claudeRepo(m);
-  openMenu(
-    anchor,
-    [
-      { section: 'GitHub' },
-      { label: repo ? `${repo.full}（${repo.branch || '新分支'}）` : '綁定一個 GitHub repo…', description: repo ? '換一個 repo 或分支' : 'clone 下來，所有程式碼都 commit 並 push 到那裡', checked: Boolean(repo), onSelect: () => repoDialog(m) },
-      { separator: true },
-      recent.length ? { section: '最近使用' } : null,
-      ...recent.map((p) => ({ label: baseName(p), description: shortPath(p, home, 4), onSelect: () => pick(p) })),
-      recent.length ? { separator: true } : null,
-      { label: '瀏覽資料夾…', description: `「${m.name}」上的資料夾`, onSelect: () => browseFolders(m, pick, claudeCwd(m)) },
-      { label: '新的空白資料夾', description: m.id ? '在 ~/agent-hub-workspaces 建立' : S.config?.workspacesDir ? `在 ${shortPath(S.config.workspacesDir, home, 3)} 建立` : null, onSelect: () => pick(null) },
-    ].filter(Boolean),
-    { width: 300 },
-  );
-}
-
-async function startClaudeSession({ text, images, files, uploadDir }) {
-  if (!S.claude?.hasKey) {
-    claudeHomeComposer.setText(text);
-    return claudeDialog();
-  }
-  const x = S.home.claude || {};
-  const list = S.claudeModels?.models || [];
-  const model = x.model && list.some((m) => m.id === x.model) ? x.model : undefined;
-  const used = list.find((m) => m.id === (model || S.claudeModels?.defaultModel));
-  const effort = x.effort && (!used || used.efforts.includes(x.effort)) ? x.effort : undefined;
-  claudeHomeComposer.el.classList.add('sending');
-  try {
-    const m = claudeHomeMachine();
-    const repo = claudeRepo(m);
-    const s = await post('/sessions', { agent: 'claude', machineId: m.id || undefined, cwd: repo ? undefined : claudeCwd(m) || undefined, files, uploadDir, repo: repo?.full, branch: repo?.branch || undefined, prompt: text, images, model, effort, permission: x.permission, planMode: x.planMode || undefined });
-    S.sessions.set(s.id, s);
-    resetHomeChoices();
-    go(`#/s/${s.id}`);
-  } catch (err) {
-    claudeHomeComposer.setText(text);
-    fail(err);
-  } finally {
-    claudeHomeComposer.el.classList.remove('sending');
-  }
-}
-
 async function startSession({ text, images, files, uploadDir }) {
   const m = homeMachine();
   if (!m) return openMachines();
-  const repo = kimiRepo(m);
+  if (!catalogOf(m.id)) await loadCatalog(m.id);
+  const { chosen, effort, sub } = homeSelection();
+  const repo = homeRepo(m);
   const cwd = repo ? undefined : S.home.cwdByMachine?.[m.id] || undefined;
-  const mm = machineModels.get(m.id);
-  const model = S.home.model && kimiModels(mm?.models).some((x) => x.id === S.home.model) ? S.home.model : undefined;
-  // The thinking chosen (or from 設定), when the model that will be used
-  // (the one picked, or Kimi's default) offers it.
-  const used = kimiModels(mm?.models).find((x) => x.id === (model || mm.defaultModel));
-  const effort = S.home.effort && used?.efforts?.includes(S.home.effort) ? S.home.effort : undefined;
   homeComposer.el.classList.add('sending');
   try {
-    const s = await post('/sessions', { machineId: m.id, cwd, files, uploadDir, repo: repo?.full, branch: repo?.branch || undefined, prompt: text, images, model, effort, permission: S.home.permission, planMode: S.home.planMode || undefined });
+    const s = await post('/sessions', {
+      machineId: m.id,
+      cwd,
+      files,
+      uploadDir,
+      repo: repo?.full,
+      branch: repo?.branch || undefined,
+      prompt: text,
+      images,
+      model: chosen || undefined,
+      effort: effort || undefined,
+      permission: S.home.permission,
+      planMode: S.home.planMode || undefined,
+      subagent: { model: sub },
+    });
     S.sessions.set(s.id, s);
     resetHomeChoices(); // the next new conversation starts from the defaults again
     go(`#/s/${s.id}`);
@@ -966,156 +937,6 @@ async function startSession({ text, images, files, uploadDir }) {
     fail(err);
   } finally {
     homeComposer.el.classList.remove('sending');
-  }
-}
-
-// ------------------------------------------------------- DeepSeek home
-
-let dsHomeComposer = null;
-
-const dsGateway = () => (S.deepseek?.gateways || []).find((g) => g.id === S.deepseek?.gateway) || null;
-const dsLabel = () => dsGateway()?.label || 'DeepSeek 閘道';
-
-// A new DeepSeek conversation: a Kimi conversation on a connected computer
-// (the same computers and folders as Kimi's home) that runs a DeepSeek model
-// of the gateway chosen in DeepSeek 設定.
-function showDeepseekHome() {
-  const m = homeMachine();
-  const acc = S.deepseek || {};
-  if (!S.machines.length) {
-    fill(
-      $view,
-      h(
-        'div',
-        { class: 'home' },
-        h(
-          'div',
-          { class: 'home-inner empty' },
-          agentSwitch('deepseek'),
-          h('div', { class: 'large-title' }, '先連接一台電腦'),
-          h('p', { class: 'home-lead' }, 'DeepSeek 對話在你電腦上的 Kimi Code 裡執行，只是把模型換成 DeepSeek。先連接一台有 Kimi Code 的電腦。'),
-          h('button', { class: 'om-btn om-btn--primary om-btn--lg', type: 'button', onclick: openMachines }, '連接電腦…'),
-        ),
-      ),
-    );
-    return;
-  }
-  dsHomeComposer ??= new Composer({
-    home: true,
-    agent: 'deepseek',
-    placeholder: '要讓 DeepSeek 做什麼？輸入 / 看指令',
-    onSend: startDeepseekSession,
-    onCommand: deepseekHomeCommand,
-    onPickUploadDir: (anchor, cur, set) => homeMachine() && uploadDirMenu(anchor, homeMachine(), null, cur, set),
-    onStop: () => {},
-    onConfig: (c) => {
-      const x = (S.home.deepseek ??= {});
-      if (c.model) x.model = c.model;
-      if (c.effort) x.effort = c.effort;
-      if (c.permission) x.permission = c.permission;
-      if ('planMode' in c) x.planMode = c.planMode;
-      saveHome();
-      updateDeepseekHome();
-    },
-    onPickMachine: machineMenu,
-    onPickFolder: folderMenu,
-    onError: (t) => toast(t),
-  });
-  dsHomeComposer.setKey('home-deepseek');
-  fill(
-    $view,
-    h(
-      'div',
-      { class: 'home' },
-      h(
-        'div',
-        { class: 'home-inner' },
-        agentSwitch('deepseek'),
-        h('div', { class: 'large-title' }, '要讓 DeepSeek 做什麼？'),
-        acc.hasKey
-          ? null
-          : h(
-              'div',
-              { class: 'callout deepseek-key' },
-              icon('alert'),
-              h('div', { class: 'callout-text' }, `還沒有設定 ${dsLabel()} 的 API key。DeepSeek 對話用這把 key 呼叫 DeepSeek 模型，費用算在這個閘道的帳戶；不會用到 Kimi 訂閱。`),
-              h('button', { class: 'om-btn om-btn--primary om-btn--sm', type: 'button', onclick: deepseekDialog }, '設定 API key…'),
-            ),
-        dsHomeComposer.el,
-        h(
-          'p',
-          { class: 'home-hint' },
-          m ? `會在「${m.name}」上的 Kimi Code 用 DeepSeek 模型執行，費用算在 ${dsLabel()} 的 API key，不用 Kimi 訂閱。${(acc.warnings || []).some((w) => w.machineId === m.id) ? `注意：那台電腦的 DeepSeek 模型來源沒能加上 session 標頭，${dsLabel()} 可能會限流。` : ''}` : '連接的電腦目前都沒有執行中的 Kimi。在那台電腦的 Kimi 裡輸入 /web，或執行 kimi web。',
-          h('button', { class: 'linklike', type: 'button', onclick: deepseekDialog }, 'DeepSeek 設定…'),
-        ),
-      ),
-    ),
-  );
-  updateDeepseekHome();
-  dsHomeComposer.focus();
-  loadDeepseekModels();
-}
-
-async function loadDeepseekModels(force = false) {
-  if (S.deepseekModels && !force) return S.deepseekModels;
-  try {
-    S.deepseekModels = await get('/deepseek/models');
-    updateDeepseekHome();
-  } catch {}
-  return S.deepseekModels;
-}
-
-function updateDeepseekHome() {
-  if (!dsHomeComposer) return;
-  const m = homeMachine();
-  const x = S.home.deepseek || {};
-  const models = S.deepseekModels?.models || [];
-  const repo = kimiRepo(m);
-  const folder = S.home.cwdByMachine?.[m?.id];
-  dsHomeComposer.update({
-    agent: 'deepseek',
-    machineName: m?.name,
-    folderName: repo ? repo.full : folder === null ? '新資料夾' : folder ? baseName(folder) : '新資料夾',
-    folderIcon: repo ? 'branch' : 'folder',
-    models,
-    defaultModel: S.deepseekModels?.defaultModel,
-    model: x.model && models.some((y) => y.id === x.model) ? x.model : '',
-    effort: x.effort || models[0]?.defaultEffort,
-    permission: x.permission || 'manual',
-    planMode: Boolean(x.planMode),
-  });
-}
-
-function deepseekHomeCommand(name) {
-  if (name === 'status') return deepseekDialog();
-  if (['model', 'effort', 'permission'].includes(name)) return dsHomeComposer.openControl(name) || toast('這個模型沒有提供這個選項');
-  if (name === 'plan') return dsHomeComposer.opts.onConfig({ planMode: !S.home.deepseek?.planMode });
-  if (['yolo', 'auto', 'manual'].includes(name)) return dsHomeComposer.opts.onConfig({ permission: name });
-}
-
-async function startDeepseekSession({ text, images, files, uploadDir }) {
-  if (!S.deepseek?.hasKey) {
-    dsHomeComposer.setText(text);
-    return deepseekDialog();
-  }
-  const m = homeMachine();
-  if (!m) return openMachines();
-  const x = S.home.deepseek || {};
-  const models = S.deepseekModels?.models || [];
-  const model = x.model && models.some((y) => y.id === x.model) ? x.model : undefined;
-  const repo = kimiRepo(m);
-  const cwd = repo ? undefined : S.home.cwdByMachine?.[m.id] || undefined;
-  dsHomeComposer.el.classList.add('sending');
-  try {
-    const s = await post('/sessions', { agent: 'deepseek', machineId: m.id, cwd, files, uploadDir, repo: repo?.full, branch: repo?.branch || undefined, prompt: text, images, model, effort: x.effort || undefined, permission: x.permission, planMode: x.planMode || undefined });
-    S.sessions.set(s.id, s);
-    resetHomeChoices();
-    go(`#/s/${s.id}`);
-  } catch (err) {
-    dsHomeComposer.setText(text);
-    fail(err);
-  } finally {
-    dsHomeComposer.el.classList.remove('sending');
   }
 }
 
@@ -1152,8 +973,6 @@ async function openSession(id) {
   S.route = `s:${id}`;
   if (S.panel?.tab === 'artifact') hidePanel();
   const summary = S.sessions.get(id);
-  // Not known yet: the snapshot decides.
-  if (summary) setLook(agentOf(summary));
   const cur = { id, summary, seq: 0, transcript: null, loading: true, syncing: true };
   S.cur = cur;
   // Keeps the conversation followed on the machine while it is open.
@@ -1161,6 +980,7 @@ async function openSession(id) {
   cur.transcript = new Transcript({
     cwd: summary?.cwd,
     agentName: nameFor(summary),
+    subagentInfo,
     onRespond: respond,
     onOpenArtifact: (path, version) => showArtifact(path, version),
     onArtifacts: (list) => {
@@ -1200,6 +1020,7 @@ async function openSession(id) {
     },
     onStop: interrupt,
     onConfig: configure,
+    onSetupSource: setupSource,
     onCancelQueued: (pid) => S.cur && del(`/sessions/${S.cur.id}/queue/${pid}`).catch(fail),
     onSteerQueued: (pid) => S.cur && post(`/sessions/${S.cur.id}/queue/${pid}/steer`).catch(fail),
     onUnlock: () => S.cur && post(`/sessions/${S.cur.id}/unlock`).catch(fail),
@@ -1215,8 +1036,9 @@ async function openSession(id) {
     onBackground: moveToBackground,
   });
   composer.setKey(id);
-  composer.update({ agent: agentOf(summary), agentsWorking: 0, foreground: 0 });
+  composer.update({ agent: isLegacyClaude(summary) ? 'claude' : 'kimi', family: familyOf(summary), agentsWorking: 0, foreground: 0 });
   cur.composerSig = '';
+  if (summary?.machineId && !isLegacyClaude(summary)) loadCatalog(summary.machineId);
   fill($view, h('div', { class: 'session' }, cur.transcript.el, h('div', { class: 'composer-dock' }, composer.el)));
   renderToolbar();
   renderSidebar();
@@ -1242,11 +1064,11 @@ function applySnapshot(full) {
   const { events, seq, ...summary } = full;
   cur.summary = summary;
   cur.seq = seq;
-  setLook(agentOf(summary));
   cur.loading = true; // pages already there are not "new" while it loads
   S.sessions.set(summary.id, summary);
   cur.transcript.opts.cwd = summary.cwd;
   cur.transcript.opts.agentName = nameFor(summary);
+  if (summary.machineId && !isLegacyClaude(summary)) loadCatalog(summary.machineId);
   cur.transcript.load(events);
   cur.loading = false;
   cur.transcript.setServed(summary.meta?.servedModel?.name);
@@ -1280,18 +1102,33 @@ function updateComposer() {
     drawTodos();
   }
   const meta = s.meta || {};
-  const ds = isDeepseek(s);
+  const legacy = isLegacyClaude(s);
+  // The models to choose from: what the computer offers, grouped by source; the
+  // conversation's own list until that has arrived (an old hub has only that).
+  let models;
+  let sources;
+  const cat = legacy ? null : catalogOf(s.machineId);
+  if (legacy) models = meta.models || [];
+  else if (cat) {
+    models = allModels(cat);
+    sources = menuSources(cat);
+  } else {
+    models = (meta.models || []).map((x) => ({ ...x, family: x.family || (x.deepseek ? 'deepseek' : 'kimi') }));
+    const ds = models.filter((x) => x.family === 'deepseek');
+    sources = ds.length ? menuSources({ sources: [{ id: 'kimi', billing: 'subscription', ready: true, models: models.filter((x) => x.family !== 'deepseek') }, { id: 'deepseek', billing: 'gateway', ready: true, models: ds }] }) : undefined;
+  }
+  const sub = s.subagent?.model || 'primary';
   const state = {
-    agent: agentOf(s),
-    cost: isClaude(s) ? s.usage?.costUsd || 0 : null,
+    agent: legacy ? 'claude' : 'kimi',
+    family: familyOf(s),
+    cost: legacy ? s.usage?.costUsd || 0 : null,
     budget: meta.budget || null,
     running: s.status === 'running',
     awaiting: s.status === 'awaiting_permission',
     queue: meta.queue || [],
     todos: meta.todos || [],
-    // A DeepSeek conversation offers the DeepSeek models only, a Kimi one
-    // none of them.
-    models: isClaude(s) ? meta.models || [] : (meta.models || []).filter((x) => Boolean(x.deepseek) === ds),
+    models,
+    sources,
     model: meta.model,
     defaultModel: meta.defaultModel,
     effort: meta.effort,
@@ -1304,9 +1141,11 @@ function updateComposer() {
     skills: meta.skills || [],
     terminal: meta.owner === 'tui',
     controllable: Boolean(meta.controllable),
-    guess: Boolean(meta.guess),
     autoPause: s.autoPause || null,
     scheduled: s.scheduled || [],
+    subagent: !legacy && models.length ? { model: sub } : null,
+    subagentLabel: subagentLabel(sub),
+    subagentNote: subagentNote(sub, cat),
   };
   // Summaries arrive many times a second while Kimi works (speed, context);
   // redraw the controls only when something they show changed.
@@ -1328,7 +1167,7 @@ function renderToolbar() {
     return;
   }
   const m = machineById(s.machineId);
-  const sub = (isClaude(s) ? ['Claude API', s.meta?.machineName || hostName(), s.repo ? `${s.repo.full} · ${s.repo.branch}` : s.cwd ? shortPath(s.cwd, s.machineId ? m?.home : S.config?.home, 3) : null] : [isDeepseek(s) ? 'DeepSeek' : null, m?.name || s.meta?.machineName, s.repo ? `${s.repo.full} · ${s.repo.branch}` : s.cwd ? shortPath(s.cwd, m?.home, 3) : null]).filter(Boolean).join(' · ');
+  const sub = (isLegacyClaude(s) ? ['Claude API', s.meta?.machineName || hostName(), s.repo ? `${s.repo.full} · ${s.repo.branch}` : s.cwd ? shortPath(s.cwd, s.machineId ? m?.home : S.config?.home, 3) : null] : [familyOf(s) !== 'kimi' ? agentName(familyOf(s)) : null, m?.name || s.meta?.machineName, s.repo ? `${s.repo.full} · ${s.repo.branch}` : s.cwd ? shortPath(s.cwd, m?.home, 3) : null]).filter(Boolean).join(' · ');
   const arts = S.artifacts.length;
   fill(
     $toolbar,
@@ -1342,9 +1181,9 @@ function renderToolbar() {
         { class: 'om-toolbar__subtitle', title: s.cwd || '' },
         sub,
         m && !m.online ? h('span', { class: 'om-badge om-badge--danger' }, '電腦離線') : null,
-        s.meta?.owner === 'tui' ? h('span', { class: 'om-badge', title: s.meta.guess ? '同一個資料夾有終端機的 Kimi 開著，可能正在用這個對話，這裡先只能看' : s.meta.controllable ? '在終端機的 Kimi 裡執行，可以從這裡操作' : '在終端機的 Kimi 裡執行，這裡只能看' }, s.meta.controllable ? '終端機' : '終端機 · 唯讀') : null,
+        s.meta?.owner === 'tui' ? h('span', { class: 'om-badge', title: s.meta.controllable ? '在終端機的 Kimi 裡執行，可以從這裡操作' : '在終端機的 Kimi 裡執行，這裡只能看' }, s.meta.controllable ? '終端機' : '終端機 · 唯讀') : null,
         autoPauseBadge(s),
-        isClaude(s) && s.meta?.budget ? h('button', { class: `om-badge${(s.usage?.costUsd || 0) >= s.meta.budget ? ' om-badge--warning' : ''}`, type: 'button', title: '這個對話的花費上限', onclick: budgetDialog }, `上限 ${fmtUsd(s.meta.budget)}`) : null,
+        isLegacyClaude(s) && s.meta?.budget ? h('button', { class: `om-badge${(s.usage?.costUsd || 0) >= s.meta.budget ? ' om-badge--warning' : ''}`, type: 'button', title: '這個對話的花費上限', onclick: budgetDialog }, `上限 ${fmtUsd(s.meta.budget)}`) : null,
       ),
     ),
     h('span', { class: 'om-toolbar__spacer' }),
@@ -1356,14 +1195,14 @@ function renderToolbar() {
 function sessionMenu(anchor) {
   const s = S.cur?.summary;
   if (!s) return;
-  if (isClaude(s)) return claudeSessionMenu(s, anchor);
+  if (isLegacyClaude(s)) return claudeSessionMenu(s, anchor);
   openMenu(
     anchor,
     [
       { label: '重新命名…', onSelect: renameSession },
       { label: '複製成新對話', hint: '/fork', onSelect: () => sessionCommand('fork', '') },
       { label: '壓縮對話', hint: '/compact', onSelect: () => sessionCommand('compact', '') },
-      isDeepseek(s) ? null : { label: '自動暫停…', hint: s.autoPause?.enabled ? `${s.autoPause.threshold}%` : '關', onSelect: autoPauseDialog },
+      isMetered(s) ? null : { label: '自動暫停…', hint: s.autoPause?.enabled ? `${s.autoPause.threshold}%` : '關', onSelect: autoPauseDialog },
       { label: '定時送出…', hint: s.scheduled?.length ? `${s.scheduled.length} 則` : '/later', onSelect: () => scheduleDialog() },
       backupItem(s),
       s.kimiSessionId
@@ -1474,6 +1313,12 @@ async function configure(change) {
   if (!s) return;
   try {
     await post(`/sessions/${s.id}/config`, change);
+    // The subagent model is on screen right away; the hub's own update follows.
+    if (change.subagent && S.cur?.summary === s) {
+      S.cur.summary = { ...s, subagent: { ...(s.subagent || {}), ...change.subagent } };
+      S.sessions.set(s.id, S.cur.summary);
+      updateComposer();
+    }
     // The agent keeps the turn it is in on what it started with.
     if (busy(s.status) && (change.model || change.effort)) {
       const what = change.effort ? `思考強度改成「${EFFORT_LABELS[change.effort] || change.effort}」` : '模型已切換';
@@ -1510,12 +1355,13 @@ async function sessionCommand(name, args) {
       return fail(err);
     }
   }
-  if (isClaude(s)) return claudeCommand(s, name, args);
+  if (isLegacyClaude(s)) return claudeCommand(s, name, args);
   const meta = s.meta || {};
   switch (name) {
     case 'model':
     case 'effort':
     case 'permission':
+    case 'subagent':
       if (!composer.openControl(name)) toast('這個模型沒有提供這個選項');
       return;
     case 'plan':
@@ -1542,10 +1388,10 @@ async function sessionCommand(name, args) {
     case 'background':
       return moveToBackground();
     case 'usage':
-      if (isDeepseek(s)) return toast('DeepSeek 對話不用 Kimi 訂閱，沒有方案額度。費用算在閘道的帳戶，請到閘道的網站查看用量。');
+      if (isMetered(s)) return toast(familyOf(s) === 'claude' ? 'Claude 對話不用 Kimi 訂閱，沒有方案額度。費用按用量從 Claude Console 帳戶扣款，請到 Claude Console 查看。' : 'DeepSeek 對話不用 Kimi 訂閱，沒有方案額度。費用算在閘道的帳戶，請到閘道的網站查看用量。');
       return accountDialog(s.machineId);
     case 'autopause': {
-      if (isDeepseek(s)) return toast('自動暫停看的是 Kimi 訂閱的 5 小時額度，DeepSeek 對話不用它。要延後送出訊息，請用 /later 30 繼續。', { kind: 'error' });
+      if (isMetered(s)) return toast(`自動暫停看的是 Kimi 訂閱的 5 小時額度，${nameFor(s)} 對話不用它。要延後送出訊息，請用 /later 30 繼續。`, { kind: 'error' });
       const a = args.trim().toLowerCase().replace(/\s*%$/, '');
       if (!a) return autoPauseDialog();
       if (['off', '關', '關閉'].includes(a)) return setAutoPause({ enabled: false });
@@ -1557,12 +1403,13 @@ async function sessionCommand(name, args) {
     case 'later':
       return laterCommand(args);
     case 'status': {
-      if (isDeepseek(s)) return deepseekStatusDialog();
+      if (isMetered(s)) return meteredStatusDialog();
       const model = (meta.models || []).find((x) => x.id === meta.model);
       const ctx = meta.context;
       return accountDialog(s.machineId, [
         ['模型', model?.name || meta.model || 'Kimi 的預設模型'],
         meta.effort ? ['思考強度', EFFORT_LABELS[meta.effort] || meta.effort] : null,
+        ['子代理', subagentLabel(s.subagent?.model)],
         ['權限', `${PERMISSION_LABELS[meta.permission] || PERMISSION_LABELS.manual}${meta.planMode ? ' · 計畫模式' : ''}`],
         ctx?.size ? ['Context', `${Math.round((ctx.used / ctx.size) * 100)}% · ${fmtK(ctx.used)} / ${fmtK(ctx.size)} tokens`] : null,
         ['資料夾', s.cwd || '—'],
@@ -1600,9 +1447,13 @@ async function claudeCommand(s, name, args) {
       await configure({ permission: name });
       return toast(`權限模式：${CLAUDE_PERMISSION_LABELS[name]}`);
     case 'new':
-      S.home.agent = 'claude';
-      S.home.claude = { ...(S.home.claude || {}), machineId: s.machineId || null, cwdByMachine: { ...(S.home.claude?.cwdByMachine || {}), [s.machineId || 'hub']: s.cwd } };
-      saveHome();
+      // New conversations run in Kimi Code on a computer: the same computer
+      // and folder, when this old one had one.
+      if (s.machineId) {
+        S.home.machineId = s.machineId;
+        S.home.cwdByMachine = { ...(S.home.cwdByMachine || {}), [s.machineId]: s.cwd };
+        saveHome();
+      }
       return go('#/');
     case 'copy': {
       const last = S.cur.transcript.all().reverse().find((e) => e.type === 'text' && !e.parent && e.text?.trim());
@@ -1970,7 +1821,7 @@ function showAgents(id) {
   artifactView = null;
   closeAgentPanel();
   showPanel('agents');
-  const steps = new Transcript({ cwd: S.cur.summary?.cwd, agentName: nameFor(S.cur.summary), onRespond: respond, onImage: lightbox, onLink: openFileLink });
+  const steps = new Transcript({ cwd: S.cur.summary?.cwd, agentName: nameFor(S.cur.summary), subagentInfo, onRespond: respond, onImage: lightbox, onLink: openFileLink });
   const section = (label, ...right) => h('div', { class: 'agent-sec' }, h('span', { class: 'agent-sec-label' }, label), h('span', { class: 'om-toolbar__spacer' }), ...right);
   applyPanes();
   agentPanel = {
@@ -2040,14 +1891,6 @@ function agentSplit(bar, key, grow) {
   bar.addEventListener('dblclick', () => setPane(key, null));
 }
 
-// "K3-256k · 思考 最高": the model and thinking a subagent runs with.
-function agentModel(a) {
-  const models = S.cur?.summary?.meta?.models || [];
-  const m = a.model && (models.find((x) => x.id === a.model)?.name || a.model.split('/').pop());
-  const e = a.effort ? `思考 ${EFFORT_LABELS[a.effort] || a.effort}` : '';
-  return [m, e].filter(Boolean).join(' · ');
-}
-
 // Rows are built once per subagent and then only have their text updated
 // (the list is drawn several times a second while they work); rebuilding
 // them would also restart their spinners.
@@ -2057,7 +1900,7 @@ function drawAgentList() {
   const status = (a) => (a.running ? h('span', { class: 'spinner', 'aria-label': '執行中' }) : a.failed ? h('span', { class: 'om-badge om-badge--danger' }, '失敗') : a.stopped ? h('span', { class: 'om-badge' }, '已中斷') : h('span', { class: 'om-badge om-badge--success' }, '完成'));
   const rows = (agentPanel.rows ??= new Map());
   const els = [...all].reverse().map((a) => {
-    const shape = JSON.stringify([a.id === agentPanel.id, a.name, a.background, agentModel(a), a.running, a.failed, a.stopped]);
+    const shape = JSON.stringify([a.id === agentPanel.id, a.name, a.background, a.info, a.running, a.failed, a.stopped]);
     let r = rows.get(a.id);
     if (r?.shape !== shape) {
       const desc = h('span', { class: 'agent-item-desc' });
@@ -2066,7 +1909,7 @@ function drawAgentList() {
         'button',
         { class: `agent-item${a.id === agentPanel.id ? ' on' : ''}`, type: 'button', onclick: () => a.id !== agentPanel.id && showAgents(a.id) },
         icon('agents'),
-        h('span', { class: 'agent-item-text' }, h('span', { class: 'agent-item-name' }, a.name ? `子代理 · ${a.name}` : '子代理', a.background ? h('span', { class: 'om-badge' }, '背景') : null, agentModel(a) ? h('span', { class: 'agent-item-model' }, agentModel(a)) : null), desc),
+        h('span', { class: 'agent-item-text' }, h('span', { class: 'agent-item-name' }, a.name ? `子代理 · ${a.name}` : '子代理', a.background ? h('span', { class: 'om-badge' }, '背景') : null), a.info ? h('span', { class: 'agent-item-model' }, a.info.text, a.info.primary ? h('span', { class: 'agent-model-tag' }, '跟主模型') : null) : null, desc),
         meta,
         status(a),
       );
@@ -2396,9 +2239,9 @@ function fetchUsage(machineId) {
 // The 5-hour and 7-day quota under the context ring's menu (for Claude:
 // what the conversation has cost, and the API's rate limits).
 function quotaMenuNode() {
-  if (isClaude(S.cur?.summary)) return claudeCostNode();
-  // DeepSeek is billed by the gateway, not against the Kimi plan.
-  if (isDeepseek(S.cur?.summary)) return null;
+  if (isLegacyClaude(S.cur?.summary)) return claudeCostNode();
+  // DeepSeek and Claude are billed by their own keys, not against the Kimi plan.
+  if (S.cur?.summary && isMetered(S.cur.summary)) return null;
   const mid = S.cur?.summary?.machineId;
   if (!mid) return null;
   const box = h('div', { class: 'menu-quota' }, h('div', { class: 'muted' }, '讀取方案用量…'));
@@ -2452,15 +2295,15 @@ async function accountDialog(machineId, rows = null) {
 const CONSOLE_KEYS = 'https://console.anthropic.com/settings/keys';
 const CONSOLE_BILLING = 'https://console.anthropic.com/settings/billing';
 
-// Claude API 設定: the Console API key (sent here once, never shown again
-// in full) and the defaults for new Claude conversations.
+// Claude API 設定: the Console API key (sent here once, never shown again in
+// full). With it, Claude models run in the Kimi Code on a computer, as the main
+// model of a conversation or as a subagent's model. Which model a new
+// conversation starts with is in 設定.
 async function claudeDialog() {
   let acc = S.claude || {};
   try {
     acc = S.claude = await get('/claude');
   } catch {}
-  const list = (await loadClaudeModels())?.models || [];
-  const d0 = acc.defaults || {};
   const form = h('form', { class: 'settings claude-settings' });
   const keyInput = h('input', { class: 'om-input', type: 'password', autocomplete: 'off', spellcheck: false, placeholder: acc.hasKey ? '貼上新的 key 來更換' : 'sk-ant-…', 'aria-label': 'Claude API key' });
   const keyNote = h('span', { class: 'om-field__help' });
@@ -2476,20 +2319,6 @@ async function claudeDialog() {
     );
   };
   drawKey();
-  const modelSel = h('select', { class: 'om-input', name: 'model' }, ...list.map((x) => h('option', { value: x.id, selected: x.id === d0.model }, x.name || x.id)));
-  if (d0.model && !list.some((x) => x.id === d0.model)) modelSel.append(h('option', { value: d0.model, selected: true }, d0.model));
-  const effortSel = h('select', { class: 'om-input', name: 'effort' });
-  const fillEfforts = () => {
-    const mod = list.find((x) => x.id === modelSel.value);
-    const efforts = mod?.efforts || [];
-    const cur = effortSel.value || d0.effort;
-    fill(effortSel, ...efforts.map((e) => h('option', { value: e, selected: e === cur }, `${EFFORT_LABELS[e] || e}${e === mod.defaultEffort ? '（模型預設）' : ''}`)));
-    effortSel.disabled = efforts.length < 2;
-  };
-  modelSel.addEventListener('change', fillEfforts);
-  fillEfforts();
-  const permSel = h('select', { class: 'om-input', name: 'permission' }, ...Object.entries(CLAUDE_PERMISSION_LABELS).map(([k, v]) => h('option', { value: k, selected: k === (d0.permission || 'manual') }, v)));
-  const plan = h('input', { class: 'om-switch', type: 'checkbox', checked: Boolean(d0.planMode) });
   const web = h('input', { class: 'om-switch', type: 'checkbox', checked: acc.webTools !== false });
   const field = (label, control, help) => h('label', { class: 'om-field' }, h('span', { class: 'om-field__label' }, label), control, help ? (typeof help === 'string' ? h('span', { class: 'om-field__help' }, help) : help) : null);
   const test = async () => {
@@ -2499,18 +2328,19 @@ async function claudeDialog() {
       const r = await post('/claude/test');
       testOut.className = `claude-test ${r.ok ? 'ok' : 'bad'}`;
       fill(testOut, r.message);
-      if (r.ok) S.claudeModels = { defaultModel: S.claudeModels?.defaultModel, models: r.models };
+      if (r.ok) refreshCatalogs();
     } catch (err) {
       testOut.className = 'claude-test bad';
       fill(testOut, err.message);
     }
   };
   const removeKey = async () => {
-    if (!(await confirmDialog({ title: '要移除這把 API key 嗎？', body: '移除後，Claude 對話要等你再設定一把 key 才能繼續。這不會撤銷 key 本身，要撤銷請到 Claude Console。', action: '移除', destructive: true }))) return;
+    if (!(await confirmDialog({ title: '要移除這把 API key 嗎？', body: '移除後，Claude 模型要等你再設定一把 key 才能用（正在用它的對話也一樣）。這不會撤銷 key 本身，要撤銷請到 Claude Console。', action: '移除', destructive: true }))) return;
     try {
       acc = S.claude = await put('/claude', { clearKey: true });
       drawKey();
       fill(testOut);
+      refreshCatalogs();
       toast('已移除 API key');
     } catch (err) {
       fail(err);
@@ -2522,16 +2352,10 @@ async function claudeDialog() {
     fill(testOut, key ? [h('span', { class: 'spinner' }), ' 向 Anthropic 確認這把 key…'] : null);
     testOut.className = 'claude-test';
     try {
-      acc = S.claude = await put('/claude', {
-        apiKey: key || undefined,
-        defaults: { model: modelSel.value, effort: effortSel.disabled ? '' : effortSel.value, permission: permSel.value, planMode: plan.checked },
-        webTools: web.checked,
-      });
-      if (key) loadClaudeModels(true);
-      resetHomeChoices();
+      acc = S.claude = await put('/claude', { apiKey: key || undefined, webTools: web.checked });
+      refreshCatalogs();
       d.close();
       toast(key ? '已設定 Claude API key' : '已儲存 Claude 設定');
-      if (S.route === 'home') showHome();
     } catch (err) {
       testOut.className = 'claude-test bad';
       fill(testOut, err.message);
@@ -2543,7 +2367,7 @@ async function claudeDialog() {
     h(
       'p',
       { class: 'dialog-text settings-lead' },
-      '中控台直接呼叫 Anthropic 官方的 Claude API（api.anthropic.com），用你在 Claude Console 建立的 API key，依用量（token）從 Console 帳戶的額度扣款。不會經過 Claude Code，也不會用到 Claude Pro／Max 訂閱；訂閱帳號的登入 token（sk-ant-oat…）會被拒絕。',
+      'Claude 模型用你在 Claude Console 建立的 API key，在你電腦的 Kimi Code 裡執行（api.anthropic.com），依用量（token）從 Console 帳戶的額度扣款。任何對話都可以用 Claude 當主模型，也可以只讓子代理用 Claude。不會用到 Claude Pro／Max 訂閱；訂閱帳號的登入 token（sk-ant-oat…）會被拒絕。',
     ),
     field('API key', keyInput, keyNote),
     h(
@@ -2554,12 +2378,8 @@ async function claudeDialog() {
       acc.hasKey && acc.keySource === 'hub' ? h('button', { class: 'om-btn om-btn--sm om-btn--destructive', type: 'button', onclick: removeKey }, '移除 key') : null,
     ),
     testOut,
-    h('div', { class: 'dialog-subtitle' }, '新對話的預設'),
-    field('模型', modelSel, list.length ? null : '設定 API key 後，會列出這把 key 能用的模型'),
-    field('思考強度', effortSel, '越高越仔細，也花越多 token'),
-    field('權限', permSel, '每次詢問：修改檔案和執行指令前都問你 · 自動接受編輯：只有指令要問 · 全部自動：不會打斷你'),
-    h('label', { class: 'settings-switch' }, plan, h('span', null, h('span', { class: 'om-field__label' }, '計畫模式'), h('span', { class: 'om-field__help' }, '先規劃，你同意後才動手'))),
-    h('label', { class: 'settings-switch' }, web, h('span', null, h('span', { class: 'om-field__label' }, '網路搜尋與讀取網頁'), h('span', { class: 'om-field__help' }, 'Anthropic 端執行；搜尋每 1000 次 US$10 另計'))),
+    h('label', { class: 'settings-switch' }, web, h('span', null, h('span', { class: 'om-field__label' }, '網路搜尋與讀取網頁'), h('span', { class: 'om-field__help' }, '只對早期以 Claude API 直接執行的對話有效；Anthropic 端執行，搜尋每 1000 次 US$10 另計'))),
+    h('p', { class: 'om-field__help' }, '新對話預設用哪個模型、思考強度與權限，在「設定」裡選。'),
     h('div', { class: 'dialog-actions' }, h('button', { class: 'om-btn', type: 'button', onclick: () => d.close() }, '取消'), h('button', { class: 'om-btn om-btn--primary', type: 'submit' }, '儲存')),
   );
   form.addEventListener('submit', save);
@@ -2569,27 +2389,22 @@ async function claudeDialog() {
 
 // ------------------------------------------------------------- DeepSeek
 
-// DeepSeek 設定: which gateway the DeepSeek models come from, its API key
-// (sent here once, never shown again in full), and the defaults for new
-// DeepSeek conversations.
+// DeepSeek 設定: which gateway the DeepSeek models come from, and its API key
+// (sent here once, never shown again in full). With a key, DeepSeek models run
+// in the Kimi Code on a computer, as the main model of a conversation or as a
+// subagent's model. Which model a new conversation starts with is in 設定.
 async function deepseekDialog() {
-  let acc = S.deepseek || { gateways: [], defaults: {} };
+  let acc = S.deepseek || { gateways: [] };
   try {
     acc = S.deepseek = await get('/deepseek');
   } catch {}
   let gw = acc.gateway;
-  const d0 = acc.defaults || {};
-  let models = [];
   const form = h('form', { class: 'settings deepseek-settings' });
   const keyInput = h('input', { class: 'om-input', type: 'password', autocomplete: 'off', spellcheck: false, 'aria-label': 'DeepSeek 閘道的 API key' });
   const keyNote = h('span', { class: 'om-field__help' });
   const keyActions = h('div', { class: 'claude-key-actions' });
   const testOut = h('div', { class: 'claude-test', role: 'status' });
   const gwBox = h('div', { class: 'gw-list', role: 'radiogroup', 'aria-label': '閘道' });
-  const modelSel = h('select', { class: 'om-input', name: 'model' });
-  const effortSel = h('select', { class: 'om-input', name: 'effort' });
-  const permSel = h('select', { class: 'om-input', name: 'permission' }, ...Object.entries(PERMISSION_LABELS).map(([k, v]) => h('option', { value: k, selected: k === (d0.permission || 'manual') }, v)));
-  const plan = h('input', { class: 'om-switch', type: 'checkbox', checked: Boolean(d0.planMode) });
   const secondaryBox = h('div', { class: 'callout small ds-secondary', hidden: true });
   const gwNote = h('p', { class: 'om-field__help ds-note' });
   const GATEWAY_NOTES = {
@@ -2601,23 +2416,6 @@ async function deepseekDialog() {
   const field = (label, control, help) => h('label', { class: 'om-field' }, h('span', { class: 'om-field__label' }, label), control, help ? (typeof help === 'string' ? h('span', { class: 'om-field__help' }, help) : help) : null);
   const cur = () => (acc.gateways || []).find((g) => g.id === gw) || { id: gw, label: gw };
 
-  const drawModels = () => {
-    const keep = modelSel.value || defaultModel;
-    fill(modelSel, ...models.map((x) => h('option', { value: x.id, selected: x.id === keep }, x.name || x.id)));
-    if (!models.some((x) => x.id === modelSel.value)) modelSel.value = models.find((x) => x.id === defaultModel)?.id || models[0]?.id || '';
-    const efforts = models[0]?.efforts || ['high', 'max'];
-    fill(effortSel, ...efforts.map((e) => h('option', { value: e, selected: e === (effortSel.value || d0.effort) }, `${EFFORT_LABELS[e] || e}${e === models[0]?.defaultEffort ? '（預設）' : ''}`)));
-  };
-  let defaultModel = d0.model;
-  const loadModels = async () => {
-    try {
-      const r = await get(`/deepseek/models?gateway=${encodeURIComponent(gw)}`);
-      models = r.models;
-      defaultModel = r.defaultModel;
-      if (gw === acc.gateway) S.deepseekModels = r;
-    } catch {}
-    drawModels();
-  };
   const drawGateways = () => {
     gwNote.textContent = `${GATEWAY_NOTES[gw] || ''}${gw !== acc.gateway ? SWITCH_NOTE : ''}`;
     return fill(
@@ -2626,7 +2424,7 @@ async function deepseekDialog() {
         h(
           'label',
           { class: `gw-item${g.id === gw ? ' on' : ''}` },
-          h('input', { type: 'radio', name: 'gateway', value: g.id, checked: g.id === gw, onchange: () => ((gw = g.id), drawGateways(), drawKey(), fill(testOut), loadModels()) }),
+          h('input', { type: 'radio', name: 'gateway', value: g.id, checked: g.id === gw, onchange: () => ((gw = g.id), drawGateways(), drawKey(), fill(testOut)) }),
           h('span', { class: 'gw-name' }, g.label),
           h('span', { class: 'gw-state' }, g.hasKey ? `已設定 …${g.keyHint}` : '還沒有 key'),
         ),
@@ -2646,23 +2444,20 @@ async function deepseekDialog() {
       const r = await post('/deepseek/test', { gateway: gw });
       testOut.className = `claude-test ${r.ok ? 'ok' : 'bad'}`;
       fill(testOut, r.message);
-      if (r.ok) {
-        models = r.models;
-        drawModels();
-      }
+      if (r.ok) refreshCatalogs();
     } catch (err) {
       testOut.className = 'claude-test bad';
       fill(testOut, err.message);
     }
   };
   const removeKey = async () => {
-    if (!(await confirmDialog({ title: `要移除 ${cur().label} 的 API key 嗎？`, body: '移除後，DeepSeek 對話要等你再設定一把 key 才能繼續。連接的電腦上 Kimi 裡的 DeepSeek 模型來源（含這把 key）也會一併移除。這不會撤銷 key 本身，要撤銷請到閘道的網站。', action: '移除', destructive: true }))) return;
+    if (!(await confirmDialog({ title: `要移除 ${cur().label} 的 API key 嗎？`, body: '移除後，DeepSeek 模型要等你再設定一把 key 才能用（正在用它的對話也一樣）。連接的電腦上 Kimi 裡的 DeepSeek 模型來源（含這把 key）也會一併移除。這不會撤銷 key 本身，要撤銷請到閘道的網站。', action: '移除', destructive: true }))) return;
     try {
       acc = S.deepseek = await put('/deepseek', { gateway: gw, clearKey: true });
       drawGateways();
       drawKey();
       fill(testOut);
-      loadModels();
+      refreshCatalogs();
       toast('已移除 API key');
     } catch (err) {
       fail(err);
@@ -2674,12 +2469,10 @@ async function deepseekDialog() {
     fill(testOut, key ? [h('span', { class: 'spinner' }), ` 向 ${cur().label} 確認這把 key…`] : null);
     testOut.className = 'claude-test';
     try {
-      acc = S.deepseek = await put('/deepseek', { gateway: gw, apiKey: key || undefined, defaults: { model: modelSel.value, effort: effortSel.value, permission: permSel.value, planMode: plan.checked } });
-      S.deepseekModels = null;
-      resetHomeChoices();
+      acc = S.deepseek = await put('/deepseek', { gateway: gw, apiKey: key || undefined });
+      refreshCatalogs();
       dlg.close();
       toast(key ? `已設定 ${cur().label} 的 API key` : '已儲存 DeepSeek 設定');
-      if (S.route === 'home') showHome();
     } catch (err) {
       testOut.className = 'claude-test bad';
       fill(testOut, err.message);
@@ -2693,7 +2486,7 @@ async function deepseekDialog() {
     h(
       'p',
       { class: 'dialog-text settings-lead' },
-      'DeepSeek 對話是在你電腦上的 Kimi Code 裡執行的普通 Kimi 對話，只是模型換成 DeepSeek，所以 Kimi 的自動壓縮、子代理、計畫模式都照常運作。模型從你選的閘道呼叫，費用算在那個閘道的 API key，不用 Kimi 訂閱。',
+      'DeepSeek 模型在你電腦上的 Kimi Code 裡執行，所以 Kimi 的自動壓縮、子代理、計畫模式都照常運作。任何對話都可以用 DeepSeek 當主模型，也可以只讓子代理用 DeepSeek。模型從你選的閘道呼叫，費用算在那個閘道的 API key，不用 Kimi 訂閱。',
     ),
     h('div', { class: 'dialog-subtitle first' }, '閘道'),
     gwBox,
@@ -2701,12 +2494,7 @@ async function deepseekDialog() {
     field('API key', keyInput, keyNote),
     keyActions,
     testOut,
-    h('div', { class: 'dialog-subtitle' }, '新對話的預設'),
-    field('模型', modelSel, '新對話預設用這個閘道的 V4.1 Flash（沒有的話用清單裡的第一個）'),
-    field('思考強度', effortSel, 'DeepSeek 模型一律會思考；max 最仔細，也花最多 token'),
-    field('權限', permSel, '每次詢問：每個指令與修改都先問你 · 需要時詢問：只有風險高的才問 · 全部自動：不會打斷你'),
-    h('label', { class: 'settings-switch' }, plan, h('span', null, h('span', { class: 'om-field__label' }, '計畫模式'), h('span', { class: 'om-field__help' }, '先規劃，你同意後才動手'))),
-    h('p', { class: 'om-field__help ds-note' }, '中控台只會在那台電腦的 Kimi 裡新增一個叫 agent-hub-deepseek 的模型來源，不會更動 Kimi 訂閱的登入，也不會改 Kimi 的預設模型；一般的 Kimi 對話照舊用訂閱的模型。'),
+    h('p', { class: 'om-field__help ds-note' }, '中控台只會在那台電腦的 Kimi 裡新增一個叫 agent-hub-deepseek 的模型來源，不會更動 Kimi 訂閱的登入，也不會改 Kimi 的預設模型；一般的 Kimi 對話照舊用訂閱的模型。新對話預設用哪個模型，在「設定」裡選。'),
     secondaryBox,
     ...(acc.warnings || []).map((w) => h('div', { class: 'callout small ds-secondary' }, icon('alert'), h('div', { class: 'callout-text' }, `「${w.machineName}」的 DeepSeek 模型來源沒有加上 session 標頭：${w.text}。閘道可能會對這台電腦的請求限流。`))),
     h('div', { class: 'dialog-actions' }, h('button', { class: 'om-btn', type: 'button', onclick: () => dlg.close() }, '取消'), h('button', { class: 'om-btn om-btn--primary', type: 'submit' }, '儲存')),
@@ -2714,7 +2502,6 @@ async function deepseekDialog() {
   form.addEventListener('submit', save);
   const dlg = dialog(form);
   if (!cur().hasKey) setTimeout(() => keyInput.focus(), 0);
-  loadModels();
   // A [secondary_model] in a computer's Kimi: subagents may run on it.
   get('/deepseek/secondary')
     .then((list) => {
@@ -2723,36 +2510,38 @@ async function deepseekDialog() {
       fill(
         secondaryBox,
         icon('alert'),
-        h('div', { class: 'callout-text' }, list.map((x) => `「${x.machineName}」的 Kimi 設定了子代理模型（[secondary_model]：${x.model}${x.force ? '，強制' : ''}）。DeepSeek 對話裡的子代理可能改用它，那可能是 Kimi 訂閱的模型。中控台不會更動這個設定；要避免的話，在那台電腦的 config.toml 拿掉 [secondary_model]。`).join('\n')),
+        h('div', { class: 'callout-text' }, list.map((x) => `「${x.machineName}」的 Kimi 設定了子代理模型（[secondary_model]：${x.model}${x.force ? '，強制' : ''}）。子代理可能改用它，那可能是 Kimi 訂閱的模型。中控台不會更動這個設定；要自己決定子代理用哪個模型，在那台電腦的 config.toml 拿掉 [secondary_model]，再到對話或「設定」選子代理模型。`).join('\n')),
       );
     })
     .catch(() => {});
 }
 
-// /status in a DeepSeek conversation.
-function deepseekStatusDialog() {
+// /status in a DeepSeek or Claude conversation (running in Kimi, paid by their own key).
+function meteredStatusDialog() {
   const s = S.cur?.summary;
   if (!s) return;
   const meta = s.meta || {};
+  const family = familyOf(s);
   const model = (meta.models || []).find((x) => x.id === meta.model);
   const ctx = meta.context;
-  const acc = S.deepseek || {};
+  const acc = family === 'claude' ? S.claude || {} : S.deepseek || {};
   const rows = [
-    ['模型', model?.name || meta.model || '—'],
+    ['模型', model?.name || modelName(meta.model) || '—'],
     meta.effort ? ['思考強度', EFFORT_LABELS[meta.effort] || meta.effort] : null,
+    ['子代理', subagentLabel(s.subagent?.model)],
     ['權限', `${PERMISSION_LABELS[meta.permission] || PERMISSION_LABELS.manual}${meta.planMode ? ' · 計畫模式' : ''}`],
     ctx?.size ? ['Context', `${Math.round((ctx.used / ctx.size) * 100)}% · ${fmtK(ctx.used)} / ${fmtK(ctx.size)} tokens（Kimi 用到約 85% 會自動壓縮）`] : null,
     ['資料夾', s.cwd || '—'],
     ['執行在', `「${machineById(s.machineId)?.name || s.meta?.machineName || '那台電腦'}」的 Kimi Code${meta.kimiVersion ? ` ${meta.kimiVersion}` : ''}`],
-    ['計費', `${dsLabel()} 的 API key，不用 Kimi 訂閱`],
-    ['API key', acc.hasKey ? `…${acc.keyHint}` : '還沒有設定'],
+    ['計費', family === 'claude' ? 'Claude API 的 key（Anthropic Console 帳戶，按 token），不用 Kimi 訂閱' : `${dsLabel()} 的 API key，不用 Kimi 訂閱`],
+    ['API key', acc.hasKey ? `${family === 'claude' ? acc.keyHint : `…${acc.keyHint}`}${acc.keySource === 'env' ? '（環境變數）' : ''}` : '還沒有設定'],
   ].filter(Boolean);
   const body = h(
     'div',
     { class: 'account' },
     h('div', { class: 'dialog-title' }, '狀態'),
     h('dl', { class: 'kv' }, rows.flatMap(([k, v]) => [h('dt', null, k), h('dd', null, v)])),
-    h('div', { class: 'dialog-actions' }, h('button', { class: 'om-btn', type: 'button', onclick: () => (d.close(), deepseekDialog()) }, 'DeepSeek 設定…'), h('button', { class: 'om-btn om-btn--primary', type: 'button', onclick: () => d.close() }, '好')),
+    h('div', { class: 'dialog-actions' }, h('button', { class: 'om-btn', type: 'button', onclick: () => (d.close(), family === 'claude' ? claudeDialog() : deepseekDialog()) }, family === 'claude' ? 'Claude API 設定…' : 'DeepSeek 設定…'), h('button', { class: 'om-btn om-btn--primary', type: 'button', onclick: () => d.close() }, '好')),
   );
   const d = dialog(body);
 }
@@ -3053,19 +2842,14 @@ async function gdriveDialog() {
 // A new Claude conversation bound to a GitHub repository: cloned on the
 // chosen computer, on a branch of its own (or one named here), and every
 // change committed and pushed there.
-// With `session`: that conversation, bound from now on.
-// `agent`: whose new conversations ('claude' or 'kimi').
-async function repoDialog(m, session = null, agent = session ? agentOf(session) : 'claude') {
-  const kimi = agent === 'kimi' || agent === 'deepseek';
-  const who = agent === 'deepseek' ? 'DeepSeek' : kimi ? 'Kimi' : 'Claude';
-  const key = kimi ? m.id : m.id || 'hub';
-  const cur = (session ? null : kimi ? kimiRepo(m) : claudeRepo(m)) || {};
+// With `session`: that conversation, bound from now on (an old Claude API
+// conversation is the one kind that is not Kimi Code on a computer).
+async function repoDialog(m, session = null) {
+  const kimi = !isLegacyClaude(session);
+  const who = session ? nameFor(session) : 'Agent';
+  const cur = (session ? null : homeRepo(m)) || {};
   const store = (value) => {
-    if (kimi) S.home.repoByMachine = { ...(S.home.repoByMachine || {}), [key]: value };
-    else {
-      const x = (S.home.claude ??= {});
-      x.repoByMachine = { ...(x.repoByMachine || {}), [key]: value };
-    }
+    S.home.repoByMachine = { ...(S.home.repoByMachine || {}), [m.id]: value };
     saveHome();
     showHome();
   };
@@ -3375,8 +3159,8 @@ async function cancelAutoResume() {
 async function armResumeAfterReset(text = '繼續') {
   const s = S.cur?.summary;
   if (!s) return false;
-  if (isDeepseek(s)) {
-    toast('DeepSeek 對話不用 Kimi 訂閱，沒有 5 小時額度。用 /later 30 繼續 定時送出。', { kind: 'error' });
+  if (isMetered(s)) {
+    toast(`${nameFor(s)} 對話不用 Kimi 訂閱，沒有 5 小時額度。用 /later 30 繼續 定時送出。`, { kind: 'error' });
     return false;
   }
   if (busy(s.status) && !(await confirmDialog({ title: 'Kimi 還在工作', body: `要等它停下、而且 5 小時額度恢復後，再送出「${text}」嗎？`, action: '好' }))) return false;
@@ -3434,7 +3218,7 @@ function laterCommand(args) {
   const [, when, rest] = a.match(/^(\S+)\s*([\s\S]*)$/);
   const text = rest.trim() || '繼續';
   const w = when.toLowerCase();
-  const noQuota = isClaude(S.cur?.summary) || isDeepseek(S.cur?.summary);
+  const noQuota = isLegacyClaude(S.cur?.summary) || isMetered(S.cur?.summary);
   if (['reset', '額度', '恢復'].includes(w)) return noQuota ? toast(`${nameFor(S.cur.summary)} 沒有 5 小時額度，請用分鐘數或時間：/later 30 繼續、/later 15:30 繼續`, { kind: 'error' }) : armResumeAfterReset(text);
   let m;
   let at = null;
@@ -3460,7 +3244,7 @@ function scheduleDialog() {
   const err = h('div', { class: 'om-field__error', role: 'alert' });
   const pending = h('div', { class: 'sched-pending' });
   // Claude's and DeepSeek's bills are not a Kimi plan with a 5-hour quota.
-  const claude = isClaude(s) || isDeepseek(s);
+  const claude = isLegacyClaude(s) || isMetered(s);
   const modes = claude ? { minutes: '幾分鐘後', clock: '指定時間' } : { minutes: '幾分鐘後', clock: '指定時間', reset: '5 小時額度恢復後' };
   let mode = 'minutes';
   const seg = h('div', { class: 'om-seg om-seg--sm', role: 'group', 'aria-label': '什麼時候送出' });
@@ -3611,19 +3395,90 @@ function autoPauseDialog() {
   });
 }
 
+// 設定: 配色, where models come from (模型來源), and what a new conversation
+// starts with (model, thinking, permission, 子代理 model; and, for a model that
+// is a subagent, how hard it thinks).
 async function openSettings() {
   const m = homeMachine();
-  if (m) await loadMachineModels(m);
-  const models = kimiModels(m && machineModels.get(m.id)?.models);
-  const kimiDefault = (m && machineModels.get(m.id)?.defaultModel) || '';
+  const cat = m ? await loadCatalog(m.id) : null;
+  const models = allModels(cat);
   const d0 = defaults();
-  const form = h('form', { class: 'settings' });
-  const modelSel = h('select', { class: 'om-input', name: 'model' }, h('option', { value: '' }, 'Kimi 的預設模型'), ...models.map((x) => h('option', { value: x.id, selected: x.id === d0.model }, x.name || x.id)));
-  if (d0.model && !models.some((x) => x.id === d0.model)) modelSel.append(h('option', { value: d0.model, selected: true }, d0.model));
+  const form = h('form', { class: 'settings all-settings' });
+  const field = (label, control, help) => h('label', { class: 'om-field' }, h('span', { class: 'om-field__label' }, label), control, help ? h('span', { class: 'om-field__help' }, help) : null);
+
+  // ---- 配色: applied and kept at once, whatever happens to the form below.
+  const swatch = (c) =>
+    h(
+      'span',
+      { class: 'look-swatch', style: { '--sw-bg': c.bg, '--sw-side': c.side, '--sw-raised': c.raised, '--sw-ink': c.ink, '--sw-accent': c.accent }, 'aria-hidden': 'true' },
+      h('span', { class: 'sw-side' }),
+      h('span', { class: 'sw-main' }, h('span', { class: 'sw-line' }), h('span', { class: 'sw-line short' }), h('span', { class: 'sw-box' }, h('span', { class: 'sw-send' }))),
+    );
+  const lookBox = h('div', { class: 'look-list', role: 'radiogroup', 'aria-label': '配色' });
+  const lookNote = h('p', { class: 'om-field__help look-note' });
+  const themeSeg = h('div', { class: 'om-seg om-seg--sm', role: 'group', 'aria-label': '淺色或深色' });
+  const themeNote = h('span', { class: 'om-field__help' });
+  const drawLook = () => {
+    const cur = look();
+    fill(
+      lookBox,
+      ...Object.entries(LOOKS).map(([id, l]) =>
+        h(
+          'button',
+          {
+            class: `look-card${cur === id ? ' on' : ''}`,
+            type: 'button',
+            role: 'radio',
+            'aria-checked': String(cur === id),
+            onclick: () => (chooseLook(id), drawLook()),
+          },
+          swatch(l.swatch),
+          h('span', { class: 'look-name' }, l.name),
+        ),
+      ),
+    );
+    lookNote.textContent = LOOKS[cur].desc;
+    const kimi = cur === 'kimi';
+    const t = theme();
+    fill(
+      themeSeg,
+      ...[['auto', '跟系統'], ['light', '淺色'], ['dark', '深色']].map(([v, label]) => h('button', { class: 'om-seg__item', type: 'button', 'aria-pressed': String(t === v), disabled: !kimi, onclick: () => (applyTheme(v === 'auto' ? null : v), drawLook()) }, label)),
+    );
+    themeNote.textContent = kimi ? '' : `淺色／深色只用在 Kimi 配色；${LOOKS[cur].name} 固定一種明暗`;
+  };
+  drawLook();
+
+  // ---- 模型來源
+  const ready = (id, key) => cat?.sources.find((x) => x.id === id)?.ready ?? Boolean(key);
+  const sourceRow = (title, status, ok, action) =>
+    h(
+      'div',
+      { class: 'src-row' },
+      h('div', { class: 'src-text' }, h('div', { class: 'src-title' }, title, h('span', { class: `om-badge${ok ? ' om-badge--success' : ''}` }, ok ? '可用' : '未設定')), h('div', { class: 'om-field__help' }, status)),
+      h('button', { class: 'om-btn om-btn--sm', type: 'button', onclick: action.run }, action.label),
+    );
+  const ds = S.deepseek || {};
+  const cl = S.claude || {};
+  const sources = h(
+    'div',
+    { class: 'src-list' },
+    sourceRow('Kimi 訂閱', m ? `${m.name} 的 Kimi 帳號${m.kimi?.version ? ` · Kimi Code ${m.kimi.version}` : ''}` : '沒有可用的電腦：連接一台有 Kimi Code 的電腦，並在那台執行 kimi login', Boolean(m), m ? { label: '用量…', run: () => accountDialog(m.id) } : { label: '連接電腦…', run: openMachines }),
+    sourceRow(`DeepSeek（${dsLabel()}）`, ds.hasKey ? `API key …${ds.keyHint}，費用算在閘道的帳戶` : '還沒有閘道的 API key', ready('deepseek', ds.hasKey), { label: '設定…', run: deepseekDialog }),
+    sourceRow('Claude API', cl.hasKey ? `API key ${cl.keyHint}${cl.keySource === 'env' ? '（環境變數）' : ''}，費用從 Claude Console 帳戶扣款` : '還沒有 Anthropic 的 API key', ready('claude', cl.hasKey), { label: '設定…', run: claudeDialog }),
+  );
+
+  // ---- 新對話的預設
+  const options = (selected) => {
+    const opt = (x) => h('option', { value: x.id, selected: x.id === selected }, x.name || x.id);
+    const shown = (cat?.sources || []).filter((src) => src.ready && src.models.length);
+    return shown.length > 1 ? shown.map((src) => h('optgroup', { label: sourceTitle(src) }, ...src.models.map(opt))) : models.map(opt);
+  };
+  const modelSel = h('select', { class: 'om-input', name: 'model' }, h('option', { value: '' }, '預設模型'), ...options(d0.model));
+  if (d0.model && !models.some((x) => x.id === d0.model)) modelSel.append(h('option', { value: d0.model, selected: true }, modelName(d0.model)));
   const effortSel = h('select', { class: 'om-input', name: 'effort' });
   const fillEfforts = () => {
-    // Kimi's default model has thinking choices too.
-    const mod = models.find((x) => x.id === (modelSel.value || kimiDefault));
+    // The default model has thinking choices too.
+    const mod = models.find((x) => x.id === (modelSel.value || cat?.defaultModel));
     const list = mod?.efforts || [];
     const cur = effortSel.value || d0.effort;
     fill(effortSel, h('option', { value: '' }, '模型預設'), ...list.map((e) => h('option', { value: e, selected: e === cur }, `${EFFORT_LABELS[e] || e}${e === mod.defaultEffort ? '（模型預設）' : ''}`)));
@@ -3633,11 +3488,32 @@ async function openSettings() {
   fillEfforts();
   const permSel = h('select', { class: 'om-input', name: 'permission' }, ...Object.entries(PERMISSION_LABELS).map(([k, v]) => h('option', { value: k, selected: k === (d0.permission || 'manual') }, v)));
   const plan = h('input', { class: 'om-switch', type: 'checkbox', checked: Boolean(d0.planMode) });
-  const field = (label, control, help) => h('label', { class: 'om-field' }, h('span', { class: 'om-field__label' }, label), control, help ? h('span', { class: 'om-field__help' }, help) : null);
+  const subSel = h('select', { class: 'om-input', name: 'subagent' }, h('option', { value: 'primary', selected: !d0.subagentModel || d0.subagentModel === 'primary' }, '跟主模型一樣'), ...options(d0.subagentModel));
+  if (d0.subagentModel && d0.subagentModel !== 'primary' && !models.some((x) => x.id === d0.subagentModel)) subSel.append(h('option', { value: d0.subagentModel, selected: true }, modelName(d0.subagentModel)));
+
+  // How hard a model thinks as a subagent: one setting per model, shared by
+  // every conversation on every computer; the hub says whether it can be set.
+  const perModel = cat?.scope === 'per-model';
+  const efforts = { ...(d0.subagentEfforts || {}) };
+  const subModels = models.filter((x) => x.family !== 'kimi' && x.efforts.length);
+  const effortRows = subModels.map((x) => {
+    const sel = h('select', { class: 'om-input', 'aria-label': `${x.name} 的子代理思考強度`, onchange: () => (efforts[x.id] = sel.value) }, ...x.efforts.map((e) => h('option', { value: e, selected: e === subagentEffortOf(x.id, x) }, `${EFFORT_LABELS[e] || e}${e === x.defaultEffort ? '（模型預設）' : ''}`)));
+    return h('div', { class: 'sub-effort-row' }, h('span', { class: 'sub-effort-name' }, x.name), sel);
+  });
+  const subEffortBox = perModel
+    ? h(
+        'div',
+        { class: 'om-field' },
+        h('span', { class: 'om-field__label' }, '子代理思考強度（依模型，所有聊天室共用）'),
+        effortRows.length ? h('div', { class: 'sub-efforts' }, effortRows) : null,
+        h('span', { class: 'om-field__help' }, effortRows.length ? '每個模型當子代理時用的思考強度，這台中控台的所有對話都一樣。「跟主模型一樣」的子代理用主對話的思考強度；Kimi 訂閱的模型由 Kimi 決定，不能設定。' : '設定好 DeepSeek 或 Claude 之後，這裡可以選它們當子代理時的思考強度。Kimi 訂閱的模型由 Kimi 決定，不能設定。'),
+      )
+    : h('span', { class: 'om-field__help' }, '子代理用模型自己的預設思考強度');
+
   const save = async (e) => {
     e.preventDefault();
     try {
-      S.config.settings = await put('/settings', { defaults: { model: modelSel.value, effort: effortSel.disabled ? '' : effortSel.value, permission: permSel.value, planMode: plan.checked } });
+      await saveSettings({ defaults: { model: modelSel.value, effort: effortSel.disabled ? '' : effortSel.value, permission: permSel.value, planMode: plan.checked, subagentModel: subSel.value, ...(perModel ? { subagentEfforts: efforts } : {}) } });
       resetHomeChoices();
       d.close();
       toast('已儲存設定');
@@ -3648,16 +3524,25 @@ async function openSettings() {
   fill(
     form,
     h('div', { class: 'dialog-title' }, '設定'),
-    h('div', { class: 'dialog-subtitle first' }, '新對話的預設'),
+    h('div', { class: 'dialog-subtitle first' }, '配色'),
+    lookBox,
+    lookNote,
+    h('div', { class: 'theme-row' }, h('span', { class: 'om-field__label' }, '明暗'), themeSeg),
+    themeNote,
+    h('div', { class: 'dialog-subtitle' }, '模型來源'),
+    sources,
+    h('div', { class: 'dialog-subtitle' }, '新對話的預設'),
     h('p', { class: 'dialog-text settings-lead' }, '從中控台開新對話、或第一次在中控台打開舊對話時，會套用這些設定。之後在對話裡改的，會保留在那個對話。'),
     field('模型', modelSel, models.length ? (m && S.machines.length > 1 ? `「${m.name}」上可用的模型` : null) : '連上一台有 Kimi 的電腦後，就能選擇模型'),
     field('思考強度', effortSel),
     field('權限', permSel, '每次詢問：每個指令與修改都先問你 · 需要時詢問：只有風險高的才問 · 全部自動：不會打斷你'),
     h('label', { class: 'settings-switch' }, plan, h('span', null, h('span', { class: 'om-field__label' }, '計畫模式'), h('span', { class: 'om-field__help' }, '先規劃，你同意後才動手'))),
+    field('子代理模型', subSel, '每個對話也有自己的子代理模型，可以在輸入框的「子代理」改'),
+    subEffortBox,
     h('div', { class: 'dialog-actions' }, h('button', { class: 'om-btn', type: 'button', onclick: () => d.close() }, '取消'), h('button', { class: 'om-btn om-btn--primary', type: 'submit' }, '儲存')),
   );
   form.addEventListener('submit', save);
-  const d = dialog(form);
+  const d = dialog(form, { wide: true });
 }
 
 async function openMachines() {
@@ -3892,20 +3777,18 @@ async function loadMachines() {
 
 async function loadSessions() {
   const list = await get('/sessions');
-  S.sessions = new Map(list.filter((s) => s.kimiSessionId || isClaude(s)).map((s) => [s.id, s]));
+  S.sessions = new Map(list.filter((s) => s.kimiSessionId || isLegacyClaude(s)).map((s) => [s.id, s]));
   renderSidebar();
 }
 
 function upsertSession(s) {
-  if (!s.kimiSessionId && !isClaude(s)) return;
+  if (!s.kimiSessionId && !isLegacyClaude(s)) return;
   const prev = S.sessions.get(s.id);
   S.sessions.set(s.id, s);
   renderSidebar();
   if (S.cur?.id === s.id) {
     const was = S.cur.summary?.status;
     S.cur.summary = s;
-    // The model decides (a DeepSeek model chosen or dropped elsewhere).
-    if (agentOf(s) !== agentOf(prev)) setLook(agentOf(s));
     S.cur.transcript.opts.agentName = nameFor(s);
     const tps = s.meta?.tps || 0;
     if (s.meta?.servedModel?.name !== prev?.meta?.servedModel?.name) S.cur.transcript.setServed(s.meta?.servedModel?.name);
@@ -3969,15 +3852,12 @@ function onMessage(m) {
     case 'machines':
       return loadMachines().then(() => machinesDialog?.draw());
     case 'claude':
-      S.claude = m.account;
-      if (S.config) S.config.claude = m.account;
-      if (S.route === 'home' && homeAgent() === 'claude') showHome();
-      return;
     case 'deepseek':
-      S.deepseek = m.account;
-      if (S.config) S.config.deepseek = m.account;
-      S.deepseekModels = null;
-      if (S.route === 'home' && homeAgent() === 'deepseek') showHome();
+      // A key was set or removed (here or in another window): the models of
+      // that source come and go.
+      S[m.t] = m.account;
+      if (S.config) S.config[m.t] = m.account;
+      refreshCatalogs();
       return;
     case 'kimi.session': {
       const mc = machineById(m.machineId);
@@ -4013,11 +3893,16 @@ window.addEventListener('focus', updateTitle);
 async function start() {
   try {
     applyTheme(savedTheme(), { save: false });
+    // The look as this browser chose it is already on (index.html); a browser
+    // that has not chosen yet takes the one the hub keeps, when it keeps one.
+    localStorage.removeItem('hubLook'); // what the modes used to set
   } catch {}
   try {
     S.config = await get('/config');
     S.claude = S.config.claude || null;
     S.deepseek = S.config.deepseek || null;
+    const kept = S.config.settings?.look;
+    if (!savedLook() && LOOKS[kept] && kept !== 'kimi') applyLook(kept);
     resetHomeChoices();
   } catch (err) {
     if (err.status === 401) return showLogin();

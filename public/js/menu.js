@@ -40,7 +40,8 @@ function keys(e) {
   } else if (e.key === 'Tab') closeMenu();
 }
 
-// entries: { label, hint, icon, checked, disabled, destructive, onSelect, keepOpen }
+// entries: { label, hint, tag, icon, checked, disabled, destructive, onSelect, keepOpen }
+//   (`tag`: a small pill after the label, e.g. a model's billing)
 //          | { separator: true } | { section: 'Title' } | { node: Element }
 // A point (right-click) to anchor a menu to, shaped like an element.
 export function pointAnchor(x, y) {
@@ -81,6 +82,7 @@ export function openMenu(anchor, entries, { align = 'start', side = 'auto', widt
         hasChecks ? h('span', { class: 'om-menu__check' }, e.checked ? '✓' : '') : null,
         e.icon ? icon(e.icon) : null,
         h('span', { class: 'menu-label' }, e.label, e.description ? h('span', { class: 'menu-desc' }, e.description) : null),
+        e.tag ? h('span', { class: 'menu-tag' }, e.tag) : null,
         e.hint ? h('span', { class: 'om-menu__shortcut' }, e.hint) : null,
       );
       el.append(item);

@@ -30,18 +30,34 @@ cd agent-hub; powershell -ExecutionPolicy Bypass -File scripts\start-public.ps1
 
 **更新**：在 `agent-hub` 資料夾裡執行 `git pull`，再執行一次上面的啟動指令。
 
+## 一種對話：任何模型都能當主模型或子代理
+
+首頁只有一個「新對話」輸入框：選電腦、資料夾、權限、**模型**、思考強度，和一個「**子代理**」。對話就是那台電腦上的 Kimi Code，主模型可以是任何一個來源的模型：
+
+- **Kimi 訂閱**：那台電腦登入的 Kimi 帳號。
+- **DeepSeek**（閘道的 API key）：左下角「⋯」→「DeepSeek…」，費用算在閘道。
+- **Claude API**（Anthropic Console 的 API key）：左下角「⋯」→「Claude API…」，按 token 計費，在那台電腦的 Kimi Code 裡執行。
+
+模型選單依來源分組，每個模型有小小的計費標籤；還沒設定的來源只有一列「設定…」，點下去開對應的 key 視窗。對話中途可以換主模型，包括換到別的來源（對話裡會寫一行計費說明）；側欄對話列在模型不是 Kimi 時標「DeepSeek」或「Claude」。
+
+**子代理模型**：輸入框的「子代理：…」選子代理用哪個模型，「跟主模型一樣」或任何來源的模型；每個對話各自一個，新對話的預設在「設定」。子代理的思考強度不是每個對話一個：「跟主模型一樣」用主對話的思考強度；DeepSeek／Claude 的模型用該模型的子代理思考強度（依模型，所有對話共用，DeepSeek 預設 max，在「設定」→「子代理思考強度」改）；Kimi 訂閱的模型由 Kimi 決定。子代理卡片和子代理面板會寫出它實際用的「模型 · 思考強度」。
+
+**配色**：「設定」→「配色」選三種外觀，每種有預覽：**Kimi**（Oatmeal 米色，可再選淺色／深色／跟系統）、**Claude 黑橘**、**DeepSeek 藍白**。配色是你的選擇，套用在首頁、所有對話和視窗，不隨模型改變；存在這個瀏覽器，也存在中控台的設定裡（新的瀏覽器會沿用）。淺色／深色只用在 Kimi 配色。
+
+「設定」還有「模型來源」（三個來源的狀態）和「新對話的預設」（主模型、思考強度、權限、子代理模型、各模型的子代理思考強度）。
+
 ## Claude API
 
-首頁上方切到「Claude API」，就能直接和 Claude 對話。中控台用 Anthropic 官方 SDK 呼叫 Claude API（api.anthropic.com），**只用 Claude Console 的 API key**（`sk-ant-…`），依 token 從 Console 帳戶的額度扣款；不經過 Claude Code，也不會用 Claude Pro／Max 訂閱，訂閱帳號的登入 token（`sk-ant-oat…`）會被拒絕。
+Claude 模型用 Anthropic Console 的 API key 呼叫 Claude API（api.anthropic.com），在那台電腦的 Kimi Code 裡執行，**只用 Claude Console 的 API key**（`sk-ant-…`），依 token 從 Console 帳戶的額度扣款；不經過 Claude Code，也不會用 Claude Pro／Max 訂閱，訂閱帳號的登入 token（`sk-ant-oat…`）會被拒絕。
 
 1. 到 [Claude Console → API Keys](https://console.anthropic.com/settings/keys) 建立一把 key。
 2. 左下角「⋯」→「Claude API…」貼上 key 後儲存（中控台會先向 Anthropic 確認 key 有效；key 只存在 `data/claude.json`，不會傳回瀏覽器）。也可以改用環境變數 `ANTHROPIC_API_KEY`。
 
-Claude 的對話由一個獨立的 **Claude 背景程式** 執行（跟 Kimi 的 `kimi web` 一樣）：在中控台這台電腦上由中控台啟動，在已連接的電腦上由那台的連接器啟動（連接器要 0.5 以上，舊的請在那台電腦重新執行連接指令）。中控台只是看和操控它的介面：關掉中控台、甚至關掉連接器，Claude 都照常做完，中控台再開時會補上這段時間的進度。工具（Bash、Read、Write、Edit、Glob、Grep、網路搜尋）在那台電腦上你選的資料夾裡跑。為了在中控台關掉時也能呼叫 API，API key 也會存一份在執行 Claude 的那台電腦上（`~/.agent-hub/claude/`，只有你的帳號能讀）。權限有「每次詢問／自動接受編輯／全部自動」和計畫模式。也支援待辦、提問、子代理、插隊、/compact、/undo、/fork、定時送出；輸入框旁顯示這個對話的估計花費與每次回應實際的模型，`/cost` 看明細與速率限制，`/budget 5` 設定花費上限（花到就先停）。預設模型 Claude Opus 5.5。只用你選的模型：如果回覆來自別的模型（例如被降級），或模型拒絕回答，這一輪會立刻停下、不執行它要的工具，對話裡寫明原因並跳出通知。背景程式本身重新啟動（例如更新）時，被中斷的那一輪會自動接著做。
+（以下是早期由中控台直接執行的 Claude API 對話，仍然可以開啟和使用。）Claude 的對話由一個獨立的 **Claude 背景程式** 執行（跟 Kimi 的 `kimi web` 一樣）：在中控台這台電腦上由中控台啟動，在已連接的電腦上由那台的連接器啟動（連接器要 0.5 以上，舊的請在那台電腦重新執行連接指令）。中控台只是看和操控它的介面：關掉中控台、甚至關掉連接器，Claude 都照常做完，中控台再開時會補上這段時間的進度。工具（Bash、Read、Write、Edit、Glob、Grep、網路搜尋）在那台電腦上你選的資料夾裡跑。為了在中控台關掉時也能呼叫 API，API key 也會存一份在執行 Claude 的那台電腦上（`~/.agent-hub/claude/`，只有你的帳號能讀）。權限有「每次詢問／自動接受編輯／全部自動」和計畫模式。也支援待辦、提問、子代理、插隊、/compact、/undo、/fork、定時送出；輸入框旁顯示這個對話的估計花費與每次回應實際的模型，`/cost` 看明細與速率限制，`/budget 5` 設定花費上限（花到就先停）。預設模型 Claude Opus 5.5。只用你選的模型：如果回覆來自別的模型（例如被降級），或模型拒絕回答，這一輪會立刻停下、不執行它要的工具，對話裡寫明原因並跳出通知。背景程式本身重新啟動（例如更新）時，被中斷的那一輪會自動接著做。
 
 ## DeepSeek 模式
 
-首頁上方切到「DeepSeek」，開出的對話用 DeepSeek 模型，費用算在你的 DeepSeek 閘道 API key 上，**不用 Kimi 訂閱**。它不是另一套 agent：DeepSeek 對話就是那台電腦上 Kimi Code 裡的一般 Kimi 對話，只是模型換成 DeepSeek，所以 Kimi 的自動壓縮（用到約 85% 的 context 時）、reasoning 回放、子代理、計畫模式、插隊、待辦都照常運作；中控台給它藍白配色的 DeepSeek 外觀、側欄上的「DeepSeek」標籤和自己的設定。
+DeepSeek 模型可以當任何對話的主模型或子代理的模型，費用算在你的 DeepSeek 閘道 API key 上，**不用 Kimi 訂閱**。它不是另一套 agent：DeepSeek 對話就是那台電腦上 Kimi Code 裡的一般 Kimi 對話，只是模型換成 DeepSeek，所以 Kimi 的自動壓縮（用到約 85% 的 context 時）、reasoning 回放、子代理、計畫模式、插隊、待辦都照常運作；側欄上有「DeepSeek」標籤；藍白外觀是「設定」→「配色」的一個選項，不是 DeepSeek 對話專用。
 
 1. 左下角「⋯」→「DeepSeek…」選閘道、貼上 API key。中控台會先用這把 key 向閘道讀模型清單確認有效（只保留 DeepSeek 的模型；讀不到清單時用內建清單），key 只存在 `data/deepseek.json`，不會傳回瀏覽器。
 2. 閘道：**OpenCode Go**（訂閱）、**OpenCode**（按量計費，原本的 Zen）、**Command Code**（要有含 API 存取的方案；Go 方案會被拒絕，`upgrade_required`）。預設模型是各閘道的 DeepSeek V4.1 Flash（沒有的話用清單裡的第一個），思考強度 low／high／max，預設 max；每個模型 1M context、最多 384k 輸出。

@@ -101,7 +101,8 @@ const agentRunning = (ev) => {
 };
 
 export class Transcript {
-  // opts: { cwd, agentName ('Kimi' | 'Claude'), onRespond(ev, optionId, extra), onOpenArtifact(path, versionId), onCopy }
+  // opts: { cwd, agentName ('Kimi' | 'Claude' | 'DeepSeek'), onRespond(ev, optionId, extra), onOpenArtifact(path, versionId), onCopy,
+  //         subagentInfo(sub) -> { text: '模型 · 思考 強度', primary } | null }
   constructor(opts) {
     this.opts = opts;
     this.column = h('div', { class: 'column' });
@@ -536,6 +537,7 @@ export class Transcript {
         // The model that answered its last step, once one has.
         model: sub.served || sub.model || '',
         effort: sub.effort || '',
+        info: this.opts.subagentInfo?.(sub) || null,
         running,
         failed,
         stopped: sub.status === 'cancelled' || ev.status === 'interrupted',
@@ -994,10 +996,13 @@ export class Transcript {
     if (running && last) activity = last.type === 'tool_use' ? `${(TOOLS[last.name] || [null, last.name])[1]} ${last.title || ''}` : last.text.trim().split('\n').pop();
     const label = ev.name === 'btw' ? verb : `${verb}${sub.name && sub.name !== 'subagent' && sub.name !== 'btw' ? ` · ${sub.name}` : ''}`;
     const summary = sub.summary;
+    // The model and thinking it really runs with, once known (and a quiet
+    // marker when that is the conversation's own model).
+    const info = this.opts.subagentInfo?.(sub) || null;
     // Redrawn only when something on it changed: a working subagent touches
     // its card many times a second, and a rebuilt spinner starts over.
     const headKey = [label, sub.description || input.description || ev.title || '', steps, Boolean(sub.background), running, sub.status, ev.status, open].join('\u0001');
-    const bodyKey = [open, running, activity, summary, sub.error].join('\u0001');
+    const bodyKey = [open, running, activity, summary, sub.error, info?.text, info?.primary].join('\u0001');
     const same = node.headKey === headKey && node.bodyKey === bodyKey && !(ev.permission && !ev.permission.chosen);
     node.children.hidden = !open;
     if (same) return;
@@ -1028,6 +1033,7 @@ export class Transcript {
     node.bodyKey = bodyKey;
     fill(
       node.body,
+      info ? h('div', { class: 'agent-model' }, info.text, info.primary ? h('span', { class: 'agent-model-tag' }, '跟主模型') : null) : null,
       !open && running && activity ? h('div', { class: 'agent-activity' }, activity) : null,
       !open && !running && summary ? h('div', { class: 'agent-summary clamp' }, summary) : null,
       sub.error ? h('div', { class: 'callout danger small' }, icon('alert'), h('div', { class: 'callout-text' }, sub.error)) : null,

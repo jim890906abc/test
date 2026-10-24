@@ -1,8 +1,11 @@
 // The message box: auto-growing input, / commands, images, and the
-// model / thinking / permission controls. Used on the home screen (new
-// conversation) and under every conversation, for Kimi and for Claude
-// (state.agent === 'claude': Claude through the Claude API, run by the hub;
-// 'deepseek': a DeepSeek model inside Kimi, billed to a gateway's API key).
+// model / thinking / permission / 子代理 controls. Used on the home screen
+// (new conversation) and under every conversation.
+// A conversation is one kind of thing: Kimi Code on a computer, with any
+// model as the main model (state.family: 'kimi' subscription, 'deepseek' by a
+// gateway key, 'claude' by an Anthropic API key) and any model for its
+// subagents (state.subagent). state.agent === 'claude' is only an old
+// conversation the hub ran itself through the Claude API (no subagent models).
 import { h, fill, icon, fmtTokens, clockTime, fmtCountdown } from './dom.js';
 import { openMenu, closeMenu, place } from './menu.js';
 import { todoList } from './transcript.js';
@@ -24,7 +27,8 @@ const CLAUDE_PERMISSION_DESC = {
   auto: '全部直接做，不會打斷你',
 };
 export const permissionLabels = (agent) => (agent === 'claude' ? CLAUDE_PERMISSION_LABELS : PERMISSION_LABELS);
-export const agentName = (agent) => (agent === 'claude' ? 'Claude' : agent === 'deepseek' ? 'DeepSeek' : 'Kimi');
+// `family`: 'kimi' | 'deepseek' | 'claude' (what a conversation's model belongs to).
+export const agentName = (family) => (family === 'claude' ? 'Claude' : family === 'deepseek' ? 'DeepSeek' : 'Kimi');
 // US$, with more digits while it is small.
 export const fmtUsd = (n) => `US$${n >= 1 ? n.toFixed(2) : n >= 0.01 ? n.toFixed(3) : (n || 0).toFixed(4)}`;
 const MAX_IMAGES = 8;
@@ -45,6 +49,7 @@ const BG_DESCRIPTION = '移到背景（Ctrl+B）：Kimi 正在等的子代理或
 export const COMMANDS = [
   { name: 'model', description: '切換模型' },
   { name: 'effort', description: '調整思考強度' },
+  { name: 'subagent', description: '選擇子代理用的模型' },
   { name: 'plan', description: '開關計畫模式：先規劃，你同意後才動手' },
   { name: 'permission', description: '選擇權限模式' },
   { name: 'yolo', description: '需要時詢問：只有風險高的動作才問你' },
@@ -67,16 +72,17 @@ export const COMMANDS = [
   { name: 'backup', description: '把這個專案的資料夾備份到你的 Google Drive（中控台自己做，不花 token）' },
   { name: 'steer', description: '全部插隊：排隊中、等待插隊的訊息一次全部送進正在跑的這一輪，下一步一起讀到', aliases: ['steerall', 'flush'] },
 ];
-const HOME_COMMANDS = ['model', 'effort', 'plan', 'permission', 'yolo', 'auto', 'manual', 'usage', 'status'];
-// DeepSeek runs in Kimi, so Kimi's commands apply, except the ones about the
-// Kimi subscription's quota (it is not used); /later has times only.
-const DEEPSEEK_NO = ['autopause', 'usage'];
-const deepseekCommands = (list) =>
+const HOME_COMMANDS = ['model', 'effort', 'subagent', 'plan', 'permission', 'yolo', 'auto', 'manual', 'usage', 'status'];
+// DeepSeek and Claude models run in Kimi too, so Kimi's commands apply, except
+// the ones about the Kimi subscription's quota (it is not used); /later has
+// times only.
+const METERED_NO = ['autopause', 'usage'];
+const meteredCommands = (list, family) =>
   list
-    .filter((c) => !DEEPSEEK_NO.includes(c.name))
+    .filter((c) => !METERED_NO.includes(c.name))
     .map((c) => ({
       ...c,
-      description: c.name === 'later' ? '定時送出：幾分鐘後或指定時間送出訊息' : c.description.replace(/Kimi/g, 'DeepSeek'),
+      description: c.name === 'later' ? '定時送出：幾分鐘後或指定時間送出訊息' : c.description.replace(/Kimi/g, agentName(family)),
       ...(c.name === 'later' ? { hint: '[30 | 15:30] [訊息]' } : {}),
     }));
 // Claude through the Claude API: the hub runs it, so these are the hub's.
@@ -165,8 +171,29 @@ export function autoPauseStatus(ap, queue = []) {
   return { label, detail: `5 小時額度用到 ${ap.threshold}% 時送出「優雅暫停」`, tone: '' };
 }
 
+// The models of every source as menu entries, grouped under a header per
+// source (with a small billing tag on each model); a source that is not set up
+// is one 「設定…」 row. With a single source there is nothing to tell apart, so
+// no header and no tag. `sources`: [{ id, title, tag, ready, setupLabel, models }];
+// without them, `models` is one flat list.
+export function modelEntries({ sources, models, current, onPick, onSetup }) {
+  // With one source a model shows its id under its name, as it always did;
+  // with several the header and the tag say more than an alias would.
+  const one = (m, multi, tag) => ({ label: m.name, description: !multi && m.id !== m.name ? m.id : null, tag, checked: m.id === current, onSelect: () => onPick(m.id) });
+  if (!sources?.length) return (models || []).map((m) => one(m, false));
+  const multi = sources.length > 1;
+  const out = [];
+  for (const src of sources) {
+    if (multi) out.push({ section: src.title });
+    if (src.ready === false || (!src.models?.length && src.setupLabel)) out.push({ label: src.setupLabel || '設定…', checked: false, onSelect: () => onSetup?.(src.id) });
+    else if (!src.models?.length) out.push({ label: '沒有可用的模型', checked: false, disabled: true });
+    else for (const m of src.models) out.push(one(m, multi, multi ? src.tag : null));
+  }
+  return out;
+}
+
 export class Composer {
-  // opts: { home, placeholder, onSend({ text, images }), onCommand(name, args),
+  // opts: { home, placeholder (or homePlaceholder(name)), onSend({ text, images }), onCommand(name, args),
   //         onStop(), onConfig(change), onCancelQueued(promptId), onPickMachine(btn), onPickFolder(btn), onPaste? }
   constructor(opts) {
     this.opts = opts;
@@ -175,7 +202,7 @@ export class Composer {
     this.docs = [];
     this.drafts = new Map();
     this.key = null;
-    this.input = h('textarea', { class: 'composer-input', rows: 1, placeholder: opts.placeholder || `回覆 ${agentName(opts.agent)}…`, 'aria-label': '訊息' });
+    this.input = h('textarea', { class: 'composer-input', rows: 1, placeholder: opts.placeholder || (opts.homePlaceholder ? opts.homePlaceholder('Kimi') : '回覆 Kimi…'), 'aria-label': '訊息' });
     this.thumbs = h('div', { class: 'composer-images', hidden: true });
     this.left = h('div', { class: 'composer-tools' });
     this.right = h('div', { class: 'composer-actions' });
@@ -257,33 +284,31 @@ export class Composer {
     el.style.height = `${Math.min(el.scrollHeight, Math.round(window.innerHeight * 0.4))}px`;
   }
 
-  // state: { running, awaiting, queue, todos, models, model, defaultModel,
-  //          effort, permission, planMode, context, skills, machineName, folderName }
+  // state: { running, awaiting, queue, todos, models, sources, model, defaultModel,
+  //          effort, permission, planMode, context, skills, machineName, folderName,
+  //          family, subagent: { model }, subagentLabel, subagentNote }
   update(state) {
     this.state = { ...this.state, ...state };
-    if (!this.opts.placeholder) this.input.placeholder = `回覆 ${agentName(this.agent())}…`;
+    if (!this.opts.placeholder) this.input.placeholder = this.opts.homePlaceholder ? this.opts.homePlaceholder(this.name()) : `回覆 ${this.name()}…`;
     const readOnly = this.state.terminal && !this.state.controllable;
     this.box.hidden = readOnly;
     if (readOnly) {
       this.note ??= h('div', { class: 'composer-note' });
-      // A terminal Kimi in the same folder might have it open: two Kimis on
+      // A terminal Kimi that really has this conversation open: two Kimis on
       // one conversation would overwrite each other, so only on request.
+      // (A terminal merely guessed to be open is no lock: both sides can type.)
       const unlock = () => {
-        const ask = this.state.guess
-          ? '確定終端機的 Kimi 沒有開著這個對話嗎？\n\n如果它開著，兩邊會各自寫入同一個對話、互相覆蓋。'
-          : '終端機的 Kimi 剛寫過這個對話。確定它已經沒有開著（已經輸入 /web、換了對話或關掉）嗎？\n\n如果它還開著，兩邊會各自寫入同一個對話、互相覆蓋。';
+        const ask = '終端機的 Kimi 剛寫過這個對話。確定它已經沒有開著（已經輸入 /web、換了對話或關掉）嗎？\n\n如果它還開著，兩邊會各自寫入同一個對話、互相覆蓋。';
         if (confirm(ask)) this.opts.onUnlock?.();
       };
       fill(
         this.note,
         icon('terminal'),
-        this.state.guess
-          ? h('div', { class: 'composer-note-text' }, h('div', { class: 'composer-note-title' }, '這個資料夾有終端機的 Kimi 開著'), h('div', null, '看不出它開的是不是這個對話，為了避免兩邊互相覆蓋，這裡先只能看。關掉那個 Kimi 就會解除。'))
-          : h('div', { class: 'composer-note-text' }, h('div', { class: 'composer-note-title' }, '這個對話正在終端機的 Kimi 裡執行'), h('div', null, '這裡會即時同步。要從這裡操作，在那個 Kimi 裡輸入 /web，或之後用 kimi-hub 啟動 Kimi。')),
+        h('div', { class: 'composer-note-text' }, h('div', { class: 'composer-note-title' }, '這個對話正在終端機的 Kimi 裡執行'), h('div', null, '這裡會即時同步。要從這裡操作，在那個 Kimi 裡輸入 /web，或之後用 kimi-hub 啟動 Kimi。')),
         h(
           'div',
           { class: 'composer-note-actions' },
-          !this.state.guess && this.opts.onHelp ? h('button', { class: 'om-btn om-btn--sm om-btn--plain', type: 'button', onclick: () => this.opts.onHelp() }, '說明…') : null,
+          this.opts.onHelp ? h('button', { class: 'om-btn om-btn--sm om-btn--plain', type: 'button', onclick: () => this.opts.onHelp() }, '說明…') : null,
           this.opts.onUnlock ? h('button', { class: 'om-btn om-btn--sm', type: 'button', onclick: unlock }, '仍要從這裡操作') : null,
         ),
       );
@@ -296,6 +321,8 @@ export class Composer {
 
   // ------------------------------------------------------------- tools
 
+  // 'claude': an old conversation the hub ran itself through the Claude API.
+  // Everything else is Kimi Code, whichever model is the main model.
   agent() {
     return this.state.agent || this.opts.agent || 'kimi';
   }
@@ -304,9 +331,19 @@ export class Composer {
     return this.agent() === 'claude';
   }
 
-  // DeepSeek models in the computer's Kimi: Kimi's controls, minus its quota.
-  deepseek() {
-    return this.agent() === 'deepseek';
+  // Whose model answers: 'kimi' | 'deepseek' | 'claude'.
+  family() {
+    return this.state.family || (this.claude() ? 'claude' : 'kimi');
+  }
+
+  name() {
+    return agentName(this.family());
+  }
+
+  // DeepSeek and Claude models run in the computer's Kimi too: Kimi's
+  // controls, minus the Kimi subscription's quota (it is not used).
+  metered() {
+    return !this.claude() && this.family() !== 'kimi';
   }
 
   currentModel() {
@@ -324,7 +361,7 @@ export class Composer {
     // Kimi fixes the model and thinking when a turn starts: changed during
     // it, they say so, until the next turn picks them up.
     const working = s.running || s.awaiting;
-    const nameOf = (id) => (s.models || []).find((m) => m.id === id)?.name || id;
+    const nameOf = (id) => (s.models || []).find((m) => m.id === id)?.name || id.split('/').pop();
     const nextModel = working && s.turnModel && s.model && s.turnModel !== s.model;
     const nextEffort = working && s.turnEffort && s.effort && s.turnEffort !== s.effort;
     const effortName = (e) => EFFORT_LABELS[e] || e;
@@ -338,8 +375,8 @@ export class Composer {
       this.opts.home ? chip(s.folderName || '選擇資料夾', (b) => this.opts.onPickFolder(b), { iconName: s.folderIcon || 'folder', title: s.folderIcon === 'branch' ? '綁定的 GitHub repo' : '工作資料夾', control: 'folder' }) : null,
       chip(s.planMode ? '計畫模式' : permissionLabels(this.agent())[s.permission] || PERMISSION_LABELS.manual, (b) => this.permissionMenu(b), { iconName: s.planMode ? 'map' : 'shield', title: '權限模式', active: s.planMode, control: 'permission' }),
       s.models?.length
-        ? chip(`${model?.name || `${agentName(this.agent())} 預設模型`}${nextModel ? '（下一輪）' : ''}`, (b) => this.modelMenu(b), {
-            title: nextModel ? `這一輪是用「${nameOf(s.turnModel)}」開始的。${agentName(this.agent())} 每一輪開始時就固定模型，「${nameOf(s.model)}」從下一輪起使用` : '模型',
+        ? chip(`${model?.name || (s.model ? nameOf(s.model) : `${this.name()} 預設模型`)}${nextModel ? '（下一輪）' : ''}`, (b) => this.modelMenu(b), {
+            title: nextModel ? `這一輪是用「${nameOf(s.turnModel)}」開始的。${this.name()} 每一輪開始時就固定模型，「${nameOf(s.model)}」從下一輪起使用` : '模型',
             control: 'model',
           })
         : null,
@@ -347,10 +384,12 @@ export class Composer {
       this.claude() && s.servedModel ? servedChip(s) : null,
       efforts.length > 1
         ? chip(`思考 ${EFFORT_LABELS[s.effort] || s.effort || EFFORT_LABELS[model.defaultEffort] || '預設'}${nextEffort ? '（下一輪）' : ''}`, (b) => this.effortMenu(b), {
-            title: nextEffort ? `這一輪是用「${effortName(s.turnEffort)}」開始的。${agentName(this.agent())} 每一輪開始時就固定思考強度，「${effortName(s.effort)}」從下一輪起使用` : '思考強度',
+            title: nextEffort ? `這一輪是用「${effortName(s.turnEffort)}」開始的。${this.name()} 每一輪開始時就固定思考強度，「${effortName(s.effort)}」從下一輪起使用` : '思考強度',
             control: 'effort',
           })
         : null,
+      // Which model the subagents use (not for an old Claude API conversation).
+      s.subagent && !this.claude() ? subagentChip(s, (b) => this.subagentMenu(b)) : null,
     );
   }
 
@@ -383,9 +422,27 @@ export class Composer {
       anchor,
       [
         ...(s.running || s.awaiting ? [{ section: '模型 · 從下一輪起使用' }] : []),
-        ...(s.models || []).map((m) => ({ label: m.name, description: m.id !== m.name ? m.id : null, checked: m.id === cur, onSelect: () => this.opts.onConfig({ model: m.id }) })),
+        ...modelEntries({ sources: s.sources, models: s.models, current: cur, onPick: (id) => this.opts.onConfig({ model: id }), onSetup: (src) => this.opts.onSetupSource?.(src) }),
       ],
-      { width: 260 },
+      { width: s.sources?.length > 1 ? 280 : 260 },
+    );
+  }
+
+  // 子代理: the model subagents run on, or 「跟主模型一樣」. Model only: how
+  // hard a model thinks as a subagent is a setting of the model itself (設定),
+  // so the one line under the menu says where that comes from.
+  subagentMenu(anchor) {
+    const s = this.state;
+    const cur = s.subagent?.model || 'primary';
+    openMenu(
+      anchor,
+      [
+        { label: '跟主模型一樣', description: '子代理用這個對話的主模型', checked: cur === 'primary', onSelect: () => this.opts.onConfig({ subagent: { model: 'primary' } }) },
+        { separator: true },
+        ...modelEntries({ sources: s.sources, models: s.models, current: cur, onPick: (id) => this.opts.onConfig({ subagent: { model: id } }), onSetup: (src) => this.opts.onSetupSource?.(src) }),
+        ...(s.subagentNote ? [{ separator: true }, { node: h('div', { class: 'menu-note' }, s.subagentNote) }] : []),
+      ],
+      { width: s.sources?.length > 1 ? 300 : 280 },
     );
   }
 
@@ -412,10 +469,10 @@ export class Composer {
     const busy = s.running || s.awaiting;
     const ctx = s.context;
     const claude = this.claude();
-    const name = agentName(this.agent());
+    const name = this.name();
     // 自動暫停 watches Kimi's plan quota; Claude's API key and DeepSeek's
     // gateway key have none.
-    const ap = this.opts.onAutoPause && !claude && !this.deepseek() ? { state: s.autoPause, open: this.opts.onAutoPause, arm: this.opts.onArmResume } : null;
+    const ap = this.opts.onAutoPause && !claude && !this.metered() ? { state: s.autoPause, open: this.opts.onAutoPause, arm: this.opts.onArmResume } : null;
     const ring = ctx?.size ? contextRing(ctx, () => this.opts.onCommand('compact', ''), this.opts.onQuotaNode, ap, claude ? '花費' : '方案用量') : null;
     const stop = busy && !this.hasContent();
     fill(
@@ -479,21 +536,21 @@ export class Composer {
           'div',
           { class: 'queued queued-all' },
           h('span', { class: 'queued-text muted' }, `${queue.filter((q) => !q.steered).length} 則訊息還沒進這一輪`),
-          h('button', { class: 'om-btn om-btn--sm', type: 'button', title: `全部插隊：${agentName(this.agent())} 下一步一起讀到，不會中斷它（/steer）`, onclick: () => this.opts.onCommand('steer', '') }, '全部插隊'),
+          h('button', { class: 'om-btn om-btn--sm', type: 'button', title: `全部插隊：${this.name()} 下一步一起讀到，不會中斷它（/steer）`, onclick: () => this.opts.onCommand('steer', '') }, '全部插隊'),
         ),
       );
     for (const q of queue) {
       // Waiting to cut in: why, in a line of its own under the message.
-      const why = cutInWhyText(q, agentName(this.agent()));
+      const why = cutInWhyText(q, this.name());
       items.push(
         h(
           'div',
           { class: `queued${why ? ' has-why' : ''}` },
           h('span', { class: 'queued-label', title: why || undefined }, q.steered ? '下一步插入' : q.cutIn ? '等待插隊' : '排隊中'),
           h('span', { class: 'queued-text' }, q.text || (q.images?.length ? `${q.images.length} 張圖片` : '')),
-          !q.steered && !q.cutIn && !q.foreign ? h('button', { class: 'om-btn om-btn--sm', type: 'button', title: `讓 ${agentName(this.agent())} 在下一步就讀到這則訊息，不會中斷它`, onclick: () => this.opts.onSteerQueued(q.promptId) }, '插隊') : null,
+          !q.steered && !q.cutIn && !q.foreign ? h('button', { class: 'om-btn om-btn--sm', type: 'button', title: `讓 ${this.name()} 在下一步就讀到這則訊息，不會中斷它`, onclick: () => this.opts.onSteerQueued(q.promptId) }, '插隊') : null,
           why && (q.handoff === 'grace' || q.handoff === 'tool') && !q.now
-            ? h('button', { class: 'om-btn om-btn--sm', type: 'button', title: `不等了，現在就接手：在下一個安全點停下這一輪，讓 ${agentName(this.agent())} 先讀這則訊息（背景工作不受影響）`, onclick: () => this.opts.onSteerQueued(q.promptId) }, '現在插隊')
+            ? h('button', { class: 'om-btn om-btn--sm', type: 'button', title: `不等了，現在就接手：在下一個安全點停下這一輪，讓 ${this.name()} 先讀這則訊息（背景工作不受影響）`, onclick: () => this.opts.onSteerQueued(q.promptId) }, '現在插隊')
             : null,
           q.foreign ? null : h('button', { class: 'om-btn om-btn--toolbar om-btn--sm', type: 'button', title: '取消這則訊息', 'aria-label': '取消這則訊息', onclick: () => this.opts.onCancelQueued(q.promptId) }, icon('x')),
           why ? h('div', { class: 'queued-why' }, why) : null,
@@ -614,7 +671,7 @@ export class Composer {
     const skills = (this.state.skills || []).map((s) => ({ name: s.name, description: s.description, skill: true, args: true, source: s.source }));
     if (this.claude()) return this.opts.home ? CLAUDE_COMMANDS.filter((c) => CLAUDE_HOME_COMMANDS.includes(c.name)) : CLAUDE_COMMANDS;
     let base = this.opts.home ? COMMANDS.filter((c) => HOME_COMMANDS.includes(c.name)) : this.state.terminal ? TERMINAL_COMMANDS : COMMANDS;
-    if (this.deepseek()) base = deepseekCommands(base);
+    if (this.metered()) base = meteredCommands(base, this.family());
     const names = new Set(base.map((c) => c.name));
     return [...base, ...skills.filter((s) => !names.has(s.name))];
   }
@@ -773,6 +830,18 @@ export class Composer {
     const model = this.currentModel();
     if (this.images.length && model && !model.image) this.opts.onError?.(`${model.name} 可能看不懂圖片`);
   }
+}
+
+// 「子代理：跟主模型一樣」 / 「子代理：DeepSeek V4.1 Flash」.
+function subagentChip(s, onclick) {
+  const label = s.subagentLabel || (s.subagent.model === 'primary' ? '跟主模型一樣' : s.subagent.model.split('/').pop());
+  return h(
+    'button',
+    { class: 'chip chip-sub', type: 'button', title: `子代理用的模型：${label}`, 'aria-haspopup': 'menu', dataset: { control: 'subagent' }, onclick: (e) => onclick(e.currentTarget) },
+    icon('agents'),
+    h('span', { class: 'chip-sub-label' }, `子代理：${label}`),
+    icon('down', 'caret'),
+  );
 }
 
 // "實際 Claude Opus 5.5": the model that produced the last response,

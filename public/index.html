@@ -14,11 +14,12 @@
       try {
         const t = localStorage.getItem('hubTheme') || 'light';
         if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
-        // Claude's or DeepSeek's look last time (app.js setLook): no flash of
-        // the Kimi theme.
-        const look = localStorage.getItem('hubLook');
-        if ((look === 'claude' || look === 'deepseek') && !/^#\/(artifacts|k\/)/.test(location.hash)) {
-          document.documentElement.dataset.agent = look;
+        // The 配色 chosen in 設定 (app.js applyLook): Kimi's Oatmeal look is the
+        // default, Claude's black-and-orange and DeepSeek's blue-and-white are
+        // choices. Put back before the first paint, so there is no flash.
+        const look = localStorage.getItem('hubLookChoice');
+        if (look === 'claude' || look === 'deepseek') {
+          document.documentElement.dataset.look = look;
           for (const m of document.querySelectorAll('meta[name="theme-color"]')) {
             m.dataset.base = m.content;
             m.content = look === 'claude' ? '#141413' : '#ffffff';

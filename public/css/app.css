@@ -43,6 +43,7 @@
     --focus-ring: 0 0 0 2px #262624, 0 0 0 4px #d97757;
     --user-bubble: #141413;
     --row-active: #141413;
+    --edge: #85837b;
   }
 }
 :root[data-theme='dark'] {
@@ -84,12 +85,14 @@
   --focus-ring: 0 0 0 2px #262624, 0 0 0 4px #d97757;
   --user-bubble: #141413;
   --row-active: #141413;
+  --edge: #85837b;
 }
 
-/* Claude mode (the Claude home, a Claude conversation): Claude's classic
-   near-black with its orange, whatever the theme. Set by app.js as
-   data-agent; after the dark blocks, so it wins over them. */
-:root[data-agent='claude'] {
+/* The Claude look (設定 → 配色 → Claude 黑橘): Claude's classic near-black
+   with its orange, whatever the theme. Set by app.js as data-look on the page
+   (a choice of the user, not of the model); after the dark blocks, so it wins
+   over them. */
+:root[data-look='claude'] {
   color-scheme: dark;
   --desktop: #0b0b0a;
   --window: #141413;
@@ -129,9 +132,10 @@
   --focus-ring: 0 0 0 2px #141413, 0 0 0 4px #d97757;
   --user-bubble: #262624;
   --row-active: #262624;
+  --edge: #85837b;
 }
 
-/* DeepSeek mode (the DeepSeek home, a DeepSeek conversation): blue and white,
+/* The DeepSeek look (設定 → 配色 → DeepSeek 藍白): blue and white,
    whatever the theme (like Claude's look it ignores the dark theme): white
    surfaces, a very pale blue-white sidebar, DeepSeek's blue (#4d6bfe) as the
    one accent and near-black ink with a blue tint. The component details are
@@ -150,7 +154,7 @@
      on #fff6e5 4.8; success #117556 on white 5.7, on #e8f6ef 5.1
      control-border #818dbd on white 3.24, on #f5f8ff 3.05, on #f7f9ff 3.08;
      icon-ink #6f7794 on white 4.4, on #f7f9ff 4.2; #4d6bfe on white 4.3, on #f3f6ff 4.0 */
-:root[data-agent='deepseek'] {
+:root[data-look='deepseek'] {
   color-scheme: light;
   accent-color: #4d6bfe;
   --desktop: #ffffff;
@@ -192,9 +196,14 @@
   --focus-ring: 0 0 0 2px #ffffff, 0 0 0 4px #4d6bfe;
   --user-bubble: #eef3ff;
   --row-active: #e6edff;
+  --edge: #818dbd;
 }
 
 :root {
+  /* The edge of a control that has to be seen (3:1 on the surface it sits on):
+     --control-border in the light looks, a little lighter in the dark ones
+     (dark theme, Claude), where --control-border is only 2.5:1. */
+  --edge: var(--control-border);
   --side-w: 248px;
   --col: 768px;
   --user-bubble: var(--window-raised);
@@ -520,8 +529,9 @@ kbd {
   display: flex;
   padding: var(--space-8) var(--space-5);
 }
+/* 760, not 720: the composer's one row of chips now has the 子代理 pill too. */
 .home-inner {
-  width: min(720px, 100%);
+  width: min(760px, 100%);
   margin: auto;
   display: flex;
   flex-direction: column;
@@ -1566,19 +1576,17 @@ pre.tail {
   flex: 1;
   min-width: 0;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 2px;
-  overflow-x: auto;
-  scrollbar-width: none;
+  row-gap: 2px;
   margin-left: -4px;
-}
-.composer-tools::-webkit-scrollbar {
-  display: none;
 }
 .composer-actions {
   flex: none;
   display: flex;
   align-items: center;
+  align-self: flex-end; /* the chips may wrap onto more lines: send stays at the bottom */
   gap: var(--space-2);
 }
 .chip {
@@ -2740,13 +2748,13 @@ pre.tail {
   border-radius: 18px;
 }
 /* (DeepSeek's blue-and-white look is at the end of this file.) */
-:root[data-agent='claude'] .om-btn--plain {
+:root[data-look='claude'] .om-btn--plain {
   color: var(--link);
 }
-:root[data-agent='claude'] .side-row[aria-current='page'] {
+:root[data-look='claude'] .side-row[aria-current='page'] {
   color: var(--ink);
 }
-:root[data-agent='claude'] .composer-box {
+:root[data-look='claude'] .composer-box {
   border-radius: 18px;
 }
 
@@ -3215,10 +3223,6 @@ pre.tail {
 
 /* ------------------------------------------------------------ Claude API */
 
-/* Which agent a new conversation goes to (home). */
-.home-agent {
-  align-self: center;
-}
 .callout.claude-key,
 .callout.deepseek-key {
   align-items: center;
@@ -3584,24 +3588,264 @@ pre.tail {
   margin-top: 2px;
 }
 
+/* ---------------------------------------- one conversation, many models */
+
+/* The billing tag after a model in the model menus, and a line of note under a menu. */
+.menu-tag {
+  flex: none;
+  align-self: center;
+  margin-left: var(--space-2);
+  padding: 0 5px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-size: 10px;
+  line-height: 14px;
+  font-weight: 600;
+  white-space: nowrap;
+  color: var(--ink-secondary);
+}
+.om-menu__item:hover .menu-tag,
+.om-menu__item:focus-visible .menu-tag,
+.om-menu__item[aria-selected='true'] .menu-tag {
+  color: var(--ink);
+  background: var(--window-raised);
+  border-color: transparent;
+}
+.menu-note {
+  padding: 4px var(--space-2) 3px;
+  font-size: 11px;
+  line-height: 15px;
+  color: var(--ink-secondary);
+}
+.om-menu__item[aria-disabled='true'] .menu-tag {
+  color: inherit;
+}
+
+/* 子代理 pill in the composer: 「子代理：跟主模型一樣」 */
+.chip.chip-sub {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 280px;
+}
+.chip-sub-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* Claude's tag in the sidebar, next to the DeepSeek one. White on #b4532f is
+   5.0:1 (10px text). */
+.row-tag.cl {
+  background: #b4532f;
+  color: #fff;
+}
+
+/* A subagent's model and thinking: on its card, and in the subagent list. */
+.agent-model {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  line-height: 17px;
+  color: var(--ink-secondary);
+}
+.agent-model-tag {
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 10px;
+  line-height: 14px;
+  white-space: nowrap;
+}
+.agent-item-model {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.tool.agent > .tool-body > .agent-model + .agent-activity,
+.tool.agent > .tool-body > .agent-model + .agent-summary {
+  margin-top: 2px;
+}
+
+/* 設定: 配色 (three looks with a preview), 模型來源, and the subagent efforts. */
+.look-list {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-2);
+}
+.look-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  padding: 6px 6px 7px;
+  border: 1px solid var(--edge);
+  border-radius: var(--radius-md);
+  background: var(--control);
+  color: var(--ink);
+  font: inherit;
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 500;
+  text-align: center;
+  cursor: pointer;
+}
+.look-card:hover {
+  background: var(--fill-hover);
+}
+.look-card.on {
+  border-color: var(--link);
+  box-shadow: 0 0 0 1px var(--link);
+  font-weight: 700;
+}
+.look-card.on .look-name::before {
+  content: '✓ ';
+}
+.look-card:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+.look-swatch {
+  display: flex;
+  height: 46px;
+  border-radius: 5px;
+  overflow: hidden;
+  background: var(--sw-bg);
+  box-shadow: inset 0 0 0 1px #00000026;
+}
+.sw-side {
+  width: 26%;
+  background: var(--sw-side);
+}
+.sw-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 7px 6px 5px;
+}
+.sw-line {
+  width: 72%;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--sw-ink);
+  opacity: 0.75;
+}
+.sw-line.short {
+  width: 42%;
+  opacity: 0.4;
+}
+.sw-box {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  margin-top: auto;
+  height: 13px;
+  padding-right: 3px;
+  border-radius: 4px;
+  background: var(--sw-raised);
+  box-shadow: inset 0 0 0 1px #88888844;
+}
+.sw-send {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--sw-accent);
+}
+.look-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.settings .look-note {
+  margin: 0;
+}
+.theme-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+.om-seg__item:disabled {
+  color: var(--ink-disabled);
+  cursor: default;
+}
+.src-list {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+}
+.src-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: 9px var(--space-3);
+}
+.src-row + .src-row {
+  border-top: 1px solid var(--line);
+}
+.src-text {
+  flex: 1;
+  min-width: 0;
+}
+.src-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+}
+.src-text .om-field__help {
+  overflow-wrap: anywhere;
+}
+.sub-efforts {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.sub-effort-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+.sub-effort-name {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.settings .sub-effort-row select.om-input {
+  flex: none;
+  width: 150px;
+}
+.all-settings select.om-input {
+  border-color: var(--edge);
+}
+
+@media (max-width: 760px) {
+  .chip.chip-sub {
+    max-width: 100%;
+  }
+}
+
 /* ------------------------------------------------- DeepSeek: blue and white */
 
-/* DeepSeek mode (data-agent="deepseek", set by app.js setLook; tokens near the
+/* The DeepSeek look (data-look="deepseek", set by app.js applyLook; tokens near the
    top of this file). Only colors, shape and type here: no logo or artwork.
    Everything is scoped to the look, after every other rule, so it wins over
    them, and nothing of the Kimi or Claude looks changes. */
 
 /* the page: air, and a faint blue haze at the top of the home */
 /* (the composer on the home page carries .home too: no haze or clipping there) */
-:root[data-agent='deepseek'] .home:not(.composer) {
+:root[data-look='deepseek'] .home:not(.composer) {
   background: radial-gradient(ellipse 75% 46% at 50% 0%, #e9efff 0%, #ffffff 74%);
 }
-:root[data-agent='deepseek'] .composer.home {
+:root[data-look='deepseek'] .composer.home {
   padding-left: 0;
   padding-right: 0;
   overflow: visible;
 }
-:root[data-agent='deepseek'] .large-title {
+:root[data-look='deepseek'] .large-title {
   font-family: var(--font-sans);
   font-size: 28px;
   line-height: 36px;
@@ -3609,112 +3853,104 @@ pre.tail {
   letter-spacing: -0.02em;
   margin-bottom: var(--space-3);
 }
-:root[data-agent='deepseek'] .om-toolbar__title {
+:root[data-look='deepseek'] .om-toolbar__title {
   font-weight: 600;
 }
-:root[data-agent='deepseek'] ::selection {
+:root[data-look='deepseek'] ::selection {
   background: #4d6bfe33;
 }
-:root[data-agent='deepseek'] * {
+:root[data-look='deepseek'] * {
   scrollbar-color: #d5ddf5 transparent;
 }
-:root[data-agent='deepseek'] ::-webkit-scrollbar-thumb {
+:root[data-look='deepseek'] ::-webkit-scrollbar-thumb {
   background-color: #d5ddf5;
 }
-:root[data-agent='deepseek'] ::-webkit-scrollbar-thumb:hover {
+:root[data-look='deepseek'] ::-webkit-scrollbar-thumb:hover {
   background-color: #bcc8f0;
 }
 
 /* sidebar: pale blue-white, rounded rows, a soft "新對話" */
-:root[data-agent='deepseek'] .om-sidebar__section {
+:root[data-look='deepseek'] .om-sidebar__section {
   padding-top: var(--space-4);
   font-size: 11px;
   letter-spacing: 0.06em;
 }
-:root[data-agent='deepseek'] .om-sidebar__item {
+:root[data-look='deepseek'] .om-sidebar__item {
   border-radius: 10px;
 }
-:root[data-agent='deepseek'] .new-item[href='#/'] {
+:root[data-look='deepseek'] .new-item[href='#/'] {
   height: 36px;
   background: var(--accent-soft);
   color: #2c47d6;
   font-weight: 600;
 }
-:root[data-agent='deepseek'] .new-item[href='#/']:hover {
+:root[data-look='deepseek'] .new-item[href='#/']:hover {
   background: #e3eaff;
 }
-:root[data-agent='deepseek'] .side-search .om-input {
+:root[data-look='deepseek'] .side-search .om-input {
   border-radius: 10px;
 }
-:root[data-agent='deepseek'] .side-row {
+:root[data-look='deepseek'] .side-row {
   border-radius: 10px;
 }
-:root[data-agent='deepseek'] .side-row:hover {
+:root[data-look='deepseek'] .side-row:hover {
   background: #4d6bfe0d;
 }
-:root[data-agent='deepseek'] .side-row[aria-current='page'] {
+:root[data-look='deepseek'] .side-row[aria-current='page'] {
   background: var(--row-active);
   color: #1f3bd0;
 }
-:root[data-agent='deepseek'] .side-row[aria-current='page'] .row-title {
+:root[data-look='deepseek'] .side-row[aria-current='page'] .row-title {
   font-weight: 600;
 }
-:root[data-agent='deepseek'] .side-row[aria-current='page'] .row-sub {
+:root[data-look='deepseek'] .side-row[aria-current='page'] .row-sub {
   color: var(--ink-secondary);
   opacity: 1;
 }
-:root[data-agent='deepseek'] .side-row[aria-current='page'].offline .row-title {
+:root[data-look='deepseek'] .side-row[aria-current='page'].offline .row-title {
   color: var(--ink-secondary);
 }
-:root[data-agent='deepseek'] .side-row[aria-current='page'] .spinner {
+:root[data-look='deepseek'] .side-row[aria-current='page'] .spinner {
   border-color: #c7d3fb;
   border-top-color: var(--accent);
 }
-:root[data-agent='deepseek'] .row-more:hover {
+:root[data-look='deepseek'] .row-more:hover {
   background: #4d6bfe14;
 }
-:root[data-agent='deepseek'] .row-tag.ds {
+:root[data-look='deepseek'] .row-tag.ds {
   background: #e3e9ff;
   color: #2c47d6;
 }
-:root[data-agent='deepseek'] .side-row[aria-current='page'] .row-tag.ds {
+:root[data-look='deepseek'] .side-row[aria-current='page'] .row-tag.ds {
   background: #ffffff;
 }
-:root[data-agent='deepseek'] .side-foot {
+:root[data-look='deepseek'] .side-foot {
   border-top-color: var(--line);
 }
 
-/* mode switch: a pill track, the chosen mode a white pill */
-:root[data-agent='deepseek'] .om-seg {
+/* segmented controls: a pill track, the chosen one a white pill */
+:root[data-look='deepseek'] .om-seg {
   gap: 2px;
   padding: 3px;
   background: var(--track);
   border-color: transparent;
   border-radius: 999px;
 }
-:root[data-agent='deepseek'] .om-seg__item {
+:root[data-look='deepseek'] .om-seg__item {
   border-radius: 999px;
   transition: background-color 0.12s ease, color 0.12s ease;
 }
-:root[data-agent='deepseek'] .om-seg__item[aria-pressed='true'] {
+:root[data-look='deepseek'] .om-seg__item[aria-pressed='true'] {
   background: #ffffff;
   color: #2c47d6;
   box-shadow: 0 1px 3px #1b2a6b1f, 0 0 0 1px #1b2a6b0a;
 }
-:root[data-agent='deepseek'] .om-seg__item:focus-visible {
+:root[data-look='deepseek'] .om-seg__item:focus-visible {
   box-shadow: var(--focus-ring);
-}
-:root[data-agent='deepseek'] .home-agent {
-  margin-bottom: var(--space-2);
-}
-:root[data-agent='deepseek'] .home-agent .om-seg__item {
-  height: 28px;
-  padding: 0 16px;
-  font-size: 13px;
 }
 
 /* composer: a white card with a blue glow while you type */
-:root[data-agent='deepseek'] .composer-box {
+:root[data-look='deepseek'] .composer-box {
   padding: 14px 16px 10px 18px;
   background: #ffffff;
   border-color: #dfe6fb;
@@ -3722,35 +3958,35 @@ pre.tail {
   box-shadow: 0 6px 28px #3b5bdb12;
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
-:root[data-agent='deepseek'] .composer-box:focus-within {
+:root[data-look='deepseek'] .composer-box:focus-within {
   border-color: #4d6bfe;
   box-shadow: 0 0 0 4px #4d6bfe1f, 0 6px 28px #3b5bdb12;
 }
-:root[data-agent='deepseek'] .composer-box.drop {
+:root[data-look='deepseek'] .composer-box.drop {
   border-style: dashed;
   border-color: #4d6bfe;
   background: #f3f6ff;
 }
-:root[data-agent='deepseek'] .composer-input {
+:root[data-look='deepseek'] .composer-input {
   min-height: 48px;
   font-size: 15px;
   line-height: 24px;
 }
-:root[data-agent='deepseek'] .composer.home .composer-input {
+:root[data-look='deepseek'] .composer.home .composer-input {
   min-height: 72px;
 }
-:root[data-agent='deepseek'] .composer-input::placeholder {
+:root[data-look='deepseek'] .composer-input::placeholder {
   color: var(--ink-secondary);
 }
-:root[data-agent='deepseek'] .composer-bar {
+:root[data-look='deepseek'] .composer-bar {
   margin-top: 8px;
 }
-:root[data-agent='deepseek'] .composer-tools {
+:root[data-look='deepseek'] .composer-tools {
   gap: 4px;
   margin: -4px;
   padding: 4px;
 }
-:root[data-agent='deepseek'] .chip {
+:root[data-look='deepseek'] .chip {
   height: 30px;
   padding: 0 9px;
   border: 1px solid #e3e9f8;
@@ -3758,37 +3994,37 @@ pre.tail {
   background: #ffffff;
   font-size: 12.5px;
 }
-:root[data-agent='deepseek'] .chip:hover {
+:root[data-look='deepseek'] .chip:hover {
   background: #4d6bfe0f;
   border-color: #cfd9fa;
 }
-:root[data-agent='deepseek'] .chip[aria-expanded='true'] {
+:root[data-look='deepseek'] .chip[aria-expanded='true'] {
   background: var(--accent-soft);
   border-color: #c3d0fb;
   color: #2c47d6;
 }
-:root[data-agent='deepseek'] .chip.active {
+:root[data-look='deepseek'] .chip.active {
   background: var(--accent-soft);
   border-color: #c3d0fb;
   color: #2c47d6;
 }
-:root[data-agent='deepseek'] .chip.icon-only {
+:root[data-look='deepseek'] .chip.icon-only {
   width: 30px;
   padding: 0;
 }
-:root[data-agent='deepseek'] .chip.static:hover {
+:root[data-look='deepseek'] .chip.static:hover {
   background: #ffffff;
   border-color: #e3e9f8;
   color: var(--ink-secondary);
 }
-:root[data-agent='deepseek'] .chip.served.bad,
-:root[data-agent='deepseek'] .chip.served.bad:hover {
+:root[data-look='deepseek'] .chip.served.bad,
+:root[data-look='deepseek'] .chip.served.bad:hover {
   color: var(--danger);
 }
-:root[data-agent='deepseek'] .chip .caret {
+:root[data-look='deepseek'] .chip .caret {
   opacity: 0.6;
 }
-:root[data-agent='deepseek'] .send {
+:root[data-look='deepseek'] .send {
   width: 36px;
   height: 36px;
   border-color: var(--accent);
@@ -3797,143 +4033,143 @@ pre.tail {
   color: #ffffff;
   box-shadow: 0 2px 8px #4d6bfe40;
 }
-:root[data-agent='deepseek'] .send:hover {
+:root[data-look='deepseek'] .send:hover {
   background: #4163fb;
   border-color: #4163fb;
 }
-:root[data-agent='deepseek'] .send:active {
+:root[data-look='deepseek'] .send:active {
   background: var(--accent-pressed);
   border-color: var(--accent-pressed);
 }
-:root[data-agent='deepseek'] .send:disabled {
+:root[data-look='deepseek'] .send:disabled {
   background: #c9d3fd;
   border-color: #c9d3fd;
   color: #ffffff;
   box-shadow: none;
 }
-:root[data-agent='deepseek'] .send.stop {
+:root[data-look='deepseek'] .send.stop {
   background: #ffffff;
   border-color: var(--accent);
   color: var(--accent);
   box-shadow: none;
 }
-:root[data-agent='deepseek'] .ctx-ring:hover {
+:root[data-look='deepseek'] .ctx-ring:hover {
   background: #4d6bfe0f;
 }
-:root[data-agent='deepseek'] .ctx-ring .track {
+:root[data-look='deepseek'] .ctx-ring .track {
   stroke: #dbe3f8;
 }
-:root[data-agent='deepseek'] .ctx-ring .bar {
+:root[data-look='deepseek'] .ctx-ring .bar {
   stroke: var(--accent);
 }
-:root[data-agent='deepseek'] .ctx-ring.warning .bar {
+:root[data-look='deepseek'] .ctx-ring.warning .bar {
   stroke: var(--warning);
 }
-:root[data-agent='deepseek'] .ctx-ring.danger .bar {
+:root[data-look='deepseek'] .ctx-ring.danger .bar {
   stroke: var(--danger);
 }
-:root[data-agent='deepseek'] .cost-chip:hover,
-:root[data-agent='deepseek'] .row-more:hover {
+:root[data-look='deepseek'] .cost-chip:hover,
+:root[data-look='deepseek'] .row-more:hover {
   background: #4d6bfe14;
 }
 
 /* the conversation */
-:root[data-agent='deepseek'] .bubble {
+:root[data-look='deepseek'] .bubble {
   border-color: transparent;
   border-radius: 18px 18px 6px 18px;
   padding: 10px 16px;
 }
-:root[data-agent='deepseek'] .md a {
+:root[data-look='deepseek'] .md a {
   text-underline-offset: 2px;
 }
-:root[data-agent='deepseek'] .md code {
+:root[data-look='deepseek'] .md code {
   background: #eef2ff;
   color: #2b45c9;
 }
-:root[data-agent='deepseek'] .md pre {
+:root[data-look='deepseek'] .md pre {
   padding: 12px 16px;
   background: #f6f8fe;
   border-color: #e6ecfa;
   border-radius: 12px;
 }
-:root[data-agent='deepseek'] .md pre code {
+:root[data-look='deepseek'] .md pre code {
   background: none;
   color: var(--ink);
 }
-:root[data-agent='deepseek'] .md blockquote {
+:root[data-look='deepseek'] .md blockquote {
   border-left-color: #c9d4fb;
 }
-:root[data-agent='deepseek'] .md th {
+:root[data-look='deepseek'] .md th {
   background: #f3f6ff;
 }
-:root[data-agent='deepseek'] .md th,
-:root[data-agent='deepseek'] .md td {
+:root[data-look='deepseek'] .md th,
+:root[data-look='deepseek'] .md td {
   border-color: #e6ecfa;
 }
-:root[data-agent='deepseek'] .code-copy {
+:root[data-look='deepseek'] .code-copy {
   border-color: #e6ecfa;
 }
-:root[data-agent='deepseek'] .fold {
+:root[data-look='deepseek'] .fold {
   color: var(--ink-secondary);
 }
-:root[data-agent='deepseek'] .thinking-text {
+:root[data-look='deepseek'] .thinking-text {
   border-left-color: #dfe6fb;
 }
-:root[data-agent='deepseek'] .tool-row {
+:root[data-look='deepseek'] .tool-row {
   border-radius: 8px;
 }
-:root[data-agent='deepseek'] .tool-icon {
+:root[data-look='deepseek'] .tool-icon {
   color: var(--icon-ink);
 }
-:root[data-agent='deepseek'] .tool-row .chev {
+:root[data-look='deepseek'] .tool-row .chev {
   color: var(--icon-ink);
 }
-:root[data-agent='deepseek'] .result,
-:root[data-agent='deepseek'] pre.result-out {
+:root[data-look='deepseek'] .result,
+:root[data-look='deepseek'] pre.result-out {
   border-left-color: #dfe6fb;
 }
-:root[data-agent='deepseek'] .tool-group:not(.solo) > .group-body,
-:root[data-agent='deepseek'] .tool-children {
+:root[data-look='deepseek'] .tool-group:not(.solo) > .group-body,
+:root[data-look='deepseek'] .tool-children {
   border-left-color: #dfe6fb;
 }
-:root[data-agent='deepseek'] .spinner {
+:root[data-look='deepseek'] .spinner {
   border-color: #dbe3f8;
   border-top-color: var(--accent);
 }
-:root[data-agent='deepseek'] .jump-end {
+:root[data-look='deepseek'] .jump-end {
   background: #ffffff;
   border-color: #e3e9f8;
 }
-:root[data-agent='deepseek'] .jump-end.new {
+:root[data-look='deepseek'] .jump-end.new {
   background: var(--accent);
   border-color: var(--accent);
 }
 
 /* cards: white, a hairline of blue-gray, 12px corners */
-:root[data-agent='deepseek'] pre.out,
-:root[data-agent='deepseek'] .diff,
-:root[data-agent='deepseek'] .web-links,
-:root[data-agent='deepseek'] .md.plan,
-:root[data-agent='deepseek'] .ask,
-:root[data-agent='deepseek'] .artifact-card,
-:root[data-agent='deepseek'] .artifact-tile,
-:root[data-agent='deepseek'] .agent-tray,
-:root[data-agent='deepseek'] .todo-tray,
-:root[data-agent='deepseek'] .queued,
-:root[data-agent='deepseek'] .composer-note {
+:root[data-look='deepseek'] pre.out,
+:root[data-look='deepseek'] .diff,
+:root[data-look='deepseek'] .web-links,
+:root[data-look='deepseek'] .md.plan,
+:root[data-look='deepseek'] .ask,
+:root[data-look='deepseek'] .artifact-card,
+:root[data-look='deepseek'] .artifact-tile,
+:root[data-look='deepseek'] .agent-tray,
+:root[data-look='deepseek'] .todo-tray,
+:root[data-look='deepseek'] .queued,
+:root[data-look='deepseek'] .composer-note {
   background: #ffffff;
   border-color: #e6ecfa;
   border-radius: 12px;
 }
-:root[data-agent='deepseek'] .queued {
+:root[data-look='deepseek'] .queued {
   border-color: #cfd9fa;
 }
-:root[data-agent='deepseek'] .artifact-card:hover,
-:root[data-agent='deepseek'] .artifact-card.active,
-:root[data-agent='deepseek'] .artifact-tile:hover {
+:root[data-look='deepseek'] .artifact-card:hover,
+:root[data-look='deepseek'] .artifact-card.active,
+:root[data-look='deepseek'] .artifact-tile:hover {
   border-color: #b9c6f5;
 }
-:root[data-agent='deepseek'] .tool.agent {
+:root[data-look='deepseek'] .tool.agent {
   padding: 0;
   overflow: hidden;
   background: #ffffff;
@@ -3941,7 +4177,7 @@ pre.tail {
   border-radius: 12px;
   box-shadow: var(--shadow-card);
 }
-:root[data-agent='deepseek'] .tool.agent > .tool-head .tool-row {
+:root[data-look='deepseek'] .tool.agent > .tool-head .tool-row {
   width: 100%;
   min-height: 38px;
   margin: 0;
@@ -3949,191 +4185,191 @@ pre.tail {
   border-radius: 0;
   background: #f7f9ff;
 }
-:root[data-agent='deepseek'] .tool.agent > .tool-head .tool-row:hover {
+:root[data-look='deepseek'] .tool.agent > .tool-head .tool-row:hover {
   background: #f0f4ff;
 }
-:root[data-agent='deepseek'] .tool.agent > .tool-body {
+:root[data-look='deepseek'] .tool.agent > .tool-body {
   margin: 0;
   padding: 0 14px;
 }
-:root[data-agent='deepseek'] .tool.agent > .tool-body:not(:empty) {
+:root[data-look='deepseek'] .tool.agent > .tool-body:not(:empty) {
   padding: 8px 14px 10px;
 }
-:root[data-agent='deepseek'] .tool.agent > .tool-children {
+:root[data-look='deepseek'] .tool.agent > .tool-children {
   margin: 0;
   padding: 10px 14px 12px;
   border-left: 0;
   border-top: 1px solid #e6ecfa;
 }
-:root[data-agent='deepseek'] .tool.agent > .tool-children .agent-summary {
+:root[data-look='deepseek'] .tool.agent > .tool-children .agent-summary {
   margin: 0;
   padding: 0;
   border-top: 0;
 }
-:root[data-agent='deepseek'] .agent-sec {
+:root[data-look='deepseek'] .agent-sec {
   background: #f7f9ff;
   border-color: #e6ecfa;
 }
-:root[data-agent='deepseek'] .artifact-card-icon {
+:root[data-look='deepseek'] .artifact-card-icon {
   border-radius: 10px;
 }
 
 /* dialogs, menus, buttons, fields */
-:root[data-agent='deepseek'] .dialog {
+:root[data-look='deepseek'] .dialog {
   padding: 24px;
   background: #ffffff;
   border-radius: 16px;
 }
-:root[data-agent='deepseek'] .dialog.lightbox {
+:root[data-look='deepseek'] .dialog.lightbox {
   padding: 0;
   background: transparent;
   border-radius: 0;
 }
-:root[data-agent='deepseek'] .dialog-title {
+:root[data-look='deepseek'] .dialog-title {
   font-size: 17px;
   line-height: 24px;
   font-weight: 600;
 }
-:root[data-agent='deepseek'] .dialog-subtitle {
+:root[data-look='deepseek'] .dialog-subtitle {
   font-weight: 600;
 }
-:root[data-agent='deepseek'] .tree {
+:root[data-look='deepseek'] .tree {
   border-color: #e6ecfa;
   border-radius: 12px;
 }
-:root[data-agent='deepseek'] .tree-row[aria-selected='true'] {
+:root[data-look='deepseek'] .tree-row[aria-selected='true'] {
   background: var(--row-active);
   color: #1f3bd0;
   font-weight: 600;
 }
-:root[data-agent='deepseek'] .om-menu {
+:root[data-look='deepseek'] .om-menu {
   padding: 6px;
   background: #ffffff;
   border-radius: 14px;
 }
-:root[data-agent='deepseek'] .om-menu__item {
+:root[data-look='deepseek'] .om-menu__item {
   padding-left: 8px;
   border-radius: 8px;
 }
-:root[data-agent='deepseek'] .om-menu__item:not(.has-desc):not(.slash-item) {
+:root[data-look='deepseek'] .om-menu__item:not(.has-desc):not(.slash-item) {
   height: 32px;
 }
-:root[data-agent='deepseek'] .om-menu__item:not([aria-disabled='true']):hover,
-:root[data-agent='deepseek'] .om-menu__item[aria-selected='true'],
-:root[data-agent='deepseek'] .om-menu__item:not([aria-disabled='true']):focus-visible {
+:root[data-look='deepseek'] .om-menu__item:not([aria-disabled='true']):hover,
+:root[data-look='deepseek'] .om-menu__item[aria-selected='true'],
+:root[data-look='deepseek'] .om-menu__item:not([aria-disabled='true']):focus-visible {
   background: #eef2ff;
   color: var(--ink);
 }
-:root[data-agent='deepseek'] .om-menu__item:not([aria-disabled='true']):hover .om-menu__shortcut,
-:root[data-agent='deepseek'] .om-menu__item[aria-selected='true'] .om-menu__shortcut {
+:root[data-look='deepseek'] .om-menu__item:not([aria-disabled='true']):hover .om-menu__shortcut,
+:root[data-look='deepseek'] .om-menu__item[aria-selected='true'] .om-menu__shortcut {
   color: var(--ink-secondary);
 }
-:root[data-agent='deepseek'] .om-menu__item:hover .menu-desc,
-:root[data-agent='deepseek'] .om-menu__item:focus-visible .menu-desc,
-:root[data-agent='deepseek'] .om-menu__item[aria-selected='true'] .menu-desc,
-:root[data-agent='deepseek'] .slash-item[aria-selected='true'] .slash-desc {
+:root[data-look='deepseek'] .om-menu__item:hover .menu-desc,
+:root[data-look='deepseek'] .om-menu__item:focus-visible .menu-desc,
+:root[data-look='deepseek'] .om-menu__item[aria-selected='true'] .menu-desc,
+:root[data-look='deepseek'] .slash-item[aria-selected='true'] .slash-desc {
   color: var(--ink-secondary);
   opacity: 1;
 }
-:root[data-agent='deepseek'] .om-menu__item--destructive,
-:root[data-agent='deepseek'] .om-menu__item--destructive:hover,
-:root[data-agent='deepseek'] .om-menu__item--destructive:focus-visible {
+:root[data-look='deepseek'] .om-menu__item--destructive,
+:root[data-look='deepseek'] .om-menu__item--destructive:hover,
+:root[data-look='deepseek'] .om-menu__item--destructive:focus-visible {
   color: var(--danger);
 }
-:root[data-agent='deepseek'] .om-menu__item[aria-disabled='true'] {
+:root[data-look='deepseek'] .om-menu__item[aria-disabled='true'] {
   color: var(--ink-disabled);
 }
-:root[data-agent='deepseek'] .om-menu__check {
+:root[data-look='deepseek'] .om-menu__check {
   color: var(--link);
   font-weight: 700;
 }
-:root[data-agent='deepseek'] .om-menu__sep {
+:root[data-look='deepseek'] .om-menu__sep {
   background: #e6ecfa;
 }
-:root[data-agent='deepseek'] .menu-section {
+:root[data-look='deepseek'] .menu-section {
   letter-spacing: 0.04em;
 }
 
-:root[data-agent='deepseek'] .om-btn {
+:root[data-look='deepseek'] .om-btn {
   border-radius: 10px;
   font-weight: 500;
 }
-:root[data-agent='deepseek'] .om-btn:not(.om-btn--sm):not(.om-btn--toolbar):not(.om-btn--lg) {
+:root[data-look='deepseek'] .om-btn:not(.om-btn--sm):not(.om-btn--toolbar):not(.om-btn--lg) {
   height: 32px;
 }
-:root[data-agent='deepseek'] .om-btn:not(.om-btn--plain):not(.om-btn--toolbar):not(.om-btn--primary):not(:disabled) {
+:root[data-look='deepseek'] .om-btn:not(.om-btn--plain):not(.om-btn--toolbar):not(.om-btn--primary):not(:disabled) {
   border-color: var(--control-border);
 }
-:root[data-agent='deepseek'] .om-btn:not(.om-btn--plain):not(.om-btn--toolbar):not(.om-btn--primary):not(:disabled):hover {
+:root[data-look='deepseek'] .om-btn:not(.om-btn--plain):not(.om-btn--toolbar):not(.om-btn--primary):not(:disabled):hover {
   background: #f3f6ff;
 }
-:root[data-agent='deepseek'] .om-btn--sm {
+:root[data-look='deepseek'] .om-btn--sm {
   border-radius: 8px;
 }
-:root[data-agent='deepseek'] .om-btn--lg {
+:root[data-look='deepseek'] .om-btn--lg {
   border-radius: 12px;
 }
-:root[data-agent='deepseek'] .om-btn--toolbar {
+:root[data-look='deepseek'] .om-btn--toolbar {
   border-radius: 8px;
 }
-:root[data-agent='deepseek'] .om-btn--primary:not(:disabled) {
+:root[data-look='deepseek'] .om-btn--primary:not(:disabled) {
   background: var(--accent-strong);
   border-color: var(--accent-strong);
   color: #ffffff;
 }
-:root[data-agent='deepseek'] .om-btn--primary:not(:disabled):hover {
+:root[data-look='deepseek'] .om-btn--primary:not(:disabled):hover {
   background: #2e4ae0;
   border-color: #2e4ae0;
 }
-:root[data-agent='deepseek'] .om-btn--primary:not(:disabled):active {
+:root[data-look='deepseek'] .om-btn--primary:not(:disabled):active {
   background: var(--accent-pressed);
   border-color: var(--accent-pressed);
 }
-:root[data-agent='deepseek'] .om-btn--plain {
+:root[data-look='deepseek'] .om-btn--plain {
   color: var(--link);
 }
-:root[data-agent='deepseek'] .om-btn--plain:hover {
+:root[data-look='deepseek'] .om-btn--plain:hover {
   background: #4d6bfe0f;
 }
-:root[data-agent='deepseek'] .om-btn--destructive {
+:root[data-look='deepseek'] .om-btn--destructive {
   color: var(--danger);
 }
-:root[data-agent='deepseek'] .om-btn:disabled,
-:root[data-agent='deepseek'] .om-btn[aria-disabled='true'] {
+:root[data-look='deepseek'] .om-btn:disabled,
+:root[data-look='deepseek'] .om-btn[aria-disabled='true'] {
   background: #f7f9ff;
   border-color: var(--line);
   color: var(--ink-disabled);
 }
-:root[data-agent='deepseek'] .om-badge--accent {
+:root[data-look='deepseek'] .om-badge--accent {
   color: var(--link);
 }
-:root[data-agent='deepseek'] .dialog input.om-input,
-:root[data-agent='deepseek'] .dialog select.om-input {
+:root[data-look='deepseek'] .dialog input.om-input,
+:root[data-look='deepseek'] .dialog select.om-input {
   height: 34px;
   padding: 0 10px;
 }
-:root[data-agent='deepseek'] .om-input {
+:root[data-look='deepseek'] .om-input {
   border-radius: 10px;
 }
 /* a menu that is only a box without a chevron does not look like one */
-:root[data-agent='deepseek'] select.om-input {
+:root[data-look='deepseek'] select.om-input {
   padding-right: 32px;
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16' fill='none' stroke='%236f7794' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 6.5l4 4 4-4'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right 10px center;
 }
-:root[data-agent='deepseek'] .om-switch {
+:root[data-look='deepseek'] .om-switch {
   background: #e6ebfb;
 }
-:root[data-agent='deepseek'] .om-switch:checked {
+:root[data-look='deepseek'] .om-switch:checked {
   background: var(--accent);
 }
 
 /* the gateway cards in DeepSeek 設定 */
-:root[data-agent='deepseek'] .gw-list {
+:root[data-look='deepseek'] .gw-list {
   gap: 8px;
 }
-:root[data-agent='deepseek'] .gw-item {
+:root[data-look='deepseek'] .gw-item {
   gap: 10px;
   padding: 10px 14px;
   border-color: #e3e9f8;
@@ -4141,18 +4377,18 @@ pre.tail {
   background: #ffffff;
   transition: border-color 0.12s ease, background-color 0.12s ease, box-shadow 0.12s ease;
 }
-:root[data-agent='deepseek'] .gw-item:hover {
+:root[data-look='deepseek'] .gw-item:hover {
   background: #f7f9ff;
 }
-:root[data-agent='deepseek'] .gw-item.on {
+:root[data-look='deepseek'] .gw-item.on {
   border-color: #4d6bfe;
   background: #f3f6ff;
   box-shadow: 0 0 0 3px #4d6bfe14;
 }
-:root[data-agent='deepseek'] .gw-item:has(input:focus-visible) {
+:root[data-look='deepseek'] .gw-item:has(input:focus-visible) {
   box-shadow: var(--focus-ring);
 }
-:root[data-agent='deepseek'] .gw-item input[type='radio'] {
+:root[data-look='deepseek'] .gw-item input[type='radio'] {
   appearance: none;
   flex: none;
   display: grid;
@@ -4164,7 +4400,7 @@ pre.tail {
   border-radius: 50%;
   background: #ffffff;
 }
-:root[data-agent='deepseek'] .gw-item input[type='radio']::after {
+:root[data-look='deepseek'] .gw-item input[type='radio']::after {
   content: '';
   width: 8px;
   height: 8px;
@@ -4173,47 +4409,44 @@ pre.tail {
   transform: scale(0);
   transition: transform 0.12s ease;
 }
-:root[data-agent='deepseek'] .gw-item input[type='radio']:checked {
+:root[data-look='deepseek'] .gw-item input[type='radio']:checked {
   border-color: var(--accent);
 }
-:root[data-agent='deepseek'] .gw-item input[type='radio']:checked::after {
+:root[data-look='deepseek'] .gw-item input[type='radio']:checked::after {
   transform: scale(1);
 }
-:root[data-agent='deepseek'] .gw-item input[type='radio']:focus-visible {
+:root[data-look='deepseek'] .gw-item input[type='radio']:focus-visible {
   outline: none;
 }
-:root[data-agent='deepseek'] .gw-name {
+:root[data-look='deepseek'] .gw-name {
   font-weight: 500;
 }
 
 /* callouts: the missing-key note is a blue note, not a warning */
-:root[data-agent='deepseek'] .callout.deepseek-key {
+:root[data-look='deepseek'] .callout.deepseek-key {
   padding: 10px 14px;
   background: #f3f6ff;
   color: var(--ink);
   border: 1px solid #dfe6fb;
   border-radius: 12px;
 }
-:root[data-agent='deepseek'] .callout.deepseek-key > .om-icon {
+:root[data-look='deepseek'] .callout.deepseek-key > .om-icon {
   color: var(--accent);
 }
-:root[data-agent='deepseek'] .quota-bar {
+:root[data-look='deepseek'] .quota-bar {
   background: #e6ebfb;
 }
 
 @media (max-width: 760px) {
-  :root[data-agent='deepseek'] .large-title {
+  :root[data-look='deepseek'] .large-title {
     font-size: 24px;
     line-height: 32px;
   }
-  :root[data-agent='deepseek'] .composer-box {
+  :root[data-look='deepseek'] .composer-box {
     padding: 12px 14px 8px 16px;
     border-radius: 22px;
   }
-  :root[data-agent='deepseek'] .home:not(.composer) {
+  :root[data-look='deepseek'] .home:not(.composer) {
     background: radial-gradient(ellipse 120% 40% at 50% 0%, #e9efff 0%, #ffffff 74%);
-  }
-  :root[data-agent='deepseek'] .home-agent .om-seg__item {
-    padding: 0 13px;
   }
 }
