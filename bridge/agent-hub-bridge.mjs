@@ -7,6 +7,12 @@
 //   • actions: a whitelisted subset of Kimi's Server API (`kimi web`), or
 //     keystrokes into a terminal Kimi started with `agent-hub-bridge.mjs kimi`.
 // Kimi keeps running on this computer, with this computer's Kimi login.
+// The hub's own models (DeepSeek through a gateway, Claude through the Claude
+// API) are put into this computer's Kimi as custom providers, and Kimi's
+// subagent model pool is kept up to date, so that a Kimi conversation can run
+// on any of them and have subagents on any of them (kimi.hub.provision,
+// kimi.hub.remove, kimi.subagents.sync). Kimi's login and global default
+// model are never touched.
 // Claude conversations (Claude API, with the hub's API key) can also work in
 // a folder here: they run in a Claude daemon the bridge starts on this
 // computer (downloaded from the hub), which keeps them going when the hub or
@@ -35,7 +41,7 @@ import { StringDecoder } from 'node:string_decoder';
 import { spawn, execFile, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-const VERSION = '0.8.0';
+const VERSION = '0.9.0';
 const SCRIPT = fileURLToPath(import.meta.url);
 
 // ------------------------------------------------------------------ args
@@ -577,22 +583,28 @@ const server = {
   },
 };
 
-// ------------------------------------------------- DeepSeek in Kimi
-// DeepSeek conversations are ordinary Kimi conversations whose model comes
-// from one custom Kimi provider, `agent-hub-deepseek`, which the hub asks
-// for here. This is the only way the hub changes Kimi's providers: ALLOW
+// ------------------------------------------------- hub models inside Kimi
+// Every conversation the hub starts is an ordinary Kimi conversation. Models
+// other than the subscription's come from custom Kimi providers the hub asks
+// for here: `agent-hub-deepseek` (an OpenAI-compatible gateway serving
+// DeepSeek) and `agent-hub-claude` (Anthropic's API, with a Claude Console
+// API key). This is the only way the hub changes Kimi's providers: ALLOW
 // above still refuses every provider path, so the hub cannot create,
 // replace or delete just any provider through `kimi.request`.
 //
 // What it must never do is touch the Kimi subscription login: no logout, no
-// change to the `managed:kimi-code` provider, to [thinking] or to
-// [secondary_model], and no change to Kimi's global default model. The last
-// one is the dangerous one: creating a provider SEEDS default_model with the
-// new provider's model when none is set (Kimi's createProvider). So before
-// creating, an empty default is pinned to the subscription's own model, and
-// afterwards the default is read again and put back if it moved.
-const DS_PROVIDER = 'agent-hub-deepseek';
+// change to the `managed:kimi-code` provider or to [thinking], and no change
+// to Kimi's global default model. The last one is the dangerous one:
+// creating a provider SEEDS default_model with the new provider's model when
+// none is set (Kimi's createProvider). So before creating, an empty default
+// is pinned to the subscription's own model, and afterwards the default is
+// read again and put back if it moved.
+//
+// The second thing here is Kimi's subagent model pool ([secondary_model]),
+// which is what makes Kimi's Agent / AgentSwarm tools take a `model`
+// argument at all (see `pool` below).
 const DS_MANAGED = 'managed:kimi-code';
+const HUB_PREFIX = 'agent-hub-';
 // The gateway → address table is the bridge's own: the hub names a gateway,
 // never a URL, so it cannot point the key anywhere else.
 // (server/deepseek-account.js has the same ids, with the models of each.)
@@ -609,16 +621,47 @@ const DS_SESSION_HEADERS = { 'opencode-go': 'x-opencode-session', opencode: 'x-o
 const DS_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 // Kimi's capability names (kosong): thinking, always_thinking, tool_use, image_in.
 const DS_CAPABILITIES = ['thinking', 'always_thinking', 'tool_use', 'image_in'];
+// Where Claude is: Anthropic's API, in the form Kimi's anthropic client takes
+// (the SDK adds /v1/messages itself; a base_url ending in /v1 would double it).
+const CLAUDE_BASE = 'https://api.anthropic.com';
+// The tests point both at a local fake; nothing else can move them.
+const loopback = (u) => (/^http:\/\/(127\.0\.0\.1|localhost):\d+$/.test(String(u || '')) ? String(u) : null);
 
-const deepseek = {
+const HUB_PROVIDERS = {
+  deepseek: { id: 'agent-hub-deepseek', label: 'DeepSeek', type: 'openai' },
+  claude: { id: 'agent-hub-claude', label: 'Claude', type: 'anthropic' },
+};
+
+// One change to Kimi's configuration at a time.
+let configChain = Promise.resolve();
+const configLock = (fn) => {
+  const run = configChain.then(fn, fn);
+  configChain = run.then(() => undefined, () => undefined);
+  return run;
+};
+
+const hubProviders = {
+  def(name) {
+    if (!Object.hasOwn(HUB_PROVIDERS, name)) throw Object.assign(new Error(`不支援的模型來源：${String(name).slice(0, 40)}`), { status: 400 });
+    return HUB_PROVIDERS[name];
+  },
+
   // Everything the hub sent, checked and rebuilt field by field. Nothing
   // else is passed on to Kimi.
-  clean({ gateway, apiKey, models } = {}) {
+  clean(P, { gateway, apiKey, models } = {}) {
     const bad = (m) => Object.assign(new Error(m), { status: 400 });
-    const base = Object.hasOwn(DS_GATEWAYS, gateway) ? DS_GATEWAYS[gateway] : null;
-    if (!base) throw bad(`不支援的閘道：${String(gateway).slice(0, 40)}`);
-    if (typeof apiKey !== 'string' || !apiKey || apiKey.length > 500 || /\s/.test(apiKey)) throw bad('API key 不能是空的、超過 500 字，或含有空白與換行');
-    if (!Array.isArray(models) || models.length < 1 || models.length > 20) throw bad('模型清單要有 1 到 20 個模型');
+    let base;
+    if (P.type === 'anthropic') {
+      base = loopback(process.env.AGENT_HUB_CLAUDE_TEST_URL) || CLAUDE_BASE;
+      if (typeof apiKey !== 'string' || !/^sk-ant-(?!o[ar]t|admin)[\w-]{20,}$/i.test(apiKey) || apiKey.length > 500) throw bad('這不是 Claude Console 的 API key（應該是 sk-ant- 開頭的一長串，不能是訂閱帳號的 token）');
+    } else {
+      base = Object.hasOwn(DS_GATEWAYS, gateway) ? DS_GATEWAYS[gateway] : null;
+      if (!base) throw bad(`不支援的閘道：${String(gateway).slice(0, 40)}`);
+      const t = loopback(process.env.AGENT_HUB_DEEPSEEK_TEST_URL);
+      if (t) base = `${t}/${gateway}/v1`;
+      if (typeof apiKey !== 'string' || !apiKey || apiKey.length > 500 || /\s/.test(apiKey)) throw bad('API key 不能是空的、超過 500 字，或含有空白與換行');
+    }
+    if (!Array.isArray(models) || models.length < 1 || models.length > 40) throw bad('模型清單要有 1 到 40 個模型');
     const seen = new Set();
     const out = models.map((m) => {
       const model = m?.model;
@@ -641,6 +684,10 @@ const deepseek = {
         if (!Array.isArray(m[field]) || m[field].length > 10 || m[field].some((x) => !allowed.includes(x))) throw bad(`${model} 的 ${field} 不在允許的清單裡`);
         entry[field] = [...new Set(m[field])];
       }
+      if (m.adaptive_thinking !== undefined) {
+        if (typeof m.adaptive_thinking !== 'boolean') throw bad(`${model} 的 adaptive_thinking 不合法`);
+        entry.adaptive_thinking = m.adaptive_thinking;
+      }
       return entry;
     });
     return { base, key: apiKey, models: out };
@@ -659,15 +706,20 @@ const deepseek = {
   async snapshot() {
     const cfg = (await this.call('GET', '/api/v1/config')) || {};
     const providers = (await this.call('GET', '/api/v1/providers'))?.items || [];
-    const models = ((await this.call('GET', '/api/v1/models').catch(() => null))?.items || []).map((m) => m.model);
+    const items = (await this.call('GET', '/api/v1/models').catch(() => null))?.items || [];
     return {
+      cfg,
       defaultModel: typeof cfg.default_model === 'string' ? cfg.default_model.trim() : '',
       // What must come out the same as it went in (apart from the default
-      // model, which is put back if it moved).
+      // model, which is put back if it moved). The pool is a thing of its
+      // own (`pool` below): provider changes leave it alone, pool changes
+      // leave out `fixedPool`.
       fixed: JSON.stringify([cfg.default_provider ?? null, cfg.thinking ?? null, cfg.secondary_model ?? null]),
+      fixedPool: JSON.stringify([cfg.default_provider ?? null, cfg.thinking ?? null]),
       secondary: this.secondary(cfg),
       providers,
-      models,
+      models: items.map((m) => m.model),
+      items,
     };
   },
 
@@ -696,7 +748,7 @@ const deepseek = {
   },
 
   // After any write: the default model and the rest are as they were.
-  async check(before, expected) {
+  async check(before, expected, what = 'DeepSeek') {
     const now = await this.snapshot();
     if (now.defaultModel !== expected) {
       let restored = false;
@@ -704,9 +756,9 @@ const deepseek = {
         await this.pin(expected).catch(() => {});
         restored = (await this.snapshot()).defaultModel === expected;
       }
-      throw new Error(`Kimi 的全域預設模型被改動了（${expected || '（沒有設定）'} → ${now.defaultModel || '（沒有設定）'}）。${restored ? '已還原成原來的模型' : '沒辦法還原，請在這台電腦的 Kimi 用 /model 選回你的模型'}。DeepSeek 設定已中止。`);
+      throw new Error(`Kimi 的全域預設模型被改動了（${expected || '（沒有設定）'} → ${now.defaultModel || '（沒有設定）'}）。${restored ? '已還原成原來的模型' : '沒辦法還原，請在這台電腦的 Kimi 用 /model 選回你的模型'}。${what} 設定已中止。`);
     }
-    if (now.fixed !== before.fixed) throw new Error('Kimi 的 default_provider、[thinking] 或 [secondary_model] 在設定 DeepSeek 時被改動了，已中止。請檢查這台電腦的 Kimi 設定。');
+    if (now.fixed !== before.fixed) throw new Error(`Kimi 的 default_provider、[thinking] 或 [secondary_model] 在設定 ${what} 時被改動了，已中止。請檢查這台電腦的 Kimi 設定。`);
     return now;
   },
 
@@ -719,29 +771,32 @@ const deepseek = {
     return STATE.dsSession;
   },
 
-  // config.toml split into its tables, minus the DeepSeek provider's own
-  // ([providers.agent-hub-deepseek…] and its [models."agent-hub-deepseek/…"]):
-  // what must come out the same after the header is added.
-  others(text) {
+  // config.toml split into its tables, minus the hub's own ([providers.
+  // agent-hub-…] and their [models."agent-hub-…/…"], and with `pool` the
+  // [secondary_model…] tables): what must come out the same after the hub
+  // has written its part.
+  others(text, { pool = false } = {}) {
     const tables = new Map();
     let head = '';
     for (const line of String(text).split('\n')) {
       const t = line.trim();
       if (/^\[.*\]$/.test(t)) head = t.replace(/\s+/g, '');
-      if (/^\[(providers\.agent-hub-deepseek|models\."agent-hub-deepseek\/)/.test(head)) continue;
+      if (/^\[(providers\.["']?agent-hub-|models\."?'?agent-hub-)/.test(head)) continue;
+      if (pool && /^\[secondary_model(\.|\])/.test(head)) continue;
       if (t) tables.set(head, [...(tables.get(head) || []), t].sort());
     }
-    return JSON.stringify([...tables]);
+    // Kimi regroups the tables whenever it writes the file: order does not count.
+    return JSON.stringify([...tables].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)));
   },
 
   // Put the session header on the provider (custom_headers in its table in
   // config.toml). Kimi writes it itself, through its own config API (a merge
   // into [providers] that leaves the other providers alone, serialized with
   // Kimi's own writes, and picked up at once: no restart, and no hand edit
-  // of the file). Then config.toml is read again: the DeepSeek provider's
-  // tables are the only thing that may differ; if anything else does, the
+  // of the file). Then config.toml is read again: the hub's provider tables
+  // are the only thing that may differ; if anything else does, the
   // file is put back as it was. Returns null, or why it could not be done.
-  async sessionHeader(gateway) {
+  async sessionHeader(P, gateway) {
     const name = DS_SESSION_HEADERS[gateway];
     const file = path.join(KIMI_HOME, 'config.toml');
     let before;
@@ -760,10 +815,10 @@ const deepseek = {
       fs.renameSync(tmp, file);
     };
     try {
-      await this.call('POST', '/api/v1/config', { providers: { [DS_PROVIDER]: { custom_headers: { [name]: value } } } });
+      await this.call('POST', '/api/v1/config', { providers: { [P.id]: { custom_headers: { [name]: value } } } });
       // Kimi writes the file just before it answers.
       const after = fs.readFileSync(file, 'utf8');
-      const has = new RegExp(`\\[providers\\.agent-hub-deepseek\\.custom_headers\\][^\\[]*${name}\\s*=\\s*"${value}"|custom_headers\\s*=\\s*\\{[^}]*${name}\\s*=\\s*"${value}"`).test(after);
+      const has = new RegExp(`\\[providers\\.${P.id}\\.custom_headers\\][^\\[]*${name}\\s*=\\s*"${value}"|custom_headers\\s*=\\s*\\{[^}]*${name}\\s*=\\s*"${value}"`).test(after);
       if (this.others(after) !== this.others(before) || !has) {
         restore();
         return 'Kimi 的 config.toml 在加上 session 標頭時出現了預期以外的變動，已還原';
@@ -780,45 +835,445 @@ const deepseek = {
     }
   },
 
-  async provision(args) {
-    const { base, key, models } = this.clean(args);
+  provision(args = {}) {
+    return configLock(() => this.doProvision(args));
+  },
+
+  async doProvision(args) {
+    const P = this.def(args.provider || 'deepseek');
+    const { base, key, models } = this.clean(P, args);
     const before = await this.snapshot();
-    const had = before.providers.some((p) => p.id === DS_PROVIDER);
+    const had = before.providers.some((p) => p.id === P.id);
     let expected = before.defaultModel;
     // Creating a provider would make it Kimi's default when there is none:
     // pin the subscription's model first, or do not create at all.
     if (!had && !expected) {
       expected = this.subscriptionModel(before);
-      if (!expected) throw new Error('這台電腦的 Kimi 沒有設定預設模型，也找不到訂閱帳號的模型。為了不讓 DeepSeek 變成 Kimi 的預設模型，沒有建立。請先在那台電腦執行 kimi login。');
+      if (!expected) throw new Error(`這台電腦的 Kimi 沒有設定預設模型，也找不到訂閱帳號的模型。為了不讓 ${P.label} 變成 Kimi 的預設模型，沒有建立。請先在那台電腦執行 kimi login。`);
       await this.pin(expected);
     }
     // Never `default_model` in the body: that is Kimi's own pointer.
-    const body = { type: 'openai', api_key: key, base_url: base, models };
+    const body = { type: P.type, api_key: key, base_url: base, models };
     let failure = null;
     try {
-      if (had) await this.call('PUT', `/api/v1/providers/${DS_PROVIDER}`, body, key);
-      else await this.call('POST', '/api/v1/providers', { id: DS_PROVIDER, ...body }, key);
+      if (had) await this.call('PUT', `/api/v1/providers/${P.id}`, body, key);
+      else await this.call('POST', '/api/v1/providers', { id: P.id, ...body }, key);
     } catch (err) {
       failure = err;
     }
-    const after = await this.check(before, expected);
+    const after = await this.check(before, expected, P.label);
     if (failure) throw failure;
     // The session header, which a gateway may want (see DS_SESSION_HEADERS).
     // Without it the provider still works; the hub is told it is missing.
-    const noHeader = await this.sessionHeader(args.gateway);
-    await this.check(after, expected);
-    return { ok: true, created: !had, models: models.map((m) => `${DS_PROVIDER}/${m.model}`), sessionHeader: !noHeader, ...(noHeader ? { warning: noHeader } : {}), ...(after.secondary ? { secondaryModel: after.secondary } : {}) };
+    let noHeader = null;
+    let last = after;
+    if (P.type === 'openai') {
+      noHeader = await this.sessionHeader(P, args.gateway);
+      last = await this.check(after, expected, P.label);
+    }
+    return {
+      ok: true,
+      created: !had,
+      models: models.map((m) => `${P.id}/${m.model}`),
+      ...(P.type === 'openai' ? { sessionHeader: !noHeader } : {}),
+      ...(noHeader ? { warning: noHeader } : {}),
+      ...(last.secondary ? { secondaryModel: last.secondary } : {}),
+    };
   },
 
-  async remove() {
-    const before = await this.snapshot();
-    if (!before.providers.some((p) => p.id === DS_PROVIDER)) return { ok: true, removed: false };
-    // Deleting would leave Kimi's default pointing at a model that is gone.
-    if (before.defaultModel.startsWith(`${DS_PROVIDER}/`)) throw new Error('Kimi 的全域預設模型是 DeepSeek 模型：先在那台電腦的 Kimi 用 /model 換回你的模型，再移除。');
-    await this.call('DELETE', `/api/v1/providers/${DS_PROVIDER}`);
-    await this.check(before, before.defaultModel);
-    return { ok: true, removed: true };
+  remove(name = 'deepseek') {
+    return configLock(() => this.doRemove(name));
   },
+
+  async doRemove(name) {
+    const P = this.def(name);
+    const before = await this.snapshot();
+    if (!before.providers.some((p) => p.id === P.id)) return { ok: true, removed: false };
+    // Deleting would leave Kimi's default pointing at a model that is gone.
+    if (before.defaultModel.startsWith(`${P.id}/`)) throw new Error(`Kimi 的全域預設模型是 ${P.label} 模型：先在那台電腦的 Kimi 用 /model 換回你的模型，再移除。`);
+    // Its models leave the subagent pool first: a pool entry that names a
+    // model Kimi no longer has is a broken pool.
+    const dropped = await pool.doDropPrefix(`${P.id}/`);
+    const mid = await this.snapshot();
+    await this.call('DELETE', `/api/v1/providers/${P.id}`);
+    await this.check(mid, before.defaultModel, P.label);
+    return { ok: true, removed: true, ...(dropped.removed?.length ? { poolRemoved: dropped.removed } : {}) };
+  },
+};
+
+// ------------------------------------------------- the subagent model pool
+// Kimi's Agent and AgentSwarm tools have a `model` argument only when the
+// computer's Kimi has a subagent model pool: [secondary_model] with a
+// `models` table (alias → description the main model reads) and a
+// `default_model` (resolveSubagentModelPool, exposesSubagentModelChoice,
+// Kimi 2.1.1). Without a pool every subagent silently runs on the main
+// model, whatever the main model was told. The pool also decides which model
+// an Agent call that names none gets: the pool's default.
+//
+// The hub keeps this pool up to date: the Kimi subscription's models and
+// every model of the hub's providers, with the pool's default_model = Kimi's
+// own default model (the subscription's), so a terminal Kimi behaves as
+// before apart from being able to pick. Never `force` (it would take the
+// choice away). A pool the user wrote is kept: their entries and their
+// default stay, the hub's are added, and the aliases the hub added are
+// remembered here (STATE.pools) so taking them away takes away only those.
+//
+// Kimi's REST config only merges (a null cannot delete a key of a table), so
+// additions go through it (serialized with Kimi's own writes, validated by
+// Kimi), and removals are made in config.toml itself, in the two small
+// tables of the pool and nothing else; Kimi's file watcher picks that up.
+// Either way config.toml is checked afterwards, and put back as it was if
+// anything outside the pool (and the hub's providers) differs.
+const POOL_ALIAS = /^[\w.\/:@+-]{1,160}$/;
+
+// Kimi's rule for a pool-wide [secondary_model].default_effort
+// (assertValidSubagentDefaultEffort): every model in the pool has to take
+// it, or the pool is turned down. `item` is the model as Kimi lists it.
+function takesDefaultEffort(item, effort) {
+  const caps = item?.capabilities || [];
+  if (effort === 'off') return !caps.includes('always_thinking');
+  if (!caps.includes('thinking') && !caps.includes('always_thinking') && !item?.adaptive_thinking) return false;
+  const levels = item?.support_efforts || [];
+  return levels.length === 0 || effort === 'on' || levels.includes(effort);
+}
+
+// The key of a `"alias" = "…"` / `alias = "…"` line of a TOML table.
+function tomlKey(line) {
+  const m = line.match(/^\s*(?:"((?:[^"\\]|\\.)*)"|'([^']*)'|([A-Za-z0-9_-]+))\s*=/);
+  if (!m) return null;
+  if (m[1] !== undefined) {
+    try {
+      return JSON.parse(`"${m[1]}"`);
+    } catch {
+      return null;
+    }
+  }
+  return m[2] !== undefined ? m[2] : m[3];
+}
+
+// config.toml with `remove` taken out of [secondary_model.models] (and the
+// default_model line of [secondary_model] with `dropDefault`), and the
+// tables themselves when nothing is left in them. Throws when the pool is
+// written in a way this does not understand (inline tables, dotted keys):
+// nothing is guessed.
+function editPoolTables(text, { remove = [], dropDefault = false } = {}) {
+  const gone = new Set(remove);
+  const lines = String(text).split('\n');
+  const out = [];
+  let table = null;
+  const cannot = (what) => Object.assign(new Error(`這台電腦的 Kimi 設定檔把 [secondary_model] 寫成這個中控台看不懂的形式（${what}），沒辦法自動移除子代理模型。請在 config.toml 自己整理 [secondary_model]。`), { status: 409 });
+  for (const line of lines) {
+    const t = line.trim();
+    if (/^\[.*\]/.test(t)) {
+      const head = t.replace(/\s+/g, '').replace(/#.*$/, '');
+      table = head === '[secondary_model]' ? 'section' : head === '[secondary_model.models]' ? 'models' : /^\[\[?secondary_model/.test(head) ? 'other' : null;
+      out.push(line);
+      continue;
+    }
+    if (table === 'models' && t && !t.startsWith('#')) {
+      const key = tomlKey(line);
+      if (key === null) throw cannot('一行看不懂');
+      if (gone.has(key)) continue;
+    } else if (table === 'section' && t && !t.startsWith('#')) {
+      if (/^\s*models\s*[.=]/.test(line) && gone.size) throw cannot('models 寫成內嵌表格或點號鍵');
+      if (dropDefault && tomlKey(line) === 'default_model') continue;
+    } else if (table === 'other' && gone.size) throw cannot('[secondary_model] 底下還有別的表格');
+    out.push(line);
+  }
+  // Tables with nothing left: the header goes too (the inner table first,
+  // so the outer one can be seen to be empty).
+  let cur = out;
+  for (let round = 0; round < 3; round++) {
+    const result = [];
+    let gap = false; // a table was taken out here: keep one blank line between its neighbours
+    for (let i = 0; i < cur.length; i++) {
+      const head = cur[i].trim().replace(/\s+/g, '');
+      if (head === '[secondary_model]' || head === '[secondary_model.models]') {
+        let j = i + 1;
+        let empty = true;
+        for (; j < cur.length && !/^\s*\[/.test(cur[j]); j++) if (cur[j].trim() && !cur[j].trim().startsWith('#')) empty = false;
+        const nested = head === '[secondary_model]' && cur.slice(j).some((l) => /^\s*\[secondary_model\./.test(l.replace(/\s+/g, '')));
+        if (empty && !nested) {
+          i = j - 1;
+          while (result.length && !result.at(-1).trim()) result.pop();
+          gap = result.length > 0;
+          continue;
+        }
+      }
+      if (gap && cur[i].trim()) result.push('');
+      if (cur[i].trim()) gap = false;
+      result.push(cur[i]);
+    }
+    if (result.length === cur.length) break;
+    cur = result;
+  }
+  return cur.join('\n');
+}
+
+const pool = {
+  file: () => path.join(KIMI_HOME, 'config.toml'),
+
+  // What the hub put in this computer's pool (kept per Kimi home).
+  state() {
+    STATE.pools ??= {};
+    const st = (STATE.pools[KIMI_HOME] ??= {});
+    st.owned = Array.isArray(st.owned) ? st.owned.filter((a) => typeof a === 'string') : [];
+    return st;
+  },
+
+  clean({ models, efforts } = {}) {
+    const bad = (m) => Object.assign(new Error(m), { status: 400 });
+    if (!models || typeof models !== 'object' || Array.isArray(models)) throw bad('子代理模型要是 { 別名: 說明 } 的物件');
+    const entries = Object.entries(models);
+    if (entries.length > 60) throw bad('子代理模型最多 60 個');
+    const outModels = {};
+    for (const [alias, desc] of entries) {
+      if (!POOL_ALIAS.test(alias) || alias === 'primary') throw bad(`子代理模型的別名不合法：${alias.slice(0, 40)}`);
+      if (typeof desc !== 'string' || !/^[^\x00-\x1f\x7f]{0,400}$/.test(desc)) throw bad(`${alias} 的說明不合法（單行，最多 400 字）`);
+      outModels[alias] = desc;
+    }
+    const outEfforts = {};
+    // Subagent thinking is the hub's to set for its own models only (the
+    // subscription's models, and the user's, are Kimi's and theirs); a model
+    // of another kind in the list is passed over.
+    for (const [alias, effort] of Object.entries(efforts && typeof efforts === 'object' ? efforts : {})) {
+      if (!POOL_ALIAS.test(alias) || /(^|\/)\.{1,2}(\/|$)/.test(alias)) throw bad(`子代理思考強度的模型別名不合法：${alias.slice(0, 40)}`);
+      if (!DS_EFFORTS.includes(effort)) throw bad(`${alias} 的思考強度不合法：${String(effort).slice(0, 20)}`);
+      if (alias.startsWith(HUB_PREFIX)) outEfforts[alias] = effort;
+    }
+    return { models: outModels, efforts: outEfforts };
+  },
+
+  // The pool in Kimi's GET /config answer (camelCase; the v1 snake_case
+  // spellings too).
+  read(cfg) {
+    const s = cfg?.secondary_model && typeof cfg.secondary_model === 'object' ? cfg.secondary_model : {};
+    const pick = (camel, snake) => s[camel] ?? s[snake];
+    const models = pick('models', 'models');
+    return {
+      exists: Object.keys(s).length > 0,
+      force: pick('force', 'force') === true,
+      models: models && typeof models === 'object' && !Array.isArray(models) ? { ...models } : {},
+      hasModels: models !== undefined && models !== null,
+      defaultModel: pick('defaultModel', 'default_model') ?? undefined,
+      legacyModel: pick('model', 'model') ?? undefined,
+      defaultEffort: pick('defaultEffort', 'default_effort') ?? undefined,
+    };
+  },
+
+  // {models: {}} takes the hub's entries out of the pool, and what the hub
+  // wrote around them (a pool the hub made is removed whole; a pool the
+  // user made keeps its entries and its default).
+  sync(args) {
+    const want = this.clean(args);
+    return configLock(() => this.apply({ ...want, dropAll: !Object.keys(want.models).length }));
+  },
+
+  // A provider is going away: its models leave the pool (inside configLock
+  // already).
+  async doDropPrefix(prefix) {
+    const st = this.state();
+    if (!st.owned.some((a) => a.startsWith(prefix))) return { removed: [] };
+    const snap = await hubProviders.snapshot();
+    const cur = this.read(snap.cfg);
+    const keep = Object.fromEntries(st.owned.filter((a) => !a.startsWith(prefix) && a in cur.models).map((a) => [a, cur.models[a]]));
+    const r = await this.apply({ models: keep, efforts: {} });
+    return { removed: r.removed || [] };
+  },
+
+  async apply({ models: hubWant, efforts = {}, dropAll = false }) {
+    const file = this.file();
+    let before;
+    try {
+      before = fs.readFileSync(file, 'utf8');
+    } catch {
+      throw new Error('找不到這台電腦 Kimi 的 config.toml，沒辦法設定子代理模型');
+    }
+    const snap = await hubProviders.snapshot();
+    const cur = this.read(snap.cfg);
+    // `force` pins every subagent to one model and cannot be combined with a
+    // pool: the user chose that, the hub leaves it.
+    if (cur.force) return { ok: true, skipped: 'force', pool: null, merged: false, warning: '這台電腦的 Kimi 設了 [secondary_model] force（所有子代理固定用同一個模型），中控台沒有動它，子代理不能選模型' };
+    const st = this.state();
+    const owned = new Set(st.owned);
+    const catalog = new Set(snap.models);
+    const describe = (alias) => snap.items.find((m) => m.model === alias)?.display_name || '';
+
+    // What the user has there: everything not put there by the hub. A pool
+    // written the old way (one `model` / default_model, no table) is one
+    // entry of theirs.
+    const user = {};
+    for (const [a, d] of Object.entries(cur.models)) if (!owned.has(a)) user[a] = typeof d === 'string' ? d : '';
+    const legacy = !cur.hasModels ? cur.defaultModel ?? cur.legacyModel : undefined;
+    if (legacy) user[legacy] = '';
+
+    // The hub's entries: only models Kimi has (a pool entry that names a
+    // model Kimi cannot resolve is a broken pool).
+    const hub = {};
+    const skipped = [];
+    // A pool-wide default effort the user set has to suit every model in the
+    // pool: the models that do not take it are not added.
+    const poolEffort = cur.defaultEffort;
+    const unfit = [];
+    if (!dropAll) {
+      for (const [a, d] of Object.entries(hubWant)) {
+        if (a in user) continue;
+        if (!catalog.has(a)) skipped.push(a);
+        else if (poolEffort !== undefined && !takesDefaultEffort(snap.items.find((m) => m.model === a), poolEffort)) unfit.push(a);
+        else hub[a] = d;
+      }
+    }
+
+    // The default: the user's own stays; otherwise Kimi's global default
+    // model (the subscription's), which has to be in the pool.
+    const hubWroteDefault = Boolean(st.defaultWritten) && cur.defaultModel === st.defaultWritten;
+    const userDefault = cur.defaultModel !== undefined && !hubWroteDefault ? cur.defaultModel : legacy;
+    let def = userDefault;
+    if (def === undefined && !dropAll) def = snap.defaultModel || hubProviders.subscriptionModel(snap) || Object.keys(user)[0] || undefined;
+    if (def !== undefined && !(def in user) && !(def in hub) && !dropAll) {
+      if (!catalog.has(def)) throw new Error(`Kimi 的預設模型「${def}」不在 Kimi 的模型清單裡，沒辦法放進子代理模型。`);
+      hub[def] = hubWant[def] ?? describe(def);
+    }
+    // Nothing left to offer (no model of the hub's, none of the user's, no
+    // default to anchor on): the hub's part of the pool goes whole.
+    if (!dropAll && !Object.keys({ ...user, ...hub }).length) {
+      dropAll = true;
+      def = undefined;
+    }
+
+    const desired = { ...user, ...hub };
+    const newOwned = Object.keys(hub);
+    const remove = [...owned].filter((a) => !newOwned.includes(a) && a in cur.models);
+    const add = Object.fromEntries(Object.entries(desired).filter(([a, d]) => cur.models[a] !== d));
+    // A pool written the old way (one `model`) gets a table the first time:
+    // its model is listed, and is the default.
+    const defaultChange = !dropAll && def !== undefined && def !== cur.defaultModel;
+    const dropDefault = dropAll && hubWroteDefault && !Object.keys(user).length;
+    const err = this.validate(desired, def);
+    if (err) throw new Error(err);
+
+    // Subagents' thinking, model by model: a hub model's default_effort
+    // (the pool cannot carry one per model, and a subagent without it
+    // thinks at the middle of the model's levels, not at the level the
+    // hub's conversations use).
+    const effortWrites = {};
+    if (!dropAll) {
+      for (const [a, e] of Object.entries(efforts)) {
+        const item = snap.items.find((m) => m.model === a);
+        if (!item || !(item.support_efforts || []).includes(e) || item.default_effort === e) continue;
+        effortWrites[a] = e;
+      }
+    }
+    const nothing = !remove.length && !Object.keys(add).length && !defaultChange && !dropDefault && !Object.keys(effortWrites).length;
+    st.owned = [...newOwned];
+    if (nothing) {
+      this.remember(st, { hubWroteDefault: hubWroteDefault && !dropDefault, def: hubWroteDefault ? cur.defaultModel : undefined });
+      return this.result({ desired, def, user, skipped, unfit, remove: [], add: {}, effortWrites: {}, unchanged: true });
+    }
+
+    const backup = path.join(STATE_DIR, 'config.toml.before-pool');
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    fs.writeFileSync(backup, before, { mode: 0o600 });
+    const restore = async () => {
+      const tmp = `${file}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, before, { mode: 0o600 });
+      fs.renameSync(tmp, file);
+      // Kimi reads its file again: wait until it shows what it showed.
+      const was = JSON.stringify(Object.keys(cur.models).sort());
+      for (let i = 0; i < 30; i++) {
+        const now = this.read((await hubProviders.call('GET', '/api/v1/config').catch(() => ({}))) || {});
+        if (JSON.stringify(Object.keys(now.models).sort()) === was) return;
+        await new Promise((r) => setTimeout(r, 200));
+      }
+    };
+    const prev = { owned: [...owned], defaultWritten: st.defaultWritten };
+    try {
+      // 1. Removals: in the file, then wait for Kimi to read it again (a
+      //    REST write made before that would write the old table back).
+      if (remove.length || dropDefault) {
+        const edited = editPoolTables(before, { remove, dropDefault });
+        if (edited !== before) {
+          const tmp = `${file}.${process.pid}.tmp`;
+          fs.writeFileSync(tmp, edited, { mode: 0o600 });
+          fs.renameSync(tmp, file);
+          let seen = false;
+          for (let i = 0; i < 40 && !seen; i++) {
+            const now = this.read((await hubProviders.call('GET', '/api/v1/config')) || {});
+            seen = remove.every((a) => !(a in now.models)) && (!dropDefault || now.defaultModel === undefined);
+            if (!seen) await new Promise((r) => setTimeout(r, 200));
+          }
+          if (!seen) throw new Error('Kimi 沒有重新讀取 config.toml（可能關掉了設定檔監看），沒辦法移除子代理模型');
+        }
+      }
+      // 2. Additions and the default: through Kimi.
+      const patch = {};
+      if (Object.keys(add).length) patch.models = add;
+      if (defaultChange) patch.default_model = def;
+      if (Object.keys(patch).length) await hubProviders.call('POST', '/api/v1/config', { secondary_model: patch });
+      // 3. Subagent thinking of the hub's models.
+      if (Object.keys(effortWrites).length) await hubProviders.call('POST', '/api/v1/config', { models: Object.fromEntries(Object.entries(effortWrites).map(([a, e]) => [a, { default_effort: e }])) });
+      // 4. What is there now is what was meant, and nothing else moved.
+      const after = fs.readFileSync(file, 'utf8');
+      if (hubProviders.others(after, { pool: true }) !== hubProviders.others(before, { pool: true })) throw new Error('Kimi 的 config.toml 在設定子代理模型時出現了預期以外的變動');
+      const snap2 = await hubProviders.snapshot();
+      const now = this.read(snap2.cfg);
+      if (snap2.defaultModel !== snap.defaultModel || snap2.fixedPool !== snap.fixedPool) throw new Error('Kimi 的全域預設模型、default_provider 或 [thinking] 在設定子代理模型時被改動了');
+      if (!dropAll) {
+        for (const a of Object.keys(desired)) if (!(a in now.models)) throw new Error(`Kimi 沒有收下子代理模型「${a}」`);
+        if (def !== undefined && now.defaultModel !== def) throw new Error(`Kimi 的子代理預設模型不是預期的「${def}」`);
+        if (now.force) throw new Error('子代理模型被設成 force，會讓 Kimi 的子代理不能選模型');
+        const bad = this.validate(now.models, now.defaultModel);
+        if (bad) throw new Error(bad);
+      }
+      for (const a of remove) if (a in now.models) throw new Error(`子代理模型「${a}」沒有移除`);
+    } catch (e) {
+      // Whatever went wrong, config.toml is as it was.
+      st.owned = prev.owned;
+      st.defaultWritten = prev.defaultWritten;
+      await restore().catch(() => {});
+      fs.rmSync(backup, { force: true });
+      throw Object.assign(new Error(`子代理模型沒有設定，已還原：${e.message}`), { status: e.status });
+    }
+    fs.rmSync(backup, { force: true });
+    this.remember(st, { hubWroteDefault: !dropAll && (hubWroteDefault || (userDefault === undefined && def !== undefined)), def });
+    return this.result({ desired, def, user, skipped, unfit, remove, add, effortWrites });
+  },
+
+  // The answer to the hub: the pool as it is now.
+  result({ desired, def, user, skipped, unfit = [], remove, add, effortWrites, unchanged = false }) {
+    const warning = [skipped.length ? `Kimi 沒有這些模型，沒有放進子代理模型：${skipped.join('、')}` : '', unfit.length ? `這台電腦的 Kimi 設了 [secondary_model].default_effort，這些模型不支援那個思考強度，沒有放進子代理模型：${unfit.join('、')}` : ''].filter(Boolean).join('；') || undefined;
+    return {
+      ok: true,
+      pool: Object.keys(desired).length ? { defaultModel: def, models: Object.keys(desired) } : null,
+      merged: Object.keys(user).length > 0,
+      efforts: effortWrites,
+      ...(unchanged ? { unchanged: true } : {}),
+      added: Object.keys(add),
+      removed: remove,
+      ...(warning ? { warning } : {}),
+    };
+  },
+
+  remember(st, { hubWroteDefault, def }) {
+    st.defaultWritten = hubWroteDefault ? def : undefined;
+    saveState(STATE);
+  },
+
+  // Kimi's own rules for a pool (assertValidSubagentModelPool), so a pool it
+  // would turn away is not written.
+  validate(models, def) {
+    if (!Object.keys(models).length) return null;
+    if (Object.hasOwn(models, 'primary')) return '子代理模型的別名不能叫 primary（Kimi 保留給「跟主模型一樣」）';
+    if (def === undefined) return 'Kimi 的子代理模型一定要有預設模型（default_model）';
+    if (!Object.hasOwn(models, def)) return `子代理預設模型「${def}」不在子代理模型的清單裡`;
+    return null;
+  },
+};
+
+// The old name: DeepSeek was the first of the hub's providers.
+const deepseek = {
+  provision: (args) => hubProviders.provision({ ...args, provider: 'deepseek' }),
+  remove: () => hubProviders.remove('deepseek'),
 };
 
 // --------------------------------------------------------- plan quota
@@ -1314,9 +1769,7 @@ class DiskSession {
       archived: Boolean(st.archived),
       owner: o?.kind || (server.busy.has(this.id) ? 'server' : null),
       model: s.model || '',
-      controllable: o?.kind === 'tui' ? o.exact && Boolean(tui.byPid.get(o.pid)) : null,
-      // Not sure the terminal Kimi has this one open; locked to be safe.
-      guess: o?.kind === 'tui' && !o.exact ? true : undefined,
+      controllable: o?.kind === 'tui' ? Boolean(tui.byPid.get(o.pid)) : null,
     };
   }
 
@@ -1442,18 +1895,15 @@ const disk = {
   },
 
   // A terminal Kimi does not say which conversation it has open. The one in
-  // its folder it wrote since it started is surely it; any other in that
-  // folder might be (opened with /resume or -c and not written yet), so it
-  // is locked too unless the hub drove it through the server since then, or
-  // a terminal Kimi handed it over with /web (procs.serverHolds).
+  // its folder it wrote since it started is surely it, and only that one is
+  // the terminal's (the hub then types into that Kimi). Another conversation
+  // in the same folder might be open there too (with /resume or -c, not
+  // written yet), but that is a guess, and a guess is not a reason to lock a
+  // conversation: it is driven through the Kimi server like any other, and
+  // if both sides do write to it, they conflict, as they would anyway.
   owner(id) {
     const pid = this.best.get(id);
-    if (pid) return { kind: 'tui', pid, exact: true };
-    if (!this.tuis.length || procs.serverHolds(id)) return null;
-    const cwd = (this.sessions.get(id) || this.get(id))?.realCwd();
-    const mine = server.mine.get(id) || 0;
-    const p = cwd && this.tuis.find((t) => t.cwd === cwd && mine < t.started);
-    return p ? { kind: 'tui', pid: p.pid, exact: false } : null;
+    return pid ? { kind: 'tui', pid, exact: true } : null;
   },
 
   list() {
@@ -1640,7 +2090,7 @@ const tui = {
 
   controller(sid) {
     const o = disk.owner(sid);
-    return o?.kind === 'tui' && o.exact ? this.byPid.get(o.pid) || null : null;
+    return o?.kind === 'tui' ? this.byPid.get(o.pid) || null : null;
   },
 
   async input(sid, args) {
@@ -1648,7 +2098,6 @@ const tui = {
     const o = disk.owner(sid);
     const c = this.controller(sid);
     if (!o) throw new Error('這個對話沒有在終端機裡執行');
-    if (!o.exact) throw new Error('這個資料夾有終端機的 Kimi 開著，但看不出它開的是不是這個對話，所以先設成唯讀。');
     if (!c) throw new Error('這個對話正在終端機的 Kimi 裡執行，但那個 Kimi 不是用 kimi-hub 啟動的，所以中控台只能看、不能操作。在那個 Kimi 裡輸入 /web 交給中控台，或之後改用 kimi-hub 啟動 Kimi。');
     const s = disk.get(sid);
     const paste = (t) => `\x1b[200~${t}\x1b[201~`;
@@ -2415,7 +2864,15 @@ const hub = {
         return server.request(String(args.method || 'GET').toUpperCase(), String(args.path || ''), args.body);
       case 'kimi.usage':
         return quota.read({ expect: args.expect && typeof args.expect === 'object' ? args.expect : {} });
-      // DeepSeek models inside this computer's Kimi (see `deepseek` above).
+      // The hub's model providers inside this computer's Kimi (DeepSeek,
+      // Claude: see `hubProviders` above), and Kimi's subagent model pool.
+      case 'kimi.hub.provision':
+        return hubProviders.provision(args);
+      case 'kimi.hub.remove':
+        return hubProviders.remove(String(args.provider || ''));
+      case 'kimi.subagents.sync':
+        return pool.sync(args);
+      // The first of them, under its old names (hubs before 0.9).
       case 'kimi.deepseek.provision':
         return deepseek.provision(args);
       case 'kimi.deepseek.remove':

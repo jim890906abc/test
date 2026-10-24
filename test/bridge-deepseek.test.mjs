@@ -315,9 +315,9 @@ test('what is not a gateway, a model or a key Kimi may be given is refused befor
     [{ apiKey: 'tab\there' }, /API key/],
     [{ apiKey: 'x'.repeat(501) }, /API key/],
     [{ apiKey: 12345 }, /API key/],
-    [{ models: [] }, /1 到 20/],
-    [{ models: 'deepseek-v4-pro' }, /1 到 20/],
-    [{ models: models(Array.from({ length: 21 }, (_, i) => `deepseek-m${i}`)) }, /1 到 20/],
+    [{ models: [] }, /1 到 40/],
+    [{ models: 'deepseek-v4-pro' }, /1 到 40/],
+    [{ models: models(Array.from({ length: 41 }, (_, i) => `deepseek-m${i}`)) }, /1 到 40/],
     [{ models: models(['bad name']) }, /模型名稱不合法/],
     [{ models: models(['x'.repeat(101)]) }, /模型名稱不合法/],
     [{ models: models(['../etc']) }, /模型名稱不合法/],
@@ -346,7 +346,7 @@ test('only the fields the bridge knows go to Kimi', async () => {
   const m = { ...models(['deepseek-v4-pro'])[0], default_model: 'x', api_key: 'sneaky', adaptive_thinking: true, base_url: 'https://evil.example', extra: { a: 1 } };
   const r = await provision({ models: [m] });
   assert.equal(r.ok, true, r.error);
-  assert.deepEqual(Object.keys(posted()[0][2].models[0]).sort(), ['capabilities', 'display_name', 'max_context_size', 'max_output_size', 'model', 'support_efforts']);
+  assert.deepEqual(Object.keys(posted()[0][2].models[0]).sort(), ['adaptive_thinking', 'capabilities', 'display_name', 'max_context_size', 'max_output_size', 'model', 'support_efforts']);
   assert.deepEqual(Object.keys(posted()[0][2]).sort(), ['api_key', 'base_url', 'id', 'models', 'type']);
 });
 

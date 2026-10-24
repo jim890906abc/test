@@ -343,7 +343,7 @@ test('a conversation running in a terminal Kimi is followed live, read-only', { 
   }
 });
 
-test('other conversations in the folder of a terminal Kimi are locked until unlocked', { skip: SKIP_TTY }, async () => {
+test('other conversations in the folder of a terminal Kimi are not locked: a guess is no reason for read-only', { skip: SKIP_TTY }, async () => {
   // An older conversation in the project folder, started on the Kimi side.
   const ks = await kimiApi('POST', '/sessions', { metadata: { cwd: PROJECT } });
   await kimiApi('POST', `/sessions/${ks.id}/prompts`, { content: [{ type: 'text', text: '聊天 舊對話' }], model: 'fake/fake-1' });
@@ -355,23 +355,19 @@ test('other conversations in the folder of a terminal Kimi are locked until unlo
     tty.type('');
     await new Promise((r) => setTimeout(r, 1000));
     tty.type('聊天 另一個');
+    // The one the terminal Kimi wrote is surely its own.
     await listed((s) => s.title === '聊天 另一個' && s.owner === 'tui' && !s.guess, 'terminal conversation');
-    // The terminal Kimi could have the older one open (/resume): read-only.
-    const locked = await until(async () => {
-      const x = await session(older.id);
-      return x.meta.owner === 'tui' && x.meta.guess && x;
-    }, 8000, 'older conversation locked');
-    assert.equal(locked.meta.controllable, false);
-    await assert.rejects(api('POST', `/sessions/${older.id}/messages`, { text: '聊天 不該送出' }), (e) => e.status === 409);
-    // A new one from the hub in the same folder is the hub's.
+    // The terminal Kimi could have the older one open (/resume), but that is only a guess: the hub drives it.
+    await new Promise((r) => setTimeout(r, 2000));
+    const free = await session(older.id);
+    assert.notEqual(free.meta.owner, 'tui');
+    assert.ok(!free.meta.guess);
+    await api('POST', `/sessions/${older.id}/messages`, { text: '聊天 照常送出' });
+    await until(async () => (await session(older.id)).events.some((e) => e.type === 'text' && e.text.includes('收到：聊天 照常送出')), 20000, 'answered through the server');
+    // A new one from the hub in the same folder is the hub's, as before.
     const fresh = await api('POST', '/sessions', { machineId, cwd: PROJECT, prompt: '聊天 新對話', permission: 'auto' });
     assert.ok((await idle(fresh.id)).events.some((e) => e.type === 'text' && e.text.includes('收到：聊天 新對話')));
     assert.notEqual((await session(fresh.id)).meta.owner, 'tui');
-    // Unlocking on request.
-    await api('POST', `/sessions/${older.id}/unlock`);
-    await until(async () => (await session(older.id)).meta.owner !== 'tui', 8000, 'unlocked');
-    await api('POST', `/sessions/${older.id}/messages`, { text: '聊天 解除後' });
-    await until(async () => (await session(older.id)).events.some((e) => e.type === 'text' && e.text.includes('收到：聊天 解除後')), 20000, 'answered after unlock');
   } finally {
     tty.stop();
   }
@@ -587,7 +583,7 @@ test('/steer: every queued message into the running turn at once', { skip: SKIP 
   await until(async () => (await session(s.id)).events.some((e) => e.type === 'tool_use' && e.status === 'running'), 20000, 'running');
   for (const t of ['聊天 甲', '聊天 乙']) await api('POST', `/sessions/${s.id}/messages`, { text: t });
   await until(async () => (await session(s.id)).meta.queue?.length === 2, 10000, 'queued');
-  assert.deepEqual(await api('POST', `/sessions/${s.id}/queue/steer-all`), { count: 2 });
+  assert.deepEqual(await api('POST', `/sessions/${s.id}/queue/steer-all`), { count: 2, steered: 2, waiting: 0 });
   const done = await until(async () => {
     const x = await session(s.id);
     return x.status === 'idle' && x.events.filter((e) => e.type === 'user').length === 3 && x;
