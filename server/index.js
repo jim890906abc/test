@@ -982,6 +982,8 @@ function broadcast(msg) {
 }
 runner.setBroadcast(broadcast);
 machines.setBroadcast(broadcast);
+// A computer's providers or pool of subagent models changed: pages ask for GET /api/models again.
+providers.onChange((machineId) => broadcast({ t: 'models', machineId }));
 runner.restoreLiveSessions();
 
 // Auto-pause and 定時送出 run here on the hub, whether or not a browser is open.

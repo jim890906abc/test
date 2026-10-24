@@ -97,6 +97,10 @@ const asOld = (err, m) => (isUnknownOp(err) ? Object.assign(new Error(oldConnect
 
 const hash = (v) => crypto.createHash('sha256').update(JSON.stringify(v)).digest('hex');
 
+// Told when a computer's providers or pool changed (pages reload the catalog).
+const changeListeners = new Set();
+export const onChange = (fn) => changeListeners.add(fn);
+
 // What the hub needs from Kimi's side, set by the adapter (avoids an import
 // cycle): `machineModels(machineId)` → { models: [info], defaultModel, pool },
 // and `forgetModels(machineId)` for when the computer's Kimi changed.
@@ -106,6 +110,22 @@ export function init(d) {
 }
 
 // ------------------------------------------------------------- one model
+
+// One Claude model as Kimi's `anthropic` provider is given it (the bridge
+// checks every field). The window and the output limit are the model's;
+// thinking matches what the Claude adapter does with it: a model that cannot
+// think "off" (Opus 5.5, Fable) is always_thinking, one that takes a budget
+// only (Haiku 4.5) is not adaptive and offers low, medium and high.
+// (Here and not in claude-account.js: that file is bundled into the Claude
+// daemon, bridge/claude-daemon.mjs, which must be built from it as it is.)
+export function claudeKimiModel(id) {
+  const m = claude.modelInfo(id);
+  const canOff = m.efforts.includes('off') || m.efforts.includes('on');
+  const levels = m.adaptive ? m.efforts.filter((e) => EFFORT_NAMES.includes(e)) : ['low', 'medium', 'high'];
+  const caps = ['thinking', ...(canOff ? [] : ['always_thinking']), 'tool_use'];
+  if (m.image) caps.push('image_in');
+  return { model: id, display_name: m.name, max_context_size: m.context, max_output_size: m.maxOut, capabilities: caps, support_efforts: levels, adaptive_thinking: m.adaptive };
+}
 
 // The thinking-effort choices Kimi's own /effort picker offers for a model.
 export function effortsFor(model) {
@@ -141,7 +161,7 @@ export function hubModelInfo(alias) {
   const family = familyOf(alias);
   const id = String(alias).slice(PROVIDER_IDS[family]?.length + 1);
   if (family === 'deepseek') return modelInfo(deepseek.kimiModel(id), alias);
-  if (family === 'claude') return modelInfo(claude.kimiModel(id), alias);
+  if (family === 'claude') return modelInfo(claudeKimiModel(id), alias);
   return null;
 }
 
@@ -172,9 +192,33 @@ export function describeModel(alias, name) {
 // --------------------------------------------------- the keyed sources
 
 // The Claude models given to Kimi: the ones the key can use, the hub's known
-// ones first, at most what the bridge takes.
+// ones first, at most what the bridge takes. Read from the API at most every
+// ten minutes and never for long (a prompt waits for this): when it does not
+// answer in a few seconds, the last list read (else the default model) stands
+// in for a minute.
+let claudeList = null; // { key, at, ok, ids }
+const CLAUDE_LIST_WAIT = Number(process.env.AGENT_HUB_CLAUDE_LIST_WAIT) || 8000;
 export async function claudeModelIds(opts = {}) {
-  const list = opts.claudeModels ? await opts.claudeModels() : await claude.models();
+  let list;
+  if (opts.claudeModels) list = await opts.claudeModels();
+  else {
+    const key = claude.apiKey();
+    const c = claudeList;
+    if (c && c.key === key && Date.now() - c.at < (c.ok ? 10 * 60_000 : 60_000)) list = c.ids;
+    else {
+      let timer;
+      try {
+        const got = await Promise.race([claude.models(), new Promise((_, reject) => (timer = setTimeout(() => reject(new Error('timeout')), CLAUDE_LIST_WAIT)))]);
+        list = got.map((m) => m.id);
+        claudeList = { key, at: Date.now(), ok: true, ids: list };
+      } catch {
+        list = c && c.key === key ? c.ids : [claude.DEFAULT_MODEL];
+        claudeList = { key, at: Date.now(), ok: false, ids: list };
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+  }
   return [...new Set(list.map((m) => (typeof m === 'string' ? m : m.id)))].slice(0, MAX_PROVIDER_MODELS);
 }
 
@@ -192,7 +236,7 @@ async function wanted(source, opts = {}) {
   const key = claude.apiKey();
   if (!key) return null;
   const ids = await claudeModelIds(opts);
-  const specs = ids.map((id) => claude.kimiModel(id));
+  const specs = ids.map((id) => claudeKimiModel(id));
   return { source, sig: hash([key, specs]), request: { provider: 'claude', apiKey: key, models: specs }, models: ids.map((id, i) => ({ alias: aliasOf('claude', id), id, spec: specs[i] })) };
 }
 
@@ -354,7 +398,10 @@ async function run(machineId, opts) {
     st.scope = 'none';
     st.poolError = oldConnector(m);
   }
-  if (changed || out.synced) deps.forgetModels(machineId);
+  if (changed || out.synced) {
+    deps.forgetModels(machineId);
+    for (const fn of changeListeners) fn(machineId);
+  }
   return out;
 }
 
@@ -393,6 +440,7 @@ export async function ensureProviders(machineId, opts = {}) {
 // leaves their Kimi. `purge`: the sources whose key was removed.
 export async function refreshAll({ purge = [], ...opts } = {}) {
   epoch++;
+  claudeList = null;
   const targets = machines.listMachines().filter((m) => m.online && (states.has(m.id) || m.kimi?.server || (purge.length && m.kimi?.available)));
   await Promise.all(
     targets.map((m) =>
@@ -435,6 +483,7 @@ export function poolState(machineId, m = machines.getMachine(machineId)) {
 
 // For tests: forget everything this process knows.
 export function reset() {
+  claudeList = null;
   states.clear();
   running.clear();
   epoch++;
@@ -494,7 +543,7 @@ export async function catalog(machineId, opts = {}) {
       ready: !machineId || (online && hub),
       ...(machineId && online && !hub ? { note: oldConnector(m) } : st?.errors.claude ? { note: st.errors.claude } : machineId && !online ? { note: '電腦離線' } : {}),
       defaultModel: aliasOf('claude', claude.DEFAULT_MODEL),
-      models: ids.map((id) => ({ ...modelInfo(claude.kimiModel(id), aliasOf('claude', id)), subagentEffort: effortOf('claude', aliasOf('claude', id), claude.kimiModel(id), saved) })),
+      models: ids.map((id) => ({ ...modelInfo(claudeKimiModel(id), aliasOf('claude', id)), subagentEffort: effortOf('claude', aliasOf('claude', id), claudeKimiModel(id), saved) })),
     });
   }
 

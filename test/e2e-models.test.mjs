@@ -301,8 +301,15 @@ test('a computer that says hello gets a pool of subagent models: its own models,
 });
 
 test('a key given: its provider first, then the pool again with its models; DeepSeek subagents at max', async () => {
+  // A page open: told when a computer's models change, so it asks for them again.
+  const page = new WebSocket(`ws://127.0.0.1:${PORT}/ws?token=${TOKEN}`);
+  const heard = [];
+  page.on('message', (d) => heard.push(JSON.parse(d)));
+  await new Promise((r) => page.on('open', r));
   await assert.rejects(api('PUT', '/deepseek', { apiKey: 'wrong-key' }), (e) => e.status === 400);
   await api('PUT', '/deepseek', { apiKey: DS_KEY });
+  await until(async () => heard.some((m) => m.t === 'models' && m.machineId === MID), 10000, 'told the models changed');
+  page.close();
   await until(async () => machine.provisioned.length === 1 && Object.keys(machine.pool.models).includes(DS_FLASH), 10000, 'DeepSeek provisioned and synced');
   const p = machine.provisioned[0];
   assert.deepEqual([p.provider, p.gateway, p.apiKey], ['deepseek', 'opencode-go', DS_KEY]);

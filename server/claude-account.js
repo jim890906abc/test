@@ -9,10 +9,7 @@
 // request goes to https://api.anthropic.com with `x-api-key`.
 //
 // The key is kept in data/claude.json (readable by this user only) and never
-// sent to a browser; pages see only its last four characters. It does go to
-// the bridge of a connected computer, which makes it a Kimi provider of type
-// `anthropic` there (server/providers.js), so Claude can be the main model of
-// a Kimi conversation, or a subagent's.
+// sent to a browser; pages see only its last four characters.
 import fs from 'node:fs';
 import path from 'node:path';
 import Anthropic from '@anthropic-ai/sdk';
@@ -211,20 +208,6 @@ export async function models({ fresh = false } = {}) {
 
 export function modelInfo(id) {
   return modelCache?.models.find((m) => m.id === id) || info(id, null);
-}
-
-// One model as Kimi's `anthropic` provider is given it (the bridge checks
-// every field). The window and the output limit are the model's; thinking
-// matches what the Claude adapter does with it: a model that cannot think
-// "off" (Opus 5.5, Fable) is always_thinking, one that takes a budget only
-// (Haiku 4.5) is not adaptive and offers low, medium and high.
-export function kimiModel(id) {
-  const m = modelInfo(id);
-  const canOff = m.efforts.includes('off') || m.efforts.includes('on');
-  const levels = m.adaptive ? m.efforts.filter((e) => FIVE.includes(e)) : ['low', 'medium', 'high'];
-  const caps = ['thinking', ...(canOff ? [] : ['always_thinking']), 'tool_use'];
-  if (m.image) caps.push('image_in');
-  return { model: id, display_name: m.name, max_context_size: m.context, max_output_size: m.maxOut, capabilities: caps, support_efforts: levels, adaptive_thinking: m.adaptive };
 }
 
 // How a request asks for thinking at `effort` on `model`: the `thinking`

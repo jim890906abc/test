@@ -6,6 +6,7 @@
 import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -13,6 +14,7 @@ const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-hub-providers-'));
 process.env.AGENT_HUB_DATA = path.join(TMP, 'data');
 process.env.AGENT_HUB_WORKSPACES = path.join(TMP, 'ws');
 delete process.env.ANTHROPIC_API_KEY;
+process.env.AGENT_HUB_CLAUDE_LIST_WAIT = '300';
 
 const DS_KEY = 'sk-oc-go-0123456789abcd';
 const CLAUDE_KEY = 'sk-ant-api03-0123456789abcdefghijklmnop';
@@ -124,7 +126,7 @@ test('where the tokens go, in words; the line after a model moves to another sou
 
 test('Claude models are given to Kimi as the Claude adapter thinks: always, off, adaptive or budget', () => {
   // Opus 5.5 cannot turn thinking off.
-  assert.deepEqual(claude.kimiModel('claude-opus-5-5'), {
+  assert.deepEqual(P.claudeKimiModel('claude-opus-5-5'), {
     model: 'claude-opus-5-5',
     display_name: 'Claude Opus 5.5',
     max_context_size: 1_000_000,
@@ -134,22 +136,22 @@ test('Claude models are given to Kimi as the Claude adapter thinks: always, off,
     adaptive_thinking: true,
   });
   // Sonnet 5.5 can.
-  const sonnet = claude.kimiModel('claude-sonnet-5-5');
+  const sonnet = P.claudeKimiModel('claude-sonnet-5-5');
   assert.deepEqual(sonnet.capabilities, ['thinking', 'tool_use', 'image_in']);
   assert.equal(sonnet.adaptive_thinking, true);
   // Opus 4.6 has no xhigh.
-  assert.deepEqual(claude.kimiModel('claude-opus-4-6').support_efforts, ['low', 'medium', 'high', 'max']);
+  assert.deepEqual(P.claudeKimiModel('claude-opus-4-6').support_efforts, ['low', 'medium', 'high', 'max']);
   // Haiku 4.5 takes a thinking budget only, and a smaller window.
-  const haiku = claude.kimiModel('claude-haiku-4-5');
+  const haiku = P.claudeKimiModel('claude-haiku-4-5');
   assert.deepEqual([haiku.adaptive_thinking, haiku.support_efforts, haiku.max_context_size, haiku.max_output_size], [false, ['low', 'medium', 'high'], 200_000, 64_000]);
   // Only what the bridge allows.
   for (const id of ['claude-opus-5-5', 'claude-haiku-4-5', 'claude-fable-5-1', 'claude-future-9']) {
-    const m = claude.kimiModel(id);
+    const m = P.claudeKimiModel(id);
     assert.ok(m.capabilities.every((c) => ['thinking', 'always_thinking', 'tool_use', 'image_in'].includes(c)), id);
     assert.ok(m.support_efforts.every((e) => ['low', 'medium', 'high', 'xhigh', 'max'].includes(e)), id);
   }
   // As the composer shows them: what Kimi's /effort picker would offer.
-  const info = (id) => P.modelInfo(claude.kimiModel(id), P.aliasOf('claude', id));
+  const info = (id) => P.modelInfo(P.claudeKimiModel(id), P.aliasOf('claude', id));
   assert.deepEqual([info('claude-opus-5-5').efforts, info('claude-opus-5-5').defaultEffort, info('claude-opus-5-5').family], [['low', 'medium', 'high', 'xhigh', 'max'], 'medium', 'claude']);
   assert.deepEqual(info('claude-sonnet-5-5').efforts, ['off', 'low', 'medium', 'high', 'xhigh', 'max']);
   assert.equal(info('claude-haiku-4-5').image, true);
@@ -175,7 +177,7 @@ test('providers first, then the pool: every keyed source is provisioned, then on
   assert.deepEqual(Object.keys(cl).sort(), ['apiKey', 'models', 'provider'], 'Claude has no gateway');
   assert.deepEqual([cl.provider, cl.apiKey], ['claude', CLAUDE_KEY]);
   assert.deepEqual(cl.models.map((m) => m.model), ['claude-opus-5-5', 'claude-haiku-4-5']);
-  assert.deepEqual(cl.models[0], claude.kimiModel('claude-opus-5-5'));
+  assert.deepEqual(cl.models[0], P.claudeKimiModel('claude-opus-5-5'));
 
   const sync = b.calls[2].args;
   assert.deepEqual(Object.keys(sync.models), [SUB, K3, DS_FLASH, DS_PRO, OPUS, HAIKU], 'Kimi\'s own models and every keyed source\'s');
@@ -428,4 +430,27 @@ test('the catalog: every source with its models, ready or not, and whether subag
   cat = await P.catalog('', { claudeModels });
   assert.equal(cat.sources[0].ready, false);
   assert.equal(cat.sources.length, 3);
+});
+
+test('the Claude models are read from the API without making a prompt wait: the default model stands in when it is slow', async () => {
+  // An API that never answers.
+  const stuck = http.createServer(() => {});
+  await new Promise((r) => stuck.listen(0, '127.0.0.1', r));
+  process.env.AGENT_HUB_CLAUDE_TEST_URL = `http://127.0.0.1:${stuck.address().port}`;
+  try {
+    claude.setKey(CLAUDE_KEY);
+    const t = Date.now();
+    const ids = await P.claudeModelIds();
+    assert.ok(Date.now() - t < 3000, `waited ${Date.now() - t} ms`);
+    assert.deepEqual(ids, [claude.DEFAULT_MODEL], 'the default model until the API answers');
+    // Not tried again for a minute.
+    const t2 = Date.now();
+    assert.deepEqual(await P.claudeModelIds(), ids);
+    assert.ok(Date.now() - t2 < 100);
+  } finally {
+    delete process.env.AGENT_HUB_CLAUDE_TEST_URL;
+    claude.clearKey();
+    stuck.closeAllConnections();
+    stuck.close();
+  }
 });
