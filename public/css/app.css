@@ -86,6 +86,188 @@
   --row-active: #141413;
 }
 
+/* Claude palette: Claude's classic near-black with its orange, whatever the
+   theme. It is a user-chosen look (data-look), never the current provider;
+   after the dark blocks, so it wins over them. */
+:root[data-look='claude'] {
+  color-scheme: dark;
+  --desktop: #0b0b0a;
+  --window: #141413;
+  --window-raised: #1f1e1c;
+  --titlebar: #141413;
+  --sidebar: #0f0f0e;
+  --material-sidebar: #0f0f0e;
+  --material-popover: #1f1e1cf5;
+  --control: #1f1e1c;
+  --control-pressed: #2b2a27;
+  --track: #0f0f0e;
+  --fill-hover: #faf9f50d;
+  --line: #2b2a27;
+  --control-border: #5e5c56;
+  --ink: #faf9f5;
+  --ink-secondary: #b7b5ac;
+  --ink-disabled: #6b6963;
+  --icon-ink: #918f87;
+  --accent: #d97757;
+  --accent-pressed: #c6613f;
+  --on-accent: #ffffff;
+  --accent-soft: #3a2219;
+  --link: #d97757;
+  --danger: #f0857a;
+  --danger-soft: #36201e;
+  --on-danger: #141413;
+  --warning: #e3b35b;
+  --warning-soft: #33291a;
+  --success: #8cc0e0;
+  --success-soft: #1a2d38;
+  --scrim: #000000b3;
+  --shadow-control: 0 1px 2px #00000080;
+  --shadow-card: 0 1px 2px #00000066;
+  --shadow-popover: 0 0 0 0.5px #faf9f51a, 0 12px 32px #000000a6;
+  --shadow-window: none;
+  --shadow-inset: inset 0 1px 1px #00000059;
+  --focus-ring: 0 0 0 2px #141413, 0 0 0 4px #d97757;
+  --user-bubble: #262624;
+  --row-active: #262624;
+}
+
+/* DeepSeek palette: blue and white, whatever the theme (like Claude's look it
+   ignores the dark theme). It is a user-chosen look (data-look), never the
+   current provider: white surfaces, a very pale blue-white sidebar, and
+   DeepSeek's blue (#4d6bfe) as the
+   one accent and near-black ink with a blue tint. The component details are
+   at the end of this file.
+   White on #4d6bfe is only 4.3:1, so #4d6bfe is for marks and fills that
+   carry an icon (send button, switch, radio, focus ring, progress, 3:1 or
+   more) and a button with white TEXT uses --accent-strong (#3451e6, 6.1:1;
+   pressed #2b44cf 7.4:1). Checked with WCAG contrast, text >= 4.5:1 and
+   UI parts >= 3:1:
+     ink #1b1f33 on white 16.3, on #f5f8ff 15.3, on #f7f9ff 15.5, on #e6edff 13.9
+     ink-secondary #596079 on white 6.2, on #f7f9ff 5.9, on #eef3ff 5.6, on #e6edff 5.3
+     link #3352e5 on white 6.0 (on #edf1ff 5.4); active row #1f3bd0 on #e6edff 6.9
+     active segment / tag #2c47d6 on white 7.05, on #e3e9ff 5.8; inline code #2b45c9 on #eef2ff 6.7
+     white on the DeepSeek tag in the other looks (#3550e6) 6.1
+     danger #c92f35 on white 5.3, on #fdeeee 4.7; warning #9a6000 on white 5.2,
+     on #fff6e5 4.8; success #117556 on white 5.7, on #e8f6ef 5.1
+     control-border #818dbd on white 3.24, on #f5f8ff 3.05, on #f7f9ff 3.08;
+     icon-ink #6f7794 on white 4.4, on #f7f9ff 4.2; #4d6bfe on white 4.3, on #f3f6ff 4.0 */
+:root[data-look='deepseek'] {
+  color-scheme: light;
+  accent-color: #4d6bfe;
+  --desktop: #ffffff;
+  --window: #ffffff;
+  --window-raised: #f5f8ff;
+  --titlebar: #ffffff;
+  --sidebar: #f7f9ff;
+  --material-sidebar: #f7f9ff;
+  --material-popover: #fffffffa;
+  --control: #ffffff;
+  --control-pressed: #eaf0ff;
+  --track: #eef2fd;
+  --fill-hover: #4d6bfe0f;
+  --line: #e3e9f8;
+  --control-border: #818dbd;
+  --ink: #1b1f33;
+  --ink-secondary: #596079;
+  --ink-disabled: #a4aac0;
+  --icon-ink: #6f7794;
+  --accent: #4d6bfe;
+  --accent-strong: #3451e6;
+  --accent-pressed: #2b44cf;
+  --on-accent: #ffffff;
+  --accent-soft: #edf1ff;
+  --link: #3352e5;
+  --danger: #c92f35;
+  --danger-soft: #fdeeee;
+  --on-danger: #ffffff;
+  --warning: #9a6000;
+  --warning-soft: #fff6e5;
+  --success: #117556;
+  --success-soft: #e8f6ef;
+  --scrim: #1b1f3366;
+  --shadow-control: 0 1px 2px #1b2a6b14;
+  --shadow-card: 0 1px 2px #1b2a6b0f, 0 1px 1px #1b2a6b08;
+  --shadow-popover: 0 0 0 1px #1b2a6b12, 0 12px 32px #1b2a6b1f;
+  --shadow-window: none;
+  --shadow-inset: inset 0 1px 1px #1b2a6b0a;
+  --focus-ring: 0 0 0 2px #ffffff, 0 0 0 4px #4d6bfe;
+  --user-bubble: #eef3ff;
+  --row-active: #e6edff;
+}
+
+/* Motion: one set of durations and curves for the whole page. What moves is
+   moved with transform and opacity only (colours may fade; nothing is ever
+   animated through width, height, top, left or margin, which would lay the page
+   out on every frame). With prefers-reduced-motion the durations collapse to
+   nothing: things appear and disappear at once. */
+:root {
+  --dur-fast: 120ms; /* hover, press, a small change of state */
+  --dur-base: 180ms; /* something entering: menu, dialog, panel, toast, the cross-fade of a new look */
+  --dur-slow: 260ms; /* a big move: the sidebar */
+  --ease-out: cubic-bezier(0.2, 0, 0, 1); /* entering and settling */
+  --ease-in: cubic-bezier(0.4, 0, 1, 1); /* leaving */
+  --ease-move: cubic-bezier(0.4, 0, 0.2, 1); /* from one place to another */
+}
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-fast: 1ms;
+    --dur-base: 1ms;
+    --dur-slow: 1ms;
+  }
+}
+/* A change of theme or look (color-fade.js): the picture of the page as it was
+   fades out over the page as it is now. One cross-fade of two pictures on the
+   compositor, however big the page; no element has a colour transition of its
+   own. The old picture stays opaque underneath, so nothing dims half way
+   (the default blends both with plus-lighter, which is for pictures that are
+   not opaque). */
+::view-transition-group(root) {
+  animation: none;
+}
+::view-transition-old(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+::view-transition-new(root) {
+  animation: fade-in var(--dur-base) var(--ease-move);
+  mix-blend-mode: normal;
+}
+/* While the sidebar slides shut it stays on screen at its full width, over
+   the column it has just given up. */
+.app.sliding {
+  overflow: hidden;
+}
+.app.sliding .sidebar {
+  position: relative;
+  z-index: 5;
+  width: var(--side-w);
+  visibility: visible !important;
+  overflow: hidden;
+}
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.98);
+  }
+}
+@keyframes rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+@keyframes slide-in-right {
+  from {
+    opacity: 0;
+    transform: translateX(28px);
+  }
+}
+
 :root {
   --side-w: 248px;
   --col: 768px;
@@ -222,7 +404,7 @@ kbd {
   color: var(--ink);
   text-decoration: none;
   cursor: default;
-  transition: background-color 0.12s ease;
+  transition: background-color var(--dur-fast) var(--ease-out);
 }
 .side-row:hover {
   background: var(--fill-hover);
@@ -236,6 +418,10 @@ kbd {
 }
 .side-row[aria-current='page'] .row-sub {
   color: inherit;
+}
+/* Only the words are dimmed on the open row; the provider tag keeps full
+   strength (an opacity on the whole line would fade it as well). */
+.side-row[aria-current='page'] .row-sub-text {
   opacity: 0.82;
 }
 .side-row.offline .row-title {
@@ -285,7 +471,7 @@ kbd {
   background: transparent;
   color: inherit;
   opacity: 0;
-  transition: opacity 0.12s ease;
+  transition: opacity var(--dur-fast) var(--ease-out);
 }
 .row-more:hover {
   background: var(--fill-hover);
@@ -305,6 +491,52 @@ kbd {
   font-size: 12px;
   line-height: 17px;
   color: var(--ink-secondary);
+}
+.side-group {
+  margin-bottom: var(--space-1);
+}
+/* A category header is a control, not a date label: same look in every
+   palette, with a chevron that turns when the group opens. */
+.side-list .side-group-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  margin: 0;
+  padding: var(--space-3) var(--space-2) var(--space-1);
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--ink-secondary);
+  font: inherit;
+  font-size: 11px;
+  line-height: 14px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+.side-group-head:hover {
+  color: var(--ink);
+  background: var(--fill-hover);
+}
+.side-group-head .om-icon {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  opacity: 0.7;
+}
+.side-group-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.side-group-count {
+  flex: none;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.8;
 }
 .side-foot {
   flex: none;
@@ -491,6 +723,86 @@ kbd {
   content-visibility: auto;
   contain-intrinsic-size: auto 72px;
 }
+/* Placeholder bars while a conversation's first copy is on its way. They fade
+   in after a moment, so a quick answer never shows them. */
+.transcript-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  width: 100%;
+  max-width: var(--col);
+  margin: 0 auto;
+  opacity: 0;
+  animation: skeleton-in var(--dur-base) var(--ease-out) 150ms forwards;
+}
+.transcript-skeleton span {
+  display: block;
+  height: 14px;
+  width: 82%;
+  border-radius: 7px;
+  background: var(--fill-hover);
+  animation: breathe 1.6s ease-in-out infinite;
+}
+.transcript-skeleton span:nth-child(1) {
+  width: 36%;
+  height: 34px;
+  margin-left: auto;
+  border-radius: var(--radius-lg);
+}
+.transcript-skeleton span:nth-child(3) {
+  width: 64%;
+}
+.transcript-skeleton span:nth-child(4) {
+  width: 48%;
+}
+@keyframes skeleton-in {
+  to {
+    opacity: 1;
+  }
+}
+
+/* "Earlier messages": the top of a conversation that has more than is drawn.
+   Reaching it loads the next slice by itself; the button is the fallback. */
+.earlier {
+  display: flex;
+  justify-content: center;
+  min-height: 40px;
+  padding: 0 0 var(--space-3);
+}
+.earlier[hidden] {
+  display: none;
+}
+.earlier-btn {
+  border: 0;
+  background: transparent;
+  color: var(--ink-secondary);
+  font-size: 12px;
+  line-height: 18px;
+  padding: 6px 12px;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+}
+.earlier-btn:hover {
+  background: var(--fill-hover);
+  color: var(--ink);
+}
+.earlier.busy .earlier-text {
+  animation: breathe 1.4s ease-in-out infinite;
+}
+.earlier.failed .earlier-btn {
+  color: var(--danger);
+}
+/* A field the Hub sent as a short preview; opening it fetches the whole */
+.trunc-note {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--ink-secondary);
+}
 /* The question on screen, pinned at the top once scrolled past */
 .prompt-pin-bar {
   position: sticky;
@@ -519,6 +831,11 @@ kbd {
 }
 .prompt-pin:hover {
   color: var(--ink);
+}
+/* The question is before the window: going to it loads what lies between first. */
+.prompt-pin.busy {
+  cursor: progress;
+  opacity: 0.7;
 }
 .prompt-pin .om-icon {
   flex: none;
@@ -555,7 +872,7 @@ kbd {
   color: var(--ink-secondary);
   box-shadow: var(--shadow-popover);
   cursor: pointer;
-  transition: color 0.12s ease, background-color 0.12s ease;
+  transition: color var(--dur-fast) var(--ease-out), background-color var(--dur-fast) var(--ease-out);
 }
 .jump-end:hover {
   color: var(--ink);
@@ -661,6 +978,20 @@ kbd {
 .callout-text {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+/* A broker child opened directly: it is a real conversation, but its card
+   lives in the parent's 子代理 panel, so say where the parent is. */
+.child-note-slot {
+  flex: none;
+  padding: var(--space-3) var(--space-3) 0;
+}
+.child-note {
+  margin: 0;
+  background: var(--fill-hover);
+  color: var(--ink-secondary);
+}
+.child-note .linklike {
+  margin-left: 4px;
 }
 
 /* markdown */
@@ -779,7 +1110,7 @@ kbd {
   background: var(--control);
   color: var(--ink-secondary);
   opacity: 0;
-  transition: opacity 0.12s ease;
+  transition: opacity var(--dur-fast) var(--ease-out);
 }
 .md pre:hover .code-copy,
 .code-copy:focus-visible {
@@ -814,7 +1145,7 @@ kbd {
   animation: breathe 1.6s ease-in-out infinite;
 }
 .chev {
-  transition: transform 0.12s ease;
+  transition: transform var(--dur-fast) var(--ease-out);
 }
 [aria-expanded='true'] > .chev {
   transform: rotate(90deg);
@@ -846,7 +1177,7 @@ kbd {
   line-height: 20px;
   color: var(--ink);
   cursor: default;
-  transition: background-color 0.12s ease;
+  transition: background-color var(--dur-fast) var(--ease-out);
 }
 button.tool-row:hover {
   background: var(--fill-hover);
@@ -923,6 +1254,11 @@ pre.out {
   line-height: 18px;
   white-space: pre-wrap;
   word-break: break-word;
+  /* A long output is laid out and painted inside its own box: nothing it does
+     moves the rows around it, and the page's scroll anchoring does not walk
+     through its lines. */
+  contain: content;
+  overflow-anchor: none;
 }
 pre.out.err {
   color: var(--danger);
@@ -953,6 +1289,42 @@ pre.result-out {
 }
 pre.result-out + .result {
   margin-top: -6px;
+}
+/* Claude's web search results and fetched page, as links */
+.web-links {
+  margin: 0;
+  padding: var(--space-1) 0;
+  list-style: none;
+  max-height: 320px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--window-raised);
+}
+.web-links li {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  padding: 3px 10px;
+  font-size: 12.5px;
+  line-height: 18px;
+  min-width: 0;
+}
+.web-links a {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-decoration: none;
+}
+.web-links a:hover {
+  text-decoration: underline;
+}
+.web-host {
+  flex: none;
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--ink-secondary);
 }
 .group-body {
   min-width: 0;
@@ -1252,7 +1624,7 @@ pre.tail {
   box-shadow: var(--shadow-card);
   text-align: left;
   cursor: default;
-  transition: border-color 0.12s ease;
+  transition: border-color var(--dur-fast) var(--ease-out);
 }
 .ev-tool_use .tool-body:has(> .artifact-card) {
   margin-left: 0;
@@ -1347,7 +1719,9 @@ pre.tail {
 @media (prefers-reduced-motion: reduce) {
   .spinner,
   .pulse,
-  .fold.live span {
+  .fold.live span,
+  .earlier.busy .earlier-text,
+  .transcript-skeleton span {
     animation-duration: 3s;
   }
 }
@@ -1376,7 +1750,7 @@ pre.tail {
   border: 1px solid var(--line);
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-card);
-  transition: border-color 0.12s ease;
+  transition: border-color var(--dur-fast) var(--ease-out);
 }
 .composer-box:focus-within {
   border-color: var(--control-border);
@@ -1414,28 +1788,45 @@ pre.tail {
 }
 .composer-bar {
   display: flex;
+  /* The send button and what sits by it (cost, context, a hint) drop under the
+     chips when the chat column is too narrow to leave the chips a row of their own. */
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--space-2);
   margin-top: 6px;
 }
+/* The chips wrap onto more rows when the chat column is narrow (a sidebar and a
+   panel open, a phone) instead of scrolling sideways with the scrollbar hidden,
+   which cut the last chip mid-letter. One that is still wider than the row is
+   shortened with an ellipsis (its full words are in its title). */
 .composer-tools {
-  flex: 1;
+  flex: 1 1 180px;
   min-width: 0;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 2px;
-  overflow-x: auto;
-  scrollbar-width: none;
   margin-left: -4px;
 }
-.composer-tools::-webkit-scrollbar {
-  display: none;
-}
 .composer-actions {
-  flex: none;
+  /* (it may shrink, so a long hint inside it gives way - ellipsis - instead of
+     running out of the message box) */
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 100%;
   display: flex;
   align-items: center;
   gap: var(--space-2);
+  /* beside several rows of chips, the send button sits on the last one; on a
+     row of its own it stays at the right */
+  align-self: flex-end;
+  margin-left: auto;
+}
+.composer-actions > * {
+  flex-shrink: 0;
+}
+.composer-actions > .ctx-hint {
+  flex-shrink: 1;
 }
 .chip {
   flex: none;
@@ -1453,7 +1844,18 @@ pre.tail {
   font-weight: 500;
   white-space: nowrap;
   cursor: default;
-  transition: background-color 0.12s ease, color 0.12s ease;
+  max-width: 100%;
+  min-width: 0;
+  transition: background-color var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
+}
+.chip > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chip > .spinner,
+.chip > .served-dot {
+  flex: none;
 }
 .chip:hover,
 .chip[aria-expanded='true'] {
@@ -1478,6 +1880,26 @@ pre.tail {
   padding: 0;
   justify-content: center;
 }
+/* (It was capped at 280px to keep one chip from filling a row that scrolled; the
+   row wraps now, so the cap only stops a very long model line from taking more
+   than a row.) */
+.chip[data-control='subagent'] {
+  max-width: min(420px, 100%);
+}
+.subagent-fields {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.subagent-fields[hidden] {
+  display: none;
+}
+.subagent-model {
+  max-width: 330px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .chip.icon-only .om-icon {
   width: 17px;
   height: 17px;
@@ -1493,7 +1915,7 @@ pre.tail {
   background: var(--accent);
   color: var(--on-accent);
   box-shadow: var(--shadow-control);
-  transition: background-color 0.12s ease;
+  transition: background-color var(--dur-fast) var(--ease-out);
 }
 .send:active {
   background: var(--accent-pressed);
@@ -1687,6 +2109,7 @@ pre.tail {
 /* ---------------------------------------------------------- popovers */
 
 .om-menu.popover {
+  animation: pop-in var(--dur-fast) var(--ease-out);
   position: fixed;
   z-index: 60;
   max-height: min(60vh, 420px);
@@ -1786,7 +2209,8 @@ pre.tail {
   font-size: 13px;
   line-height: 18px;
   color: var(--ink);
-  transition: opacity 0.2s ease;
+  animation: rise-in var(--dur-base) var(--ease-out);
+  transition: opacity var(--dur-base) var(--ease-out);
 }
 .toast.error {
   color: var(--danger);
@@ -1798,6 +2222,7 @@ pre.tail {
 /* --------------------------------------------------------------- panel */
 
 .panel {
+  animation: slide-in-right var(--dur-base) var(--ease-out);
   position: relative;
   width: var(--panel-w, min(32vw, 620px));
   min-width: 0;
@@ -2204,8 +2629,10 @@ pre.tail {
   place-items: center;
   padding: var(--space-4);
   background: var(--scrim);
+  animation: fade-in var(--dur-base) var(--ease-out);
 }
 .dialog {
+  animation: rise-in var(--dur-base) var(--ease-out);
   width: min(380px, 100%);
   max-height: calc(100dvh - 32px);
   overflow-y: auto;
@@ -2470,7 +2897,7 @@ pre.tail {
   border-left: 5px solid currentColor;
   border-top: 4px solid transparent;
   border-bottom: 4px solid transparent;
-  transition: transform 0.12s ease;
+  transition: transform var(--dur-fast) var(--ease-out);
 }
 .tree-row[aria-expanded='true'] > .tree-caret::before {
   transform: rotate(90deg);
@@ -2583,6 +3010,16 @@ pre.tail {
 :root[data-theme='dark'] .composer-box {
   border-radius: 18px;
 }
+/* (DeepSeek's blue-and-white look is at the end of this file.) */
+:root[data-look='claude'] .om-btn--plain {
+  color: var(--link);
+}
+:root[data-look='claude'] .side-row[aria-current='page'] {
+  color: var(--ink);
+}
+:root[data-look='claude'] .composer-box {
+  border-radius: 18px;
+}
 
 /* -------------------------------------------------------------- mobile */
 
@@ -2603,7 +3040,7 @@ pre.tail {
     width: min(300px, 86vw);
     background: var(--sidebar);
     transform: translateX(-100%);
-    transition: transform 0.2s ease;
+    transition: transform var(--dur-slow) var(--ease-move);
     visibility: visible !important;
     padding-top: env(safe-area-inset-top);
   }
@@ -2617,6 +3054,7 @@ pre.tail {
     inset: 0;
     z-index: 39;
     background: var(--scrim);
+    animation: fade-in var(--dur-slow) var(--ease-out);
   }
   .sidebar-toggle {
     display: inline-flex;
@@ -2690,6 +3128,13 @@ pre.tail {
   flex: 1;
   min-width: 0;
 }
+.composer-note-actions {
+  flex: none;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
 .composer-note-title {
   font-size: 13px;
   line-height: 18px;
@@ -2698,6 +3143,62 @@ pre.tail {
 }
 .chip.static {
   cursor: default;
+}
+/* The native Kimi runs another model than the one chosen (summary.modelDrift). */
+.chip.drift-warn {
+  gap: 0 6px;
+  color: var(--danger);
+  background: var(--danger-soft);
+  font-weight: 600;
+  /* the two sentences go under one another when the row is too narrow for both */
+  flex-wrap: wrap;
+  height: auto;
+  min-height: 26px;
+}
+.chip.drift-warn:hover {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+.chip.drift-warn .drift-differs {
+  font-weight: 500;
+}
+.chip.drift-restore {
+  color: var(--ink);
+  background: var(--fill-hover);
+  font-weight: 600;
+}
+/* From 80% of the context: said once, put away with the ×. */
+.ctx-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  max-width: min(360px, 52vw);
+  height: 24px;
+  padding: 0 4px 0 8px;
+  border-radius: var(--radius-sm);
+  background: var(--warning-soft);
+  color: var(--warning);
+  font-size: 12px;
+  line-height: 16px;
+}
+.ctx-hint__text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ctx-hint__x {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.ctx-hint__x:hover {
+  background: var(--fill-hover);
 }
 .chip.static:hover {
   background: transparent;
@@ -2752,7 +3253,7 @@ pre.tail {
   left: 3px;
   width: 2px;
   background: transparent;
-  transition: background-color 0.12s ease;
+  transition: background-color var(--dur-fast) var(--ease-out);
 }
 .panel-grip:hover::after,
 .panel-grip:focus-visible::after,
@@ -2762,11 +3263,21 @@ pre.tail {
 .panel-grip:focus-visible {
   box-shadow: none;
 }
+/* While a divider is dragged: its cursor everywhere, nothing selectable, and
+   no frame (an Artifact page) takes the pointer from the divider. */
 .app.resizing,
 .app.resizing * {
-  cursor: col-resize !important;
   user-select: none;
 }
+.app.resizing-col,
+.app.resizing-col * {
+  cursor: col-resize !important;
+}
+.app.resizing-row,
+.app.resizing-row * {
+  cursor: row-resize !important;
+}
+.app.resizing iframe,
 .app.resizing .artifact-frame {
   pointer-events: none;
 }
@@ -2802,7 +3313,7 @@ pre.tail {
   box-shadow: var(--shadow-card);
   color: var(--ink);
   text-decoration: none;
-  transition: border-color 0.12s ease;
+  transition: border-color var(--dur-fast) var(--ease-out);
 }
 .artifact-tile:hover {
   border-color: var(--control-border);
@@ -3038,4 +3549,1398 @@ pre.tail {
   flex: 1;
   min-width: 0;
   overflow-wrap: anywhere;
+}
+
+/* ------------------------------------------------------------ Claude API */
+
+.callout.claude-key,
+.callout.deepseek-key {
+  align-items: center;
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+.callout.claude-key .callout-text,
+.callout.deepseek-key .callout-text {
+  flex: 1;
+  white-space: normal;
+}
+/* DeepSeek: the tag on its conversations in the sidebar, the gateway choice
+   and notes in 設定. */
+.row-tag {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 0 5px;
+  border-radius: 4px;
+  font-size: 10px;
+  line-height: 14px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+/* In the Kimi and Claude looks: DeepSeek blue dark enough for 10px white text
+   (6.1:1). In DeepSeek's own look it is a soft tag (end of this file). */
+.row-tag.ds,
+.row-tag.deepseek {
+  background: #3550e6;
+  color: #fff;
+}
+/* The provider is written out; color is never the only clue. */
+.row-tag.kimi,
+.row-tag.claude {
+  background: var(--fill-hover);
+  color: var(--ink-secondary);
+}
+/* On the open row and under the pointer the tag is an outline in the row's own
+   text colour: its contrast is then the row text's, whatever the look paints
+   the row with (a translucent fill over a coloured row is what made it vanish
+   in the Kimi look). */
+.side-row[aria-current='page'] .row-tag,
+.side-row[aria-current='page'] .row-tag.ds,
+.side-row[aria-current='page'] .row-tag.deepseek,
+.side-row:hover .row-tag.kimi,
+.side-row:hover .row-tag.claude {
+  background: transparent;
+  color: inherit;
+  box-shadow: inset 0 0 0 1px currentColor;
+}
+/* A pending runtime switch needs the whole 「本回合 …／下一回合 …」 text;
+   only that row may wrap instead of ellipsizing it away. */
+.row-sub.pending {
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+}
+.row-tag.pending {
+  white-space: normal;
+}
+/* A conversation whose file was damaged and repaired. Written out (colour is
+   never the only clue); red while the repaired version is not yet on disk. */
+.row-tag.salvaged {
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+.row-tag.salvaged.unsaved {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+.salvaged-badge .om-icon {
+  flex: none;
+}
+/* Conversation files the Hub could not load at all: a banner at the top of the
+   sidebar, closed to a line, opened to the list. */
+.damaged-slot {
+  flex: none;
+  margin: 0 var(--space-2) var(--space-2);
+}
+.damaged-banner {
+  border-radius: var(--radius-md);
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 17px;
+}
+.damaged-bar {
+  display: flex;
+  align-items: flex-start;
+}
+.damaged-head {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-1) var(--space-2) var(--space-3);
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.damaged-head .om-icon {
+  flex: none;
+  margin-top: 1px;
+}
+.damaged-head .chev {
+  margin-left: auto;
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+.damaged-head[aria-expanded='true'] .chev {
+  transform: rotate(90deg);
+}
+.damaged-text {
+  flex: 1;
+  min-width: 0;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.damaged-close {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  margin: 2px 2px 0 0;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-xs);
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+.damaged-close:hover {
+  background: var(--fill-hover);
+}
+.damaged-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  max-height: 40vh;
+  overflow-y: auto;
+  padding: 0 var(--space-3) var(--space-3);
+  color: var(--ink);
+}
+.damaged-note,
+.damaged-item {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+.damaged-item {
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--line);
+}
+.damaged-file {
+  font-weight: 600;
+}
+.damaged-reason,
+.damaged-backup {
+  color: var(--ink-secondary);
+}
+.gw-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: var(--space-2);
+}
+.gw-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 6px var(--space-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  font-size: 13px;
+  line-height: 18px;
+  cursor: pointer;
+}
+.gw-item.on {
+  border-color: var(--link);
+  background: var(--accent-soft);
+}
+.gw-name {
+  flex: 1;
+}
+.gw-state {
+  font-size: 11px;
+  color: var(--ink-secondary);
+}
+.ds-note {
+  margin: var(--space-2) 0;
+}
+.ds-secondary {
+  background: var(--warning-soft);
+  color: var(--warning);
+  margin-bottom: var(--space-2);
+}
+.linklike {
+  margin-left: 6px;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: var(--link);
+  cursor: pointer;
+}
+.linklike:hover {
+  text-decoration: underline;
+}
+/* What the conversation has cost so far, next to the context ring. */
+.cost-chip {
+  height: 26px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  font-size: 11px;
+  line-height: 14px;
+  color: var(--ink-secondary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.cost-chip:hover {
+  background: var(--fill-hover);
+}
+.cost-chip.over {
+  color: var(--warning);
+}
+.claude-key-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+.claude-test {
+  font-size: 12px;
+  line-height: 17px;
+  color: var(--ink-secondary);
+  overflow-wrap: anywhere;
+}
+.claude-test:empty {
+  display: none;
+}
+.claude-test.ok {
+  color: var(--success);
+}
+.claude-test.bad {
+  color: var(--danger);
+}
+/* DeepSeek key pool: one row per key, plus each computer's actual key. */
+.ds-key-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-2) 0 var(--space-1);
+}
+.ds-key-count {
+  font-size: 11px;
+  line-height: 14px;
+  color: var(--ink-secondary);
+  font-variant-numeric: tabular-nums;
+}
+.ds-key-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: var(--space-2);
+}
+.ds-key {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  padding: 7px var(--space-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  font-size: 12px;
+  line-height: 17px;
+}
+.ds-key.on {
+  border-color: var(--link);
+  background: var(--accent-soft);
+}
+.ds-key.exhausted {
+  border-color: var(--warning);
+}
+.ds-key-main {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.ds-key-hint {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.ds-key-added {
+  color: var(--ink-secondary);
+}
+.ds-key-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.ds-key-add {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.ds-key-add .om-input {
+  flex: 1;
+  min-width: 0;
+}
+.ds-error {
+  margin: 0 0 var(--space-2);
+}
+.ds-error:empty {
+  display: none;
+}
+.ds-machines {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: var(--space-2);
+}
+.ds-machine {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  padding: 6px var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--fill-hover);
+  font-size: 12px;
+  line-height: 17px;
+}
+.ds-machine > .om-icon {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  color: var(--ink-secondary);
+}
+.ds-machine-name {
+  font-weight: 500;
+}
+.ds-machine-key {
+  flex: 1;
+  min-width: 0;
+  color: var(--ink-secondary);
+  overflow-wrap: anywhere;
+}
+.ds-machine-rev {
+  flex: none;
+  font-size: 10px;
+  color: var(--ink-secondary);
+  opacity: 0.75;
+  font-variant-numeric: tabular-nums;
+}
+
+/* The model that produced the last response (Claude), next to the picker. */
+.chip.served {
+  gap: 6px;
+}
+.served-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--success);
+}
+.chip.served.bad,
+.chip.served.bad:hover {
+  color: var(--danger);
+}
+.chip.served.bad .served-dot {
+  background: var(--danger);
+}
+
+/* GitHub: one card per computer. */
+.gh-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.gh-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+.gh-card__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+.gh-card__name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.gh-card__tag {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--ink-secondary);
+}
+.gh-card__state {
+  flex: none;
+  font-size: 12px;
+  color: var(--ink-secondary);
+}
+.gh-card__state.ok {
+  color: var(--success);
+}
+.gh-cmd,
+.gh-code {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.gh-cmd code,
+.gh-code code {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 8px;
+  border-radius: var(--radius-xs);
+  background: var(--fill-hover);
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+.gh-code code {
+  font-size: 20px;
+  letter-spacing: 0.12em;
+  text-align: center;
+}
+.gh-token {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.gh-token[hidden] {
+  display: none;
+}
+
+/* Binding a new Claude conversation to a GitHub repository. */
+.repo-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+.repo-list:empty {
+  display: none;
+}
+.repo-list > .om-field__help,
+.repo-list > .claude-test,
+.repo-list > .claude-key-actions {
+  padding: 8px 10px;
+}
+.repo-row {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 8px 10px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.repo-row:last-child {
+  border-bottom: 0;
+}
+.repo-row:hover,
+.repo-row.on {
+  background: var(--fill-hover);
+}
+.repo-row__name {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+.repo-row__desc {
+  font-size: 12px;
+  color: var(--ink-secondary);
+  overflow-wrap: anywhere;
+}
+
+/* A text file attached to the message (sent as text). */
+.doc-chip {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 220px;
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+}
+.doc-chip .om-icon {
+  flex: none;
+  width: 16px;
+  height: 16px;
+}
+.doc-chip__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.doc-chip .thumb-x .om-icon {
+  width: 12px;
+  height: 12px;
+}
+.user-files {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+}
+.user-file summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.user-file summary .om-icon {
+  width: 14px;
+  height: 14px;
+  flex: none;
+}
+.user-file__size {
+  color: var(--ink-secondary);
+  font-size: 12px;
+}
+.user-file pre {
+  max-height: 320px;
+  overflow: auto;
+  margin: 6px 0 0;
+  padding: 8px;
+  border-radius: var(--radius-xs);
+  background: var(--fill-hover);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+/* Where attached files will be saved (picked before sending). */
+.upload-dir {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 36px;
+  padding: 0 10px;
+  border: 1px dashed var(--line);
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--ink-secondary);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  max-width: 260px;
+}
+.upload-dir span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.upload-dir .om-icon {
+  flex: none;
+  width: 14px;
+  height: 14px;
+}
+.upload-dir:hover {
+  background: var(--fill-hover);
+}
+.user-attach {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+  color: var(--ink-secondary);
+  font-size: 12px;
+  line-height: 18px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.user-attach .om-icon {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin-top: 2px;
+}
+
+/* ------------------------------------------------- DeepSeek: blue and white */
+
+/* DeepSeek palette (data-look="deepseek"; tokens near the top of this file).
+   Only colors, shape and type here: no logo or artwork.
+   Everything is scoped to the look, after every other rule, so it wins over
+   them, and nothing of the Kimi or Claude looks changes. */
+
+/* the page: air, and a faint blue haze at the top of the home */
+/* (the composer on the home page carries .home too: no haze or clipping there) */
+:root[data-look='deepseek'] .home:not(.composer) {
+  background: radial-gradient(ellipse 75% 46% at 50% 0%, #e9efff 0%, #ffffff 74%);
+}
+:root[data-look='deepseek'] .composer.home {
+  padding-left: 0;
+  padding-right: 0;
+  overflow: visible;
+}
+:root[data-look='deepseek'] .large-title {
+  font-family: var(--font-sans);
+  font-size: 28px;
+  line-height: 36px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  margin-bottom: var(--space-3);
+}
+:root[data-look='deepseek'] .om-toolbar__title {
+  font-weight: 600;
+}
+:root[data-look='deepseek'] ::selection {
+  background: #4d6bfe33;
+}
+:root[data-look='deepseek'] * {
+  scrollbar-color: #d5ddf5 transparent;
+}
+:root[data-look='deepseek'] ::-webkit-scrollbar-thumb {
+  background-color: #d5ddf5;
+}
+:root[data-look='deepseek'] ::-webkit-scrollbar-thumb:hover {
+  background-color: #bcc8f0;
+}
+
+/* sidebar: pale blue-white, rounded rows, a soft "新對話" */
+:root[data-look='deepseek'] .om-sidebar__section {
+  padding-top: var(--space-4);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+}
+:root[data-look='deepseek'] .om-sidebar__item {
+  border-radius: 10px;
+}
+:root[data-look='deepseek'] .new-item[href='#/'] {
+  height: 36px;
+  background: var(--accent-soft);
+  color: #2c47d6;
+  font-weight: 600;
+}
+:root[data-look='deepseek'] .new-item[href='#/']:hover {
+  background: #e3eaff;
+}
+:root[data-look='deepseek'] .side-search .om-input {
+  border-radius: 10px;
+}
+:root[data-look='deepseek'] .side-row {
+  border-radius: 10px;
+}
+:root[data-look='deepseek'] .side-row:hover {
+  background: #4d6bfe0d;
+}
+:root[data-look='deepseek'] .side-row[aria-current='page'] {
+  background: var(--row-active);
+  color: #1f3bd0;
+}
+:root[data-look='deepseek'] .side-row[aria-current='page'] .row-title {
+  font-weight: 600;
+}
+:root[data-look='deepseek'] .side-row[aria-current='page'] .row-sub {
+  color: var(--ink-secondary);
+  opacity: 1;
+}
+:root[data-look='deepseek'] .side-row[aria-current='page'].offline .row-title {
+  color: var(--ink-secondary);
+}
+:root[data-look='deepseek'] .side-row[aria-current='page'] .spinner {
+  border-color: #c7d3fb;
+  border-top-color: var(--accent);
+}
+:root[data-look='deepseek'] .row-more:hover {
+  background: #4d6bfe14;
+}
+:root[data-look='deepseek'] .row-tag.ds,
+:root[data-look='deepseek'] .row-tag.deepseek {
+  background: #e3e9ff;
+  color: #2c47d6;
+}
+:root[data-look='deepseek'] .side-foot {
+  border-top-color: var(--line);
+}
+
+/* mode switch: a pill track, the chosen mode a white pill */
+:root[data-look='deepseek'] .om-seg {
+  gap: 2px;
+  padding: 3px;
+  background: var(--track);
+  border-color: transparent;
+  border-radius: 999px;
+}
+:root[data-look='deepseek'] .om-seg__item {
+  border-radius: 999px;
+  transition: background-color var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
+}
+:root[data-look='deepseek'] .om-seg__item[aria-pressed='true'] {
+  background: #ffffff;
+  color: #2c47d6;
+  box-shadow: 0 1px 3px #1b2a6b1f, 0 0 0 1px #1b2a6b0a;
+}
+:root[data-look='deepseek'] .om-seg__item:focus-visible {
+  box-shadow: var(--focus-ring);
+}
+/* composer: a white card with a blue glow while you type */
+:root[data-look='deepseek'] .composer-box {
+  padding: 14px 16px 10px 18px;
+  background: #ffffff;
+  border-color: #dfe6fb;
+  border-radius: 24px;
+  box-shadow: 0 6px 28px #3b5bdb12;
+  transition: border-color var(--dur-fast) var(--ease-out), box-shadow var(--dur-fast) var(--ease-out);
+}
+:root[data-look='deepseek'] .composer-box:focus-within {
+  border-color: #4d6bfe;
+  box-shadow: 0 0 0 4px #4d6bfe1f, 0 6px 28px #3b5bdb12;
+}
+:root[data-look='deepseek'] .composer-box.drop {
+  border-style: dashed;
+  border-color: #4d6bfe;
+  background: #f3f6ff;
+}
+:root[data-look='deepseek'] .composer-input {
+  min-height: 48px;
+  font-size: 15px;
+  line-height: 24px;
+}
+:root[data-look='deepseek'] .composer.home .composer-input {
+  min-height: 72px;
+}
+:root[data-look='deepseek'] .composer-input::placeholder {
+  color: var(--ink-secondary);
+}
+:root[data-look='deepseek'] .composer-bar {
+  margin-top: 8px;
+}
+:root[data-look='deepseek'] .composer-tools {
+  gap: 4px;
+  margin: -4px;
+  padding: 4px;
+}
+:root[data-look='deepseek'] .chip {
+  height: 30px;
+  padding: 0 9px;
+  border: 1px solid #e3e9f8;
+  border-radius: 999px;
+  background: #ffffff;
+  font-size: 12.5px;
+}
+:root[data-look='deepseek'] .chip:hover {
+  background: #4d6bfe0f;
+  border-color: #cfd9fa;
+}
+:root[data-look='deepseek'] .chip[aria-expanded='true'] {
+  background: var(--accent-soft);
+  border-color: #c3d0fb;
+  color: #2c47d6;
+}
+:root[data-look='deepseek'] .chip.active {
+  background: var(--accent-soft);
+  border-color: #c3d0fb;
+  color: #2c47d6;
+}
+:root[data-look='deepseek'] .chip.icon-only {
+  width: 30px;
+  padding: 0;
+}
+:root[data-look='deepseek'] .chip.drift-warn {
+  height: auto;
+  min-height: 30px;
+}
+:root[data-look='deepseek'] .chip.static:hover {
+  background: #ffffff;
+  border-color: #e3e9f8;
+  color: var(--ink-secondary);
+}
+:root[data-look='deepseek'] .chip.served.bad,
+:root[data-look='deepseek'] .chip.served.bad:hover {
+  color: var(--danger);
+}
+:root[data-look='deepseek'] .chip .caret {
+  opacity: 0.6;
+}
+:root[data-look='deepseek'] .send {
+  width: 36px;
+  height: 36px;
+  border-color: var(--accent);
+  border-radius: 50%;
+  background: var(--accent);
+  color: #ffffff;
+  box-shadow: 0 2px 8px #4d6bfe40;
+}
+:root[data-look='deepseek'] .send:hover {
+  background: #4163fb;
+  border-color: #4163fb;
+}
+:root[data-look='deepseek'] .send:active {
+  background: var(--accent-pressed);
+  border-color: var(--accent-pressed);
+}
+:root[data-look='deepseek'] .send:disabled {
+  background: #c9d3fd;
+  border-color: #c9d3fd;
+  color: #ffffff;
+  box-shadow: none;
+}
+:root[data-look='deepseek'] .send.stop {
+  background: #ffffff;
+  border-color: var(--accent);
+  color: var(--accent);
+  box-shadow: none;
+}
+:root[data-look='deepseek'] .ctx-ring:hover {
+  background: #4d6bfe0f;
+}
+:root[data-look='deepseek'] .ctx-ring .track {
+  stroke: #dbe3f8;
+}
+:root[data-look='deepseek'] .ctx-ring .bar {
+  stroke: var(--accent);
+}
+:root[data-look='deepseek'] .ctx-ring.warning .bar {
+  stroke: var(--warning);
+}
+:root[data-look='deepseek'] .ctx-ring.danger .bar {
+  stroke: var(--danger);
+}
+:root[data-look='deepseek'] .cost-chip:hover,
+:root[data-look='deepseek'] .row-more:hover {
+  background: #4d6bfe14;
+}
+
+/* the conversation */
+:root[data-look='deepseek'] .bubble {
+  border-color: transparent;
+  border-radius: 18px 18px 6px 18px;
+  padding: 10px 16px;
+}
+:root[data-look='deepseek'] .md a {
+  text-underline-offset: 2px;
+}
+:root[data-look='deepseek'] .md code {
+  background: #eef2ff;
+  color: #2b45c9;
+}
+:root[data-look='deepseek'] .md pre {
+  padding: 12px 16px;
+  background: #f6f8fe;
+  border-color: #e6ecfa;
+  border-radius: 12px;
+}
+:root[data-look='deepseek'] .md pre code {
+  background: none;
+  color: var(--ink);
+}
+:root[data-look='deepseek'] .md blockquote {
+  border-left-color: #c9d4fb;
+}
+:root[data-look='deepseek'] .md th {
+  background: #f3f6ff;
+}
+:root[data-look='deepseek'] .md th,
+:root[data-look='deepseek'] .md td {
+  border-color: #e6ecfa;
+}
+:root[data-look='deepseek'] .code-copy {
+  border-color: #e6ecfa;
+}
+:root[data-look='deepseek'] .fold {
+  color: var(--ink-secondary);
+}
+:root[data-look='deepseek'] .thinking-text {
+  border-left-color: #dfe6fb;
+}
+:root[data-look='deepseek'] .tool-row {
+  border-radius: 8px;
+}
+:root[data-look='deepseek'] .tool-icon {
+  color: var(--icon-ink);
+}
+:root[data-look='deepseek'] .tool-row .chev {
+  color: var(--icon-ink);
+}
+:root[data-look='deepseek'] .result,
+:root[data-look='deepseek'] pre.result-out {
+  border-left-color: #dfe6fb;
+}
+:root[data-look='deepseek'] .tool-group:not(.solo) > .group-body,
+:root[data-look='deepseek'] .tool-children {
+  border-left-color: #dfe6fb;
+}
+:root[data-look='deepseek'] .spinner {
+  border-color: #dbe3f8;
+  border-top-color: var(--accent);
+}
+:root[data-look='deepseek'] .jump-end {
+  background: #ffffff;
+  border-color: #e3e9f8;
+}
+:root[data-look='deepseek'] .jump-end.new {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+/* cards: white, a hairline of blue-gray, 12px corners */
+:root[data-look='deepseek'] pre.out,
+:root[data-look='deepseek'] .diff,
+:root[data-look='deepseek'] .web-links,
+:root[data-look='deepseek'] .md.plan,
+:root[data-look='deepseek'] .ask,
+:root[data-look='deepseek'] .artifact-card,
+:root[data-look='deepseek'] .artifact-tile,
+:root[data-look='deepseek'] .agent-tray,
+:root[data-look='deepseek'] .todo-tray,
+:root[data-look='deepseek'] .queued,
+:root[data-look='deepseek'] .composer-note {
+  background: #ffffff;
+  border-color: #e6ecfa;
+  border-radius: 12px;
+}
+:root[data-look='deepseek'] .queued {
+  border-color: #cfd9fa;
+}
+:root[data-look='deepseek'] .artifact-card:hover,
+:root[data-look='deepseek'] .artifact-card.active,
+:root[data-look='deepseek'] .artifact-tile:hover {
+  border-color: #b9c6f5;
+}
+:root[data-look='deepseek'] .tool.agent {
+  padding: 0;
+  overflow: hidden;
+  background: #ffffff;
+  border-color: #e6ecfa;
+  border-radius: 12px;
+  box-shadow: var(--shadow-card);
+}
+:root[data-look='deepseek'] .tool.agent > .tool-head .tool-row {
+  width: 100%;
+  min-height: 38px;
+  margin: 0;
+  padding: 6px 14px;
+  border-radius: 0;
+  background: #f7f9ff;
+}
+:root[data-look='deepseek'] .tool.agent > .tool-head .tool-row:hover {
+  background: #f0f4ff;
+}
+:root[data-look='deepseek'] .tool.agent > .tool-body {
+  margin: 0;
+  padding: 0 14px;
+}
+:root[data-look='deepseek'] .tool.agent > .tool-body:not(:empty) {
+  padding: 8px 14px 10px;
+}
+:root[data-look='deepseek'] .tool.agent > .tool-children {
+  margin: 0;
+  padding: 10px 14px 12px;
+  border-left: 0;
+  border-top: 1px solid #e6ecfa;
+}
+:root[data-look='deepseek'] .tool.agent > .tool-children .agent-summary {
+  margin: 0;
+  padding: 0;
+  border-top: 0;
+}
+:root[data-look='deepseek'] .agent-sec {
+  background: #f7f9ff;
+  border-color: #e6ecfa;
+}
+:root[data-look='deepseek'] .artifact-card-icon {
+  border-radius: 10px;
+}
+
+/* dialogs, menus, buttons, fields */
+:root[data-look='deepseek'] .dialog {
+  padding: 24px;
+  background: #ffffff;
+  border-radius: 16px;
+}
+:root[data-look='deepseek'] .dialog.lightbox {
+  padding: 0;
+  background: transparent;
+  border-radius: 0;
+}
+:root[data-look='deepseek'] .dialog-title {
+  font-size: 17px;
+  line-height: 24px;
+  font-weight: 600;
+}
+:root[data-look='deepseek'] .dialog-subtitle {
+  font-weight: 600;
+}
+:root[data-look='deepseek'] .tree {
+  border-color: #e6ecfa;
+  border-radius: 12px;
+}
+:root[data-look='deepseek'] .tree-row[aria-selected='true'] {
+  background: var(--row-active);
+  color: #1f3bd0;
+  font-weight: 600;
+}
+:root[data-look='deepseek'] .om-menu {
+  padding: 6px;
+  background: #ffffff;
+  border-radius: 14px;
+}
+:root[data-look='deepseek'] .om-menu__item {
+  padding-left: 8px;
+  border-radius: 8px;
+}
+:root[data-look='deepseek'] .om-menu__item:not(.has-desc):not(.slash-item) {
+  height: 32px;
+}
+:root[data-look='deepseek'] .om-menu__item:not([aria-disabled='true']):hover,
+:root[data-look='deepseek'] .om-menu__item[aria-selected='true'],
+:root[data-look='deepseek'] .om-menu__item:not([aria-disabled='true']):focus-visible {
+  background: #eef2ff;
+  color: var(--ink);
+}
+:root[data-look='deepseek'] .om-menu__item:not([aria-disabled='true']):hover .om-menu__shortcut,
+:root[data-look='deepseek'] .om-menu__item[aria-selected='true'] .om-menu__shortcut {
+  color: var(--ink-secondary);
+}
+:root[data-look='deepseek'] .om-menu__item:hover .menu-desc,
+:root[data-look='deepseek'] .om-menu__item:focus-visible .menu-desc,
+:root[data-look='deepseek'] .om-menu__item[aria-selected='true'] .menu-desc,
+:root[data-look='deepseek'] .slash-item[aria-selected='true'] .slash-desc {
+  color: var(--ink-secondary);
+  opacity: 1;
+}
+:root[data-look='deepseek'] .om-menu__item--destructive,
+:root[data-look='deepseek'] .om-menu__item--destructive:hover,
+:root[data-look='deepseek'] .om-menu__item--destructive:focus-visible {
+  color: var(--danger);
+}
+:root[data-look='deepseek'] .om-menu__item[aria-disabled='true'] {
+  color: var(--ink-disabled);
+}
+:root[data-look='deepseek'] .om-menu__check {
+  color: var(--link);
+  font-weight: 700;
+}
+:root[data-look='deepseek'] .om-menu__sep {
+  background: #e6ecfa;
+}
+:root[data-look='deepseek'] .menu-section {
+  letter-spacing: 0.04em;
+}
+
+:root[data-look='deepseek'] .om-btn {
+  border-radius: 10px;
+  font-weight: 500;
+}
+:root[data-look='deepseek'] .om-btn:not(.om-btn--sm):not(.om-btn--toolbar):not(.om-btn--lg) {
+  height: 32px;
+}
+:root[data-look='deepseek'] .om-btn:not(.om-btn--plain):not(.om-btn--toolbar):not(.om-btn--primary):not(:disabled) {
+  border-color: var(--control-border);
+}
+:root[data-look='deepseek'] .om-btn:not(.om-btn--plain):not(.om-btn--toolbar):not(.om-btn--primary):not(:disabled):hover {
+  background: #f3f6ff;
+}
+:root[data-look='deepseek'] .om-btn--sm {
+  border-radius: 8px;
+}
+:root[data-look='deepseek'] .om-btn--lg {
+  border-radius: 12px;
+}
+:root[data-look='deepseek'] .om-btn--toolbar {
+  border-radius: 8px;
+}
+:root[data-look='deepseek'] .om-btn--primary:not(:disabled) {
+  background: var(--accent-strong);
+  border-color: var(--accent-strong);
+  color: #ffffff;
+}
+:root[data-look='deepseek'] .om-btn--primary:not(:disabled):hover {
+  background: #2e4ae0;
+  border-color: #2e4ae0;
+}
+:root[data-look='deepseek'] .om-btn--primary:not(:disabled):active {
+  background: var(--accent-pressed);
+  border-color: var(--accent-pressed);
+}
+:root[data-look='deepseek'] .om-btn--plain {
+  color: var(--link);
+}
+:root[data-look='deepseek'] .om-btn--plain:hover {
+  background: #4d6bfe0f;
+}
+:root[data-look='deepseek'] .om-btn--destructive {
+  color: var(--danger);
+}
+:root[data-look='deepseek'] .om-btn:disabled,
+:root[data-look='deepseek'] .om-btn[aria-disabled='true'] {
+  background: #f7f9ff;
+  border-color: var(--line);
+  color: var(--ink-disabled);
+}
+:root[data-look='deepseek'] .om-badge--accent {
+  color: var(--link);
+}
+:root[data-look='deepseek'] .dialog input.om-input,
+:root[data-look='deepseek'] .dialog select.om-input {
+  height: 34px;
+  padding: 0 10px;
+}
+:root[data-look='deepseek'] .om-input {
+  border-radius: 10px;
+}
+/* a menu that is only a box without a chevron does not look like one */
+:root[data-look='deepseek'] select.om-input {
+  padding-right: 32px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 16 16' fill='none' stroke='%236f7794' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 6.5l4 4 4-4'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+}
+:root[data-look='deepseek'] .om-switch {
+  background: #e6ebfb;
+}
+:root[data-look='deepseek'] .om-switch:checked {
+  background: var(--accent);
+}
+
+/* the gateway cards in DeepSeek 設定 */
+:root[data-look='deepseek'] .gw-list {
+  gap: 8px;
+}
+:root[data-look='deepseek'] .gw-item {
+  gap: 10px;
+  padding: 10px 14px;
+  border-color: #e3e9f8;
+  border-radius: 12px;
+  background: #ffffff;
+  transition: border-color var(--dur-fast) var(--ease-out), background-color var(--dur-fast) var(--ease-out), box-shadow var(--dur-fast) var(--ease-out);
+}
+:root[data-look='deepseek'] .gw-item:hover {
+  background: #f7f9ff;
+}
+:root[data-look='deepseek'] .gw-item.on {
+  border-color: #4d6bfe;
+  background: #f3f6ff;
+  box-shadow: 0 0 0 3px #4d6bfe14;
+}
+:root[data-look='deepseek'] .gw-item:has(input:focus-visible) {
+  box-shadow: var(--focus-ring);
+}
+:root[data-look='deepseek'] .gw-item input[type='radio'] {
+  appearance: none;
+  flex: none;
+  display: grid;
+  place-content: center;
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  border: 1.5px solid var(--control-border);
+  border-radius: 50%;
+  background: #ffffff;
+}
+:root[data-look='deepseek'] .gw-item input[type='radio']::after {
+  content: '';
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  transform: scale(0);
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+:root[data-look='deepseek'] .gw-item input[type='radio']:checked {
+  border-color: var(--accent);
+}
+:root[data-look='deepseek'] .gw-item input[type='radio']:checked::after {
+  transform: scale(1);
+}
+:root[data-look='deepseek'] .gw-item input[type='radio']:focus-visible {
+  outline: none;
+}
+:root[data-look='deepseek'] .gw-name {
+  font-weight: 500;
+}
+/* the key pool rows in DeepSeek 設定 */
+:root[data-look='deepseek'] .ds-key {
+  padding: 9px 14px;
+  border-color: #e3e9f8;
+  border-radius: 12px;
+  background: #ffffff;
+}
+:root[data-look='deepseek'] .ds-key.on {
+  border-color: #4d6bfe;
+  background: #f3f6ff;
+  box-shadow: 0 0 0 3px #4d6bfe14;
+}
+:root[data-look='deepseek'] .ds-key.exhausted {
+  border-color: #e8b04a;
+}
+:root[data-look='deepseek'] .ds-machine {
+  background: #f7f9ff;
+  border-radius: 10px;
+}
+
+/* callouts: the missing-key note is a blue note, not a warning */
+:root[data-look='deepseek'] .callout.deepseek-key {
+  padding: 10px 14px;
+  background: #f3f6ff;
+  color: var(--ink);
+  border: 1px solid #dfe6fb;
+  border-radius: 12px;
+}
+:root[data-look='deepseek'] .callout.deepseek-key > .om-icon {
+  color: var(--accent);
+}
+:root[data-look='deepseek'] .quota-bar {
+  background: #e6ebfb;
+}
+
+@media (max-width: 760px) {
+  :root[data-look='deepseek'] .large-title {
+    font-size: 24px;
+    line-height: 32px;
+  }
+  :root[data-look='deepseek'] .composer-box {
+    padding: 12px 14px 8px 16px;
+    border-radius: 22px;
+  }
+  :root[data-look='deepseek'] .home:not(.composer) {
+    background: radial-gradient(ellipse 120% 40% at 50% 0%, #e9efff 0%, #ffffff 74%);
+  }
+  .ds-key-add {
+    flex-wrap: wrap;
+  }
+  .ds-key-add .om-input {
+    flex-basis: 100%;
+  }
+  .ds-key-actions {
+    width: 100%;
+  }
+  .child-note-slot {
+    padding: var(--space-2) var(--space-2) 0;
+  }
+}
+
+/* ---- subagent cards: what was asked for is not what ran -------------------
+   The model on a card is the one the runtime reported. When it did not, the
+   card says so in the warning colour and shows the request on its own line. */
+.subagent-model.unconfirmed,
+.agent-item-model.unconfirmed {
+  color: var(--warning);
+}
+.subagent-model.mismatch,
+.agent-item-model.mismatch,
+.subagent-mismatch {
+  color: var(--warning);
+  font-weight: 600;
+}
+.mark-text.agent-unknown {
+  padding: 0 6px;
+  border-radius: 4px;
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+/* The name of a subagent in the panel keeps its words together; a long model
+   line wraps under it instead of squeezing it. */
+.agent-item-name {
+  flex-wrap: wrap;
+  column-gap: 6px;
+}
+.agent-item-label {
+  flex: none;
+  white-space: nowrap;
+}
+.agent-notes {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* ---- a subagent card's header never runs past the card -----------------------
+   Wide card: one line - icon, title, task, then the model, the mismatch tag, the
+   steps and "背景" (the .agent-meta box adds nothing, `display: contents`), then
+   the status and the arrow. The task gives way first, then the model shortens
+   with an ellipsis (its title says the rest); the tag and the arrow never do.
+   Card narrower than 560px (a phone, or the chat column beside a panel): the
+   model line goes under the title, in full, and wraps if it has to. */
+.tool.agent {
+  container: agentcard / inline-size;
+}
+.agent-meta {
+  display: contents;
+}
+.tool.agent > .tool-head .tool-verb {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tool.agent > .tool-head .subagent-model {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.tool.agent > .tool-head .subagent-mismatch,
+.tool.agent > .tool-head .agent-meta .om-badge,
+.tool.agent > .tool-head .tool-row > .mark-text {
+  white-space: nowrap;
+}
+@container agentcard (max-width: 560px) {
+  .tool.agent > .tool-head .tool-row {
+    flex-wrap: wrap;
+    row-gap: 2px;
+  }
+  .tool.agent > .tool-head .agent-meta {
+    order: 3;
+    flex: 1 1 100%;
+    min-width: 0;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 2px var(--space-2);
+    /* under the title, not under the icon */
+    padding-left: calc(16px + var(--space-2));
+  }
+  .tool.agent > .tool-head .tool-row > .spinner,
+  .tool.agent > .tool-head .tool-row > .mark,
+  .tool.agent > .tool-head .tool-row > .mark-text {
+    order: 1;
+  }
+  .tool.agent > .tool-head .tool-row > .chev {
+    order: 2;
+  }
+  .tool.agent > .tool-head .subagent-model {
+    flex: 0 1 auto;
+    max-width: 100%;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+}
+.agent-note,
+.agent-item-note {
+  font-size: 12px;
+  line-height: 17px;
+  color: var(--ink-secondary);
+}
+.agent-item-note {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- phones: the chip row wraps (it does at every width now, see
+   .composer-tools); what is phone-only is the tighter row gap, the send button
+   on the last row and a subagent chip that may use the whole row ----------- */
+@media (max-width: 760px) {
+  .composer-tools,
+  :root[data-look='deepseek'] .composer-tools {
+    row-gap: 2px;
+  }
+  .composer-bar {
+    align-items: flex-end;
+  }
+  .chip,
+  .chip[data-control='subagent'] {
+    max-width: 100%;
+  }
+  .composer-actions {
+    padding-bottom: 1px;
+  }
 }

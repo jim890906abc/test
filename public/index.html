@@ -11,10 +11,28 @@
     <link rel="stylesheet" href="/css/oatmeal.css" />
     <link rel="stylesheet" href="/css/app.css" />
     <script>
+      // The palette is the user's own choice, never the current model's. Set it
+      // before the first paint on every route (also artifacts), so reloading or
+      // moving between conversations cannot change it.
+      let look = 'kimi';
       try {
         const t = localStorage.getItem('hubTheme') || 'light';
         if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
+        const valid = ['kimi', 'claude', 'deepseek'];
+        const saved = localStorage.getItem('hubPalette');
+        const legacy = localStorage.getItem('hubLook');
+        look = valid.includes(saved) ? saved : valid.includes(legacy) ? legacy : 'kimi';
+        // One-time migration from the old, auto-written hubLook. From now on
+        // only an explicit palette choice writes this key.
+        if (!valid.includes(saved)) localStorage.setItem('hubPalette', look);
+        if (look === 'claude' || look === 'deepseek') {
+          for (const m of document.querySelectorAll('meta[name="theme-color"]')) {
+            m.dataset.base = m.dataset.base || m.content;
+            m.content = look === 'claude' ? '#141413' : '#ffffff';
+          }
+        }
       } catch {}
+      document.documentElement.dataset.look = look;
     </script>
   </head>
   <body>

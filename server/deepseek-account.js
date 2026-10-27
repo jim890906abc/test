@@ -1,0 +1,1111 @@
+// DeepSeek mode: DeepSeek models run inside the Kimi Code CLI of a connected
+// computer, so Kimi's own harness (context compaction, subagents, plan mode,
+// reasoning replay) does the work. The model comes from one custom Kimi
+// provider, `agent-hub-deepseek`, which the hub has the bridge create on
+// that computer (bridge op kimi.deepseek.provision), pointing at an
+// OpenAI-compatible gateway that serves DeepSeek and billed to that
+// gateway's API key, never to the Kimi subscription.
+//
+// This file is the hub's side of it: the gateway keys and the defaults for
+// new DeepSeek conversations, the DeepSeek models a key can use, and keeping
+// that provider provisioned on each computer.
+//
+// Keys are kept in data/deepseek.json (readable by this user only) and never
+// sent to a browser; pages see only the last four characters. The file is
+// written whole or not at all (flushed to disk first), and a file that is there
+// but cannot be used is never taken for "no keys": it is copied into
+// data/damaged-config/, said, shown to the person (`damaged` in the account),
+// and written over only when they type a key in again (store.GuardedConfig).
+// They go to the
+// bridge over its authenticated channel. New pool connectors keep them in
+// private bridge state and put only a random local credential in Kimi; the
+// legacy single-key direct mode may still put that one key in Kimi's config.
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { DATA_DIR, GuardedConfig } from './store.js';
+import * as machines from './machines.js';
+
+const FILE = path.join(DATA_DIR, 'deepseek.json');
+
+// The provider the bridge creates in Kimi; a DeepSeek model's alias in Kimi
+// is `agent-hub-deepseek/<model id at the gateway>`.
+export const PROVIDER_ID = 'agent-hub-deepseek';
+export const MODEL_PREFIX = `${PROVIDER_ID}/`;
+
+// The gateways, in one place (id → address, models). `base` is the address
+// Kimi sends chat completions to (the bridge keeps its own copy of id → base,
+// DS_GATEWAYS in bridge/agent-hub-bridge.mjs: the hub names a gateway to it,
+// never an address, so a change of `base` here needs the same change there);
+// `list` is where the hub asks for the models a key can use. `models` are the
+// DeepSeek models to offer when that list cannot be read, with the ones new
+// conversations start on named by DEFAULT_MODEL below. Ids are the gateway's
+// own, vendor prefix and all. `site` is where its keys are made.
+export const GATEWAYS = {
+  // The OpenCode Go subscription.
+  'opencode-go': {
+    label: 'OpenCode Go',
+    base: 'https://opencode.ai/inference/go/openai/v1',
+    list: 'https://opencode.ai/inference/go/v1/models',
+    models: ['deepseek-v4.1-flash', 'deepseek-v4-pro'],
+    site: 'https://opencode.ai',
+  },
+  // OpenCode pay-as-you-go (formerly Zen).
+  opencode: {
+    label: 'OpenCode（按量計費）',
+    base: 'https://opencode.ai/inference/openai/v1',
+    list: 'https://opencode.ai/inference/v1/models',
+    models: ['deepseek-v4.1-flash', 'deepseek-v4-pro', 'deepseek-v4.1-flash-free'],
+    site: 'https://opencode.ai',
+  },
+  // Needs a plan with API access (Provider, GOAT, Pro, Max, Team); the Go
+  // plan is refused with 403 upgrade_required.
+  commandcode: {
+    label: 'Command Code',
+    base: 'https://api.commandcode.ai/provider/v1',
+    list: 'https://api.commandcode.ai/provider/v1/models',
+    models: ['deepseek/deepseek-v4.1-flash', 'deepseek/deepseek-v4.1-flash-fast', 'deepseek/deepseek-v4-pro', 'deepseek/deepseek-v4-flash', 'deepseek/deepseek-v4-flash-fast', 'deepseek/deepseek-v4-flash-vision-exp'],
+    site: 'https://commandcode.ai',
+  },
+};
+export const DEFAULT_GATEWAY = 'opencode-go';
+// New conversations start on this one when the gateway has it.
+const DEFAULT_MODEL = /deepseek-v4\.1-flash$/i;
+// The models that take images: V4.1 Flash, and any vision one.
+const IMAGE_MODELS = /v4\.1-flash|vision/i;
+
+// What every DeepSeek model gets in Kimi: a 1M window, up to 384k of output,
+// always reasoning (which keeps "off" out of its choices), the efforts the
+// gateways take as reasoning_effort, and tools.
+export const CONTEXT_SIZE = 1_000_000;
+export const MAX_OUTPUT = 384_000;
+export const EFFORTS = ['low', 'high', 'max'];
+export const DEFAULT_EFFORT = 'max';
+
+// The tests run the hub against a local fake gateway: every gateway then
+// answers at <that address>/<gateway id>. Nothing else can point it anywhere
+// but the addresses above.
+function listUrl(gateway) {
+  const t = process.env.AGENT_HUB_DEEPSEEK_TEST_URL;
+  if (t && /^http:\/\/(127\.0\.0\.1|localhost):\d+$/.test(t)) return `${t}/${gateway}/models`;
+  return GATEWAYS[gateway].list;
+}
+
+// ------------------------------------------------------------- storage
+
+export const isGateway = (id) => Object.hasOwn(GATEWAYS, id);
+
+const newKeyId = () => `dk_${crypto.randomBytes(8).toString('hex')}`;
+// How long an exhausted key waits before it is tried again when its gateway
+// named no reset time (milliseconds; AGENT_HUB_DEEPSEEK_RETRY_MS, default 10
+// minutes). The same number goes to every connector in a provision, so the hub
+// and the proxies agree on when a key is due.
+export const retryMs = () => {
+  const n = Number(process.env.AGENT_HUB_DEEPSEEK_RETRY_MS);
+  return Number.isInteger(n) && n >= 1000 && n <= 35 * 86_400_000 ? n : 600_000;
+};
+// When an exhausted key is tried again (0: it is not exhausted).
+export const retryAtOf = (k) => (k?.exhaustedAt ? k.retryAt || k.exhaustedAt + retryMs() : 0);
+// A key a request may use: healthy, or exhausted with its wait over (the
+// connector's next real request is then the probe).
+const isUsable = (k, now = Date.now()) => !k.exhaustedAt || retryAtOf(k) <= now;
+const firstUsable = (keys, now = Date.now()) => keys.find((k) => !k.exhaustedAt) || keys.find((k) => isUsable(k, now)) || keys[0] || null;
+
+// One gateway's keys: the old single string (one key) and the current
+// { revision, activeId, keys[] } both load into the same shape, so an update
+// never loses a key a user already saved.
+function normalizePool(raw) {
+  const pool = { revision: 1, activeId: '', keys: [] };
+  const seen = new Set();
+  if (typeof raw === 'string') {
+    const key = raw.trim();
+    if (key) pool.keys.push({ id: newKeyId(), key, addedAt: Date.now() });
+  } else if (raw && typeof raw === 'object' && Array.isArray(raw.keys)) {
+    for (const item of raw.keys) {
+      const key = typeof item?.key === 'string' ? item.key.trim() : '';
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      const id = typeof item.id === 'string' && /^[\w-]{1,64}$/.test(item.id) && !pool.keys.some((k) => k.id === item.id) ? item.id : newKeyId();
+      const out = { id, key, addedAt: Number(item.addedAt) || Date.now() };
+      const exhaustedAt = Number(item.exhaustedAt);
+      if (Number.isFinite(exhaustedAt) && exhaustedAt > 0) {
+        out.exhaustedAt = exhaustedAt;
+        const retryAt = Number(item.retryAt);
+        if (item.retryAt != null && Number.isFinite(retryAt) && retryAt > 0) out.retryAt = retryAt;
+        const exhaustedRev = Number(item.exhaustedRev);
+        if (Number.isInteger(exhaustedRev) && exhaustedRev > 0) out.exhaustedRev = exhaustedRev;
+      }
+      pool.keys.push(out);
+    }
+    const revision = Number(raw.revision);
+    if (Number.isInteger(revision) && revision > 0) pool.revision = revision;
+    if (typeof raw.activeId === 'string' && pool.keys.some((k) => k.id === raw.activeId)) pool.activeId = raw.activeId;
+  }
+  if (!pool.activeId) pool.activeId = firstUsable(pool.keys)?.id || '';
+  return pool;
+}
+
+function normalizeSaved(raw) {
+  const data = raw && typeof raw === 'object' && !Array.isArray(raw) ? { ...raw } : {};
+  let dirty = false;
+  const pools = {};
+  const rawPools = data.keys && typeof data.keys === 'object' && !Array.isArray(data.keys) ? data.keys : {};
+  for (const id of Object.keys(GATEWAYS)) {
+    if (!rawPools[id]) continue;
+    const pool = normalizePool(rawPools[id]);
+    if (JSON.stringify(rawPools[id]) !== JSON.stringify(pool)) dirty = true;
+    pools[id] = pool;
+  }
+  if (JSON.stringify(rawPools) !== JSON.stringify(pools)) dirty = true;
+  data.keys = pools;
+
+  // Each machine's latest report, kept across a hub restart. Only known
+  // gateways, revisions and string ids get this far; no key material.
+  const activity = {};
+  const rawActivity = data.activity && typeof data.activity === 'object' && !Array.isArray(data.activity) ? data.activity : {};
+  for (const [machineId, a] of Object.entries(rawActivity)) {
+    if (!a || !isGateway(a.gateway)) continue;
+    const revision = Number(a.revision);
+    if (!Number.isInteger(revision) || revision < 1) continue;
+    activity[String(machineId).slice(0, 64)] = {
+      gateway: a.gateway,
+      activeId: typeof a.activeId === 'string' ? a.activeId.slice(0, 64) : null,
+      revision,
+      at: Number(a.at) || Date.now(),
+    };
+  }
+  if (JSON.stringify(rawActivity) !== JSON.stringify(activity)) dirty = true;
+  data.activity = activity;
+  return { data, dirty };
+}
+
+const keyFile = new GuardedConfig(FILE, {
+  tag: 'deepseek',
+  what: 'DeepSeek 金鑰池',
+  lost: 'DeepSeek 金鑰池（API key）已無法載入，請重新輸入或從備份還原（左下角「⋯」→「DeepSeek…」）',
+  until: '重新輸入 API key',
+});
+
+function load() {
+  return normalizeSaved(keyFile.read().value ?? {});
+}
+const loaded = load();
+let saved = loaded.data;
+if (loaded.dirty) save();
+
+// Why the saved pool cannot be used (its file is damaged or cannot be read), or
+// null. Said instead of "no key is set" wherever that would be said.
+export const keyProblem = () => keyFile.describe();
+
+// The state in memory, on disk whole or not at all (private, flushed first).
+// Without `explicit` this is the Hub's own bookkeeping (a rotated key's health,
+// a computer's report, the model list a key can see): it is not worth writing
+// over a file that cannot be used, so it is kept in memory only (false). With
+// it, a person typed a key in, which may replace a damaged file (throws
+// ConfigBlockedError when nothing may be written).
+function save({ explicit = false } = {}) {
+  if (explicit) keyFile.write(saved, { mode: 0o600, explicit });
+  else return keyFile.writeIfAllowed(saved, { mode: 0o600 });
+  return true;
+}
+
+// For the tests: read the file again.
+export function reload() {
+  saved = load().data;
+  provisioned.clear();
+  headerWarnings.clear();
+  jobs.clear();
+  tails.clear();
+  epochs.clear();
+  secondary.clear();
+  provisionWarnings.clear();
+  autoFailures.clear();
+  scheduledProvisions.clear();
+  for (const r of retries.values()) clearTimeout(r.timer);
+  retries.clear();
+}
+
+// The gateway in use. A key saved without choosing one goes to OpenCode Go.
+export const gateway = () => (isGateway(saved.gateway) ? saved.gateway : DEFAULT_GATEWAY);
+
+// ------------------------------------------------------------- the keys
+
+// Why `key` cannot be a gateway key, or null.
+export function checkKey(key) {
+  const k = String(key ?? '').trim();
+  if (!k) return '請貼上 API key';
+  if (k.length > 500) return 'API key 太長了（最多 500 個字元）';
+  if (/\s/.test(k)) return 'API key 裡不能有空白或換行，請確認複製的是完整的一把 key';
+  return null;
+}
+
+// The gateway's pool, or null. `keys` keeps the secret; nothing public may
+// serialize this object.
+export const poolOf = (gw = gateway()) => (isGateway(gw) ? saved.keys?.[gw] || null : null);
+export const poolRevision = (gw = gateway()) => poolOf(gw)?.revision || 0;
+export const keyById = (gw, id) => poolOf(gw)?.keys.find((k) => k.id === id) || null;
+
+// The key old callers mean: the gateway's preferred active key (even when it
+// is marked exhausted; ensureProvider says so with pool_exhausted instead).
+export function apiKey(gw = gateway()) {
+  const pool = poolOf(gw);
+  if (!pool) return '';
+  return (pool.keys.find((k) => k.id === pool.activeId) || firstUsable(pool.keys))?.key || '';
+}
+
+const keyForAttempt = (gw) => {
+  const pool = poolOf(gw);
+  if (!pool) return null;
+  const now = Date.now();
+  const usable = pool.keys.filter((k) => isUsable(k, now));
+  return usable.find((k) => k.id === pool.activeId && !k.exhaustedAt) || usable.find((k) => !k.exhaustedAt) || usable[0] || null;
+};
+
+// The last four characters: all a page is ever told of a key.
+const hint = (k) => (k ? k.slice(-4) : '');
+
+function putPool(gw, pool) {
+  saved.keys = { ...(saved.keys || {}), [gw]: pool };
+}
+
+// Add and prefer `key`. The old single-key callers keep working: the key
+// becomes the gateway's preferred active one. Pasting the same key again
+// keeps one entry (and prefers it) instead of duplicating the secret.
+export function setKey(gw, key) {
+  if (!isGateway(gw)) throw Object.assign(new Error('不支援的閘道'), { status: 400 });
+  const why = checkKey(key);
+  if (why) throw Object.assign(new Error(why), { status: 400 });
+  // Refused before anything changes in memory.
+  keyFile.check({ explicit: true });
+  const text = String(key).trim();
+  const pool = poolOf(gw) || { revision: 0, activeId: '', keys: [] };
+  const existing = pool.keys.find((k) => k.key === text);
+  if (existing) {
+    if (pool.activeId !== existing.id) {
+      pool.activeId = existing.id;
+      pool.revision += 1;
+      putPool(gw, pool);
+      save({ explicit: true });
+    }
+    return existing.id;
+  }
+  const id = newKeyId();
+  pool.keys.push({ id, key: text, addedAt: Date.now() });
+  pool.activeId = id;
+  pool.revision += 1;
+  putPool(gw, pool);
+  save({ explicit: true });
+  return id;
+}
+
+// Prefer an existing key. No revision bump when it already is the one.
+export function activateKey(gw, id) {
+  if (!isGateway(gw)) throw Object.assign(new Error('不支援的閘道'), { status: 400 });
+  const pool = poolOf(gw);
+  const key = pool?.keys.find((k) => k.id === id);
+  if (!pool || !key) throw Object.assign(new Error('找不到這把 API key'), { status: 404 });
+  if (pool.activeId === id) return false;
+  pool.activeId = id;
+  pool.revision += 1;
+  save();
+  return true;
+}
+
+// Remove one key. Removing the preferred one prefers the next usable key.
+export function removeKey(gw, id) {
+  if (!isGateway(gw)) throw Object.assign(new Error('不支援的閘道'), { status: 400 });
+  const pool = poolOf(gw);
+  const i = pool ? pool.keys.findIndex((k) => k.id === id) : -1;
+  if (i === -1) throw Object.assign(new Error('找不到這把 API key'), { status: 404 });
+  pool.keys.splice(i, 1);
+  if (pool.activeId === id) pool.activeId = firstUsable(pool.keys)?.id || '';
+  pool.revision += 1;
+  if (!pool.keys.length) {
+    // Keep the (empty) pool so its revision stays ahead of every connector's
+    // last one; a new key can never look like an older, already-seen state.
+    if (saved.models) delete saved.models[gw];
+    for (const [machineId, a] of Object.entries(saved.activity || {})) if (a.gateway === gw) delete saved.activity[machineId];
+  }
+  save();
+  return pool.keys.length;
+}
+
+// A real chat request needs the gateway's chat-completions address (the same
+// base Kimi is pointed at); tests answer it at <fake>/<gateway>/chat/completions.
+function chatUrl(gateway) {
+  const t = process.env.AGENT_HUB_DEEPSEEK_TEST_URL;
+  if (t && /^http:\/\/(127\.0\.0\.1|localhost):\d+$/.test(t)) return `${t}/${gateway}/chat/completions`;
+  return `${GATEWAYS[gateway].base}/chat/completions`;
+}
+
+// What a refused probe said, in the gateway's own error fields only, with
+// every key in the pool masked.
+function gatewayReason(text) {
+  let reason = '';
+  try {
+    const j = JSON.parse(text);
+    const e = j && typeof j.error === 'object' && j.error ? j.error : j || {};
+    reason = [e.code, e.type, e.message].filter((x) => typeof x === 'string' && x).join(' / ');
+    if (!reason && typeof j?.error === 'string') reason = j.error;
+  } catch {}
+  return provisionWarning({ message: reason.slice(0, 160) });
+}
+
+// Is this key usable RIGHT NOW? One tiny real completion (a handful of tokens)
+// with that key: /models answers for a key whose quota is gone, so it cannot
+// tell. Resolves only on a completion; otherwise throws why not.
+export async function probeKey(gw, key) {
+  const ids = modelIds(gw);
+  const model = pickDefaultModel(ids);
+  let res;
+  let text = '';
+  try {
+    res = await fetch(chatUrl(gw), {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 16, stream: false }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    text = await res.text();
+  } catch (err) {
+    throw Object.assign(new Error(`無法確認這把 key 是否恢復：${explain(gw, { err })}`), { status: 502, code: 'probe_unreachable' });
+  }
+  if (res.ok) return true;
+  const why = gatewayReason(text);
+  if (res.status === 402 || res.status === 429) throw Object.assign(new Error(`這把 key 的額度還沒恢復（閘道回 HTTP ${res.status}${why ? `：${why}` : ''}）。等額度重置後再試，或加入新的 key。`), { status: 409, code: 'still_exhausted' });
+  if (res.status === 401 || res.status === 403) throw Object.assign(new Error(`閘道現在不接受這把 key（HTTP ${res.status}${why ? `：${why}` : ''}）`), { status: 409, code: 'key_refused' });
+  throw Object.assign(new Error(`無法確認這把 key 是否恢復：閘道回 HTTP ${res.status}${why ? `：${why}` : ''}`), { status: 502, code: 'probe_failed' });
+}
+
+// Re-enable a key the gateway refused for quota. Only a real completion with
+// that key clears the exhaustion and makes it the preferred key again; a
+// refused or failed probe changes nothing.
+export async function retryKey(gw, id) {
+  if (!isGateway(gw)) throw Object.assign(new Error('不支援的閘道'), { status: 400 });
+  const pool = poolOf(gw);
+  const key = pool?.keys.find((k) => k.id === id);
+  if (!pool || !key) throw Object.assign(new Error('找不到這把 API key'), { status: 404 });
+  await refreshModels(gw, key.key);
+  await probeKey(gw, key.key);
+  // The pool may have moved while the probe was out.
+  const now = poolOf(gw)?.keys.find((k) => k.id === id);
+  if (!now) throw Object.assign(new Error('找不到這把 API key'), { status: 404 });
+  delete now.exhaustedAt;
+  delete now.retryAt;
+  delete now.exhaustedRev;
+  const live = poolOf(gw);
+  live.activeId = now.id;
+  live.revision += 1;
+  save();
+  return true;
+}
+
+export function clearKey(gw) {
+  if (!isGateway(gw)) throw Object.assign(new Error('不支援的閘道'), { status: 400 });
+  const pool = poolOf(gw);
+  if (!pool) return;
+  // Empty, not gone: the revision must keep moving so replacing the last key
+  // cannot match a connector's cached provision.
+  saved.keys = { ...(saved.keys || {}), [gw]: { revision: pool.revision + 1, activeId: '', keys: [] } };
+  if (saved.models) delete saved.models[gw];
+  for (const [machineId, a] of Object.entries(saved.activity || {})) if (a.gateway === gw) delete saved.activity[machineId];
+  save();
+}
+
+// A connector's {t:'deepseek.pool'} report: only known gateways and key ids,
+// never secret material or an address. `activeId` is that machine's actual
+// key, not the hub's preferred one: it never rewrites the pool's activeId.
+// A report older than the pool must not undo a newer key change.
+export function applyPoolReport(machineId, msg) {
+  if (!machineId || !msg || typeof msg !== 'object') return false;
+  const gw = msg.gateway;
+  if (!isGateway(gw)) return false;
+  const revision = Number(msg.revision);
+  if (!Number.isInteger(revision) || revision < 1) return false;
+  const activeId = typeof msg.activeId === 'string' ? msg.activeId.slice(0, 64) : null;
+  const pool = poolOf(gw);
+  if (!pool) return false;
+  const known = new Map(pool.keys.map((k) => [k.id, k]));
+  let changed = false;
+
+  const id = String(machineId).slice(0, 64);
+  const prev = saved.activity?.[id];
+  // The newest report by revision wins for a machine's activity. A different
+  // gateway is a new fact even when its revision counter is lower (another
+  // gateway has its own counter).
+  if (!prev || prev.gateway !== gw || revision >= prev.revision) {
+    const next = { gateway: gw, activeId: known.has(activeId) ? activeId : null, revision, at: Date.now() };
+    if (!prev || prev.gateway !== next.gateway || prev.activeId !== next.activeId || prev.revision !== next.revision) {
+      saved.activity = { ...(saved.activity || {}), [id]: next };
+      changed = true;
+    }
+  }
+
+  // Key health only from a report that matches the hub's current revision, and
+  // only what a report actually SAYS about a key:
+  //   - { exhaustedAt[, retryAt] }  the newest exhaustion any computer saw wins;
+  //   - { recoveredAt, recoveredFrom }  a real request succeeded on that key;
+  //     it clears the exhaustion only if it is later than the exhaustion (and
+  //     not from the future: a wrong clock is not evidence);
+  //   - { exhaustedAt: null }  an explicit reset, honoured only from a revision
+  //     newer than the one the exhaustion was recorded at;
+  //   - no field at all  this computer has no news about the key. That is not
+  //     "healthy": another computer's view must never undo an exhaustion.
+  if (revision === pool.revision && Array.isArray(msg.keys)) {
+    const now = Date.now();
+    for (const item of msg.keys.slice(0, 100)) {
+      if (!item || typeof item.id !== 'string') continue;
+      const key = known.get(item.id);
+      if (!key) continue;
+      const exhaustedAt = Number(item.exhaustedAt);
+      const recoveredAt = Number(item.recoveredAt);
+      if (item.exhaustedAt != null) {
+        if (Number.isFinite(exhaustedAt) && exhaustedAt > 0 && exhaustedAt >= (key.exhaustedAt || 0) && (key.exhaustedAt !== exhaustedAt || (item.retryAt != null && key.retryAt !== Number(item.retryAt)))) {
+          const retryAt = Number(item.retryAt);
+          key.exhaustedAt = exhaustedAt;
+          if (item.retryAt != null && Number.isFinite(retryAt) && retryAt > 0) key.retryAt = retryAt;
+          else delete key.retryAt;
+          key.exhaustedRev = revision;
+          changed = true;
+        }
+      } else if (item.recoveredAt != null) {
+        if (key.exhaustedAt && Number.isFinite(recoveredAt) && recoveredAt > key.exhaustedAt && recoveredAt <= now + 60_000) {
+          delete key.exhaustedAt;
+          delete key.retryAt;
+          delete key.exhaustedRev;
+          changed = true;
+        }
+      } else if (item.exhaustedAt === null && key.exhaustedAt && revision > (key.exhaustedRev ?? Infinity)) {
+        delete key.exhaustedAt;
+        delete key.retryAt;
+        delete key.exhaustedRev;
+        changed = true;
+      }
+    }
+  }
+  if (changed) save();
+  return changed;
+}
+
+// ------------------------------------------------------------- settings
+
+const PERMISSIONS = ['manual', 'yolo', 'auto'];
+
+// The model new conversations start on: the V4.1 Flash of the gateway when
+// it is among `ids`, else the first DeepSeek model.
+export function pickDefaultModel(ids) {
+  return ids.find((id) => DEFAULT_MODEL.test(id)) || ids[0] || '';
+}
+
+export function settings(gw = gateway()) {
+  const d = saved.defaults || {};
+  const ids = modelIds(gw);
+  return {
+    gateway: gw,
+    defaults: {
+      model: typeof d.model === 'string' && ids.includes(d.model) ? d.model : pickDefaultModel(ids),
+      effort: EFFORTS.includes(d.effort) ? d.effort : DEFAULT_EFFORT,
+      permission: PERMISSIONS.includes(d.permission) ? d.permission : 'manual',
+      planMode: Boolean(d.planMode),
+    },
+  };
+}
+
+export function setSettings({ gateway: gw, defaults } = {}) {
+  if (gw !== undefined && !isGateway(gw)) throw Object.assign(new Error('不支援的閘道'), { status: 400 });
+  const next = { ...saved };
+  if (gw !== undefined) next.gateway = gw;
+  if (defaults && typeof defaults === 'object') {
+    const d = { ...(saved.defaults || {}) };
+    if (typeof defaults.model === 'string' && defaults.model.length <= 100) d.model = defaults.model;
+    if (EFFORTS.includes(defaults.effort)) d.effort = defaults.effort;
+    if (PERMISSIONS.includes(defaults.permission)) d.permission = defaults.permission;
+    if ('planMode' in defaults) d.planMode = Boolean(defaults.planMode);
+    next.defaults = d;
+  }
+  if (JSON.stringify(next) === JSON.stringify(saved)) return;
+  // Not the key: a file that cannot be used is not written over for this (the
+  // person is told, and types the key in again).
+  keyFile.check();
+  saved = next;
+  save();
+}
+
+export function publicAccount() {
+  const gw = gateway();
+  // Session-header and native-subagent provisioning problems stay visible;
+  // both maps contain only non-secret explanations.
+  const warnings = [
+    ...[...headerWarnings].map(([id, text]) => ({ machineId: id, machineName: machines.getMachine(id)?.name || id, text: `DeepSeek session 標頭未設定：${text}（閘道可能限流）` })),
+    ...[...provisionWarnings].map(([id, text]) => ({ machineId: id, machineName: machines.getMachine(id)?.name || id, text: `原生 DeepSeek 子代理尚未就緒：${text}` })),
+  ];
+  const gateways = Object.entries(GATEWAYS).map(([id, g]) => {
+    const pool = poolOf(id);
+    const keys = pool?.keys || [];
+    const active = keys.find((k) => k.id === pool?.activeId) || null;
+    return {
+      id,
+      label: g.label,
+      site: g.site,
+      hasKey: keys.length > 0,
+      // The preferred key's last four characters, as before; then the whole
+      // key list (ids and hints only, never the secrets).
+      keyHint: hint(active?.key),
+      keyCount: keys.length,
+      // retryAt: when an exhausted key is next tried automatically (null for a
+      // healthy key). allExhausted/nextRetryAt: the whole gateway is out, and
+      // the earliest automatic try.
+      keys: keys.map((k) => ({ id: k.id, hint: hint(k.key), addedAt: k.addedAt, active: k.id === pool.activeId, exhaustedAt: k.exhaustedAt ?? null, retryAt: k.exhaustedAt ? retryAtOf(k) : null })),
+      allExhausted: keys.length > 0 && keys.every((k) => k.exhaustedAt),
+      nextRetryAt: keys.some((k) => k.exhaustedAt) && keys.every((k) => k.exhaustedAt) ? Math.min(...keys.map(retryAtOf)) : null,
+    };
+  });
+  const cur = gateways.find((g) => g.id === gw);
+  // Each computer's latest actual key. This is not the hub's preferred one:
+  // the hub must not force every computer back onto the same key.
+  const activity = Object.entries(saved.activity || {})
+    .map(([machineId, a]) => ({ machineId, machineName: machines.getMachine(machineId)?.name || machineId, gateway: a.gateway, activeId: a.activeId, revision: a.revision }))
+    .sort((a, b) => a.machineId.localeCompare(b.machineId));
+  // What each computer's Kimi actually has as [secondary_model], as the
+  // bridge last reported it. This is the real value (model, effort, force),
+  // never the Hub's preference; a machine with none is absent.
+  const secondaryModels = [...secondary]
+    .map(([machineId, s]) => ({ machineId, machineName: machines.getMachine(machineId)?.name || machineId, ...s }))
+    .sort((a, b) => a.machineId.localeCompare(b.machineId));
+  return { gateway: gw, hasKey: cur.hasKey, keyHint: cur.keyHint, gateways, defaults: settings(gw).defaults, warnings, activity, secondaryModels, damaged: keyFile.public() };
+}
+
+// -------------------------------------------------------------- models
+
+const titleCase = (w) => (/^v\d/i.test(w) ? `V${w.slice(1)}` : /^deepseek$/i.test(w) ? 'DeepSeek' : w.charAt(0).toUpperCase() + w.slice(1));
+
+// "deepseek/deepseek-v4.1-flash" → "DeepSeek V4.1 Flash".
+export function displayName(id) {
+  return String(id)
+    .replace(/^.*\//, '')
+    .split(/[-_\s]+/)
+    .filter(Boolean)
+    .map(titleCase)
+    .join(' ');
+}
+
+// One model as Kimi's provider is given it (the bridge checks every field).
+export function kimiModel(id) {
+  const caps = ['thinking', 'always_thinking', 'tool_use'];
+  if (IMAGE_MODELS.test(id)) caps.push('image_in');
+  return { model: id, display_name: displayName(id), max_context_size: CONTEXT_SIZE, max_output_size: MAX_OUTPUT, capabilities: caps, support_efforts: [...EFFORTS] };
+}
+
+// One model as the composer shows it (same shape as Kimi's model list).
+function info(id) {
+  return { id, name: displayName(id), efforts: [...EFFORTS], defaultEffort: DEFAULT_EFFORT, image: IMAGE_MODELS.test(id), context: CONTEXT_SIZE, maxOut: MAX_OUTPUT, deepseek: true };
+}
+
+// The DeepSeek model ids of a gateway: the live list read when its key was
+// last tested or saved, else the built-in one.
+export function modelIds(gw = gateway()) {
+  const live = saved.models?.[gw]?.ids;
+  return Array.isArray(live) && live.length ? live : [...GATEWAYS[gw].models];
+}
+
+export function models(gw = gateway()) {
+  const ids = modelIds(gw);
+  return { gateway: gw, live: Boolean(saved.models?.[gw]?.ids?.length), defaultModel: settings(gw).defaults.model, models: ids.map(info) };
+}
+
+// What the gateway's /models answer says, said plainly.
+export function explain(gw, { status, body, err } = {}) {
+  const label = GATEWAYS[gw]?.label || '閘道';
+  if (err) {
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') return `連不到閘道：${label} 15 秒內沒有回應`;
+    return `連不到閘道：${label}（${err.cause?.code || err.code || err.message}）`;
+  }
+  if (status === 401) return `金鑰無效：${label} 不接受這把 API key（401）`;
+  if (status === 403) {
+    if (/upgrade_required/i.test(body || '')) return 'Command Code 的 Go 方案不含 API 存取，請升級到 GOAT/Pro/Max 等含 API 的方案';
+    return `這把 API key 沒有權限使用 ${label}（403）${body ? `：${String(body).slice(0, 200)}` : ''}`;
+  }
+  return `${label} 回應了 HTTP ${status}${body ? `：${String(body).slice(0, 200)}` : ''}`;
+}
+
+// The DeepSeek models `key` can use at the gateway: GET its model list, ids
+// containing "deepseek". { ids, live }: `live` is false when the gateway
+// has no usable list (the built-in one is used then) but did not refuse the
+// key. Throws, with a plain message, when the key is refused or the gateway
+// cannot be reached.
+export async function fetchModels(gw, key) {
+  let res;
+  let text = '';
+  try {
+    res = await fetch(listUrl(gw), { headers: { Authorization: `Bearer ${key}`, Accept: 'application/json' }, signal: AbortSignal.timeout(15_000) });
+    text = await res.text();
+  } catch (err) {
+    throw Object.assign(new Error(explain(gw, { err })), { status: 400, code: 'unreachable' });
+  }
+  if (res.status === 401 || res.status === 403) throw Object.assign(new Error(explain(gw, { status: res.status, body: text })), { status: 400, code: res.status === 401 ? 'bad_key' : 'forbidden' });
+  const fallback = (note) => ({ ids: [...GATEWAYS[gw].models], live: false, note });
+  if (!res.ok) return fallback(`${GATEWAYS[gw].label} 沒有提供模型清單（HTTP ${res.status}）`);
+  let list;
+  try {
+    const j = JSON.parse(text);
+    list = Array.isArray(j) ? j : j?.data || j?.models;
+  } catch {}
+  if (!Array.isArray(list)) return fallback(`${GATEWAYS[gw].label} 的模型清單看不懂`);
+  const ids = [...new Set(list.map((m) => (typeof m === 'string' ? m : m?.id)).filter((id) => typeof id === 'string' && /^[\w.\/:-]{1,100}$/.test(id) && /deepseek/i.test(id)))];
+  if (!ids.length) return fallback(`${GATEWAYS[gw].label} 的模型清單裡沒有 DeepSeek 模型`);
+  return { ids, live: true };
+}
+
+// Read the live list with `key` and remember it for the gateway.
+export async function refreshModels(gw, key) {
+  const r = await fetchModels(gw, key);
+  if (r.live) {
+    saved.models = { ...(saved.models || {}), [gw]: { at: Date.now(), ids: r.ids } };
+    save();
+  } else if (saved.models?.[gw]) {
+    // The gateway gave no list this time: the one read before still stands.
+    return { ...r, ids: saved.models[gw].ids, note: `${r.note}，沿用上次讀到的清單` };
+  }
+  return r.note ? { ...r, note: `${r.note}，先用內建的 DeepSeek 模型清單` } : r;
+}
+
+// ------------------------------------------------- Kimi on the computers
+
+const provisioned = new Map(); // machine id -> { sig, at }: the last answer known to match the connector
+const headerWarnings = new Map(); // machine id -> why the provider has no session header
+const jobs = new Map(); // machine id -> { promise }: the provision under way, joined by every caller
+const tails = new Map(); // machine id -> Promise: this machine's provisions and removals, in order
+const epochs = new Map(); // machine id -> number: an explicit forget makes an answer already out obsolete
+const secondary = new Map(); // machine id -> the actual [secondary_model] the bridge last reported
+const provisionWarnings = new Map(); // machine id -> why native DeepSeek subagents are not ready
+const autoFailures = new Map(); // machine id -> { sig, at }; no retry storm on repeated hello
+const scheduledProvisions = new Set();
+const AUTO_RETRY_MS = 60_000;
+// Backoff for a provision that failed for a reason that can pass by itself (the
+// connector or Kimi was busy or restarting, a network blip). machine id ->
+// { timer, attempt }. After the last delay it stops: the next hello, Kimi
+// server start, key change or retryProvision() tries again.
+const retries = new Map();
+let retryDelays = (process.env.AGENT_HUB_DEEPSEEK_PROVISION_RETRY_MS || '5000,30000,120000,600000')
+  .split(',')
+  .map((x) => Number(x))
+  .filter((x) => Number.isFinite(x) && x >= 0);
+// For tests: other delays (milliseconds, one per retry).
+export function setProvisionRetryDelays(delays) {
+  retryDelays = delays.map(Number).filter((x) => Number.isFinite(x) && x >= 0);
+}
+// Failures a retry cannot fix: say so and wait for someone to change something.
+const FINAL_CODES = new Set(['no_key', 'pool_exhausted', 'pool_unsupported', 'connector_old']);
+
+function provisionWarning(err) {
+  let text = String(err?.message || err);
+  for (const gw of Object.keys(GATEWAYS)) {
+    for (const k of poolOf(gw)?.keys || []) if (k.key) text = text.replaceAll(k.key, `[key …${hint(k.key)}]`);
+  }
+  return text.slice(0, 500);
+}
+
+// The gateway's own revision and model list: a runtime key report does not
+// change this, so it must not make every computer provision again.
+const sigOf = (gw, revision, ids) => crypto.createHash('sha256').update(JSON.stringify([gw, revision, ids])).digest('hex');
+
+// An older bridge does not know the op.
+const tooOld = (err, m) => (/未知的操作/.test(err?.message || '') ? Object.assign(new Error(`「${m?.name || '這台電腦'}」的連接器太舊，不支援 DeepSeek 模式。在那台電腦重新執行連接指令（左下角「連接電腦…」）後再試。`), { status: 409, code: 'connector_old' }) : err);
+
+const noKey = () => Object.assign(new Error('還沒有設定 DeepSeek 的 API key。在「設定」→「DeepSeek…」貼上閘道的 API key。'), { status: 409, code: 'no_key' });
+// Every key is out of quota and none is due yet. Says when the connectors try
+// again by themselves and what to do right now; `retryAt` is that time.
+const poolExhausted = (pool) => {
+  const retryAt = Math.min(...(pool?.keys || []).map(retryAtOf).filter((t) => t > 0));
+  const when = Number.isFinite(retryAt) ? `最早 ${new Date(retryAt).toLocaleString('zh-TW', { hour12: false })} 之後會自動再試` : '';
+  return Object.assign(new Error(`這個閘道的 API key 都已用盡${when ? `（${when}）` : ''}。要現在恢復：在「設定」→「DeepSeek…」對其中一把按「重新啟用」（會用一次很小的請求確認額度回來了），或加入新的 key。`), {
+    status: 409,
+    code: 'pool_exhausted',
+    ...(Number.isFinite(retryAt) ? { retryAt } : {}),
+  });
+};
+const poolUnsupported = (m) =>
+  Object.assign(new Error(`「${m?.name || '這台電腦'}」的連接器太舊，只能使用一把 DeepSeek API key。這個閘道已有多把 key，請在那台電腦重新執行連接指令，更新到 connector 0.10 以上；在那之前不會只用其中一把。`), {
+    status: 409,
+    code: 'pool_unsupported',
+  });
+
+// Which key a computer should start on: the one it last reported using, when
+// it is still in the pool and usable, else the hub's preferred key. A report
+// from one computer must not move every other computer.
+function keyForMachine(machineId, gw, pool) {
+  const recent = saved.activity?.[machineId];
+  if (recent?.gateway === gw) {
+    const k = pool.keys.find((x) => x.id === recent.activeId);
+    if (k && !k.exhaustedAt) return k.id;
+  }
+  const preferred = pool.keys.find((k) => k.id === pool.activeId);
+  if (preferred && !preferred.exhaustedAt) return preferred.id;
+  return pool.keys.find((k) => !k.exhaustedAt)?.id || firstUsable(pool.keys)?.id || '';
+}
+
+// Everything a provision needs, read at the moment it is about to be sent.
+// The gateway, pool and revision may have changed while an older request was
+// out; that older request must not be sent again, and its answer must not be
+// taken for the current state.
+function planFor(machineId) {
+  const gw = gateway();
+  const pool = poolOf(gw);
+  if (!pool?.keys.length) throw noKey();
+  if (!keyForAttempt(gw)) throw poolExhausted(pool);
+  const ids = modelIds(gw);
+  const sig = sigOf(gw, pool.revision, ids);
+  const machine = machines.getMachine(machineId);
+  let args;
+  if ((Number(machine?.pool) || 0) >= 1) {
+    args = {
+      gateway: gw,
+      models: ids.map(kimiModel),
+      pool: {
+        revision: pool.revision,
+        activeId: keyForMachine(machineId, gw, pool),
+        retryMs: retryMs(),
+        keys: pool.keys.map((k) => ({ id: k.id, apiKey: k.key, ...(k.exhaustedAt ? { exhaustedAt: k.exhaustedAt, ...(k.retryAt ? { retryAt: k.retryAt } : {}) } : {}) })),
+      },
+    };
+  } else {
+    if (pool.keys.length > 1) throw poolUnsupported(machine);
+    const key = keyForAttempt(gw);
+    args = { gateway: gw, apiKey: key.key, models: ids.map(kimiModel) };
+  }
+  return { sig, ids, args, machine };
+}
+
+// One machine's operations run one after another; different machines do not
+// wait for each other. `run` also runs after a failed operation, so one bad
+// provision cannot wedge a machine.
+function enqueue(machineId, run) {
+  const prev = tails.get(machineId) || Promise.resolve();
+  const next = prev.then(run, run);
+  const tail = next.catch(() => {});
+  tails.set(machineId, tail);
+  const clear = () => {
+    if (tails.get(machineId) === tail) tails.delete(machineId);
+  };
+  tail.then(clear, clear);
+  return next;
+}
+
+async function removeQuietly(machineId, rpc) {
+  try {
+    await rpc(machineId, 'kimi.deepseek.remove', {}, 30_000);
+  } catch {}
+}
+
+// The provision loop. It reads the current state immediately before each
+// request, and once more when the bridge answers. An answer for a state that
+// has been replaced in the meantime is never cached: the loop asks again for
+// whatever is current now, so a slower, older request cannot put an old key
+// pool back on the computer or overwrite the newer signature.
+async function runProvision(machineId, rpc) {
+  let replaced = false;
+  for (;;) {
+    const plan = planFor(machineId);
+    if (!replaced && provisioned.get(machineId)?.sig === plan.sig) return { ok: true, cached: true, models: plan.ids.map(aliasFor) };
+    const epoch = epochs.get(machineId) || 0;
+    let answer;
+    try {
+      answer = await rpc(machineId, 'kimi.deepseek.provision', plan.args, 60_000);
+    } catch (err) {
+      // A failed attempt is never a cached provider: the next caller tries
+      // again against whatever the state is then.
+      provisioned.delete(machineId);
+      throw tooOld(err, plan.machine);
+    }
+    let after;
+    try {
+      after = planFor(machineId);
+    } catch (err) {
+      provisioned.delete(machineId);
+      // The key was removed or cleared while the request was out: the bridge
+      // may just have installed the old one. Take it off before saying there
+      // is no key, so the removed key cannot linger on that computer.
+      if (err?.code === 'no_key') await removeQuietly(machineId, rpc);
+      throw err;
+    }
+    if (after.sig !== plan.sig || (epochs.get(machineId) || 0) !== epoch) {
+      // The answer describes a state that is no longer current (or a provider
+      // this hub was told to forget). Never cache it; the computer has to end
+      // on the state that is current now.
+      provisioned.delete(machineId);
+      replaced = true;
+      continue;
+    }
+    provisioned.set(machineId, { sig: plan.sig, at: Date.now() });
+    if (answer?.secondaryModel) secondary.set(machineId, answer.secondaryModel);
+    else secondary.delete(machineId);
+    if (answer?.sessionHeader === false) headerWarnings.set(machineId, answer.warning || '沒有加上 session 標頭');
+    else headerWarnings.delete(machineId);
+    // The provider is live; a problem with the native subagent default
+    // ([secondary_model]) is a warning about that default, never a failed
+    // provision (the main conversation does not wait on it).
+    if (answer?.secondaryWarning) provisionWarnings.set(machineId, provisionWarning({ message: answer.secondaryWarning }));
+    else provisionWarnings.delete(machineId);
+    return answer;
+  }
+}
+
+function queueProvision(machineId, rpc) {
+  const job = { superseded: false };
+  const promise = enqueue(machineId, () => runProvision(machineId, rpc));
+  job.promise = promise;
+  jobs.set(machineId, job);
+  const clear = () => {
+    if (jobs.get(machineId) === job) jobs.delete(machineId);
+  };
+  promise.then(clear, clear);
+  return promise;
+}
+
+// Make sure `machineId`'s Kimi has the agent-hub-deepseek provider for the
+// gateway and key pool in use, with its models. Asked of the bridge once per
+// (computer, gateway, revision, model list); again when any of those changes,
+// when the computer reconnects, or after an error. Calls for one computer are
+// answered by one ordered provision and share its promise; other computers
+// proceed in parallel. Connectors with pool:1 get every key and start on their
+// own last reported one; an older connector may still use exactly one key, but
+// never silently takes just one of several.
+// Resolves to the bridge's answer ({ ok, models: [alias], secondaryModel? }),
+// or { cached: true }.
+export async function ensureProvider(machineId, { rpc = machines.rpc } = {}) {
+  try {
+    const answer = await ensureProviderInner(machineId, { rpc });
+    // A cached answer changes nothing: the last real attempt stays on record.
+    if (!answer?.cached) recordProvision(machineId, answer);
+    return answer;
+  } catch (err) {
+    recordProvision(machineId, null, err);
+    throw err;
+  }
+}
+
+// What the machine's status carries about its last provision, for the pages
+// and for the checks other modules make before they rely on a computer:
+//   { ok, at, reason, warning, code, retry }
+//   ok       the DeepSeek provider is on that computer
+//   reason   why not (ok: false), plain text with every key masked
+//   warning  ok, but the native subagent default ([secondary_model]) is not
+//            what it should be, and why
+//   code     no_key / pool_exhausted / pool_unsupported / connector_old for
+//            failures only a person can fix; absent for transient ones
+//   retry    { attempt, at }: the next automatic try, when one is scheduled
+function recordProvision(machineId, answer, err = null) {
+  if (!machines.getMachine(machineId)) return;
+  const at = Date.now();
+  if (err) {
+    machines.setProvision(machineId, { ok: false, at, reason: provisionWarning(err), ...(err.code ? { code: String(err.code) } : {}) });
+    return;
+  }
+  const warning = answer?.secondaryWarning ? provisionWarning({ message: answer.secondaryWarning }) : '';
+  machines.setProvision(machineId, { ok: true, at, reason: null, ...(warning ? { warning } : {}) });
+}
+
+async function ensureProviderInner(machineId, { rpc }) {
+  const plan = planFor(machineId); // no key, every key exhausted or an old connector fails at once
+  const job = jobs.get(machineId);
+  if (job && !job.superseded) return job.promise;
+  // A queued removal for this machine must go first: until it has run, a
+  // previous answer is not the truth on that computer. A job that a removal
+  // superseded is not joined; the new one is queued behind the removal.
+  if (!tails.has(machineId) && provisioned.get(machineId)?.sig === plan.sig) {
+    return { ok: true, cached: true, models: plan.ids.map(aliasFor) };
+  }
+  return queueProvision(machineId, rpc);
+}
+
+async function provisionOne(machineId, { rpc, sig, throttle }) {
+  const previous = autoFailures.get(machineId);
+  if (throttle && previous?.sig === sig && Date.now() - previous.at < AUTO_RETRY_MS) {
+    return { machineId, ok: false, throttled: true, error: provisionWarnings.get(machineId) || previous.error };
+  }
+  try {
+    const answer = await ensureProvider(machineId, { rpc });
+    // A provision that worked ends any backoff. (A secondary warning in the
+    // answer was recorded by runProvision and stays visible.)
+    stopRetry(machineId);
+    if (!answer.secondaryWarning) provisionWarnings.delete(machineId);
+    autoFailures.delete(machineId);
+    return { machineId, ok: true, cached: Boolean(answer.cached), secondaryModel: answer.secondaryModel || secondary.get(machineId) || null };
+  } catch (err) {
+    const error = provisionWarning(err);
+    provisionWarnings.set(machineId, error);
+    autoFailures.set(machineId, { sig, at: Date.now(), error });
+    scheduleRetry(machineId, err, rpc);
+    return { machineId, ok: false, error };
+  }
+}
+
+function stopRetry(machineId) {
+  const r = retries.get(machineId);
+  if (r) clearTimeout(r.timer);
+  retries.delete(machineId);
+}
+
+// After a failure that may pass by itself, try again later: delays grow
+// (5 s, 30 s, 2 min, 10 min by default) and then stop for good until a new
+// trigger. Failures a person has to fix (no key, every key out, a connector
+// that is too old) are not retried.
+function scheduleRetry(machineId, err, rpc) {
+  const prev = retries.get(machineId);
+  if (prev) clearTimeout(prev.timer);
+  const attempt = (prev?.attempt ?? -1) + 1;
+  if (FINAL_CODES.has(err?.code) || attempt >= retryDelays.length) {
+    if (attempt >= retryDelays.length && !FINAL_CODES.has(err?.code)) retries.set(machineId, { attempt, timer: null, spent: true });
+    else retries.delete(machineId);
+    return;
+  }
+  const at = Date.now() + retryDelays[attempt];
+  const timer = setTimeout(() => {
+    const cur = retries.get(machineId);
+    if (!cur || cur.timer !== timer) return;
+    cur.timer = null;
+    const m = machines.getMachine(machineId);
+    if (!m?.online || !m.kimi?.server || !apiKey()) return retries.delete(machineId);
+    provisionOne(machineId, { rpc, sig: sigOf(gateway(), poolRevision(), modelIds()), throttle: false }).catch(() => {});
+  }, retryDelays[attempt]);
+  timer.unref?.();
+  retries.set(machineId, { attempt, timer, at });
+  const m = machines.getMachine(machineId);
+  if (m?.provision && !m.provision.ok) machines.setProvision(machineId, { ...m.provision, retry: { attempt: attempt + 1, at } });
+}
+
+// Try a computer's provision now, whatever failed or was throttled before
+// (a settings page's "retry" button, a person fixing the connector). Resets
+// the backoff. Resolves to provisionOne's result.
+export function retryProvision(machineId, { rpc = machines.rpc } = {}) {
+  stopRetry(machineId);
+  autoFailures.delete(machineId);
+  const m = machines.getMachine(machineId);
+  if (!m?.online || !m.kimi?.server) return Promise.resolve({ machineId, ok: false, error: '這台電腦現在連不上 Kimi 伺服器' });
+  if (!apiKey()) return Promise.resolve({ machineId, ok: false, error: '還沒有設定 DeepSeek 的 API key' });
+  return provisionOne(machineId, { rpc, sig: sigOf(gateway(), poolRevision(), modelIds()), throttle: false });
+}
+
+// Best-effort provisioning for native DeepSeek subagents. Only the automatic
+// path is throttled; an explicit provision or a changed key can retry at once.
+export async function provisionOnline({ rpc = machines.rpc, list = machines.listMachines, ids = null } = {}) {
+  if (!apiKey()) return [];
+  const wanted = ids && new Set(ids);
+  const online = list().filter((m) => m.online && m.kimi?.server && (!wanted || wanted.has(m.id)));
+  const sig = sigOf(gateway(), poolRevision(), modelIds());
+  return Promise.all(online.map((m) => provisionOne(m.id, { rpc, sig, throttle: true })));
+}
+
+// A key or gateway change also reaches computers that already had the provider.
+// Offline machines are not dropped from this existing explicit contract.
+export async function reprovision({ rpc = machines.rpc, list = machines.listMachines } = {}) {
+  if (!apiKey()) return [];
+  const online = list().filter((m) => m.online && m.kimi?.server).map((m) => m.id);
+  const ids = new Set([...provisioned.keys(), ...jobs.keys(), ...online]);
+  const sig = sigOf(gateway(), poolRevision(), modelIds());
+  const results = await Promise.all([...ids].map((id) => provisionOne(id, { rpc, sig, throttle: false })));
+  return results.filter((r) => r.ok && !r.cached).map((r) => r.machineId);
+}
+
+function scheduleProvision(machineId) {
+  if (scheduledProvisions.has(machineId)) return;
+  scheduledProvisions.add(machineId);
+  queueMicrotask(() => {
+    scheduledProvisions.delete(machineId);
+    const m = machines.getMachine(machineId);
+    if (!m?.online || !m.kimi?.server || !apiKey()) return;
+    provisionOnline({ ids: [machineId] }).catch(() => {});
+  });
+}
+
+// The computer's Kimi may have lost the provider (its config was edited, or
+// it was reinstalled): ask for it again next time. An answer already out is
+// not trusted after this.
+export const forgetProvider = (machineId) => {
+  provisioned.delete(machineId);
+  epochs.set(machineId, (epochs.get(machineId) || 0) + 1);
+};
+// Every moment Kimi can newly be provisioned: the connector (re)connected, or
+// Kimi's server came up on a computer that was already connected (the hello
+// had said it was not up). Both start fresh: no stale backoff or throttle.
+machines.onBridgeHello((id) => {
+  forgetProvider(id);
+  stopRetry(id);
+  autoFailures.delete(id);
+  scheduleProvision(id);
+});
+machines.onKimiServer((id) => {
+  stopRetry(id);
+  autoFailures.delete(id);
+  scheduleProvision(id);
+});
+
+// Take the provider (and the key in it) off the computers it was put on. The
+// removal is ordered after a provision that is already out for that machine
+// (whose result could otherwise put the old key back afterwards); a provision
+// asked for after this removal queues behind it.
+export async function removeProviders({ rpc = machines.rpc } = {}) {
+  const ids = new Set([...provisioned.keys(), ...jobs.keys()]);
+  // New callers must not join a request that is being superseded; they queue
+  // behind the removal instead (reprovision can still see the machine here).
+  for (const id of ids) {
+    const job = jobs.get(id);
+    if (job) job.superseded = true;
+  }
+  await Promise.all(
+    [...ids].map((id) =>
+      enqueue(id, async () => {
+        await removeQuietly(id, rpc);
+        // A provision queued after this removal runs later; one before it has
+        // just been undone and must not remain cached.
+        provisioned.delete(id);
+        headerWarnings.delete(id);
+        provisionWarnings.delete(id);
+        autoFailures.delete(id);
+        secondary.delete(id);
+        stopRetry(id);
+        machines.setProvision(id, null);
+      }),
+    ),
+  );
+}
+
+// The computers whose Kimi has a [secondary_model]: subagents of a DeepSeek
+// conversation may run on it, and it may be a subscription model. The bridge
+// only creates the DeepSeek default when the section is empty; this live read
+// reports whatever is actually there.
+export async function secondaryModels({ rpc = machines.rpc, list = machines.listMachines } = {}) {
+  const out = [];
+  await Promise.all(
+    list()
+      .filter((m) => m.online && m.kimi?.server)
+      .map(async (m) => {
+        try {
+          const env = await rpc(m.id, 'kimi.request', { method: 'GET', path: '/api/v1/config' }, 10_000);
+          const s = secondaryOf(env?.data);
+          if (s) out.push({ machineId: m.id, machineName: m.name, ...s });
+        } catch {}
+      }),
+  );
+  return out;
+}
+
+// [secondary_model] in Kimi's GET /config answer (the same reading the
+// bridge makes). `effort` is present only when Kimi has a default_effort.
+export function secondaryOf(cfg) {
+  const s = cfg?.secondary_model;
+  if (!s || typeof s !== 'object') return null;
+  const pick = (camel, snake) => s[camel] ?? s[snake];
+  const pool = pick('models', 'models');
+  const names = pool && typeof pool === 'object' ? Object.keys(pool) : [];
+  const model = pick('defaultModel', 'default_model') ?? pick('model', 'model') ?? names[0];
+  const effort = pick('defaultEffort', 'default_effort');
+  return model ? { model: String(model), models: names, force: pick('force', 'force') === true, ...(typeof effort === 'string' && effort ? { effort } : {}) } : null;
+}
+
+// ------------------------------------------------------- recognizing one
+
+export const aliasFor = (id) => `${MODEL_PREFIX}${id}`;
+export const isDeepseekModel = (id) => typeof id === 'string' && id.startsWith(MODEL_PREFIX);
+// A conversation is a DeepSeek one if it was started as such, or its model
+// is one of the DeepSeek provider's.
+export const isDeepseek = (s) => s?.mode === 'deepseek' || isDeepseekModel(s?.meta?.model);

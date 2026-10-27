@@ -150,7 +150,7 @@ export function runCommand(command, { cwd, signal, timeoutMs = 120_000, onData }
     const child = spawn('bash', ['-c', command], {
       cwd,
       detached: true,
-      env: { ...process.env, TERM: 'dumb', CI: process.env.CI ?? '1' },
+      env: { ...process.env, TERM: 'dumb', CI: process.env.CI ?? '1', GIT_TERMINAL_PROMPT: '0', GH_PROMPT_DISABLED: '1' },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let out = '';
@@ -164,8 +164,12 @@ export function runCommand(command, { cwd, signal, timeoutMs = 120_000, onData }
     const timer = setTimeout(() => kill('timeout'), timeoutMs);
     const onAbort = () => kill('interrupted');
     signal?.addEventListener('abort', onAbort, { once: true });
-    const collect = (chunk) => {
-      const s = chunk.toString();
+    // Decoded as a stream, one decoder per pipe (setEncoding is a
+    // StringDecoder that is flushed when the pipe ends): a multi-byte
+    // character cut at a chunk boundary is not two replacement characters.
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    const collect = (s) => {
       if (out.length < MAX_OUTPUT * 4) out += s;
       onData?.(s);
     };

@@ -7,8 +7,9 @@
 // conversation per update: children and the newest row of each parent are
 // indexed as events arrive.
 import { h, fill, icon, fmtDuration } from './dom.js';
-import { markdownInto, renderMarkdown, renderLineDiff, diffStats } from './markdown.js';
-import { artifactOf, collectArtifacts, artifactCard } from './artifacts.js';
+import { markdownInto, MarkdownStream, renderMarkdown, renderLineDiff, diffStats } from './markdown.js';
+import { artifactOf, collectArtifacts, mergeArtifactIndex, artifactCard } from './artifacts.js';
+import { agentLife, subagentModelView, lifeBadge } from './agent-state.js';
 
 export const TOOLS = {
   Bash: ['terminal', '執行'],
@@ -26,9 +27,13 @@ export const TOOLS = {
   WebFetch: ['globe', '讀取網頁'],
   WebSearch: ['globe', '搜尋網路'],
   SearchWeb: ['globe', '搜尋網路'],
+  CodeExecution: ['terminal', '雲端執行程式'],
   Agent: ['agents', '子代理'],
   AgentSwarm: ['agents', '子代理群'],
   Task: ['agents', '子代理'],
+  StartConversation: ['agents', '開新對話'],
+  MessageConversation: ['agent', '傳訊息給對話'],
+  ReadConversation: ['eye', '讀對話'],
   btw: ['question', '順便問'],
   TodoList: ['todo', '待辦'],
   TodoWrite: ['todo', '待辦'],
@@ -48,35 +53,86 @@ export const TOOLS = {
   GetGoal: ['sparkle', '目標'],
   UpdateGoal: ['sparkle', '更新目標'],
   SetGoalBudget: ['sparkle', '目標預算'],
+  delegate_to_provider: ['agents', '子代理'],
+  'mcp__agent-hub__delegate_to_provider': ['agents', '子代理'],
 };
 
 const ACTIVE = ['pending', 'running', 'awaiting'];
-// Rows drawn right away when a conversation opens; the rest follow.
-const NOW = 150;
+// Rows drawn right away when a conversation opens (what fills the screen
+// and a little more); the rest of the window follows a slice at a time.
+const NOW = 40;
+// Text longer than this, while it is being written, is drawn a block at a time.
+const STREAM_MIN = 1500;
+// A copy of the whole conversation (a Hub that does not cut it into windows)
+// is shown as its newest LEGACY_TAIL events; the rest is kept aside and
+// drawn as you scroll up, CHUNK events at a time, like a windowed one.
+const LEGACY_TAIL = 240;
+const CHUNK = 80;
+// How far above the top of the view the "earlier messages" marker starts a
+// load, and how many loads in a row one look at the top may start.
+const EARLIER_MARGIN = 700;
+const EARLIER_RUN = 12;
+// The most slices the pinned question is loaded through (a turn this long has thousands of events).
+const PROMPT_PAGES = 200;
+const fmtSize = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : n >= 1e3 ? `${Math.round(n / 1e3)} KB` : `${n} B`);
 // Look-around tools: a run of them folds into one line, like Claude Code.
 const LOOK = /^(Read|ReadFile|ReadMediaFile|Glob|Grep|FetchURL|WebFetch|WebSearch|SearchWeb)$/;
 const lineCount = (t) => (t ? String(t).replace(/\n+$/, '').split('\n').length : 0);
-const isAgent = (ev) => Boolean(ev.subagent) || /^(Agent|AgentSwarm|Task)$/.test(ev.name);
+const isAgent = (ev) => Boolean(ev.subagent) || /^(Agent|AgentSwarm|Task)$/.test(ev.name) || /(^|__)delegate_to_provider$/.test(ev.name || '');
 const isTodo = (ev) => /^(TodoList|TodoWrite|SetTodoList)$/.test(ev.name);
+const INTERNAL_AGENT = /delegate_to_provider|mcp__agent-hub|agent-hub|(^|[\s·])broker([\s·]|$)/i;
+// Internal tool/connection names must never become a user-facing card title.
+// This one is deliberately broad: a display name such as "agent-hub-broker"
+// or "broker_task" is internal even though it is not a whole word.
+const INTERNAL_TITLE = /delegate_to_provider|mcp__agent-hub|agent-hub|broker/i;
+function agentName(sub) {
+  const name = String(sub?.name || '').trim();
+  return name && !/^(subagent|btw)$/i.test(name) && !INTERNAL_TITLE.test(name) ? name : '';
+}
+function agentDescription(ev, sub = {}) {
+  const input = ev.input && typeof ev.input === 'object' ? ev.input : {};
+  let text = sub.description || input.description || ev.title || input.prompt || input.task || '';
+  if (INTERNAL_AGENT.test(String(text))) text = input.task || input.prompt || sub.description || '';
+  const out = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+  return INTERNAL_TITLE.test(out) ? '' : out;
+}
+// Claude's web search and fetch (run by the Claude API) come back as
+// "title\n  url" per search result, or "title\nurl" for the fetched page.
+function webLinks(ev) {
+  if (!/^(WebSearch|WebFetch)$/.test(ev.name) || ev.status !== 'done') return null;
+  const lines = String(ev.output || '').trim().split('\n').map((l) => l.trim());
+  const url = (l) => /^https?:\/\/\S+$/.test(l || '');
+  if (lines.length === 1 && url(lines[0])) return [{ title: lines[0], url: lines[0] }];
+  const links = [];
+  for (let i = 0; i < lines.length; i += 2) {
+    if (!url(lines[i + 1])) return null;
+    links.push({ title: lines[i] || lines[i + 1], url: lines[i + 1] });
+  }
+  return links.length ? links : null;
+}
+const hostOf = (u) => {
+  try {
+    return new URL(u).hostname.replace(/^www\./, '');
+  } catch {
+    return '';
+  }
+};
 // Following the newest message: back on when you reach the end by
 // scrolling down (within this many pixels), off as soon as you scroll up.
 const STICK_PX = 32;
 // After you scroll up, reaching the end again within this long does not
 // count: the end moves while Kimi writes.
 const UP_GRACE_MS = 600;
+// How often a subagent card is checked against the clock.
+const LIFE_CHECK_MS = 5000;
 // Browsers keep what is on screen in place when rows above change height
 // (scroll anchoring); where one does not, the transcript does it itself.
 const NATIVE_ANCHOR = typeof CSS !== 'undefined' && CSS.supports?.('overflow-anchor', 'auto');
 
 const sameValue = (a, b) => a === b || (a !== null && b !== null && typeof a === 'object' && typeof b === 'object' && JSON.stringify(a) === JSON.stringify(b));
 
-const agentRunning = (ev) => {
-  const sub = ev.subagent || {};
-  return sub.status === 'running' || (!sub.status && ACTIVE.includes(ev.status));
-};
-
 export class Transcript {
-  // opts: { cwd, onRespond(ev, optionId, extra), onOpenArtifact(path, versionId), onCopy }
+  // opts: { cwd, agentName ('Kimi' | 'Claude'), onRespond(ev, optionId, extra), onOpenArtifact(path, versionId), onCopy }
   constructor(opts) {
     this.opts = opts;
     this.column = h('div', { class: 'column' });
@@ -89,13 +145,36 @@ export class Transcript {
     this.pinText = h('span', { class: 'prompt-pin-text' });
     this.pin = h('button', { class: 'prompt-pin', type: 'button', title: '跳到這個問題', onclick: () => this.toPrompt() }, icon('up'), this.pinText);
     this.pinBar = h('div', { class: 'prompt-pin-bar', hidden: true }, this.pin);
+    // "Earlier messages": the top of the conversation when more exists than is
+    // drawn. Reaching it (a screenful before) loads the next slice.
+    this.earlierText = h('span', { class: 'earlier-text' }, '載入更早的訊息');
+    this.earlierBtn = h('button', { class: 'earlier-btn', type: 'button', onclick: () => ((this.olderFailed = false), this.loadOlder(true)) }, this.earlierText);
+    this.earlier = h('div', { class: 'earlier', hidden: true }, this.earlierBtn);
+    this.fullBusy = new Set(); // events whose whole content is being fetched
+    this.fullFailed = new Set();
+    this.fullIds = new Set(); // events fetched whole: a fresh copy's short preview must not replace them
+    // Cards older than the window that steps inside the window belong to, or
+    // subagents still at work (the Hub sends them with the window). Held, drawn
+    // above everything else, but not part of `order`: the held events are one
+    // run of the conversation and what is asked for next starts at its first.
+    this.above = new Set();
+    this.stepsOlder = new Map(); // card id -> its tool calls before the window that are not held yet (the Hub counts them)
+    this.question = null; // the person's message before the window: { id, ts, text, images? }, until it is loaded
+    this.reserve = []; // older events kept aside (a copy that arrived whole), oldest first
+    this.firstIndex = 0; // the position, in the whole conversation, of the oldest event held
+    this.hasEarlier = false; // a Hub that windows has older events than are held
+    this.gen = 0; // bumped when the held events are replaced, so a late answer is dropped
+    this.host = null; // where new rows are mounted (the column, or a fragment while older ones are built)
     this.users = []; // top-level user message ids, in order
     this.agentIds = []; // top-level subagent calls
     this.mainTools = []; // top-level tool calls
     this.kids = new Map(); // parent id -> ids of its direct children, in order
     this.lastOf = new Map(); // parent id ('' for the top) -> its newest child
     this.deferred = new Set(); // dirty, but inside a closed subagent card
-    this.el = h('div', { class: 'transcript', tabindex: '-1' }, this.pinBar, this.column, this.working, this.jumpBar);
+    // Until the first copy of the conversation arrives: grey bars that fade in
+    // after a moment (a quick answer never shows them).
+    this.skeleton = h('div', { class: 'transcript-skeleton', 'aria-hidden': 'true' }, h('span'), h('span'), h('span'), h('span'));
+    this.el = h('div', { class: 'transcript', tabindex: '-1' }, this.pinBar, this.earlier, this.skeleton, this.column, this.working, this.jumpBar);
     this.events = new Map();
     this.order = [];
     this.nodes = new Map();
@@ -174,6 +253,10 @@ export class Transcript {
       this.pinRaf ||= requestAnimationFrame(() => ((this.pinRaf = 0), this.updatePin()));
     });
     this.tick = setInterval(() => this.renderWorking(), 1000);
+    // A subagent's spinner has to stop by itself when its evidence runs out
+    // (nothing arrives to tell the page), so the cards are looked at again.
+    this.lifeSeen = new Map(); // agent id -> the state its card was drawn for
+    this.lifeTick = setInterval(() => this.recheckAgents(), opts.lifeCheckMs || LIFE_CHECK_MS);
     // Links in Kimi's replies to local files (a page it wrote) open in the
     // panel instead of a browser tab.
     this.el.addEventListener('click', (e) => {
@@ -189,13 +272,36 @@ export class Transcript {
     this.resize.observe(this.column);
     this.resize.observe(this.working);
     this.resize.observe(this.el);
+    // Reaching the top (a screenful before it) loads the slice before.
+    this.olderRun = 0;
+    if (typeof IntersectionObserver !== 'undefined') {
+      this.topWatch = new IntersectionObserver((entries) => entries.some((e) => e.isIntersecting) && this.loadOlder(), { root: this.el, rootMargin: `${EARLIER_MARGIN}px 0px 0px 0px` });
+      this.topWatch.observe(this.earlier);
+    }
+    // Scrolling by hand starts the count of automatic loads again.
+    this.el.addEventListener('scroll', () => (this.olderRun = 0), { passive: true });
   }
 
   destroy() {
+    this.gen++;
     cancelAnimationFrame(this.raf);
+    cancelAnimationFrame(this.pinRaf);
     clearTimeout(this.backlogTimer);
     clearInterval(this.tick);
+    clearInterval(this.lifeTick);
     this.resize.disconnect();
+    this.topWatch?.disconnect();
+    // The node and event tables are the heavy part; a transcript that is
+    // kept alive by something (a closure, a pending callback) must not hold
+    // the conversation with it.
+    for (const node of this.nodes.values()) if (node.mdTimer) clearTimeout(node.mdTimer);
+    this.events.clear();
+    this.nodes.clear();
+    this.above.clear();
+    this.order = [];
+    this.reserve = [];
+    this.backlog = [];
+    this.column.replaceChildren();
   }
 
   // A conversation's events, all at once: when it opens, and again whenever
@@ -203,20 +309,56 @@ export class Transcript {
   // fresh copy of what is already shown only updates what changed, so the
   // view stays as it is; one that does not line up is drawn anew, back at
   // the same place if you had scrolled up.
-  load(events) {
-    if (this.order.length && this.order.length <= events.length && this.order.every((id, i) => events[i].id === id)) {
-      for (let i = 0; i < this.order.length; i++) {
-        const old = this.events.get(this.order[i]);
-        const ev = events[i];
-        const changed = {};
-        for (const k of Object.keys(ev)) if (!sameValue(old[k], ev[k])) changed[k] = ev[k];
-        for (const k of Object.keys(old)) if (!(k in ev)) changed[k] = undefined;
-        if (Object.keys(changed).length) this.patch(ev.id, changed);
+  //
+  // `info.window` ({ total, firstIndex, hasEarlier }) says the events are only
+  // the newest part of a longer conversation (the Hub cuts them into windows);
+  // earlier ones come from `opts.fetchEarlier` as you scroll up. A copy that
+  // arrives whole is cut the same way here: its newest LEGACY_TAIL events are
+  // drawn and the rest is held back (`reserve`) for the same scroll.
+  load(events, info = {}) {
+    const win = info.window && typeof info.window === 'object' ? info.window : null;
+    const outside = win && info.outside && typeof info.outside === 'object' ? info.outside : null;
+    const ancestors = Array.isArray(outside?.ancestors) ? outside.ancestors : [];
+    const question = outside?.question && typeof outside.question === 'object' && typeof outside.question.id === 'string' ? outside.question : null;
+    let reserve = [];
+    let first = win ? Number(win.firstIndex) : 0;
+    // Where the copy lines up with what is already held, if it does: a
+    // window starts somewhere inside the held events (or at their start), a
+    // whole copy has the first held event somewhere inside it.
+    let at = -1;
+    if (this.order.length && events.length) {
+      if (win) {
+        const p = this.order.indexOf(events[0].id);
+        if (p !== -1 && this.order.length - p <= events.length && this.order.slice(p).every((id, i) => events[i].id === id)) {
+          this.holdAncestors(ancestors);
+          // The question before the window is the one before the first event held only when the window starts there.
+          if (p === 0) this.question = question;
+          this.reconcile(events, p);
+          if (p === 0) this.setEarlier(first, win.hasEarlier ?? first > 0);
+          this.schedulePin();
+          return;
+        }
+      } else {
+        const j = events.findIndex((e) => e.id === this.order[0]);
+        if (j !== -1 && this.order.length <= events.length - j && this.order.every((id, i) => events[j + i].id === id)) at = j;
       }
-      for (const ev of events.slice(this.order.length)) this.add(ev);
+    }
+    if (at !== -1) {
+      // Whole copy: what is held is its newest part; the rest stays aside.
+      reserve = events.slice(0, at);
+      this.reconcile(events.slice(at), 0);
+      this.reserve = reserve;
+      this.setEarlier(reserve.length, reserve.length > 0, true);
       return;
     }
-    const at = this.order.length && !this.stick ? this.viewSpot() : null;
+    if (!win && events.length > LEGACY_TAIL) {
+      reserve = events.slice(0, events.length - LEGACY_TAIL);
+      events = events.slice(-LEGACY_TAIL);
+    }
+    const spot = this.order.length && !this.stick ? this.viewSpot() : null;
+    this.skeleton?.remove();
+    this.skeleton = null;
+    this.gen++;
     this.events.clear();
     this.order = [];
     this.nodes.clear();
@@ -228,17 +370,30 @@ export class Transcript {
     this.kids.clear();
     this.lastOf.clear();
     this.deferred.clear();
+    this.dirty.clear();
+    this.dirtyGroups.clear();
     this.pinBar.hidden = true;
     this.column.replaceChildren();
+    this.above.clear();
+    this.stepsOlder.clear();
+    this.question = question;
+    this.groupEls = new WeakMap();
     clearTimeout(this.backlogTimer);
+    this.olderBusy = false;
+    this.olderFailed = false;
+    this.fullIds.clear();
+    this.fullBusy.clear();
+    this.fullFailed.clear();
+    this.holdAncestors(ancestors);
     for (const ev of events) this.add(ev, true);
     // The newest part (what is on screen, at the bottom) is drawn now; the
     // rest after it, a slice at a time, so a long conversation shows at once
     // and stays responsive while the older part fills in.
     const all = [...this.dirty];
     const keep = new Set(all.slice(-NOW));
+    for (const id of this.above) keep.add(id);
     // Where you were reading is drawn now too.
-    const i = at?.id ? all.indexOf(at.id) : -1;
+    const i = spot?.id ? all.indexOf(spot.id) : -1;
     if (i !== -1) for (const id of all.slice(Math.max(0, i - NOW / 2), i + NOW / 2)) keep.add(id);
     this.backlog = all.filter((id) => !keep.has(id));
     this.dirty = keep;
@@ -247,9 +402,221 @@ export class Transcript {
       if (p) keep.add(p); // a card shows its latest step
     }
     this.flush();
-    if (at) this.backTo(at);
+    if (spot) this.backTo(spot);
     else this.scrollToEnd();
     if (this.backlog.length) this.backlogTimer = setTimeout(() => this.drawBacklog(), 0);
+    this.reserve = reserve;
+    if (win) this.setEarlier(first, win.hasEarlier ?? first > 0);
+    else this.setEarlier(reserve.length, reserve.length > 0, true);
+    this.schedulePin();
+  }
+
+  // A fresh copy of the newest events lines up with the held ones from
+  // `from`: update what changed, add what is new. The older part is untouched.
+  reconcile(events, from) {
+    for (let i = from; i < this.order.length; i++) {
+      const old = this.events.get(this.order[i]);
+      const ev = events[i - from];
+      if (ev.truncated && this.fullIds.has(ev.id)) continue;
+      const changed = {};
+      for (const k of Object.keys(ev)) if (!sameValue(old[k], ev[k])) changed[k] = ev[k];
+      for (const k of Object.keys(old)) if (!(k in ev)) changed[k] = undefined;
+      if (Object.keys(changed).length) this.patch(ev.id, changed);
+    }
+    for (const ev of events.slice(this.order.length - from)) this.add(ev);
+  }
+
+  // The cards the Hub sent along with a window (see `above`), oldest first.
+  // One already held is only brought up to date; the rest go above everything
+  // else, in the order given.
+  holdAncestors(list) {
+    const fresh = [];
+    for (const ev of list) {
+      if (!ev || typeof ev.id !== 'string') continue;
+      if (this.events.has(ev.id)) this.patch(ev.id, ev);
+      else fresh.push(ev);
+    }
+    if (!fresh.length) return;
+    const top = document.createDocumentFragment();
+    const agents = [];
+    const calls = [];
+    for (const ev of fresh) {
+      this.above.add(ev.id);
+      if (ev.stepsBefore > 0) this.stepsOlder.set(ev.id, ev.stepsBefore);
+      this.events.set(ev.id, ev);
+      if (ev.type === 'tool_use' && !ev.parent && isAgent(ev)) agents.push(ev.id);
+      if (ev.type === 'tool_use' && !ev.parent) calls.push(ev.id);
+      if (ev.parent) (this.kids.get(ev.parent) || this.kids.set(ev.parent, []).get(ev.parent)).push(ev.id);
+      const node = this.makeNode(ev);
+      this.nodes.set(ev.id, node);
+      const parent = ev.parent && this.nodes.get(ev.parent);
+      (parent?.children || top).append(node.el);
+      this.markDirty(ev.id, true);
+    }
+    this.agentIds.unshift(...agents);
+    this.mainTools.unshift(...calls); // what a foreground subagent card is: a call Kimi is waiting on
+    this.column.insertBefore(top, this.column.firstChild);
+    if (!this.raf) this.raf = requestAnimationFrame(() => this.flush());
+  }
+
+  // What is held reaches back to position `index` of the conversation, and
+  // there is (or is not) more before it.
+  setEarlier(index, has, local = false) {
+    this.firstIndex = index;
+    this.hasEarlier = Boolean(has);
+    this.localEarlier = local; // true: the older events are in `reserve`, not on the Hub
+    this.drawEarlier();
+  }
+
+  canLoadOlder() {
+    return this.reserve.length > 0 || (this.hasEarlier && !this.localEarlier && this.firstIndex > 0 && typeof this.opts.fetchEarlier === 'function');
+  }
+
+  drawEarlier() {
+    const can = this.canLoadOlder();
+    this.earlier.hidden = !can;
+    this.earlier.classList.toggle('busy', Boolean(this.olderBusy));
+    this.earlier.classList.toggle('failed', Boolean(this.olderFailed));
+    this.earlierText.textContent = this.olderFailed ? '載入失敗，點這裡重試' : this.olderBusy ? '載入更早的訊息…' : '載入更早的訊息';
+  }
+
+  // The next slice of older events, drawn above the held ones without
+  // moving what is on screen. `manual`: the button was pressed.
+  async loadOlder(manual = false) {
+    if (this.olderBusy || !this.canLoadOlder()) return;
+    if (!manual && (this.olderFailed || this.olderRun >= EARLIER_RUN)) return;
+    if (!manual) this.olderRun++;
+    const gen = this.gen;
+    this.olderBusy = true;
+    this.drawEarlier();
+    let chunk;
+    let first = this.firstIndex;
+    let has = false;
+    try {
+      if (this.reserve.length) {
+        chunk = this.reserve.splice(-CHUNK);
+        first = this.reserve.length;
+        has = first > 0;
+      } else {
+        const r = await this.opts.fetchEarlier({ before: this.firstIndex, beforeId: this.order[0], limit: CHUNK });
+        chunk = Array.isArray(r?.events) ? r.events : [];
+        first = Number.isFinite(Number(r?.firstIndex)) ? Number(r.firstIndex) : Math.max(0, this.firstIndex - chunk.length);
+        has = Boolean(r?.hasEarlier ?? first > 0) && chunk.length > 0;
+      }
+    } catch {
+      if (gen === this.gen) (this.olderBusy = false), (this.olderFailed = true), this.drawEarlier();
+      return;
+    }
+    if (gen !== this.gen) return; // the conversation was replaced meanwhile
+    this.olderBusy = false;
+    this.prepend(chunk);
+    this.setEarlier(first, has, this.localEarlier);
+    // Still near the top (the slice was short, or all hidden rows): go on, a bounded number of times.
+    requestAnimationFrame(() => {
+      if (gen !== this.gen || !this.canLoadOlder()) return;
+      const near = this.earlier.getBoundingClientRect().bottom > this.el.getBoundingClientRect().top - EARLIER_MARGIN;
+      if (near) this.loadOlder();
+    });
+  }
+
+  // Events older than every held one, oldest first. Built off-screen in a
+  // fragment, put in above, and the view put back where it was.
+  prepend(events) {
+    // A card held above everything (see `above`) whose own place is in this
+    // slice goes back there, keeping the steps it already shows.
+    const steps = new Map();
+    for (const ev of events) {
+      if (!this.above.has(ev.id)) continue;
+      const node = this.nodes.get(ev.id);
+      steps.set(ev.id, [...node.children.childNodes]);
+      node.el.remove();
+      this.nodes.delete(ev.id);
+      this.events.delete(ev.id);
+      this.above.delete(ev.id);
+      this.stepsOlder.delete(ev.id); // its own place is here: every step before the window is held by now
+      const at = this.agentIds.indexOf(ev.id);
+      if (at !== -1) this.agentIds.splice(at, 1);
+      const call = this.mainTools.indexOf(ev.id);
+      if (call !== -1) this.mainTools.splice(call, 1);
+      const siblings = ev.parent && this.kids.get(ev.parent);
+      const k = siblings ? siblings.indexOf(ev.id) : -1;
+      if (k !== -1) siblings.splice(k, 1);
+    }
+    const fresh = events.filter((e) => !this.events.has(e.id));
+    if (!fresh.length) return;
+    for (const e of fresh) if (e.parent && e.type === 'tool_use' && this.stepsOlder.has(e.parent)) this.stepsOlder.set(e.parent, Math.max(0, this.stepsOlder.get(e.parent) - 1));
+    const fromEnd = this.el.scrollHeight - this.el.scrollTop - this.el.clientHeight;
+    const grew = this.grew;
+    const kept = { order: this.order, users: this.users, agentIds: this.agentIds, mainTools: this.mainTools, kids: this.kids, lastOf: this.lastOf, dirty: this.dirty };
+    this.order = [];
+    this.users = [];
+    this.agentIds = [];
+    this.mainTools = [];
+    this.kids = new Map();
+    this.lastOf = new Map();
+    this.dirty = new Set();
+    const host = document.createDocumentFragment();
+    this.host = host;
+    this.attachLater = [];
+    this.attachFirst = new Map();
+    for (const ev of fresh) this.add(ev, true);
+    this.host = null;
+    this.grew = grew; // older events are not news
+    // A step whose card is held already: it goes after the ones that came with the slice.
+    for (const [parent, kid] of this.attachLater) this.nodes.get(parent)?.children.append(this.nodes.get(kid).el);
+    this.attachLater = null;
+    // …and the steps a card held above everything had already come after the older ones that arrive now.
+    for (const [id, els] of steps) this.nodes.get(id)?.children.append(...els);
+    for (const [parent, els] of this.attachFirst) this.nodes.get(parent)?.children.prepend(...els);
+    this.attachFirst = null;
+    const chunkDirty = [...this.dirty];
+    this.order = [...this.order, ...kept.order];
+    this.users = [...this.users, ...kept.users];
+    // Cards held above everything are older than any slice: they stay first.
+    this.agentIds = [...kept.agentIds.filter((id) => this.above.has(id)), ...this.agentIds, ...kept.agentIds.filter((id) => !this.above.has(id))];
+    this.mainTools = [...kept.mainTools.filter((id) => this.above.has(id)), ...this.mainTools, ...kept.mainTools.filter((id) => !this.above.has(id))];
+    for (const [p, list] of kept.kids) this.kids.set(p, [...(this.kids.get(p) || []), ...list]);
+    for (const [p, id] of kept.lastOf) this.lastOf.set(p, id);
+    this.dirty = kept.dirty;
+    // A read/search run cut by the edge of the slice is one row, as it would be whole.
+    const tail = host.lastElementChild && this.groupEls?.get(host.lastElementChild);
+    const head = this.column.firstElementChild && this.groupEls?.get(this.column.firstElementChild);
+    if (tail && head && tail !== head) {
+      tail.members.push(...head.members);
+      for (const id of head.members) this.groupOf.set(id, tail);
+      tail.body.append(...head.body.childNodes);
+      head.el.remove();
+      this.dirtyGroups.add(tail);
+    }
+    this.column.insertBefore(host, this.column.firstChild);
+    // The newest part of the slice (just above the screen) is drawn now, the rest after.
+    const now = chunkDirty.slice(-NOW);
+    const rest = chunkDirty.slice(0, -NOW);
+    this.renderIds(now);
+    this.backlog = [...rest, ...(this.backlog || [])];
+    if (this.backlog.length && !this.backlogTimer) this.backlogTimer = setTimeout(() => this.drawBacklog(), 0);
+    this.el.scrollTop = this.el.scrollHeight - this.el.clientHeight - fromEnd;
+    this.lastTop = this.el.scrollTop;
+    this.lastHeight = this.el.scrollHeight;
+    this.lastClient = this.el.clientHeight;
+    if (this.artifactsChanged) {
+      this.artifactsChanged = false;
+      this.opts.onArtifacts?.(this.artifacts(), { older: true });
+    }
+    this.schedulePin();
+    // Subagents came in with the slice: the tray's count of those at work is not the one it was.
+    if (fresh.some((e) => e.type === 'tool_use' && isAgent(e))) this.opts.onFlush?.([]);
+  }
+
+  renderIds(ids) {
+    for (const id of ids) {
+      const node = this.nodes.get(id);
+      if (!node) continue;
+      if (this.insideClosed(node.ev)) this.deferred.add(id);
+      else this.render(node);
+    }
+    for (const g of this.dirtyGroups) this.renderGroup(g);
+    this.dirtyGroups.clear();
   }
 
   // The row at the top of the view and how far from the end it is.
@@ -270,14 +637,19 @@ export class Transcript {
   }
 
   drawBacklog() {
-    const end = performance.now() + 10;
+    this.backlogTimer = 0;
+    const end = performance.now() + 8;
     while (this.backlog.length && performance.now() < end) {
       const id = this.backlog.pop(); // newest first: nearest to the view
       const node = this.nodes.get(id);
       if (!node) continue;
       if (this.insideClosed(node.ev)) this.deferred.add(id);
       else this.render(node);
+      // Something to do for the person (a key, a click) comes before the rest.
+      if (navigator.scheduling?.isInputPending?.()) break;
     }
+    for (const g of this.dirtyGroups) this.renderGroup(g);
+    this.dirtyGroups.clear();
     if (this.stick) this.scrollToEnd();
     if (this.backlog.length) this.backlogTimer = setTimeout(() => this.drawBacklog(), 0);
   }
@@ -307,7 +679,15 @@ export class Transcript {
   patch(id, fields) {
     const ev = this.events.get(id);
     if (!ev) return;
+    const wasAgent = isAgent(ev);
     Object.assign(ev, fields);
+    // The MCP tool call may arrive before its child session links the
+    // subagent data. It becomes a card (and a work count) the moment it does.
+    if (!wasAgent && isAgent(ev) && ev.type === 'tool_use' && !ev.parent && !this.agentIds.includes(id)) {
+      const at = this.order.indexOf(id);
+      const i = this.agentIds.findIndex((x) => this.order.indexOf(x) > at);
+      this.agentIds.splice(i === -1 ? this.agentIds.length : i, 0, id);
+    }
     this.markDirty(id);
     if (ev.parent) this.markDirty(ev.parent);
     if (ev.type === 'tool_use' && (artifactOf(ev) || 'input' in fields)) this.artifactsChanged = true;
@@ -331,17 +711,77 @@ export class Transcript {
     return this.order.map((id) => this.events.get(id));
   }
 
+  // What the agent said last, whole: its newest text (not a subagent's) with
+  // something in it. Looked for in the events held, then in the part held
+  // aside, then, a slice at a time without drawing anything, in the part the
+  // Hub has not sent (a turn can end in a long run of tool calls, with the last
+  // reply before them). A reply the Hub sent as a preview is fetched whole.
+  // null when there is none.
+  async lastReply(maxSlices = 100) {
+    const pick = (list) => {
+      for (let i = list.length - 1; i >= 0; i--) {
+        const e = list[i];
+        if (e.type === 'text' && !e.parent && e.text?.trim()) return e;
+      }
+      return null;
+    };
+    let ev = pick(this.all()) || pick(this.reserve);
+    let before = this.firstIndex;
+    let beforeId = this.order[0];
+    for (let n = 0; !ev && n < maxSlices && this.hasEarlier && !this.localEarlier && before > 0 && typeof this.opts.fetchEarlier === 'function'; n++) {
+      const r = await this.opts.fetchEarlier({ before, beforeId, limit: CHUNK });
+      const list = Array.isArray(r?.events) ? r.events : [];
+      if (!list.length) break;
+      ev = pick(list);
+      before = Number.isFinite(Number(r.firstIndex)) ? Number(r.firstIndex) : before - list.length;
+      beforeId = list[0].id;
+      if (!r.hasEarlier) break;
+    }
+    if (!ev) return null;
+    if (ev.truncated && this.opts.fetchFull) {
+      try {
+        const whole = await this.opts.fetchFull(ev);
+        if (typeof whole?.text === 'string') return whole.text;
+      } catch {
+        // the preview is all there is
+      }
+    }
+    return ev.text;
+  }
+
+  // The pages this conversation made. From the events held, plus: the older
+  // part a copy that arrived whole keeps aside (`reserve`), and the Hub's list
+  // of pages over the whole conversation (setArtifactIndex), for the part it
+  // never sent because it sends only the newest window.
   artifacts() {
-    return collectArtifacts(this.all());
+    const held = this.reserve.length ? [...this.reserve, ...this.all()] : this.all();
+    return mergeArtifactIndex(collectArtifacts(held), this.artifactIndex);
+  }
+
+  // The Hub's list of artifact events over the whole conversation arrived.
+  // Pages found in it are older than anything on screen: not news.
+  setArtifactIndex(entries) {
+    this.artifactIndex = Array.isArray(entries) ? entries : null;
+    this.opts.onArtifacts?.(this.artifacts(), { older: true });
+  }
+
+  // The model that produced the last response (Claude), shown while working.
+  setServed(name) {
+    this.served = name || '';
+    if (this.servedEl) this.servedEl.textContent = this.served ? ` · ${this.served}` : '';
   }
 
   setStatus(status, since, tps) {
+    const changed = this.status !== status || !this.statusKnown;
     this.status = status;
+    this.statusKnown = true;
     if (since) this.since = since;
     if (tps !== undefined) this.tps = tps;
     this.renderWorking();
     // The last open thinking/tool rows reflect whether Kimi is still going.
     for (const id of this.order.slice(-6)) this.markDirty(id);
+    // Whether a subagent is still working depends on whether the conversation is.
+    if (changed) for (const id of this.agentIds) this.markDirty(id);
   }
 
   markDirty(id, batch) {
@@ -437,7 +877,7 @@ export class Transcript {
   // How many are still working, without looking at their steps.
   runningCount() {
     let n = 0;
-    for (const id of this.agentIds) if (this.events.has(id) && agentRunning(this.events.get(id))) n++;
+    for (const id of this.agentIds) if (this.events.has(id) && this.agentLife(this.events.get(id)).running) n++;
     return n;
   }
 
@@ -481,36 +921,89 @@ export class Transcript {
     }
   }
 
+  // ------------------------------------------------- what a subagent is doing
+
+  // The conversation's status, when it is known. A transcript that was never
+  // told is not evidence of an idle conversation.
+  sessionStatus() {
+    const v = this.opts?.sessionStatus?.();
+    if (v !== undefined && v !== null) return v;
+    return this.statusKnown ? this.status : undefined;
+  }
+
+  // Newest sign of life from a subagent: its own event or its newest step.
+  lastActivity(id) {
+    const ev = this.events.get(id);
+    const newest = this.events.get(this.lastOf.get(id) || '');
+    return Math.max(ev?.ts || 0, newest?.parent === id ? newest.ts || 0 : 0);
+  }
+
+  // What the card may claim about one subagent: whether it is alive, and the
+  // model it ran on. Cards and the 子代理 panel both come through here.
+  agentLife(ev) {
+    return agentLife(ev, { sessionStatus: this.sessionStatus(), childStatus: this.opts?.childStatus, lastActivity: this.lastActivity(ev.id) || undefined, limits: this.opts?.limits });
+  }
+
+  agentView(ev) {
+    const life = this.agentLife(ev);
+    const model = subagentModelView(ev, life, { modelName: this.opts?.modelName, effortLabel: this.opts?.effortLabel, limits: this.opts?.limits });
+    return { life, model };
+  }
+
+  // The names of models came in (the catalog loaded): cards redraw with them.
+  refreshAgents() {
+    for (const id of this.agentIds) this.markDirty(id);
+  }
+
+  // Cards whose evidence changed with the clock alone are drawn again.
+  recheckAgents() {
+    for (const id of this.agentIds) {
+      const ev = this.events.get(id);
+      if (!ev) continue;
+      const { life, model } = this.agentView(ev);
+      if (this.lifeSeen.get(id) !== `${life.state}|${life.reason}|${model.waiting}`) this.markDirty(id);
+    }
+  }
+
   // Every subagent this conversation started (newest last), or only the
   // ones still working.
   agentList(onlyRunning = false) {
-    const ids = this.agentIds.filter((id) => this.events.has(id) && (!onlyRunning || agentRunning(this.events.get(id))));
     const out = [];
-    for (const id of ids) {
+    for (const id of this.agentIds) {
       const ev = this.events.get(id);
+      if (!ev) continue;
+      const { life, model } = this.agentView(ev);
+      if (onlyRunning && !life.running) continue;
       const sub = ev.subagent || {};
-      const running = agentRunning(ev);
-      const failed = sub.status === 'error' || ev.status === 'error';
       const kids = this.childrenOf(id);
       const last = [...kids].reverse().find((k) => k.type === 'tool_use' || (k.type === 'text' && k.text?.trim()));
       const activity = !last ? '' : last.type === 'tool_use' ? `${(TOOLS[last.name] || [null, last.name])[1]} ${last.title || ''}`.trim() : last.text.trim().split('\n').pop();
       out.push({
         id,
-        name: sub.name && !['subagent', 'btw'].includes(sub.name) ? sub.name : '',
+        name: agentName(sub),
         // Without a description, the first line of the task it was given.
-        description: sub.description || ev.input?.description || ev.title || String(ev.input?.prompt || '').trim().split('\n')[0].slice(0, 120),
+        description: agentDescription(ev, sub),
         activity: activity.slice(0, 120),
-        steps: kids.filter((k) => k.type === 'tool_use').length,
+        steps: this.stepCount(id, kids),
         background: Boolean(sub.background),
-        model: sub.model || '',
-        effort: sub.effort || '',
-        running,
-        failed,
-        stopped: sub.status === 'cancelled' || ev.status === 'interrupted',
-        summary: running ? '' : sub.summary || '',
+        life,
+        badge: lifeBadge(life),
+        modelView: model,
+        running: life.running,
+        failed: life.failed,
+        stopped: life.stopped,
+        unknown: life.unknown,
+        done: life.done,
+        summary: life.running ? '' : sub.summary || '',
       });
     }
     return out;
+  }
+
+  // A card's tool calls: the ones held, and the ones before the window that the Hub counted.
+  stepCount(id, kids = this.childrenOf(id)) {
+    // (`?.`: a Transcript built without its constructor, as the broker tests do, has no such table)
+    return kids.filter((k) => k.type === 'tool_use').length + (this.stepsOlder?.get(id) || 0);
   }
 
   childrenOf(id) {
@@ -544,7 +1037,15 @@ export class Transcript {
     node.el.scrollIntoView({ block: 'start', behavior: 'smooth' });
   }
 
-  // The newest question whose bubble is entirely above the visible area.
+  // The pin is worked out when the view moves (scroll) and when what is held
+  // changes under a view that does not: once per frame at most, never per event.
+  schedulePin() {
+    this.pinRaf ||= requestAnimationFrame(() => ((this.pinRaf = 0), this.updatePin()));
+  }
+
+  // The newest question whose bubble is entirely above the visible area. When
+  // no question held is above it, the one before the window (the Hub names it)
+  // is: the answer on screen is the answer to it.
   updatePin() {
     // Under the bar itself counts as out of view.
     const top = this.el.getBoundingClientRect().top + (this.pinBar.hidden ? 0 : this.pin.offsetHeight) + 4;
@@ -558,16 +1059,31 @@ export class Transcript {
         break;
       }
     }
-    this.pinned = found;
-    this.pinBar.hidden = !found;
-    if (found) {
-      const ev = this.events.get(found);
-      this.pinText.textContent = (ev.text || (ev.images?.length ? `${ev.images.length} 張圖片` : '')).replace(/\s+/g, ' ').trim();
-    }
+    const ask = !found && this.question && !this.events.has(this.question.id) ? this.question : null;
+    this.pinned = found || null;
+    this.pinBar.hidden = !found && !ask;
+    const ev = found ? this.events.get(found) : ask;
+    if (ev) this.pinText.textContent = (ev.text || (ev.images?.length || ev.images ? `${ev.images?.length ?? ev.images} 張圖片` : '')).replace(/\s+/g, ' ').trim();
+    this.pinAsk = ask?.id || null;
   }
 
-  toPrompt() {
-    const el = this.pinned && this.nodes.get(this.pinned)?.el;
+  // Back to the pinned question. One that is still before the window is loaded
+  // first, a slice at a time, with the pin saying so.
+  async toPrompt() {
+    const wanted = this.pinAsk || this.pinned;
+    if (this.pinAsk && !this.nodes.has(this.pinAsk)) {
+      const gen = this.gen;
+      this.pin.classList.add('busy');
+      this.pin.disabled = true;
+      for (let i = 0; i < PROMPT_PAGES && gen === this.gen && !this.nodes.has(wanted) && this.canLoadOlder() && !this.olderFailed; i++) {
+        while (this.olderBusy && gen === this.gen) await new Promise((r) => setTimeout(r, 40));
+        await this.loadOlder(true);
+      }
+      this.pin.classList.remove('busy');
+      this.pin.disabled = false;
+      if (gen !== this.gen) return;
+    }
+    const el = wanted && this.nodes.get(wanted)?.el;
     if (!el) return;
     this.upAt = performance.now();
     this.setStick(false);
@@ -599,18 +1115,23 @@ export class Transcript {
     const { ev } = node;
     if (ev.parent) {
       const parent = this.nodes.get(ev.parent);
-      if (parent?.children) parent.children.append(node.el);
-      else {
+      if (parent?.children) {
+        // An older step of a card held above everything goes before the steps it shows.
+        if (this.attachFirst && this.above.has(ev.parent)) (this.attachFirst.get(ev.parent) || this.attachFirst.set(ev.parent, []).get(ev.parent)).push(node.el);
+        else parent.children.append(node.el);
+      } else {
         const list = this.waiting.get(ev.parent) || [];
         list.push(ev.id);
         this.waiting.set(ev.parent, list);
       }
     } else if ((ev.type === 'tool_use' && LOOK.test(ev.name)) || ev.type === 'thinking') this.joinGroup(node);
-    else this.column.append(node.el);
+    else (this.host || this.column).append(node.el);
     const kids = this.waiting.get(ev.id);
     if (kids && node.children) {
       this.waiting.delete(ev.id);
-      for (const k of kids) node.children.append(this.nodes.get(k).el);
+      // While older events are being put in, the steps already held come after theirs.
+      if (this.attachLater) for (const k of kids) this.attachLater.push([ev.id, k]);
+      else for (const k of kids) node.children.append(this.nodes.get(k).el);
     }
   }
 
@@ -621,16 +1142,34 @@ export class Transcript {
         return this.renderUser(node);
       case 'text': {
         if (!node.md) node.el.append((node.md = h('div', { class: 'md' })));
-        // A long reply still being written is parsed again at most about
-        // eight times a second, not on every frame.
-        const t = performance.now();
-        if (ev.text?.length > 3000 && this.isLive(ev) && t - (node.mdAt || 0) < 120) {
-          node.mdTimer ??= setTimeout(() => ((node.mdTimer = null), this.markDirty(ev.id)), 120);
+        // Drawn already, as it is now, and not a reply being written: nothing to
+        // parse. (The newest rows are marked again whenever the conversation
+        // starts or stops working; a 100 kB reply must not be parsed each time.)
+        if (!node.stream && node.drawn === ev.text && node.md.firstChild) {
+          this.truncMark(node);
           return;
         }
+        const t = performance.now();
+        if (this.isLive(ev) && ev.text?.length > STREAM_MIN) {
+          // A long reply still being written: only its last block is drawn
+          // again, and no more often than it can afford (a fifth of the
+          // time at most), so typing and scrolling stay smooth.
+          const gap = Math.min(250, Math.max(0, 3 * (node.mdCost || 0) - 16));
+          if (t - (node.mdAt || 0) < gap) {
+            node.mdTimer ??= setTimeout(() => ((node.mdTimer = null), this.markDirty(ev.id)), gap);
+            return;
+          }
+          (node.stream ??= new MarkdownStream(node.md)).update(ev.text);
+        } else {
+          // Anything else (short, or finished) is drawn whole.
+          node.stream = null;
+          markdownInto(node.md, ev.text);
+        }
+        node.drawn = node.stream ? null : ev.text;
         node.mdAt = t;
-        markdownInto(node.md, ev.text);
+        node.mdCost = performance.now() - t;
         node.el.hidden = !ev.text?.trim();
+        this.truncMark(node);
         return;
       }
       case 'thinking':
@@ -642,9 +1181,13 @@ export class Transcript {
         return fill(node.el, h('span', { class: 'note' }, ev.text));
       case 'error':
         return fill(node.el, h('div', { class: 'callout danger' }, icon('alert'), h('div', { class: 'callout-text' }, ev.text)));
-      case 'turn_end':
-        node.el.hidden = !(ev.interrupted || ev.error);
-        return fill(node.el, h('span', { class: 'note' }, ev.interrupted ? '已中斷' : '這一輪沒有完成'));
+      case 'turn_end': {
+        // Claude: which model(s) actually answered this turn.
+        const by = (ev.models || []).map((m) => m.name || m.id).join('、');
+        node.el.hidden = !(ev.interrupted || ev.error || by);
+        const what = ev.restarted ? '中控台重新啟動，這一輪被中斷了' : ev.interrupted ? '已中斷' : ev.error ? '這一輪沒有完成' : '';
+        return fill(node.el, h('span', { class: 'note', title: (ev.models || []).map((m) => m.id).join('\n') }, [what, by ? `由 ${by} 回覆` : ''].filter(Boolean).join(' · ')));
+      }
       default:
         node.el.hidden = true;
     }
@@ -653,10 +1196,10 @@ export class Transcript {
   renderUser(node) {
     const ev = node.ev;
     const images = (ev.images || []).map((src) => (src ? h('img', { class: 'user-img', src, alt: '附加的圖片', loading: 'lazy', onclick: () => this.opts.onImage?.(src) }) : h('span', { class: 'user-img placeholder' }, icon('image'), '圖片')));
-    const note = [ev.note, ev.steered ? '在 Kimi 工作時插入' : null].filter(Boolean).join(' · ');
+    const note = [ev.note, ev.steered ? `在 ${this.name()} 工作時插入` : null].filter(Boolean).join(' · ');
     fill(
       node.el,
-      h('div', { class: 'bubble' }, images.length ? h('div', { class: 'user-imgs' }, images) : null, ev.text ? h('div', { class: 'user-text' }, ev.text) : null),
+      h('div', { class: 'bubble' }, images.length ? h('div', { class: 'user-imgs' }, images) : null, ...userText(ev.text)),
       note ? h('div', { class: 'bubble-note' }, note) : null,
     );
   }
@@ -675,10 +1218,69 @@ export class Transcript {
         icon('chev', 'chev'),
       ),
       open ? h('div', { class: 'thinking-text' }, ev.text) : null,
+      open && ev.truncated ? this.truncNote(ev) : null,
     );
   }
 
-  // The newest unfinished row while Kimi is working.
+  // ------------------------------------------------------ cut-short content
+  // The Hub may send a very long field (a command's output, a file) as a
+  // short preview marked `truncated: { field, bytes }`. The row says so, and
+  // opening it fetches the whole thing.
+
+  truncNote(ev) {
+    const t = ev.truncated || {};
+    const bytes = Number(t.bytes) || 0;
+    const busy = this.fullBusy.has(ev.id);
+    const failed = this.fullFailed.has(ev.id);
+    return h(
+      'div',
+      { class: 'trunc-note' },
+      h('span', null, `內容很長${bytes ? `（${fmtSize(bytes)}）` : ''}，這裡只顯示前面一段。`),
+      this.opts.fetchFull ? h('button', { class: 'om-btn om-btn--sm trunc-btn', type: 'button', disabled: busy, onclick: () => this.loadFull(ev.id) }, busy ? '載入中…' : failed ? '載入失敗，再試一次' : '載入完整內容') : null,
+    );
+  }
+
+  // Keeps the note under a text row in step with the event.
+  truncMark(node) {
+    const ev = node.ev;
+    if (ev.truncated) {
+      const note = this.truncNote(ev);
+      if (node.trunc) node.trunc.replaceWith(note);
+      else node.el.append(note);
+      node.trunc = note;
+    } else if (node.trunc) {
+      node.trunc.remove();
+      node.trunc = null;
+    }
+  }
+
+  async loadFull(id) {
+    const ev = this.events.get(id);
+    if (!ev || this.fullBusy.has(id) || !this.opts.fetchFull) return;
+    this.fullBusy.add(id);
+    this.fullFailed.delete(id);
+    this.markDirty(id);
+    const gen = this.gen;
+    try {
+      const full = await this.opts.fetchFull(ev);
+      if (gen !== this.gen || !full || typeof full !== 'object') throw new Error('no event');
+      const fields = {};
+      for (const k of Object.keys(full)) if (k !== 'id' && k !== 'truncated') fields[k] = full[k];
+      fields.truncated = undefined;
+      this.fullIds.add(id);
+      this.patch(id, fields);
+    } catch {
+      this.fullFailed.add(id);
+    }
+    this.fullBusy.delete(id);
+    this.markDirty(id);
+  }
+
+  name() {
+    return this.opts.agentName || 'Kimi';
+  }
+
+  // The newest unfinished row while the agent is working.
   isLive(ev) {
     return this.status === 'running' && this.lastOf.get(ev.parent || '') === ev.id;
   }
@@ -702,13 +1304,14 @@ export class Transcript {
   // ("讀取 3 個檔案、搜尋 2 次") that opens to show each step.
 
   joinGroup(node) {
-    const last = this.column.lastElementChild;
+    const host = this.host || this.column;
+    const last = host.lastElementChild;
     let g = last && this.groupEls?.get(last);
     if (!g) {
       g = { id: `g:${node.ev.id}`, members: [], head: h('div', { class: 'tool-head' }), body: h('div', { class: 'group-body' }) };
       g.el = h('div', { class: 'ev tool-group' }, g.head, g.body);
       (this.groupEls ??= new WeakMap()).set(g.el, g);
-      this.column.append(g.el);
+      host.append(g.el);
     }
     g.members.push(node.ev.id);
     g.body.append(node.el);
@@ -791,6 +1394,7 @@ export class Transcript {
       );
     }
     fill(node.body, ...(open ? this.toolBody(ev) : this.peek(ev)));
+    if (open && ev.truncated) node.body.append(this.truncNote(ev));
     if (waiting) node.body.append(this.permissionUI(ev));
     else if (ev.permission?.chosen && !/^approved/.test(ev.permission.chosen)) node.body.append(this.permissionResult(ev));
   }
@@ -801,8 +1405,13 @@ export class Transcript {
       const cwd = this.opts.cwd;
       return cwd && p?.startsWith(`${cwd}/`) ? p.slice(cwd.length + 1) : p;
     };
-    if (ev.name === 'Bash' || ev.name === 'Shell') return h('code', null, (input.command || ev.title || '').split('\n')[0]);
+    if (ev.name === 'Bash' || ev.name === 'Shell') {
+      const cmd = (input.command || ev.title || '').split('\n')[0];
+      // Claude says what a command does: that, with the command in the card.
+      return input.description ? h('span', { title: cmd }, input.description) : h('code', null, cmd);
+    }
     if (input.path || input.file_path) return h('code', null, rel(input.path || input.file_path));
+    if (ev.name === 'CodeExecution' && (input.code || input.command)) return h('code', null, String(input.code || input.command).split('\n')[0]);
     if (input.pattern) return h('code', null, input.pattern);
     if (input.url) return h('span', null, input.url);
     if (ev.name === 'AskUserQuestion') return h('span', null, ev.title);
@@ -837,22 +1446,34 @@ export class Transcript {
   // "⎿ Read 120 lines": the first lines of a command's output, how many
   // lines were read, how many matches were found.
   peek(ev) {
-    const bash = /^(Bash|Shell)$/.test(ev.name);
+    const bash = /^(Bash|Shell|CodeExecution)$/.test(ev.name);
     if (ev.status === 'running' && ev.output && bash) {
       return [h('pre', { class: 'tail' }, ev.output.replace(/\n$/, '').split('\n').slice(-3).join('\n'))];
     }
     if (ev.status !== 'done') return [];
+    // A preview cut short has no honest line count: say how big it is.
+    if (ev.truncated?.field === 'output') return [h('div', { class: 'result' }, `輸出很長（${fmtSize(Number(ev.truncated.bytes) || 0)}），展開後可載入完整內容`)];
     const out = String(ev.output || '').replace(/\s+$/, '');
     const n = lineCount(out);
     const line = (text) => [h('div', { class: 'result' }, text)];
     if (bash) {
-      if (!out) return line('（沒有輸出）');
+      if (!out || out === '(no output)') return line('（沒有輸出）');
       const lines = out.split('\n');
       return [h('pre', { class: 'result-out' }, lines.slice(0, 3).join('\n')), lines.length > 3 ? h('div', { class: 'result' }, `… 還有 ${lines.length - 3} 行`) : null].filter(Boolean);
     }
-    if (/^Read/.test(ev.name)) return line(n ? `讀了 ${n} 行` : '空的檔案');
-    if (ev.name === 'Grep') return line(n ? `找到 ${n} 筆` : '沒有找到');
-    if (ev.name === 'Glob') return line(n ? `找到 ${n} 個檔案` : '沒有找到');
+    // Claude's Read, Grep and Glob end a long result with "… 120 more lines".
+    const more = out.match(/\n… (?:and )?(\d+) more[^\n]*$/);
+    const shown = more ? n - 1 : n;
+    if (/^Read/.test(ev.name)) {
+      if (/^（圖片/.test(out)) return line(out);
+      if (!shown || out === '(the file is empty)') return line('空的檔案');
+      return line(`讀了 ${shown} 行${more ? `，還有 ${more[1]} 行` : ''}`);
+    }
+    const total = shown + (more ? Number(more[1]) : 0);
+    if (ev.name === 'Grep') return line(total ? `找到 ${total} 筆` : '沒有找到');
+    if (ev.name === 'Glob') return line(total ? `找到 ${total} 個檔案` : '沒有找到');
+    const links = webLinks(ev);
+    if (links) return line(ev.name === 'WebSearch' ? `找到 ${links.length} 個結果` : links[0].title);
     if (/^(Write|WriteFile|Edit|MultiEdit|StrReplaceFile|TodoList|TodoWrite|SetTodoList|ExitPlanMode|EnterPlanMode|AskUserQuestion)$/.test(ev.name)) return [];
     if (!out) return [];
     const first = out.split('\n')[0];
@@ -866,9 +1487,22 @@ export class Transcript {
     switch (ev.name) {
       case 'Bash':
       case 'Shell':
-        if (input?.command?.includes('\n')) out.push(h('pre', { class: 'out cmd' }, input.command));
+        // On one line in the row, unless a description took its place.
+        if (input?.command && (input.description || input.command.includes('\n'))) out.push(h('pre', { class: 'out cmd' }, input.command));
         output(ev.output, ev.status === 'error' ? 'err' : '');
         break;
+      case 'CodeExecution':
+        // Run in the Claude API's sandbox, not on this computer.
+        if (input?.code || input?.command?.includes('\n')) out.push(h('pre', { class: 'out cmd' }, input.code || input.command));
+        output(ev.output, ev.status === 'error' ? 'err' : '');
+        break;
+      case 'WebSearch':
+      case 'WebFetch': {
+        const links = webLinks(ev);
+        if (!links) return this.toolArgs(ev, input, out);
+        out.push(h('ul', { class: 'web-links' }, ...links.map((l) => h('li', null, h('a', { href: l.url, target: '_blank', rel: 'noopener noreferrer' }, l.title), h('span', { class: 'web-host' }, hostOf(l.url))))));
+        break;
+      }
       case 'Edit':
       case 'StrReplaceFile':
         if (typeof input?.old_string === 'string') out.push(renderLineDiff(input.old_string, input.new_string ?? '', { context: 2 }));
@@ -888,12 +1522,18 @@ export class Transcript {
         else output(ev.output);
         break;
       default:
-        if (input && !/^(Read|ReadFile|Glob|Grep)$/.test(ev.name)) {
-          const keys = Object.keys(input).filter((k) => input[k] !== '' && input[k] != null);
-          if (keys.length) out.push(h('pre', { class: 'out args' }, keys.map((k) => `${k}: ${typeof input[k] === 'string' ? input[k] : JSON.stringify(input[k])}`).join('\n')));
-        } else if (!input && ev.argsText) out.push(h('pre', { class: 'out args' }, ev.argsText));
-        output(ev.output, ev.status === 'error' ? 'err' : '');
+        return this.toolArgs(ev, input, out);
     }
+    return out;
+  }
+
+  // Any other tool: its arguments, then its output.
+  toolArgs(ev, input, out) {
+    if (input && !/^(Read|ReadFile|Glob|Grep|AskUserQuestion)$/.test(ev.name)) {
+      const keys = Object.keys(input).filter((k) => input[k] !== '' && input[k] != null);
+      if (keys.length) out.push(h('pre', { class: 'out args' }, keys.map((k) => `${k}: ${typeof input[k] === 'string' ? input[k] : JSON.stringify(input[k])}`).join('\n')));
+    } else if (!input && ev.argsText) out.push(h('pre', { class: 'out args' }, ev.argsText));
+    if (ev.output) out.push(h('pre', { class: `out ${ev.status === 'error' ? 'err' : ''}` }, ev.output.replace(/\n$/, '')));
     return out;
   }
 
@@ -910,30 +1550,36 @@ export class Transcript {
   renderAgent(node, ic, verb) {
     const ev = node.ev;
     const sub = ev.subagent || {};
-    const input = ev.input || {};
     const kids = this.childrenOf(ev.id);
-    const running = agentRunning(ev);
+    const { life, model } = this.agentView(ev);
+    const { running, failed, stopped, unknown } = life;
+    this.lifeSeen.set(ev.id, `${life.state}|${life.reason}|${model.waiting}`);
     const open = this.agentOpen(ev);
-    const steps = kids.filter((k) => k.type === 'tool_use').length;
+    const steps = this.stepCount(ev.id, kids);
     const last = [...kids].reverse().find((k) => k.type === 'tool_use' || (k.type === 'text' && k.text?.trim()));
     let activity = '';
     if (running && last) activity = last.type === 'tool_use' ? `${(TOOLS[last.name] || [null, last.name])[1]} ${last.title || ''}` : last.text.trim().split('\n').pop();
-    const label = ev.name === 'btw' ? verb : `${verb}${sub.name && sub.name !== 'subagent' && sub.name !== 'btw' ? ` · ${sub.name}` : ''}`;
+    const name = agentName(sub);
+    const base = ev.name === 'btw' || !INTERNAL_TITLE.test(String(verb || '')) ? verb : '子代理';
+    const label = ev.name === 'btw' ? verb : `${base}${name ? ` · ${name}` : ''}`;
+    const description = agentDescription(ev, sub);
     const summary = sub.summary;
     // Redrawn only when something on it changed: a working subagent touches
     // its card many times a second, and a rebuilt spinner starts over.
-    const headKey = [label, sub.description || input.description || ev.title || '', steps, Boolean(sub.background), running, sub.status, ev.status, open].join('\u0001');
-    const bodyKey = [open, running, activity, summary, sub.error].join('\u0001');
+    const headKey = [label, description, steps, Boolean(sub.background), life.state, life.reason, sub.status, ev.status, open, model.text, model.mismatch, model.confirmed].join('\u0001');
+    const bodyKey = [open, running, activity, summary, sub.error, life.reason, model.requestedText, model.note].join('\u0001');
     const same = node.headKey === headKey && node.bodyKey === bodyKey && !(ev.permission && !ev.permission.chosen);
     node.children.hidden = !open;
     if (same) return;
     const statusEl = running
       ? h('span', { class: 'spinner' })
-      : sub.status === 'error' || ev.status === 'error'
-        ? h('span', { class: 'mark danger', title: '失敗' }, icon('alert'))
-        : sub.status === 'cancelled' || ev.status === 'interrupted'
-          ? h('span', { class: 'mark-text' }, '已中斷')
-          : null;
+      : failed
+        ? h('span', { class: 'mark danger', title: life.reasonText || '失敗' }, icon('alert'))
+        : stopped
+          ? h('span', { class: 'mark-text', title: life.reasonText || '' }, '已中斷')
+          : unknown
+            ? h('span', { class: 'mark-text agent-unknown', title: life.reasonText }, '狀態未知')
+            : null;
     if (node.headKey !== headKey) {
       node.headKey = headKey;
       fill(
@@ -942,20 +1588,33 @@ export class Transcript {
           'button',
           { class: 'tool-row', type: 'button', 'aria-expanded': String(open), onclick: () => this.toggle(ev.id, open) },
           h('span', { class: 'tool-icon' }, icon(ic)),
-          h('span', { class: 'tool-verb' }, label),
-          h('span', { class: 'tool-target' }, sub.description || input.description || ev.title || ''),
-          steps ? h('span', { class: 'tool-meta' }, `${steps} 個步驟`) : null,
-          sub.background ? h('span', { class: 'om-badge' }, '背景') : null,
+          h('span', { class: 'tool-verb', title: label }, label),
+          h('span', { class: 'tool-target' }, description),
+          // The model and what goes with it. Beside the title on a wide card
+          // (the box is `display: contents`); on its own line under it on a
+          // narrow one (app.css, @container agentcard), so none of it is cut off.
+          h(
+            'span',
+            { class: 'agent-meta' },
+            h('span', { class: `tool-meta subagent-model${model.confirmed ? '' : ' unconfirmed'}${model.mismatch ? ' mismatch' : ''}`, title: model.title }, model.text),
+            model.mismatch ? h('span', { class: 'tool-meta subagent-mismatch', title: model.title }, '與要求不同') : null,
+            steps ? h('span', { class: 'tool-meta' }, `${steps} 個步驟`) : null,
+            sub.background ? h('span', { class: 'om-badge' }, '背景') : null,
+          ),
           statusEl,
           icon('chev', 'chev'),
         ),
       );
     }
     node.bodyKey = bodyKey;
+    // What was asked for is said on its own line, and as a request: it is not
+    // the model that ran.
+    const notes = [model.requestedText, model.note, unknown || stopped || failed ? life.reasonText : ''].filter(Boolean);
     fill(
       node.body,
       !open && running && activity ? h('div', { class: 'agent-activity' }, activity) : null,
       !open && !running && summary ? h('div', { class: 'agent-summary clamp' }, summary) : null,
+      notes.length ? h('div', { class: 'agent-notes' }, notes.map((t) => h('div', { class: 'agent-note' }, t))) : null,
       sub.error ? h('div', { class: 'callout danger small' }, icon('alert'), h('div', { class: 'callout-text' }, sub.error)) : null,
     );
     if (open && summary && !running) {
@@ -1002,7 +1661,7 @@ export class Transcript {
     }
     const verb = /^(Bash|Shell)$/.test(ev.name) ? '執行這個指令' : /^(Write|Edit|MultiEdit|StrReplaceFile)$/.test(ev.name) ? '修改這個檔案' : `使用 ${ev.name}`;
     box.append(
-      h('div', { class: 'ask-q' }, `要讓 Kimi ${verb}嗎？`),
+      h('div', { class: 'ask-q' }, `要讓 ${this.name()} ${verb}嗎？`),
       h(
         'div',
         { class: 'ask-actions' },
@@ -1023,7 +1682,7 @@ export class Transcript {
         type: 'button',
         onclick: (e) => {
           const actions = e.currentTarget.parentElement;
-          const ta = h('textarea', { class: 'om-input', rows: 2, placeholder: '告訴 Kimi 要改成怎麼做（可以留白）' });
+          const ta = h('textarea', { class: 'om-input', rows: 2, placeholder: `告訴 ${this.name()} 要改成怎麼做（可以留白）` });
           const form = h(
             'div',
             { class: 'ask-reject' },
@@ -1142,7 +1801,8 @@ export class Transcript {
         this.workingKind = 'running';
         this.secsEl = h('span', { class: 'muted' });
         this.tpsEl = h('span', { class: 'muted', title: '產生速度：這一輪生成的 token 數 ÷ 生成時間' });
-        fill(this.working, h('div', { class: 'working-line' }, h('span', { class: 'pulse' }), h('span', null, 'Kimi 正在處理'), this.secsEl, this.tpsEl, h('span', { class: 'muted hint' }, ' · Esc 停止')));
+        this.servedEl = h('span', { class: 'muted', title: '最近一次回應實際由這個模型產生（每次回應都會更新）' }, this.served ? ` · ${this.served}` : '');
+        fill(this.working, h('div', { class: 'working-line' }, h('span', { class: 'pulse' }), h('span', null, `${this.name()} 正在處理`), this.servedEl, this.secsEl, this.tpsEl, h('span', { class: 'muted hint' }, ' · Esc 停止')));
       }
       this.secsEl.textContent = secs ? ` · ${secs}` : '';
       this.tpsEl.textContent = this.tps ? ` · ${this.tps} tok/s` : '';
@@ -1188,3 +1848,48 @@ export function todoList(todos) {
   );
 }
 
+
+// A message's text, with the files attached to it (<file name="…">…</file>)
+// as cards that open to show what was sent.
+function userText(text) {
+  if (!text) return [];
+  const files = [];
+  let rest = text.replace(/\n*<file name="([^"]*)">\n([\s\S]*?)\n<\/file>/g, (_, name, content) => (files.push({ name, content }), '')).trim();
+  // Files saved in the folder: the list the hub added, set apart.
+  const i = rest.search(/\n*\[附件\] /);
+  const saved = i === -1 ? '' : rest.slice(i).trim();
+  if (i !== -1) rest = rest.slice(0, i).trim();
+  return [
+    rest ? h('div', { class: 'user-text' }, rest) : null,
+    saved ? h('div', { class: 'user-attach' }, icon('attach'), h('span', null, saved.replace(/^\[附件\] /, ''))) : null,
+    files.length
+      ? h(
+          'div',
+          { class: 'user-files' },
+          ...files.map((f) => h('details', { class: 'user-file' }, h('summary', null, icon('document'), h('span', null, f.name), h('span', { class: 'user-file__size' }, `${f.content.split('\n').length} 行`)), h('pre', null, f.content))),
+        )
+      : null,
+  ];
+}
+
+// Draws a few made-up rows once the page is idle, off screen. The first
+// conversation a person opens would otherwise pay for the Markdown and DOMPurify
+// code being run for the first time (about 60 ms on a laptop); this pays it
+// while nothing is waiting.
+export function warmTranscript() {
+  try {
+    const t = new Transcript({ cwd: '/', agentName: 'Kimi', onRespond: async () => {} });
+    const md = '# Title\n\nSome **bold**, `code` and a [link](https://example.com).\n\n- one\n- two\n\n```js\nconst a = 1;\n```\n\n| a | b |\n| - | - |\n| 1 | 2 |\n';
+    const ts = Date.now();
+    t.load([
+      { id: 'w1', ts, type: 'user', text: 'hello' },
+      { id: 'w2', ts, type: 'thinking', text: 'hm' },
+      { id: 'w3', ts, type: 'tool_use', agentId: 'main', name: 'Read', title: '/a', status: 'done', input: { path: '/a' }, output: '1\t2' },
+      { id: 'w4', ts, type: 'tool_use', agentId: 'main', name: 'Bash', title: 'ls', status: 'done', input: { command: 'ls' }, output: 'a\nb\nc\nd' },
+      { id: 'w5', ts, type: 'tool_use', agentId: 'main', name: 'Edit', title: '/a', status: 'done', input: { path: '/a', old_string: 'a', new_string: 'b' }, output: 'ok' },
+      { id: 'w6', ts, type: 'text', agentId: 'main', text: md },
+      { id: 'w7', ts, type: 'turn_end', durationMs: 1 },
+    ]);
+    t.destroy();
+  } catch {}
+}

@@ -152,8 +152,11 @@ class AcpConnection {
     this.proc.stdin.on('error', () => {});
 
     let buf = '';
+    // Decoded as a stream: a multi-byte character cut at a chunk boundary stays whole.
+    this.proc.stdout.setEncoding('utf8');
+    this.proc.stderr.setEncoding('utf8');
     this.proc.stdout.on('data', (chunk) => {
-      buf += chunk.toString('utf8');
+      buf += chunk;
       let nl;
       while ((nl = buf.indexOf('\n')) !== -1) {
         const line = buf.slice(0, nl).trim();
@@ -170,7 +173,7 @@ class AcpConnection {
       }
     });
     this.proc.stderr.on('data', (chunk) => {
-      this.stderr = (this.stderr + chunk.toString('utf8')).slice(-8000);
+      this.stderr = (this.stderr + chunk).slice(-8000);
     });
   }
 

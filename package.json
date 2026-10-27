@@ -2,24 +2,35 @@
   "name": "agent-hub",
   "version": "0.3.0",
   "description": "A Claude-Code-web-style control center for Kimi Code on all your computers: follow and drive Kimi (terminal or kimi web) from one browser UI.",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jim890906abc/test.git"
+  },
   "type": "module",
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",
     "dev": "node --watch server/index.js",
-    "test": "node --test test/*.test.mjs",
-    "check": "for f in server/*.js server/adapters/*.js public/js/*.js bridge/*.mjs test/*.mjs; do node --check \"$f\" || exit 1; done",
+    "test": "node scripts/run-tests.mjs",
+    "check": "for f in server/*.js server/adapters/*.js public/js/*.js bridge/*.mjs scripts/*.mjs test/*.mjs test/fixtures/*.mjs; do node --check \"$f\" || exit 1; done && npm run --silent check:bundle",
+    "check:bundle": "node scripts/check-bundle.mjs",
     "public": "bash scripts/start-public.sh",
-    "bridge": "node bridge/agent-hub-bridge.mjs"
+    "bridge": "node bridge/agent-hub-bridge.mjs",
+    "build:daemon": "esbuild server/claude-daemon.js --bundle --platform=node --format=esm --target=node22 --outfile=bridge/claude-daemon.mjs \"--banner:js=/* Generated from server/claude-daemon.js by npm run build:daemon (do not edit). */ import { createRequire as __agentHubCreateRequire } from 'node:module'; const require = __agentHubCreateRequire(import.meta.url);\""
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "license": "MIT",
   "dependencies": {
-    "dompurify": "^3.4.16",
+    "@anthropic-ai/sdk": "0.129.0",
+    "dompurify": "^3.4.17",
     "express": "^5.2.1",
     "marked": "^18.0.14",
     "ws": "^8.22.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
   }
 }

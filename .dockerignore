@@ -1,6 +1,56 @@
-node_modules
+# Nothing from the working folder that is local state, a secret or somebody's
+# files goes into the image (COPY . . would burn it in, for good). Patterns here
+# are relative to the folder root: **/ is what makes one apply at any depth.
+
+# Version control and editors
+.git
+.gitignore
+.gitattributes
+**/.DS_Store
+**/*.swp
+**/*~
+.idea
+.vscode
+.claude
+
+# Local state and secrets: login token and bridge key (data/hub.json), API
+# keys, conversations, workspaces; environment files and keys
+**/node_modules
 data
 workspaces
 bin
 dist
-.git
+**/.env
+**/.env.*
+!**/.env.example
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+
+# Logs, scratch files and backups, wherever they are
+**/*.log
+**/*.tmp
+**/*.bak
+**/*.orig
+**/*.rej
+**/npm-debug.log*
+.npm
+coverage
+
+# public/ is the product page only (index.html, css/*.css, js/*.js); the Hub
+# serves nothing else from it, so a report, a screenshot or a note dropped there
+# must never reach the image
+public/*
+!public/index.html
+!public/css
+public/css/*
+!public/css/*.css
+!public/js
+public/js/*
+!public/js/*.js
+
+# Strays from running the connect command inside this folder
+/agent-hub-bridge.mjs
+undefined
+null

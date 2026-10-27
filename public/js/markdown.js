@@ -5,13 +5,16 @@ import { h, fill, icon, copyText } from './dom.js';
 
 marked.setOptions({ gfm: true, breaks: false });
 
-export function markdownInto(el, text) {
-  el.innerHTML = DOMPurify.sanitize(marked.parse(text || ''), { ADD_ATTR: ['target'] });
-  for (const a of el.querySelectorAll('a[href]')) {
+// The HTML for Markdown `text`, safe to put in a page, as a fragment.
+function fragmentOf(html) {
+  const t = document.createElement('template');
+  t.innerHTML = DOMPurify.sanitize(html, { ADD_ATTR: ['target'] });
+  const root = t.content;
+  for (const a of root.querySelectorAll('a[href]')) {
     a.target = '_blank';
     a.rel = 'noopener';
   }
-  for (const pre of el.querySelectorAll('pre')) {
+  for (const pre of root.querySelectorAll('pre')) {
     const btn = h('button', { class: 'code-copy', type: 'button', title: '複製', 'aria-label': '複製' }, icon('copy'));
     btn.onclick = async () => {
       await copyText(pre.querySelector('code')?.innerText ?? pre.innerText);
@@ -20,7 +23,83 @@ export function markdownInto(el, text) {
     };
     pre.append(btn);
   }
+  return root;
+}
+
+export function markdownInto(el, text) {
+  el.replaceChildren(fragmentOf(marked.parse(text || '')));
   return el;
+}
+
+// A reply that is still being written. Text only grows, so everything but its
+// last block is final: those blocks are drawn once and left alone, and only
+// the last block (the one still changing) is parsed and drawn again with
+// each addition. A long reply then costs about as much per update as a short
+// one, and the part already on screen is not laid out again. The finished
+// reply is always drawn whole by markdownInto, so any difference this could
+// make lives only while it is being written.
+//
+// Reference-style links ([text][ref] with "[ref]: url" somewhere) are the
+// one thing a later block can change in an earlier one; text that has any is
+// drawn whole each time.
+const REF_DEF = /^ {0,3}\[[^\]\n]+\]:[ \t]*\S/m;
+// Blocks that the block after them can still become part of (a list gets
+// another item, a quote another line, a table another row).
+const OPEN_ENDED = new Set(['list', 'blockquote', 'table']);
+// Raw HTML can leave a tag open for a later block to close, and the browser
+// then nests the later block inside it: it cannot be drawn in separate pieces.
+const hasHtml = (t) => t.type === 'html' || Boolean(t.tokens?.some(hasHtml)) || Boolean(t.items?.some(hasHtml));
+
+export class MarkdownStream {
+  constructor(el) {
+    this.el = el;
+    this.reset();
+  }
+
+  reset() {
+    this.text = '';
+    this.fixedLen = 0; // characters of the text that are final
+    this.fixedNodes = 0; // child nodes of the element that draw them
+  }
+
+  update(text) {
+    text = text || '';
+    if (!text.startsWith(this.text) || REF_DEF.test(text) || text.includes('\r')) {
+      this.reset();
+      if (REF_DEF.test(text) || text.includes('\r')) {
+        markdownInto(this.el, text);
+        this.text = text;
+        return this.el;
+      }
+    }
+    const tokens = marked.lexer(text.slice(this.fixedLen));
+    // Final: every block before the last one, except a block the next one can
+    // still join, and anything from the first raw HTML on.
+    let cut = tokens.length - 1;
+    while (cut >= 0 && tokens[cut].type === 'space') cut--;
+    cut = Math.max(0, cut);
+    for (;;) {
+      let j = cut - 1;
+      while (j >= 0 && tokens[j].type === 'space') j--;
+      if (j >= 0 && OPEN_ENDED.has(tokens[j].type)) cut = j;
+      else break;
+    }
+    const html = tokens.findIndex(hasHtml);
+    if (html !== -1) cut = Math.min(cut, html);
+    const stable = tokens.slice(0, cut);
+    const live = tokens.slice(cut);
+    // what was drawn for the changing part goes; what is final stays
+    while (this.el.childNodes.length > this.fixedNodes) this.el.lastChild.remove();
+    if (stable.length) {
+      const frag = fragmentOf(marked.parser(stable));
+      this.fixedNodes += frag.childNodes.length;
+      this.fixedLen += stable.reduce((n, t) => n + t.raw.length, 0);
+      this.el.append(frag);
+    }
+    if (live.length) this.el.append(fragmentOf(marked.parser(live)));
+    this.text = text;
+    return this.el;
+  }
 }
 
 export const renderMarkdown = (text, cls = 'md') => markdownInto(h('div', { class: cls }), text);

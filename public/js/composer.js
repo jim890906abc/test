@@ -1,9 +1,14 @@
 // The message box: auto-growing input, / commands, images, and the
 // model / thinking / permission controls. Used on the home screen (new
-// conversation) and under every conversation.
+// conversation) and under every conversation, for Kimi and for Claude
+// (state.agent === 'claude': Claude through the Claude API, run by the hub;
+// 'deepseek': a DeepSeek model inside Kimi, billed to a gateway's API key).
 import { h, fill, icon, fmtTokens, clockTime, fmtCountdown } from './dom.js';
 import { openMenu, closeMenu, place } from './menu.js';
 import { todoList } from './transcript.js';
+import { effectiveSubagent } from './home-state.js';
+import { modelWithProvider } from './providers.js';
+import { driftChips, driftText, contextHintNode } from './model-drift.js';
 
 export const PERMISSION_LABELS = { manual: '每次詢問', yolo: '需要時詢問', auto: '全部自動' };
 const PERMISSION_DESC = {
@@ -11,8 +16,30 @@ const PERMISSION_DESC = {
   yolo: '一般修改與指令直接做，有風險的才問',
   auto: '全部自動決定，不會打斷你',
 };
-export const EFFORT_LABELS = { off: '關閉', on: '開啟', low: '低', medium: '中', high: '高', xhigh: '很高', max: '最高' };
+// Thinking levels by their official names (Kimi's and Claude's alike).
+export const EFFORT_LABELS = { off: 'off', on: 'on', low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' };
+// Claude's permission modes, as Claude Code names them.
+export const CLAUDE_PERMISSION_LABELS = { manual: '每次詢問', edits: '自動接受編輯', auto: '全部自動' };
+const CLAUDE_PERMISSION_DESC = {
+  manual: '每個檔案修改與指令都先問你',
+  edits: '修改檔案直接做，執行指令前先問你',
+  auto: '全部直接做，不會打斷你',
+};
+export const permissionLabels = (agent) => (agent === 'claude' ? CLAUDE_PERMISSION_LABELS : PERMISSION_LABELS);
+export const agentName = (agent) => (agent === 'claude' ? 'Claude' : agent === 'deepseek' ? 'DeepSeek' : 'Kimi');
+// US$, with more digits while it is small.
+export const fmtUsd = (n) => `US$${n >= 1 ? n.toFixed(2) : n >= 0.01 ? n.toFixed(3) : (n || 0).toFixed(4)}`;
 const MAX_IMAGES = 8;
+// Text files (Markdown, HTML, code, logs…): read here and sent with the
+// message as text, so Claude and Kimi both get them.
+const MAX_DOCS = 15;
+const MAX_DOC_BYTES = 1_000_000;
+const DOC_EXT = /\.(md|markdown|mdx|txt|text|html?|xhtml|css|js|mjs|cjs|jsx|ts|tsx|json|jsonl|ya?ml|toml|ini|cfg|conf|env\.example|csv|tsv|log|xml|svg|py|rb|go|rs|java|kt|c|h|cc|cpp|hpp|cs|php|sh|bash|zsh|ps1|sql|r|lua|swift|vue|svelte|tex|rst|org|diff|patch)$/i;
+const MAX_ZIP_BYTES = 20_000_000;
+const isZip = (f) => /\.zip$/i.test(f.name || '') || /zip/.test(f.type || '');
+const isDoc = (f) => isZip(f) || DOC_EXT.test(f.name || '') || /^text\//.test(f.type || '') || /json|xml|javascript/.test(f.type || '');
+const isImage = (f) => /^image\//.test(f.type || '') && !/svg/.test(f.type || '');
+const DOC_ACCEPT = '.zip,.md,.markdown,.mdx,.txt,.html,.htm,.css,.js,.mjs,.jsx,.ts,.tsx,.json,.jsonl,.yaml,.yml,.toml,.ini,.cfg,.conf,.csv,.tsv,.log,.xml,.svg,.py,.rb,.go,.rs,.java,.kt,.c,.h,.cpp,.hpp,.cs,.php,.sh,.ps1,.sql,.lua,.swift,.vue,.svelte,.tex,.rst,.diff,.patch';
 
 // Built-in commands; Kimi skills are appended from the session.
 const BG_DESCRIPTION = '移到背景（Ctrl+B）：Kimi 正在等的子代理或指令改到背景繼續跑，Kimi 不用再等它';
@@ -39,10 +66,49 @@ export const COMMANDS = [
   { name: 'status', description: '目前的模型、權限、context、帳號與電腦' },
   { name: 'autopause', description: '自動暫停：5 小時額度用到設定的 % 送出「優雅暫停」，恢復後送出「繼續」', args: true, hint: '[% | off]' },
   { name: 'later', description: '定時送出：幾分鐘後、指定時間，或 5 小時額度恢復後送出訊息', args: true, hint: '[30 | 15:30 | reset] [訊息]' },
+  { name: 'backup', description: '把這個專案的資料夾備份到你的 Google Drive（中控台自己做，不花 token）' },
+  { name: 'steer', description: '全部插隊：排隊中、等待插隊的訊息一次全部送進正在跑的這一輪，下一步一起讀到', aliases: ['steerall', 'flush'] },
 ];
 const HOME_COMMANDS = ['model', 'effort', 'plan', 'permission', 'yolo', 'auto', 'manual', 'usage', 'status'];
+// DeepSeek runs in Kimi, so Kimi's commands apply, except the ones about the
+// Kimi subscription's quota (it is not used); /later has times only.
+const DEEPSEEK_NO = ['autopause', 'usage'];
+const deepseekCommands = (list) =>
+  list
+    .filter((c) => !DEEPSEEK_NO.includes(c.name))
+    .map((c) => ({
+      ...c,
+      description: c.name === 'later' ? '定時送出：幾分鐘後或指定時間送出訊息' : c.description.replace(/Kimi/g, 'DeepSeek'),
+      ...(c.name === 'later' ? { hint: '[30 | 15:30] [訊息]' } : {}),
+    }));
+// Claude through the Claude API: the hub runs it, so these are the hub's.
+export const CLAUDE_COMMANDS = [
+  { name: 'model', description: '切換模型' },
+  { name: 'effort', description: '調整思考強度' },
+  { name: 'plan', description: '開關計畫模式：先規劃，你同意後才動手' },
+  { name: 'permission', description: '選擇權限模式' },
+  { name: 'manual', description: '每次詢問：修改檔案與執行指令前都先問你' },
+  { name: 'edits', description: '自動接受編輯：修改檔案直接做，執行指令前先問你', aliases: ['accept-edits'] },
+  { name: 'auto', description: '全部自動：不再詢問' },
+  { name: 'compact', description: '壓縮對話：讓 Claude 寫摘要取代前面的內容，省下之後每一輪的 token', args: true, hint: '[補充指示]' },
+  { name: 'undo', description: '撤回上一輪對話（檔案的修改不會還原）', aliases: ['rewind'] },
+  { name: 'init', description: '分析專案並寫出 CLAUDE.md' },
+  { name: 'fork', description: '複製這個對話成新的對話', args: true, hint: '[標題]' },
+  { name: 'title', description: '修改對話標題', args: true, hint: '<標題>' },
+  { name: 'new', description: '在同一個資料夾開新對話', aliases: ['clear'] },
+  { name: 'copy', description: '複製 Claude 最後一則回覆' },
+  { name: 'cost', description: '這個對話花了多少（依 API 用量估計）與速率限制', aliases: ['usage'] },
+  { name: 'budget', description: '花費上限：這個對話花到這個金額就先停下', args: true, hint: '<美元> | off' },
+  { name: 'status', description: '目前的模型、權限、context、API key 與資料夾' },
+  { name: 'later', description: '定時送出：幾分鐘後或指定時間送出訊息', args: true, hint: '[30 | 15:30] [訊息]' },
+  { name: 'backup', description: '把這個專案的資料夾備份到你的 Google Drive（中控台自己做，不花 token）' },
+  { name: 'steer', description: '全部插隊：排隊中、等待插隊的訊息一次全部送進正在跑的這一輪，下一步一起讀到', aliases: ['steerall', 'flush'] },
+];
+const CLAUDE_HOME_COMMANDS = ['model', 'effort', 'plan', 'permission', 'manual', 'edits', 'auto', 'status'];
 // A Kimi running in a terminal runs its own slash commands; these are the
-// ones that work without its on-screen pickers.
+// ones that work without its on-screen pickers. An uncontrollable terminal
+// keeps this list too, but the hub sends the commands through the Kimi
+// Server API instead of the TUI.
 const TERMINAL_COMMANDS = [
   { name: 'bg', description: BG_DESCRIPTION, aliases: ['background'] },
   { name: 'usage', description: '方案用量：5 小時、7 天與本月額度' },
@@ -62,6 +128,8 @@ const TERMINAL_COMMANDS = [
   { name: 'copy', description: '複製 Kimi 最後一則回覆' },
   { name: 'autopause', description: '自動暫停：5 小時額度用到設定的 % 送出「優雅暫停」，恢復後送出「繼續」', args: true, hint: '[% | off]' },
   { name: 'later', description: '定時送出：幾分鐘後、指定時間，或 5 小時額度恢復後送出訊息', args: true, hint: '[30 | 15:30 | reset] [訊息]' },
+  { name: 'backup', description: '把這個專案的資料夾備份到你的 Google Drive（中控台自己做，不花 token）' },
+  { name: 'steer', description: '全部插隊：排隊中、等待插隊的訊息一次全部送進正在跑的這一輪，下一步一起讀到', aliases: ['steerall', 'flush'] },
 ];
 
 // "15:42（2 小時 13 分後）", or just the time once it has passed.
@@ -110,13 +178,14 @@ export class Composer {
     this.opts = opts;
     this.state = {};
     this.images = [];
+    this.docs = [];
     this.drafts = new Map();
     this.key = null;
-    this.input = h('textarea', { class: 'composer-input', rows: 1, placeholder: opts.placeholder || '回覆 Kimi…', 'aria-label': '訊息' });
+    this.input = h('textarea', { class: 'composer-input', rows: 1, placeholder: opts.placeholder || `回覆 ${agentName(opts.agent)}…`, 'aria-label': '訊息' });
     this.thumbs = h('div', { class: 'composer-images', hidden: true });
     this.left = h('div', { class: 'composer-tools' });
     this.right = h('div', { class: 'composer-actions' });
-    this.file = h('input', { type: 'file', accept: 'image/*', multiple: true, hidden: true, onchange: () => (this.addFiles(this.file.files), (this.file.value = '')) });
+    this.file = h('input', { type: 'file', accept: `image/*,${DOC_ACCEPT}`, multiple: true, hidden: true, onchange: () => (this.addFiles(this.file.files), (this.file.value = '')) });
     this.box = h('div', { class: 'composer-box' }, this.thumbs, this.input, h('div', { class: 'composer-bar' }, this.left, this.right), this.file);
     this.tray = h('div', { class: 'composer-tray' });
     this.slash = null;
@@ -137,7 +206,7 @@ export class Composer {
     });
     input.addEventListener('keydown', (e) => this.onKey(e));
     input.addEventListener('paste', (e) => {
-      const files = [...(e.clipboardData?.files || [])].filter((f) => f.type.startsWith('image/'));
+      const files = [...(e.clipboardData?.files || [])].filter((f) => isImage(f) || isDoc(f));
       if (files.length) {
         e.preventDefault();
         this.addFiles(files);
@@ -152,7 +221,7 @@ export class Composer {
     this.box.addEventListener('dragleave', () => this.box.classList.remove('drop'));
     this.box.addEventListener('drop', (e) => {
       this.box.classList.remove('drop');
-      const files = [...(e.dataTransfer?.files || [])].filter((f) => f.type.startsWith('image/'));
+      const files = [...(e.dataTransfer?.files || [])].filter((f) => isImage(f) || isDoc(f));
       if (files.length) {
         e.preventDefault();
         this.addFiles(files);
@@ -163,12 +232,19 @@ export class Composer {
     });
   }
 
-  // Remember unsent text per conversation.
+  // Remember unsent text per conversation. Calling it again for the same
+  // conversation is a redraw, not a new conversation: keep attachments.
   setKey(key) {
+    if (this.key === key) {
+      this.renderActions();
+      return;
+    }
     if (this.key) this.drafts.set(this.key, this.input.value);
     this.key = key;
     this.input.value = this.drafts.get(key) || '';
     this.images = [];
+    this.docs = [];
+    this.uploadDir = null; // each conversation starts with its own folder
     this.renderImages();
     this.grow();
     this.renderActions();
@@ -193,32 +269,11 @@ export class Composer {
   }
 
   // state: { running, awaiting, queue, todos, models, model, defaultModel,
-  //          effort, permission, planMode, context, skills, machineName, folderName }
+  //          effort, permission, planMode, context, skills, machineName, folderName,
+  //          terminal, controllable }
   update(state) {
     this.state = { ...this.state, ...state };
-    const readOnly = this.state.terminal && !this.state.controllable;
-    this.box.hidden = readOnly;
-    if (readOnly) {
-      this.note ??= h('div', { class: 'composer-note' });
-      // A terminal Kimi in the same folder might have it open: two Kimis on
-      // one conversation would overwrite each other, so only on request.
-      const unlock = () => {
-        if (confirm('確定終端機的 Kimi 沒有開著這個對話嗎？\n\n如果它開著，兩邊會各自寫入同一個對話、互相覆蓋。')) this.opts.onUnlock?.();
-      };
-      fill(
-        this.note,
-        icon('terminal'),
-        this.state.guess
-          ? h('div', { class: 'composer-note-text' }, h('div', { class: 'composer-note-title' }, '這個資料夾有終端機的 Kimi 開著'), h('div', null, '看不出它開的是不是這個對話，為了避免兩邊互相覆蓋，這裡先只能看。關掉那個 Kimi 就會解除。'))
-          : h('div', { class: 'composer-note-text' }, h('div', { class: 'composer-note-title' }, '這個對話正在終端機的 Kimi 裡執行'), h('div', null, '這裡會即時同步。要從這裡操作，在那個 Kimi 裡輸入 /web，或之後用 kimi-hub 啟動 Kimi。')),
-        this.state.guess && this.opts.onUnlock
-          ? h('button', { class: 'om-btn om-btn--sm', type: 'button', onclick: unlock }, '仍要從這裡操作')
-          : this.opts.onHelp
-            ? h('button', { class: 'om-btn om-btn--sm', type: 'button', onclick: () => this.opts.onHelp() }, '說明…')
-            : null,
-      );
-      if (!this.note.isConnected) this.el.append(this.note);
-    } else this.note?.remove();
+    if (!this.opts.placeholder) this.input.placeholder = `回覆 ${agentName(this.agent())}…`;
     this.renderTools();
     this.renderActions();
     this.renderTray();
@@ -226,10 +281,26 @@ export class Composer {
 
   // ------------------------------------------------------------- tools
 
+  agent() {
+    return this.state.agent || this.opts.agent || 'kimi';
+  }
+
+  claude() {
+    return this.agent() === 'claude';
+  }
+
+  // DeepSeek models in the computer's Kimi: Kimi's controls, minus its quota.
+  deepseek() {
+    return this.agent() === 'deepseek';
+  }
+
   currentModel() {
     const s = this.state;
     const id = s.model || s.defaultModel;
-    return (s.models || []).find((m) => m.id === id) || null;
+    const provider = s.provider || this.agent();
+    const list = s.models || [];
+    const hit = (m) => m.id === id || (m.alias && m.alias === id);
+    return list.find((m) => hit(m) && (!m.provider || m.provider === provider)) || list.find(hit) || null;
   }
 
   renderTools() {
@@ -241,30 +312,108 @@ export class Composer {
     // Kimi fixes the model and thinking when a turn starts: changed during
     // it, they say so, until the next turn picks them up.
     const working = s.running || s.awaiting;
-    const nameOf = (id) => (s.models || []).find((m) => m.id === id)?.name || id;
+    const runtime = this.agent();
+    const target = s.provider || runtime;
+    const actualProvider = s.turnProvider || runtime;
+    const pendingProvider = working && target !== actualProvider;
+    const nameOf = (id, provider = target) => (s.models || []).find((m) => m.id === id && (!m.provider || m.provider === provider))?.name || (s.models || []).find((m) => m.id === id)?.name || id;
     const nextModel = working && s.turnModel && s.model && s.turnModel !== s.model;
     const nextEffort = working && s.turnEffort && s.effort && s.turnEffort !== s.effort;
+    const showNextEffort = Boolean(nextEffort || pendingProvider);
     const effortName = (e) => EFFORT_LABELS[e] || e;
+    const targetName = model?.name || `${agentName(target)} 預設模型`;
+    // The native reports a model other than the one chosen (summary.modelDrift):
+    // the chip names what really runs, and the notice + button come after it.
+    const drift = s.drift || null;
+    const listName = (provider, id) => (s.models || []).find((m) => (m.id === id || m.alias === id) && (!m.provider || m.provider === provider))?.name || '';
+    const driftWords = drift ? driftText(drift, listName) : null;
+    // "DeepSeek V4.1 Flash", not "DeepSeek · DeepSeek V4.1 Flash": the provider
+    // is said once (providers.js modelWithProvider).
+    const targetFull = modelWithProvider(agentName(target), targetName);
+    const modelLabel = pendingProvider ? `本回合 ${agentName(actualProvider)}／下一回合 ${targetFull}` : `${targetFull}${nextModel ? '（下一輪）' : ''}`;
+    const modelTitle = pendingProvider
+      ? `本回合實際：${modelWithProvider(agentName(actualProvider), s.turnModel ? nameOf(s.turnModel, actualProvider) : '模型未回報')}；下一回合：${targetFull}。切換會在這一輪結束後才生效。`
+      : nextModel
+        ? `這一輪是用「${nameOf(s.turnModel, actualProvider)}」開始的。${agentName(target)} 每一輪開始時就固定模型，「${nameOf(s.model)}」從下一輪起使用`
+        : '模型（依 Kimi、Claude、DeepSeek 分組）';
     fill(
       this.left,
-      s.terminal ? null : h('button', { class: 'chip icon-only', type: 'button', title: '加入圖片', 'aria-label': '加入圖片', onclick: () => this.file.click() }, icon('attach')),
-      s.terminal ? h('span', { class: 'chip static', title: '這個對話在終端機的 Kimi 裡執行，你的訊息會打進那個終端機' }, icon('terminal'), h('span', null, '終端機')) : null,
-      this.opts.home ? chip(s.machineName || '選擇電腦', (b) => this.opts.onPickMachine(b), { iconName: 'computer', title: '要在哪一台電腦上執行', control: 'machine' }) : null,
-      this.opts.home ? chip(s.folderName || '選擇資料夾', (b) => this.opts.onPickFolder(b), { iconName: 'folder', title: '工作資料夾', control: 'folder' }) : null,
-      chip(s.planMode ? '計畫模式' : PERMISSION_LABELS[s.permission] || PERMISSION_LABELS.manual, (b) => this.permissionMenu(b), { iconName: s.planMode ? 'map' : 'shield', title: '權限模式', active: s.planMode, control: 'permission' }),
+      h('button', { class: 'chip icon-only', type: 'button', title: '加入圖片', 'aria-label': '加入圖片', onclick: () => this.file.click() }, icon('attach')),
+      s.terminal
+        ? h(
+            'span',
+            {
+              class: 'chip static',
+              title:
+                s.controllable === true
+                  ? '這個對話在終端機的 Kimi 裡執行，你的訊息會打進那個終端機'
+                  : '這個對話在終端機的 Kimi 裡執行；終端機目前不可控，這裡的訊息與操作會經 Kimi Server API 送出',
+            },
+            icon('terminal'),
+            h('span', null, '終端機'),
+          )
+        : null,
+      this.opts.home && this.opts.onPickMachine ? chip(s.machineName || '選擇電腦', (b) => this.opts.onPickMachine(b), { iconName: 'computer', title: '要在哪一台電腦上執行', control: 'machine' }) : null,
+      // Claude runs on the hub's own computer.
+      this.opts.home && !this.opts.onPickMachine && s.machineName ? h('span', { class: 'chip static', title: 'Claude 由中控台執行，工具在這台電腦上跑' }, icon('computer'), h('span', null, s.machineName)) : null,
+      this.opts.home ? chip(s.folderName || '選擇資料夾', (b) => this.opts.onPickFolder(b), { iconName: s.folderIcon || 'folder', title: s.folderIcon === 'branch' ? '綁定的 GitHub repo' : '工作資料夾', control: 'folder' }) : null,
+      chip(s.planMode ? '計畫模式' : permissionLabels(this.agent())[s.permission] || (s.permission ? s.permission : '權限（未回報）'), (b) => this.permissionMenu(b), { iconName: s.planMode ? 'map' : 'shield', title: '權限模式', active: s.planMode, control: 'permission' }),
       s.models?.length
-        ? chip(`${model?.name || 'Kimi 預設模型'}${nextModel ? '（下一輪）' : ''}`, (b) => this.modelMenu(b), {
-            title: nextModel ? `這一輪是用「${nameOf(s.turnModel)}」開始的。Kimi 每一輪開始時就固定模型，「${nameOf(s.model)}」從下一輪起使用` : '模型',
+        ? chip(driftWords ? driftWords.actual : modelLabel, (b) => this.modelMenu(b), {
+            title: driftWords ? driftWords.title : modelTitle,
+            active: Boolean(drift),
             control: 'model',
           })
         : null,
+      drift ? driftChips({ h, drift, nameOf: listName, onRestore: this.opts.onRestoreModel, running: working }) : null,
+      // Which model Anthropic says answered, as of the last response.
+      this.claude() && s.servedModel ? servedChip(s) : null,
       efforts.length > 1
-        ? chip(`思考 ${EFFORT_LABELS[s.effort] || s.effort || EFFORT_LABELS[model.defaultEffort] || '預設'}${nextEffort ? '（下一輪）' : ''}`, (b) => this.effortMenu(b), {
-            title: nextEffort ? `這一輪是用「${effortName(s.turnEffort)}」開始的。Kimi 每一輪開始時就固定思考強度，「${effortName(s.effort)}」從下一輪起使用` : '思考強度',
+        ? chip(`思考 ${EFFORT_LABELS[s.effort] || s.effort || EFFORT_LABELS[model.defaultEffort] || '預設'}${showNextEffort ? '（下一回合）' : ''}`, (b) => this.effortMenu(b), {
+            title: showNextEffort
+              ? `本回合實際：思考 ${effortName(s.turnEffort) || '模型預設'}；下一回合：思考 ${effortName(s.effort) || '模型預設'}`
+              : '思考強度',
             control: 'effort',
           })
         : null,
+      this.opts.onOpenSubagent ? this.subagentChip(chip) : null,
+      !s.models?.length && s.modelsLoading ? h('span', { class: 'chip static', title: '模型清單載入中' }, h('span', { class: 'spinner' }), h('span', null, '模型載入中…')) : null,
     );
+    // A chip wider than its row is shortened with an ellipsis (a computer or a
+    // folder with a long name, a long model line): its title always says the
+    // words in full, so nothing is only cut off.
+    for (const el of this.left.children) {
+      const words = [...el.children]
+        .filter((c) => c.tagName === 'SPAN')
+        .map((c) => c.textContent.trim())
+        .filter(Boolean)
+        .join(' ');
+      if (words && !el.title.includes(words)) el.title = el.title ? `${words}\n${el.title}` : words;
+    }
+  }
+
+  // The subagent for the next new subagent, and, while a turn runs, the one this
+  // turn started with when it is not the same (spec §2.2).
+  subagentChip(chip) {
+    const s = this.state;
+    const nameOf = (sub) => {
+      if (!sub) return '跟隨主模型';
+      const model = (s.models || []).find((m) => m.provider === sub.provider && (m.id === sub.model || m.alias === sub.model));
+      return `${modelWithProvider(agentName(sub.provider), model?.name || String(sub.model).split('/').pop())}${sub.effort ? ` · 思考 ${EFFORT_LABELS[sub.effort] || sub.effort}` : ''}`;
+    };
+    const mode = s.subagentMode || (s.subagent ? 'custom' : 'follow');
+    const next = effectiveSubagent(mode, s.subagent);
+    const nextName = `${nameOf(next)}${mode === 'default' ? '（預設）' : ''}`;
+    const working = s.running || s.awaiting;
+    // turnSubagent is undefined when no turn has recorded one.
+    const changed = Boolean(working) && s.turnSubagent !== undefined && JSON.stringify(s.turnSubagent ?? null) !== JSON.stringify(next ?? null);
+    const label = changed ? `本回合 ${nameOf(s.turnSubagent)}／下一回合 ${nextName}` : nextName;
+    const title = changed
+      ? `這一輪的新子代理用：${nameOf(s.turnSubagent)}。你改過設定，下一輪起新建的子代理用：${nextName}。已在跑的子代理不會換。`
+      : mode === 'follow'
+        ? '新子代理跟隨主模型（原生規則）；點一下可指定供應商、模型與思考強度。'
+        : `新子代理：${nextName}。只影響之後新建的子代理；已在跑的不會換。點一下可修改。`;
+    return chip(`子代理 ${label}`, (b) => this.opts.onOpenSubagent(b), { iconName: 'agents', title, control: 'subagent' });
   }
 
   // Open the menu behind a control (for /model, /effort, /permission).
@@ -276,10 +425,12 @@ export class Composer {
 
   permissionMenu(anchor) {
     const s = this.state;
+    const labels = permissionLabels(this.agent());
+    const desc = this.claude() ? CLAUDE_PERMISSION_DESC : PERMISSION_DESC;
     openMenu(
       anchor,
       [
-        ...['manual', 'yolo', 'auto'].map((p) => ({ label: PERMISSION_LABELS[p], description: PERMISSION_DESC[p], checked: (s.permission || 'manual') === p, onSelect: () => this.opts.onConfig({ permission: p }) })),
+        ...Object.keys(labels).map((p) => ({ label: labels[p], description: desc[p], checked: s.permission === p, onSelect: () => this.opts.onConfig({ permission: p }) })),
         { separator: true },
         { label: '計畫模式', description: '先寫好計畫，你同意後才開始修改', checked: Boolean(s.planMode), onSelect: () => this.opts.onConfig({ planMode: !s.planMode }) },
       ],
@@ -290,14 +441,45 @@ export class Composer {
   modelMenu(anchor) {
     const s = this.state;
     const cur = s.model || s.defaultModel;
-    openMenu(
-      anchor,
-      [
-        ...(s.running || s.awaiting ? [{ section: '模型 · 從下一輪起使用' }] : []),
-        ...(s.models || []).map((m) => ({ label: m.name, description: m.id !== m.name ? m.id : null, checked: m.id === cur, onSelect: () => this.opts.onConfig({ model: m.id }) })),
-      ],
-      { width: 260 },
-    );
+    const provider = s.provider || this.agent();
+    const groups = new Map();
+    for (const p of s.providers || []) groups.set(p.id, { provider: p, models: [] });
+    for (const m of s.models || []) {
+      const p = m.provider || provider;
+      if (!groups.has(p)) groups.set(p, { provider: null, models: [] });
+      groups.get(p).models.push(m);
+    }
+    const entries = [];
+    if (s.running || s.awaiting) entries.push({ section: '模型 · 從下一輪起使用' });
+    for (const [p, group] of groups) {
+      const list = group.models;
+      const available = group.provider ? group.provider.available !== false : list.some((m) => !m.disabled && m.providerAvailable !== false && m.available !== false);
+      const why = group.provider?.reason || list.find((m) => m.reason)?.reason || '';
+      entries.push({ section: `${agentName(p)}${available ? '' : `（不可用${why ? `：${why}` : ''}）`}` });
+      if (!list.length) {
+        entries.push({ label: '沒有可用模型', description: why || '這個供應商目前不可用', disabled: true });
+        continue;
+      }
+      for (const m of list) {
+        const disabled = Boolean(m.disabled || m.providerAvailable === false || m.available === false);
+        const efforts = Array.isArray(m.efforts) ? m.efforts : [];
+        // Picking a model whose thinking levels do not include the current one
+        // silently moves to its own default; say so before the click.
+        const nextEffort = efforts.includes(s.effort) ? s.effort : m.defaultEffort || '';
+        const isCur = (m.id === cur || m.alias === cur) && p === provider;
+        const changes = !isCur && s.effort && efforts.length && nextEffort !== s.effort;
+        const effortLine = efforts.length ? `思考：${efforts.map((e) => `${EFFORT_LABELS[e] || e}${e === m.defaultEffort ? '（預設）' : ''}`).join(' / ')}` : '沒有思考強度選項';
+        entries.push({
+          label: m.name || m.id,
+          description: [m.id !== m.name ? m.id : null, effortLine, changes ? `切換後思考強度改為 ${EFFORT_LABELS[nextEffort] || nextEffort}` : null, disabled ? m.reason || '目前不可用' : null].filter(Boolean).join(' · ') || null,
+          checked: isCur,
+          disabled,
+          onSelect: () => this.opts.onConfig({ provider: p, model: m.alias || m.id, effort: nextEffort }),
+        });
+      }
+    }
+    if (!entries.length) entries.push({ label: '沒有可用的模型', disabled: true });
+    openMenu(anchor, entries, { width: 300, className: 'model-menu' });
   }
 
   effortMenu(anchor) {
@@ -315,27 +497,37 @@ export class Composer {
   // ----------------------------------------------------------- actions
 
   hasContent() {
-    return Boolean(this.input.value.trim() || this.images.length);
+    return Boolean(this.input.value.trim() || this.images.length || this.docs.length);
   }
 
   renderActions() {
     const s = this.state;
     const busy = s.running || s.awaiting;
     const ctx = s.context;
-    const ap = this.opts.onAutoPause ? { state: s.autoPause, open: this.opts.onAutoPause, arm: this.opts.onArmResume } : null;
-    const ring = ctx?.size ? contextRing(ctx, () => this.opts.onCommand('compact', ''), this.opts.onQuotaNode, ap) : null;
+    const claude = this.claude();
+    const name = agentName(this.agent());
+    // 自動暫停 watches Kimi's plan quota; Claude's API key and DeepSeek's
+    // gateway key have none.
+    const ap = this.opts.onAutoPause && !claude && !this.deepseek() ? { state: s.autoPause, open: this.opts.onAutoPause, arm: this.opts.onArmResume } : null;
+    const ring = ctx?.size ? contextRing(ctx, () => this.opts.onCommand('compact', ''), this.opts.onQuotaNode, ap, claude ? '花費' : '方案用量') : null;
     const stop = busy && !this.hasContent();
     fill(
       this.right,
+      // What this conversation has cost so far (Claude API, per token).
+      claude && !this.opts.home && s.cost != null
+        ? h('button', { class: `cost-chip${s.budget && s.cost >= s.budget ? ' over' : ''}`, type: 'button', title: `這個對話到目前約花了 ${fmtUsd(s.cost)}（依 Claude API 公開價格估計）${s.budget ? `，上限 ${fmtUsd(s.budget)}` : ''}。點一下看明細`, onclick: () => this.opts.onCommand('cost', '') }, fmtUsd(s.cost))
+        : null,
+      s.ctxHint ? contextHintNode({ h, hint: s.ctxHint, onDismiss: (hint) => this.opts.onDismissCtxHint?.(hint) }) : null,
       ring,
-      // While Kimi works: Enter queues the message for after this turn;
-      // 插隊 (Ctrl+S, like Kimi's CLI) slips it into the running turn.
-      busy && this.hasContent() ? h('button', { class: 'om-btn om-btn--sm steer-btn', type: 'button', title: '插隊：讓 Kimi 在下一步就讀到，不會中斷它（Ctrl+S）', onclick: () => this.submit({ steer: true }) }, '插隊') : null,
+      // While the agent works: Enter slips the message into the running turn
+      // (插隊, read at its next step with any others waiting); 排隊 keeps it
+      // for after the turn.
+      busy && this.hasContent() ? h('button', { class: 'om-btn om-btn--sm steer-btn', type: 'button', title: `排隊：等 ${name} 這一輪做完才送出`, onclick: () => this.submit({ steer: false }) }, '排隊') : null,
       // Kimi waiting on a subagent or a command in the foreground.
-      stop && s.foreground ? h('button', { class: 'om-btn om-btn--sm bg-btn', type: 'button', title: BG_DESCRIPTION, onclick: () => this.opts.onBackground?.() }, '移到背景') : null,
+      stop && s.foreground && !claude ? h('button', { class: 'om-btn om-btn--sm bg-btn', type: 'button', title: BG_DESCRIPTION, onclick: () => this.opts.onBackground?.() }, '移到背景') : null,
       stop
         ? h('button', { class: 'send stop', type: 'button', title: '停止（Esc）', 'aria-label': '停止', onclick: () => this.opts.onStop() }, icon('stop'))
-        : h('button', { class: 'send', type: 'button', title: busy ? '排隊：這一輪結束後送出（Enter）' : '送出（Enter）', 'aria-label': busy ? '排隊送出' : '送出', disabled: !this.hasContent(), onclick: () => this.submit() }, icon('up')),
+        : h('button', { class: 'send', type: 'button', title: busy ? `插隊：${name} 下一步就讀到，不會中斷它（Enter）` : '送出（Enter）', 'aria-label': busy ? '插隊送出' : '送出', disabled: !this.hasContent(), onclick: () => this.submit() }, icon('up')),
     );
   }
 
@@ -374,6 +566,16 @@ export class Composer {
         ),
       );
     }
+    // More than one waiting: all of them into the turn at once (/steer).
+    if (queue.filter((q) => !q.steered).length > 1 && this.opts.onCommand && !this.opts.home)
+      items.push(
+        h(
+          'div',
+          { class: 'queued queued-all' },
+          h('span', { class: 'queued-text muted' }, `${queue.filter((q) => !q.steered).length} 則訊息還沒進這一輪`),
+          h('button', { class: 'om-btn om-btn--sm', type: 'button', title: `全部插隊：${agentName(this.agent())} 下一步一起讀到，不會中斷它（/steer）`, onclick: () => this.opts.onCommand('steer', '') }, '全部插隊'),
+        ),
+      );
     for (const q of queue) {
       items.push(
         h(
@@ -381,7 +583,7 @@ export class Composer {
           { class: 'queued' },
           h('span', { class: 'queued-label', title: q.cutIn && !q.steered ? CUT_IN_WHY : undefined }, q.steered ? '下一步插入' : q.cutIn ? '等待插隊' : '排隊中'),
           h('span', { class: 'queued-text' }, q.text || (q.images?.length ? `${q.images.length} 張圖片` : '')),
-          !q.steered && !q.cutIn && !q.foreign ? h('button', { class: 'om-btn om-btn--sm', type: 'button', title: '讓 Kimi 在下一步就讀到這則訊息，不會中斷它', onclick: () => this.opts.onSteerQueued(q.promptId) }, '插隊') : null,
+          !q.steered && !q.cutIn && !q.foreign ? h('button', { class: 'om-btn om-btn--sm', type: 'button', title: `讓 ${agentName(this.agent())} 在下一步就讀到這則訊息，不會中斷它`, onclick: () => this.opts.onSteerQueued(q.promptId) }, '插隊') : null,
           q.foreign ? null : h('button', { class: 'om-btn om-btn--toolbar om-btn--sm', type: 'button', title: '取消這則訊息', 'aria-label': '取消這則訊息', onclick: () => this.opts.onCancelQueued(q.promptId) }, icon('x')),
         ),
       );
@@ -450,7 +652,7 @@ export class Composer {
     } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's' && (this.state.running || this.state.awaiting)) {
       e.preventDefault();
       this.submit({ steer: true });
-    } else if (e.ctrlKey && !e.metaKey && !e.altKey && e.key.toLowerCase() === 'b' && this.state.running && this.opts.onBackground) {
+    } else if (e.ctrlKey && !e.metaKey && !e.altKey && e.key.toLowerCase() === 'b' && this.state.running && this.opts.onBackground && !this.claude()) {
       // Like Kimi's Ctrl+B, only while it works.
       e.preventDefault();
       this.opts.onBackground();
@@ -460,25 +662,33 @@ export class Composer {
     }
   }
 
-  submit({ steer = false } = {}) {
+  // While the agent works, a message cuts in (插隊) by default: it and any
+  // others waiting go into the running turn together at its next step.
+  // `steer: false` (排隊) waits for the turn to end instead.
+  submit({ steer } = {}) {
+    if (steer === undefined) steer = Boolean(this.state.running || this.state.awaiting) && !this.opts.home;
     const raw = this.input.value;
     const text = raw.trim();
-    if (!text && !this.images.length) return;
+    if (!text && !this.images.length && !this.docs.length) return;
     const m = text.match(/^\/([\w.:-]+)(?:\s+([\s\S]*))?$/);
-    if (m && !this.images.length && this.commands().some((c) => c.name === m[1] || c.aliases?.includes(m[1]))) {
+    if (m && !this.images.length && !this.docs.length && this.commands().some((c) => c.name === m[1] || c.aliases?.includes(m[1]))) {
       const cmd = this.commands().find((c) => c.name === m[1] || c.aliases?.includes(m[1]));
       this.clear();
       this.opts.onCommand(cmd.name, (m[2] || '').trim());
       return;
     }
     const images = this.images.map(({ mimeType, data, thumb }) => ({ mimeType, data, thumb }));
+    // Saved in the conversation's folder by the hub; the message says where.
+    const files = this.docs.map(({ name, content, data }) => (data ? { name, data } : { name, content }));
+    const uploadDir = files.length ? this.uploadDir || undefined : undefined;
     this.clear();
-    this.opts.onSend({ text, images, steer });
+    this.opts.onSend({ text, images, files, uploadDir, steer });
   }
 
   clear() {
     this.input.value = '';
     this.images = [];
+    this.docs = [];
     if (this.key) this.drafts.delete(this.key);
     this.renderImages();
     this.grow();
@@ -490,7 +700,9 @@ export class Composer {
 
   commands() {
     const skills = (this.state.skills || []).map((s) => ({ name: s.name, description: s.description, skill: true, args: true, source: s.source }));
-    const base = this.opts.home ? COMMANDS.filter((c) => HOME_COMMANDS.includes(c.name)) : this.state.terminal ? TERMINAL_COMMANDS : COMMANDS;
+    if (this.claude()) return this.opts.home ? CLAUDE_COMMANDS.filter((c) => CLAUDE_HOME_COMMANDS.includes(c.name)) : CLAUDE_COMMANDS;
+    let base = this.opts.home ? COMMANDS.filter((c) => HOME_COMMANDS.includes(c.name)) : this.state.terminal ? TERMINAL_COMMANDS : COMMANDS;
+    if (this.deepseek()) base = deepseekCommands(base);
     const names = new Set(base.map((c) => c.name));
     return [...base, ...skills.filter((s) => !names.has(s.name))];
   }
@@ -573,7 +785,26 @@ export class Composer {
   // ------------------------------------------------------------ images
 
   async addFiles(files) {
-    for (const f of [...files].slice(0, MAX_IMAGES - this.images.length)) {
+    const all = [...files];
+    const docs = all.filter((f) => !isImage(f) && isDoc(f));
+    const images = all.filter((f) => isImage(f));
+    for (const f of all) if (!docs.includes(f) && !images.includes(f)) this.opts.onError?.(`沒辦法讀取「${f.name}」：支援圖片（PNG、JPEG…）和文字檔（.md、.html、.txt、程式碼…）`);
+    if (docs.length > MAX_DOCS - this.docs.length) this.opts.onError?.(`一次最多附 ${MAX_DOCS} 個檔案，多的沒有加入`);
+    for (const f of docs.slice(0, Math.max(0, MAX_DOCS - this.docs.length))) {
+      const zip = isZip(f);
+      if (f.size > (zip ? MAX_ZIP_BYTES : MAX_DOC_BYTES)) {
+        this.opts.onError?.(`「${f.name}」超過 ${zip ? '20' : '1'} MB，沒有加入`);
+        continue;
+      }
+      try {
+        // A .zip goes as base64 and is unpacked on the conversation's computer.
+        if (zip) this.docs.push({ name: f.name, data: await base64Of(f), size: f.size, zip: true });
+        else this.docs.push({ name: f.name, content: await f.text(), size: f.size });
+      } catch {
+        this.opts.onError?.(`沒辦法讀取「${f.name}」`);
+      }
+    }
+    for (const f of images.slice(0, MAX_IMAGES - this.images.length)) {
       try {
         this.images.push(await readImage(f));
       } catch {
@@ -596,12 +827,59 @@ export class Composer {
           h('button', { class: 'thumb-x', type: 'button', title: '移除', 'aria-label': '移除圖片', onclick: () => (this.images.splice(i, 1), this.renderImages(), this.renderActions()) }, icon('x')),
         ),
       ),
+      ...this.docs.map((d, i) =>
+        h(
+          'div',
+          { class: 'doc-chip', title: `${d.name}（${d.size >= 1000 ? `${Math.round(d.size / 1000)} KB` : `${d.size} B`}）` },
+          icon('document'),
+          h('span', { class: 'doc-chip__name' }, d.name),
+          h('button', { class: 'thumb-x', type: 'button', title: '移除', 'aria-label': `移除 ${d.name}`, onclick: () => (this.docs.splice(i, 1), this.renderImages(), this.renderActions()) }, icon('x')),
+        ),
+      ),
     );
-    this.thumbs.hidden = !this.images.length;
+    // Where the files go: picked here (the conversation's folder by default).
+    if (this.docs.length && this.opts.onPickUploadDir)
+      this.thumbs.append(
+        h(
+          'button',
+          {
+            class: 'upload-dir',
+            type: 'button',
+            title: this.uploadDir || '對話資料夾裡的 .agent-hub/attachments（不會進 git）',
+            onclick: (e) =>
+              this.opts.onPickUploadDir(e.currentTarget, this.uploadDir, (dir) => {
+                this.uploadDir = dir;
+                this.renderImages();
+              }),
+          },
+          icon('folder'),
+          h('span', null, `上傳到：${this.uploadDir ? this.uploadDir.split('/').filter(Boolean).slice(-2).join('/') || '/' : '對話資料夾（預設）'}`),
+          icon('down', 'caret'),
+        ),
+      );
+    this.thumbs.hidden = !this.images.length && !this.docs.length;
     const model = this.currentModel();
     if (this.images.length && model && !model.image) this.opts.onError?.(`${model.name} 可能看不懂圖片`);
   }
 }
+
+// "實際 Claude Opus 5.5": the model that produced the last response,
+// updated with each one. Red when it is not the one chosen (the turn has
+// then been stopped).
+function servedChip(s) {
+  const x = s.servedModel;
+  const bad = Boolean(x.asked) && !x.id.startsWith(x.asked);
+  const title = `Anthropic 回報最近一次回應（${clockTime(x.at)}）是由 ${x.id} 產生的。每次回應都會更新；跟你選的模型不同時，這一輪會立刻停下。`;
+  return h('span', { class: `chip static served${bad ? ' bad' : ''}`, title }, h('span', { class: 'served-dot', 'aria-hidden': 'true' }), h('span', null, `實際 ${x.name || x.id}`));
+}
+
+const base64Of = (file) =>
+  new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).replace(/^data:[^,]*,/, ''));
+    r.onerror = reject;
+    r.readAsDataURL(file);
+  });
 
 // Downscale to at most 2000px (and a small thumbnail for the transcript).
 async function readImage(file) {
@@ -626,7 +904,7 @@ async function readImage(file) {
   return { mimeType, data, thumb, name: file.name };
 }
 
-function contextRing(ctx, onCompact, quotaNode, autoPause) {
+function contextRing(ctx, onCompact, quotaNode, autoPause, quotaLabel) {
   const pct = Math.min(1, ctx.used / ctx.size);
   const r = 7;
   const c = 2 * Math.PI * r;
@@ -646,7 +924,7 @@ function contextRing(ctx, onCompact, quotaNode, autoPause) {
         [
           { section: 'Context' },
           { node: h('div', { class: 'menu-quota' }, h('div', { class: 'quota' }, h('div', { class: 'quota-head' }, h('span', null, `${fmtTokens(ctx.used)} / ${fmtTokens(ctx.size)}`), h('span', { class: 'muted' }, `已用 ${Math.round(pct * 100)}%`)), h('div', { class: `quota-bar${level ? ` ${level}` : ''}` }, h('span', { style: { width: `${Math.round(pct * 100)}%` } })))) },
-          ...(quota ? [{ separator: true }, { section: '方案用量' }, { node: quota }] : []),
+          ...(quota ? [{ separator: true }, { section: quotaLabel }, { node: quota }] : []),
           ...(autoPause
             ? [
                 { label: '自動暫停…', hint: autoPause.state?.enabled ? `${autoPause.state.threshold}%` : '關', onSelect: autoPause.open },

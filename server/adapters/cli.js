@@ -63,8 +63,11 @@ export async function run(ctx, text) {
     ctx.delta(outEv, s);
   };
   let buf = '';
+  // Decoded as a stream: a multi-byte character cut at a chunk boundary stays whole.
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
   child.stdout.on('data', (chunk) => {
-    buf += chunk.toString('utf8');
+    buf += chunk;
     let nl;
     while ((nl = buf.indexOf('\n')) !== -1) {
       const line = buf.slice(0, nl + 1);
@@ -84,7 +87,7 @@ export async function run(ctx, text) {
     }
   });
   child.stderr.on('data', (c) => {
-    stderr = (stderr + c.toString('utf8')).slice(-6000);
+    stderr = (stderr + c).slice(-6000);
   });
 
   const code = await new Promise((resolve, reject) => {

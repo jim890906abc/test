@@ -173,7 +173,7 @@ svg.om-icon { width: 16px; height: 16px; flex: none; fill: none; stroke: current
   border: 1px solid var(--line); border-radius: var(--radius-sm);
   box-shadow: var(--shadow-control);
   cursor: default; white-space: nowrap;
-  transition: background-color .12s ease;
+  transition: background-color var(--dur-fast) var(--ease-out);
 }
 .om-btn:active { background: var(--control-pressed); }
 .om-btn:focus-visible { outline: none; box-shadow: var(--focus-ring); }
@@ -211,13 +211,13 @@ svg.om-icon { width: 16px; height: 16px; flex: none; fill: none; stroke: current
   appearance: none; position: relative; flex: none; margin: 0;
   width: 32px; height: 18px; border-radius: var(--radius-full);
   background: var(--track); border: 1px solid var(--control-border);
-  transition: background-color .15s ease, border-color .15s ease;
+  transition: background-color var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out);
 }
 .om-switch::before {
   content: ""; position: absolute; top: 1px; left: 1px;
   width: 14px; height: 14px; border-radius: var(--radius-full);
   background: var(--control); box-shadow: var(--shadow-control);
-  transition: transform .15s ease;
+  transition: transform var(--dur-fast) var(--ease-out);
 }
 .om-switch:checked { background: var(--accent); border-color: var(--accent); }
 .om-switch:checked::before { transform: translateX(14px); background: var(--on-accent); }

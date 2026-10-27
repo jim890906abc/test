@@ -6,3 +6,35 @@ workspaces/
 .DS_Store
 bin/
 dist/
+node_modules
+# public/ is the product page only (index.html, css/, js/). The Hub serves it
+# without a login, so nothing else belongs there: reports, screenshots and
+# notes are ignored by default (a new product file is un-ignored on purpose,
+# together with server/index.js's list of what public/ serves).
+public/*
+!public/index.html
+!public/css/
+public/css/*
+!public/css/*.css
+!public/js/
+public/js/*
+!public/js/*.js
+# Strays from running the connect command inside this folder (it downloads
+# into the current directory) and from scripts that built a path from a
+# missing variable. The connector lives in bridge/.
+/agent-hub-bridge.mjs
+undefined/
+null/
+
+# Secrets and local state that must never be committed: the login token, the
+# bridge key and every API key live in data/ (ignored above); these are the
+# usual other places a key or a machine-specific file ends up.
+.env.*
+*.pem
+*.key
+*.tgz
+.claude/
+.vscode/
+.idea/
+coverage/
+Thumbs.db

@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shop 訂單儀表板</title>
+<style>
+  :root {
+    --bg: #f6f0e4;
+    --card: #fffdf8;
+    --ink: #2b241b;
+    --muted: #675b4a;
+    --line: #e0d4bf;
+    --accent: #94501b;
+    --accent-soft: #f3e2cc;
+    --blue: #2b6388;
+    --blue-soft: #dde9f0;
+    --amber: #7f5508;
+    --amber-soft: #f6e8c4;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 20px;
+    font: 14px/1.5 -apple-system, "PingFang TC", "Noto Sans TC", system-ui, sans-serif;
+    color: var(--ink);
+    background: var(--bg);
+  }
+  header { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+  h1 { margin: 0; font-size: 20px; line-height: 1.25; }
+  .sub { margin: 2px 0 0; color: var(--muted); font-size: 12px; }
+  .range { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--card); }
+  .range button { border: 0; padding: 5px 10px; font: inherit; font-size: 12px; color: var(--muted); background: transparent; cursor: pointer; }
+  .range button.on { color: #fffaf2; background: var(--accent); }
+  .kpis { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 14px; }
+  .kpi { padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); }
+  .kpi .label { color: var(--muted); font-size: 12px; }
+  .kpi .value { margin-top: 2px; font-size: 22px; font-weight: 650; letter-spacing: -0.01em; }
+  .kpi .delta { font-size: 12px; color: var(--blue); }
+  .kpi .delta.down { color: #ad3b2c; }
+  .panel { margin-bottom: 14px; padding: 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--card); }
+  .panel h2 { margin: 0 0 10px; font-size: 13px; font-weight: 650; color: var(--muted); }
+  .bars { display: flex; align-items: flex-end; gap: 10px; height: 120px; padding-top: 6px; border-bottom: 1px solid var(--line); }
+  .bar { position: relative; flex: 1; min-width: 0; border-radius: 6px 6px 0 0; background: var(--accent-soft); cursor: default; }
+  .bar.today { background: var(--accent); }
+  .bar:hover { filter: brightness(0.94); }
+  .bar .n { position: absolute; left: 0; right: 0; top: -17px; text-align: center; font-size: 11px; color: var(--muted); }
+  .days { display: flex; gap: 10px; margin-top: 4px; }
+  .days span { flex: 1; text-align: center; font-size: 11px; color: var(--muted); }
+  .tabs { display: flex; gap: 6px; margin-bottom: 8px; }
+  .tabs button { border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; font: inherit; font-size: 12px; color: var(--muted); background: transparent; cursor: pointer; }
+  .tabs button.on { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { padding: 4px 0; text-align: left; font-size: 11px; font-weight: 500; color: var(--muted); border-bottom: 1px solid var(--line); }
+  td { padding: 7px 0; border-bottom: 1px solid var(--line); }
+  tr:last-child td { border-bottom: 0; }
+  td.num, th.num { text-align: right; padding-right: 14px; }
+  .id { font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+  .mail { color: var(--muted); }
+  .tag { display: inline-block; padding: 0 8px; border-radius: 999px; font-size: 11px; line-height: 18px; }
+  .tag.paid { color: var(--blue); background: var(--blue-soft); }
+  .tag.ship { color: var(--amber); background: var(--amber-soft); }
+  .tag.done { color: var(--muted); background: var(--line); }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Shop 訂單儀表板</h1>
+    <p class="sub">shop-api · 範例資料</p>
+  </div>
+  <div class="range" id="range">
+    <button data-n="7" class="on">7 天</button>
+    <button data-n="14">14 天</button>
+  </div>
+</header>
+
+<section class="kpis">
+  <div class="kpi"><div class="label">今日訂單</div><div class="value" id="k-orders">128</div><div class="delta">▲ 12% 較昨日</div></div>
+  <div class="kpi"><div class="label">營收</div><div class="value" id="k-rev">$86,420</div><div class="delta">▲ 8% 較昨日</div></div>
+  <div class="kpi"><div class="label">待出貨</div><div class="value" id="k-ship">17</div><div class="delta down">▼ 3 件逾時</div></div>
+</section>
+
+<section class="panel">
+  <h2>每日訂單數</h2>
+  <div class="bars" id="bars"></div>
+  <div class="days" id="days"></div>
+</section>
+
+<section class="panel">
+  <h2>最近訂單</h2>
+  <div class="tabs" id="tabs">
+    <button data-s="all" class="on">全部</button>
+    <button data-s="ship">待出貨</button>
+    <button data-s="paid">已付款</button>
+  </div>
+  <table>
+    <thead><tr><th>編號</th><th>客戶</th><th class="num">金額</th><th>狀態</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+</section>
+
+<script>
+  var DAYS = [['一', 96], ['二', 112], ['三', 88], ['四', 131], ['五', 119], ['六', 74], ['日', 128]];
+  var ORDERS = [
+    ['#1042', 'amy@example.com', 1280, 'paid'],
+    ['#1041', 'ben@example.net', 460, 'ship'],
+    ['#1040', 'cat@example.org', 2390, 'ship'],
+    ['#1039', 'dan@example.com', 880, 'done'],
+    ['#1038', 'eve@example.net', 1520, 'paid']
+  ];
+  var LABEL = { paid: '已付款', ship: '待出貨', done: '已完成' };
+  var state = 'all';
+
+  function drawBars() {
+    var max = 140, bars = document.getElementById('bars'), days = document.getElementById('days');
+    bars.innerHTML = days.innerHTML = '';
+    DAYS.forEach(function (d, i) {
+      var b = document.createElement('div');
+      b.className = 'bar' + (i === DAYS.length - 1 ? ' today' : '');
+      b.style.height = Math.round(d[1] / max * 100) + '%';
+      b.title = '週' + d[0] + '：' + d[1] + ' 筆';
+      b.innerHTML = '<span class="n">' + d[1] + '</span>';
+      bars.appendChild(b);
+      var s = document.createElement('span');
+      s.textContent = d[0];
+      days.appendChild(s);
+    });
+  }
+
+  function drawRows() {
+    var rows = document.getElementById('rows');
+    rows.innerHTML = '';
+    ORDERS.filter(function (o) { return state === 'all' || o[3] === state; }).forEach(function (o) {
+      var tr = document.createElement('tr');
+      tr.innerHTML = '<td class="id">' + o[0] + '</td><td class="mail">' + o[1] + '</td><td class="num">$' + o[2].toLocaleString('en-US') + '</td><td><span class="tag ' + o[3] + '">' + LABEL[o[3]] + '</span></td>';
+      rows.appendChild(tr);
+    });
+  }
+
+  document.getElementById('tabs').addEventListener('click', function (e) {
+    var s = e.target.getAttribute && e.target.getAttribute('data-s');
+    if (!s) return;
+    state = s;
+    Array.prototype.forEach.call(this.children, function (b) { b.className = b === e.target ? 'on' : ''; });
+    drawRows();
+  });
+  document.getElementById('range').addEventListener('click', function (e) {
+    if (!e.target.getAttribute || !e.target.getAttribute('data-n')) return;
+    Array.prototype.forEach.call(this.children, function (b) { b.className = b === e.target ? 'on' : ''; });
+  });
+
+  drawBars();
+  drawRows();
+</script>
+</body>
+</html>

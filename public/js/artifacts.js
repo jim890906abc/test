@@ -1,93 +1,14 @@
 // Artifacts: HTML pages Kimi writes (Write/Edit on *.html) are rendered live
 // in a sandboxed side panel while the tool call streams. Pages can message
 // the conversation through window.agentHub.send() / .fill().
+//
+// Which tool calls make a page, and what it looks like after each, is
+// artifact-rules.js: the Hub applies the same rule to the part of a
+// conversation the page does not hold.
 import { h, icon } from './dom.js';
+import { htmlTitle } from './artifact-rules.js';
 
-export const isHtmlPath = (p) => /\.html?$/i.test(String(p || ''));
-
-// Decode the body of a JSON string that may be cut off mid-stream.
-export function decodePartial(s) {
-  let out = '';
-  for (let i = 0; i < s.length; i++) {
-    const c = s[i];
-    if (c === '"') return out;
-    if (c !== '\\') {
-      out += c;
-      continue;
-    }
-    const n = s[i + 1];
-    if (n === undefined) return out;
-    i++;
-    if (n === 'n') out += '\n';
-    else if (n === 't') out += '\t';
-    else if (n === 'r') out += '\r';
-    else if (n === 'b') out += '\b';
-    else if (n === 'f') out += '\f';
-    else if (n === 'u') {
-      const hex = s.slice(i + 1, i + 5);
-      if (hex.length < 4) return out;
-      out += String.fromCharCode(parseInt(hex, 16));
-      i += 4;
-    } else out += n;
-  }
-  return out;
-}
-
-export function partialField(text, key) {
-  const m = new RegExp(`"${key}"\\s*:\\s*"`).exec(text || '');
-  return m ? decodePartial(text.slice(m.index + m[0].length)) : null;
-}
-
-// The artifact a tool event writes, if any: { path, kind, content? }.
-export function artifactOf(ev) {
-  if (ev.type !== 'tool_use' || !/^(Write|Edit|MultiEdit|WriteFile|StrReplaceFile)$/.test(ev.name)) return null;
-  const input = ev.input && typeof ev.input === 'object' ? ev.input : null;
-  const path = input?.path || input?.file_path || partialField(ev.argsText, 'path') || partialField(ev.argsText, 'file_path');
-  if (!isHtmlPath(path)) return null;
-  const write = /Write/.test(ev.name);
-  let content = null;
-  if (write) content = typeof input?.content === 'string' ? input.content : partialField(ev.argsText, 'content');
-  return { path, kind: write ? 'write' : 'edit', content, input, append: input?.mode === 'append' };
-}
-
-function applyEdits(base, input) {
-  if (base == null || !input) return null;
-  const edits = Array.isArray(input.edits) ? input.edits : [input];
-  let out = base;
-  for (const e of edits) {
-    if (typeof e.old_string !== 'string' || typeof e.new_string !== 'string' || !out.includes(e.old_string)) return null;
-    out = e.replace_all ? out.split(e.old_string).join(e.new_string) : out.replace(e.old_string, () => e.new_string);
-  }
-  return out;
-}
-
-export const htmlTitle = (html, path) => (html && /<title[^>]*>([^<]*)<\/title>/i.exec(html)?.[1]?.trim()) || String(path || '').split('/').pop();
-
-// All artifacts in a session, oldest first, each with its versions. A
-// version's html is null when it can only be read from disk (an Edit whose
-// base we never saw).
-export function collectArtifacts(events) {
-  const byPath = new Map();
-  for (const ev of events) {
-    const a = artifactOf(ev);
-    if (!a) continue;
-    let art = byPath.get(a.path);
-    if (!art) byPath.set(a.path, (art = { path: a.path, versions: [] }));
-    const prev = art.versions.at(-1)?.html ?? null;
-    let html = null;
-    if (a.kind === 'write') html = a.append ? (prev ?? '') + (a.content ?? '') : a.content;
-    else if (['done', 'running'].includes(ev.status)) html = applyEdits(prev, a.input);
-    else html = prev;
-    const streaming = ev.status === 'pending' || (ev.status === 'running' && !ev.input);
-    art.versions.push({ id: ev.id, html, streaming, failed: ev.status === 'error' });
-  }
-  for (const art of byPath.values()) {
-    const v = art.versions.filter((x) => !x.failed);
-    art.title = htmlTitle(v.at(-1)?.html, art.path);
-    art.updated = art.versions.at(-1).id;
-  }
-  return [...byPath.values()];
-}
+export { isHtmlPath, decodePartial, partialField, artifactOf, htmlTitle, collectArtifacts, mergeArtifactIndex } from './artifact-rules.js';
 
 // ---------------------------------------------------------------- panel
 
@@ -194,7 +115,7 @@ export function artifactCard(art, version, { onOpen, active }) {
     h(
       'span',
       { class: 'artifact-card-text' },
-      h('span', { class: 'artifact-card-title' }, htmlTitle(v?.html, art.path)),
+      h('span', { class: 'artifact-card-title' }, v?.html != null ? htmlTitle(v.html, art.path) : art.title || htmlTitle(null, art.path)),
       h('span', { class: 'artifact-card-sub' }, streaming ? '正在產生…' : `HTML 頁面${art.versions.length > 1 ? ` · 第 ${n} 版` : ''}`),
     ),
     streaming ? h('span', { class: 'spinner' }) : h('span', { class: 'artifact-card-open' }, '開啟'),
