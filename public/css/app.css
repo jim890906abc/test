@@ -1800,7 +1800,12 @@ pre.tail {
    which cut the last chip mid-letter. One that is still wider than the row is
    shortened with an ellipsis (its full words are in its title). */
 .composer-tools {
-  flex: 1 1 180px;
+  /* The chips ask for the room they need on one line (basis: auto = all of them
+     side by side), so the notice, ring and button that sit at the right drop
+     under them when the two do not fit together - they used to take what they
+     wanted first and leave the chips a sliver, one chip per line. When the chips
+     alone are wider than the box this shrinks (min-width: 0) and they wrap. */
+  flex: 1 1 auto;
   min-width: 0;
   display: flex;
   flex-wrap: wrap;
@@ -3823,10 +3828,13 @@ pre.tail {
   margin-bottom: var(--space-2);
 }
 .ds-key {
+  /* Three lines, top to bottom: the facts (position, gateway, tail, state), when
+     it was added, and the buttons. The buttons used to share the first line with
+     the facts and, with six of them, left the facts a thin column. */
   display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  flex-wrap: wrap;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
   padding: 7px var(--space-2);
   border: 1px solid var(--line);
   border-radius: var(--radius-md);
@@ -3843,15 +3851,17 @@ pre.tail {
 .ds-key-main {
   display: flex;
   align-items: center;
-  gap: 6px;
-  flex: 1;
+  gap: 4px 6px;
+  flex: none;
   min-width: 0;
   flex-wrap: wrap;
 }
+/* A gateway name and a key tail are one word each: they never break inside. */
 .ds-key-hint {
+  min-width: 4.5em;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
-  overflow-wrap: anywhere;
+  white-space: nowrap;
 }
 .ds-all-out-box:empty {
   display: none;
@@ -3864,23 +3874,53 @@ pre.tail {
   color: var(--ink-secondary);
 }
 .ds-key-pos {
+  flex: none;
   min-width: 16px;
   color: var(--ink-secondary);
   font-variant-numeric: tabular-nums;
 }
 .ds-key-gw {
+  flex: none;
+  /* wide enough for the longest gateway name, so the tails line up from card to card */
+  min-width: 9em;
   font-weight: 600;
+  white-space: nowrap;
 }
+/* A long state ("已滿，… 重置") takes the line to itself and its words wrap inside
+   the badge, which grows with them instead of letting them run out of the pill. */
 .ds-key-state {
+  flex: 0 1 auto;
+  height: auto;
+  min-height: 18px;
+  padding-top: 2px;
+  padding-bottom: 2px;
   white-space: normal;
+  border-radius: 9px;
+  line-height: 14px;
 }
+/* "加入於 …" on a line of its own (and no line at all for a key with no date). */
 .ds-key-added {
+  flex: 0 0 100%;
   color: var(--ink-secondary);
+}
+.ds-key-added:empty {
+  display: none;
 }
 .ds-key-actions {
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
+}
+/* Buttons alike in size: words have a common least width, the arrows are small
+   square icon buttons. (A button that does not fit goes to the next line whole.) */
+.ds-key-actions .om-btn {
+  min-width: 48px;
+}
+.ds-key-actions .om-btn[data-act='up'],
+.ds-key-actions .om-btn[data-act='down'] {
+  min-width: 0;
+  width: var(--control-height-sm);
+  padding: 0;
 }
 .ds-key-add {
   display: flex;
