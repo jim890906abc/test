@@ -1379,6 +1379,10 @@ export async function setSubagent(session, input) {
 export async function configure(session, change = {}) {
   const adapter = adapterFor(session);
   if (!adapter?.configure) throw Object.assign(new Error('這個對話不支援切換設定'), { status: 400 });
+  // Swarm mode is Kimi Code's (one main model sends many subagents at once);
+  // Claude has nothing that does it, and a setting that does nothing is not
+  // accepted.
+  if (change.swarmMode !== undefined && providerOf(session) === 'claude') throw Object.assign(new Error('Claude 沒有 swarm 模式：那是 Kimi Code 的功能，Kimi 與 DeepSeek 對話才有'), { status: 400 });
   let nextModel = change.model;
   let nextEffort = change.effort;
   if (typeof nextModel === 'string' && nextModel) {
@@ -1419,8 +1423,14 @@ export async function command(session, name, args) {
   if (!adapter?.command) throw Object.assign(new Error('這個對話不支援指令'), { status: 400 });
   const r = (await adapter.command(session, name, args)) || {};
   // A Kimi /fork is still made from the Hub: it keeps the category of the
-  // conversation it was forked from. Any other native id is an attach.
-  if (r.kimiSessionId) return { session: summarize(await attachKimi(session.machineId, r.kimiSessionId, { origin: name === 'fork' ? originOf(store.leafOf(session) || session) : 'external' })) };
+  // conversation it was forked from, and it is a copy of that conversation, so
+  // it keeps its provider and its settings too (see forkedFrom). Any other
+  // native id is an attach.
+  if (r.kimiSessionId) {
+    const source = store.leafOf(session) || session;
+    const fork = name === 'fork';
+    return { session: summarize(await attachKimi(session.machineId, r.kimiSessionId, fork ? { origin: originOf(source), from: source } : { origin: 'external' })) };
+  }
   if (r.session) {
     broadcast({ t: 'session', session: summarize(r.session) });
     return { session: summarize(r.session) };
@@ -2319,11 +2329,57 @@ async function configureDeepseek(kimi, session, config) {
   }
 }
 
+// What a fork carries over from the conversation it was made from. The native
+// :fork copies the history (and Kimi restores its model from the copied
+// journal), but the Hub's own record of the conversation lives only here:
+// without it a DeepSeek conversation forks into a node the Hub takes for a
+// Kimi one - the wrong badge, a provider drift on a model that is right, and a
+// refusal to send the first message - and the subagent choice is dropped
+// (unmarked, so a restart gives it today's global default). Same fields a
+// runtime switch gives its new node. Only Kimi/DeepSeek conversations fork
+// through here; Claude forks inside its own adapter.
+function forkedFrom(source) {
+  const provider = providerOf(source) === 'deepseek' ? 'deepseek' : 'kimi';
+  const mc = source.modelConfig || {};
+  const state = {
+    // A fork is not a new conversation: the global defaults are not laid over
+    // what its history was running with.
+    defaultsApplied: true,
+    ...(source.state?.subagentExplicit ? { subagentExplicit: true } : {}),
+    ...(source.state?.userSet ? { userSet: { ...source.state.userSet } } : {}),
+    ...(source.state?.promptModel ? { promptModel: true } : {}),
+    ...(provider === 'deepseek' ? { deepseek: structuredClone(source.state?.deepseek) || { gateway: deepseek.gateway(), model: mc.model || source.meta?.model || '' } } : {}),
+  };
+  return {
+    provider,
+    ...(provider === 'deepseek' ? { mode: 'deepseek' } : {}),
+    modelConfig: { provider, model: mc.model || source.meta?.model || '', effort: mc.effort || source.meta?.effort || '' },
+    meta: Object.hasOwn(source.meta || {}, 'subagent') ? { subagent: structuredClone(source.meta.subagent) } : {},
+    state,
+  };
+}
+
 // Take over a Kimi session that already exists on a machine (e.g. one handed
 // to the local Kimi server with /web). Reuses the hub session if attached,
 // without upgrading or rewriting its origin: merely looking at an external
 // native conversation must leave it external.
-export async function attachKimi(machineId, kimiSessionId, { origin = 'external' } = {}) {
+//
+// Two requests for the same native conversation at once (a double click, a
+// fork and a click on the computer's list) used to both find no node, wait for
+// the machine, and each make one: two nodes bound to one native conversation.
+// The second request now joins the first.
+const attachingKimi = new Map(); // `${machineId}:${kimiSessionId}` -> the attach in progress
+export function attachKimi(machineId, kimiSessionId, opts = {}) {
+  const key = `${machineId}:${kimiSessionId}`;
+  let running = attachingKimi.get(key);
+  if (!running) {
+    running = attachKimiNow(machineId, kimiSessionId, opts).finally(() => attachingKimi.delete(key));
+    attachingKimi.set(key, running);
+  }
+  return running;
+}
+
+async function attachKimiNow(machineId, kimiSessionId, { origin = 'external', from = null } = {}) {
   const attachedOrigin = normalizeOrigin(origin, 'external');
   const existing = ADAPTERS['kimi-remote'].findByKimi(machineId, kimiSessionId);
   if (existing && store.getSession(existing)) {
@@ -2343,6 +2399,7 @@ export async function attachKimi(machineId, kimiSessionId, { origin = 'external'
     title: info.title || info.last_prompt || 'Kimi 對話',
     titled: true,
     origin: attachedOrigin,
+    ...(from ? forkedFrom(from) : {}),
   });
   ADAPTERS['kimi-remote'].restore(session);
   broadcast({ t: 'session', session: summarize(session) });

@@ -33,6 +33,7 @@ export function startFakeMachine({ port, key, id = 'm_fake', name = 'fake-machin
     profiles: [], // { sid, agent_config }
     prompts: [], // { sid, body }
     archived: [],
+    forks: [], // { from, to, body } for every :fork asked of the machine
     requests: [],
     rpcs: [], // every bridge operation asked of this machine, in order
     dsModels: [],
@@ -92,6 +93,10 @@ export function startFakeMachine({ port, key, id = 'm_fake', name = 'fake-machin
   k.refuseProfile = false;
   // Kimi answers a prompt: the frames of one finished turn.
   k.autoReply = true;
+  // Imitate a Kimi that predates swarm mode (see the status answer below).
+  k.swarmUnsupported = false;
+  // Imitate a Kimi that answers a swarm change with "ok" and keeps its state.
+  k.swarmIgnore = false;
   k.reply = (sid, promptId, text) => {
     const frame = (type, payload) => send({ t: 'kimi.event', frame: { type, session_id: sid, payload: { agentId: 'main', ...payload } } });
     frame('turn.started', { turnId: `turn_${++k.n}`, promptId, origin: { kind: 'user' }, prompt: text });
@@ -124,6 +129,15 @@ export function startFakeMachine({ port, key, id = 'm_fake', name = 'fake-machin
         if (c.model) s.model = c.model;
         if (c.thinking) s.thinking = c.thinking;
         if (c.permission_mode) s.permission = c.permission_mode;
+        // Plan and swarm mode are the native's own state (Kimi 2.3.3 takes
+        // them in agent_config); a swarm change is announced on its event
+        // stream, as the real one does (SwarmModeEnter/Exit emit
+        // agent.status.updated), and only when the state really changes.
+        if (typeof c.plan_mode === 'boolean') s.plan = c.plan_mode;
+        if (typeof c.swarm_mode === 'boolean' && Boolean(s.swarm) !== c.swarm_mode && !k.swarmUnsupported && !k.swarmIgnore) {
+          s.swarm = c.swarm_mode;
+          queueMicrotask(() => k.frame(m[1], 'agent.status.updated', { swarmMode: c.swarm_mode }));
+        }
       }
       if (k.echoProfile && (c.model || c.thinking)) {
         const said = typeof k.echoProfile === 'function' ? k.echoProfile(m[1], c) : { model: c.model, thinking: c.thinking };
@@ -132,11 +146,33 @@ export function startFakeMachine({ port, key, id = 'm_fake', name = 'fake-machin
       }
       return ok({ id: m[1] });
     }
+    // GET /sessions/:id/status, as 2.3.3 answers it. An older Kimi has no
+    // swarm_mode in it (k.swarmUnsupported imitates one: it also drops the
+    // swarm_mode a profile change carries).
+    if (m && method === 'GET' && m[2] === '/status') {
+      const s = k.sessions.get(m[1]);
+      if (!s) return { code: 40401, msg: 'session not found', data: null };
+      return ok({ busy: Boolean(s.busy), model: s.model, thinking_level: s.thinking || 'off', permission: s.permission, plan_mode: Boolean(s.plan), ...(k.swarmUnsupported ? {} : { swarm_mode: Boolean(s.swarm) }), context_tokens: 0 });
+    }
     if (m && method === 'POST' && m[2] === '/prompts') {
       k.prompts.push({ sid: m[1], body });
       const said = (body.content || []).filter((c) => c.type === 'text' && !c.text.startsWith('<system-reminder>')).map((c) => c.text).join('');
       if (k.autoReply) setTimeout(() => k.reply(m[1], body.prompt_id, said), 20);
       return ok({ prompt_id: body.prompt_id, status: 'started' });
+    }
+    // Kimi's :fork, as the real Kimi 2.3.3 answered it (test/e2e-fork.test.mjs
+    // runs the real one): a new conversation in the same folder with the whole
+    // history copied, the given title or "Fork: <title>", and the model,
+    // thinking and permission of the journal it copied. A busy conversation is
+    // refused with 40901.
+    if (m && method === 'POST' && m[2] === ':fork') {
+      const src = k.sessions.get(m[1]);
+      if (!src) return { code: 40401, msg: 'session not found', data: null };
+      if (src.busy) return { code: 40901, msg: 'session busy', data: null };
+      const sid = `session_fork${++k.n}`;
+      k.add(sid, { cwd: src.cwd, title: body?.title || `Fork: ${src.title}`, model: src.model, thinking: src.thinking, permission: src.permission, history: src.history.map((h) => ({ ...h })) });
+      k.forks.push({ from: m[1], to: sid, body });
+      return ok({ id: sid, metadata: { cwd: src.cwd } });
     }
     if (m && method === 'POST' && m[2] === ':archive') {
       k.archived.push(m[1]);

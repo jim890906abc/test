@@ -315,8 +315,12 @@ test('key changes also provision online machines that only run Kimi parents', as
   assert.deepEqual(await account.reprovision({ rpc, list }), [], 'the same state is not sent twice');
   assert.equal(calls.length, 1);
 
+  // Keys are one list across gateways (2026-10-28): a key left on another
+  // gateway is still a key, so emptying the gateway in use does not take the
+  // provider away. Only when no gateway has a key is there nothing to send.
   account.clearKey('opencode-go');
-  assert.deepEqual(await account.reprovision({ rpc, list }), [], 'no key means no background request');
+  for (const gw of ['opencode', 'commandcode']) account.clearKey(gw);
+  assert.deepEqual(await account.reprovision({ rpc, list }), [], 'no key anywhere means no background request');
   assert.equal(calls.length, 1);
 });
 

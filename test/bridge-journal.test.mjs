@@ -87,3 +87,43 @@ test('thinking changed after the conversation started is what the bridge reports
   assert.equal(longInfo.data.effort, 'max');
   assert.equal(longInfo.data.permission, 'auto');
 });
+
+test('swarm mode turned on and off in a terminal Kimi is what the bridge reports; the model entering it by a tool call is not', async () => {
+  const sid = 'session_journal_swarm';
+  const dir = path.join(KIMI_HOME, 'sessions', 'ws1', sid);
+  fs.mkdirSync(path.join(dir, 'agents', 'main'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'agents', 'sub1'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'state.json'), JSON.stringify({ title: 'swarm 日誌', cwd: TMP }));
+  const main = [
+    { type: 'profile.bind', agentId: 'main', modelAlias: 'kimi/k3-256k', profileName: 'default', thinkingEffort: 'high', systemPrompt: 'x', disallowedTools: [], time: 1 },
+    { type: 'subagent.spawned', agentId: 'main', subagentId: 'sub1', time: 1.5 },
+    { type: 'swarm_mode.enter', agentId: 'main', trigger: 'manual', time: 2 },
+    { type: 'swarm_mode.exit', agentId: 'main', time: 3 },
+    { type: 'swarm_mode.enter', agentId: 'main', trigger: 'task', time: 4 },
+    { type: 'swarm_mode.exit', agentId: 'main', time: 5 },
+    { type: 'swarm_mode.enter', agentId: 'main', trigger: 'tool', time: 6 },
+    { type: 'swarm_mode.enter', agentId: 'main', trigger: 'manual', time: 7 },
+  ];
+  fs.writeFileSync(path.join(dir, 'agents', 'main', 'wire.jsonl'), main.map((l) => JSON.stringify(l)).join('\n') + '\n');
+  // A subagent's own mode is not the conversation's.
+  fs.writeFileSync(path.join(dir, 'agents', 'sub1', 'wire.jsonl'), [{ type: 'swarm_mode.enter', agentId: 'sub1', trigger: 'manual', time: 8 }].map((l) => JSON.stringify(l)).join('\n') + '\n');
+
+  const answer = await new Promise((resolve, reject) => {
+    const server = new WebSocketServer({ port: 0, path: '/bridge' });
+    const t = setTimeout(() => reject(new Error('bridge did not answer')), 15000);
+    server.on('connection', (ws) => {
+      ws.on('message', (d) => {
+        const m = JSON.parse(d);
+        if (m.t === 'hello') ws.send(JSON.stringify({ t: 'req', id: 'history', op: 'kimi.history', args: { sessionId: sid, turns: 10 } }));
+        if (m.t === 'res') (clearTimeout(t), resolve(m), setTimeout(() => (proc.kill('SIGTERM'), server.close()), 50));
+      });
+    });
+    let proc;
+    server.on('listening', () => {
+      proc = spawn(process.execPath, [path.join(ROOT, 'bridge/agent-hub-bridge.mjs'), '--hub', `http://127.0.0.1:${server.address().port}`, '--key', 'k', '--kimi-home', KIMI_HOME, '--kimi-bin', path.join(TMP, 'no-kimi'), '--no-skill', '--state-dir', path.join(TMP, 'state-swarm')], { env: { ...process.env, HOME: TMP }, stdio: 'ignore' });
+    });
+  });
+  assert.equal(answer.ok, true);
+  const swarm = answer.data.frames.filter((f) => f.type === 'agent.status.updated' && 'swarmMode' in f.payload);
+  assert.deepEqual(swarm.map((f) => [f.payload.agentId, f.payload.swarmMode]), [['main', true], ['main', false], ['main', true], ['main', false], ['main', true]], 'on, off, on (a one-shot task), off, on; the tool entry and the subagent say nothing');
+});

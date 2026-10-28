@@ -48,6 +48,7 @@ export const COMMANDS = [
   { name: 'model', description: '切換模型' },
   { name: 'effort', description: '調整思考強度' },
   { name: 'plan', description: '開關計畫模式：先規劃，你同意後才動手' },
+  { name: 'swarm', description: '開關 swarm 模式：讓 Kimi 一次派出子代理群（用量可能是平常的好幾倍）。/swarm <任務> 會開啟並送出任務，之後保持開啟，直到你關掉', hint: 'on | off | <任務>' },
   { name: 'permission', description: '選擇權限模式' },
   { name: 'yolo', description: '需要時詢問：只有風險高的動作才問你' },
   { name: 'auto', description: '全部自動：不再詢問' },
@@ -118,6 +119,7 @@ const TERMINAL_COMMANDS = [
   { name: 'btw', description: '順便問一個問題，不影響主對話', args: true, hint: '<問題>' },
   { name: 'goal', description: '設定讓 Kimi 自主完成的目標', args: true, hint: '<目標> | pause | resume | cancel' },
   { name: 'plan', description: '計畫模式', args: true, hint: 'on | off' },
+  { name: 'swarm', description: '開關 swarm 模式：讓 Kimi 一次派出子代理群（用量可能是平常的好幾倍）。/swarm <任務> 會開啟並送出任務，之後保持開啟，直到你關掉', hint: 'on | off | <任務>' },
   { name: 'effort', description: '調整思考強度', args: true, hint: '<off | low | medium | high | max>' },
   { name: 'model', description: '切換模型', args: true, hint: '<模型>' },
   { name: 'yolo', description: '需要時詢問：只有風險高的動作才問你' },
@@ -269,7 +271,7 @@ export class Composer {
   }
 
   // state: { running, awaiting, queue, todos, models, model, defaultModel,
-  //          effort, permission, planMode, context, skills, machineName, folderName,
+  //          effort, permission, planMode, swarmMode, context, skills, machineName, folderName,
   //          terminal, controllable }
   update(state) {
     this.state = { ...this.state, ...state };
@@ -358,6 +360,7 @@ export class Composer {
       this.opts.home && !this.opts.onPickMachine && s.machineName ? h('span', { class: 'chip static', title: 'Claude 由中控台執行，工具在這台電腦上跑' }, icon('computer'), h('span', null, s.machineName)) : null,
       this.opts.home ? chip(s.folderName || '選擇資料夾', (b) => this.opts.onPickFolder(b), { iconName: s.folderIcon || 'folder', title: s.folderIcon === 'branch' ? '綁定的 GitHub repo' : '工作資料夾', control: 'folder' }) : null,
       chip(s.planMode ? '計畫模式' : permissionLabels(this.agent())[s.permission] || (s.permission ? s.permission : '權限（未回報）'), (b) => this.permissionMenu(b), { iconName: s.planMode ? 'map' : 'shield', title: '權限模式', active: s.planMode, control: 'permission' }),
+      this.swarmAvailable() && s.swarmMode ? this.swarmChip() : null,
       s.models?.length
         ? chip(driftWords ? driftWords.actual : modelLabel, (b) => this.modelMenu(b), {
             title: driftWords ? driftWords.title : modelTitle,
@@ -416,6 +419,33 @@ export class Composer {
     return chip(`子代理 ${label}`, (b) => this.opts.onOpenSubagent(b), { iconName: 'agents', title, control: 'subagent' });
   }
 
+  // Swarm mode is Kimi Code's (the main model sends many subagents at once):
+  // a conversation on Kimi or DeepSeek has it, Claude does not, and the home
+  // screen has no conversation to put it on.
+  swarmAvailable() {
+    return !this.claude() && !this.opts.home;
+  }
+
+  // Shown only while it is on, because that is when it costs: pressing it
+  // turns it off.
+  swarmChip() {
+    return h(
+      'button',
+      {
+        class: 'chip active',
+        type: 'button',
+        title: 'Swarm 模式已開：Kimi 可以一次派出子代理群，用量可能是平常的好幾倍。點一下關閉',
+        'aria-label': 'Swarm 模式已開，點一下關閉',
+        'aria-pressed': 'true',
+        dataset: { control: 'swarm' },
+        onclick: () => this.opts.onConfig({ swarmMode: false }),
+      },
+      icon('agents'),
+      h('span', null, 'Swarm'),
+      icon('x'),
+    );
+  }
+
   // Open the menu behind a control (for /model, /effort, /permission).
   openControl(name) {
     const btn = this.left.querySelector(`[data-control="${name}"]`);
@@ -433,6 +463,7 @@ export class Composer {
         ...Object.keys(labels).map((p) => ({ label: labels[p], description: desc[p], checked: s.permission === p, onSelect: () => this.opts.onConfig({ permission: p }) })),
         { separator: true },
         { label: '計畫模式', description: '先寫好計畫，你同意後才開始修改', checked: Boolean(s.planMode), onSelect: () => this.opts.onConfig({ planMode: !s.planMode }) },
+        ...(this.swarmAvailable() ? [{ label: 'Swarm 模式', description: '讓 Kimi 一次派出子代理群；用量可能是平常的好幾倍', checked: Boolean(s.swarmMode), onSelect: () => this.opts.onConfig({ swarmMode: !s.swarmMode }) }] : []),
       ],
       { side: 'auto', width: 280 },
     );
@@ -742,6 +773,8 @@ export class Composer {
           {
             class: 'om-menu__item slash-item',
             role: 'option',
+            // The row cuts a long description short; the whole of it is here.
+            title: c.description || '',
             'aria-selected': String(i === index),
             onpointerdown: (e) => e.preventDefault(),
             onclick: () => this.pickSlash(c),

@@ -10,6 +10,9 @@ const FILE = path.join(DATA_DIR, 'machines.json');
 // What a connector says it can do, in its hello: `capabilities`, an array of
 // these names (a connector lists only what that version really supports).
 //   pool             DeepSeek key pool through the loopback proxy
+//   pool_cross       that pool rotating across gateways (one order of keys, each
+//                    with its own gateway); an older `pool` connector rotates
+//                    within the gateway it was given
 //   secondary_model  can set/repair the native subagent default ([secondary_model])
 //   broker           cross-provider subagents through the local broker channel
 //   handoff          relays a continuation's handoff to the Claude daemon, and
@@ -18,7 +21,7 @@ const FILE = path.join(DATA_DIR, 'machines.json');
 // version string is never used to guess. The first connector that sends the
 // field is CAPABILITY_CONNECTOR_VERSION; older ones must be reconnected with
 // the current command (a message about "upgrade" can name this version).
-export const CAPABILITIES = ['pool', 'secondary_model', 'broker', 'handoff'];
+export const CAPABILITIES = ['pool', 'pool_cross', 'secondary_model', 'broker', 'handoff'];
 export const CAPABILITY_CONNECTOR_VERSION = '0.11.0';
 const cleanCapabilities = (raw) => (Array.isArray(raw) ? [...new Set(raw.filter((x) => typeof x === 'string' && /^[a-z][a-z0-9_]{0,31}$/.test(x)))].slice(0, 16) : []);
 const machines = new Map(); // id -> machine

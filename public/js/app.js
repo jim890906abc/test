@@ -426,6 +426,7 @@ function rowMenu(r, anchor) {
     [
       { label: '在新分頁開啟', onSelect: () => window.open(`${location.pathname}${href}`, '_blank', 'noopener') },
       { label: '重新命名…', disabled: !reachable, onSelect: () => renameRow(r, mid, kid) },
+      { label: '分叉', disabled: !reachable, onSelect: () => forkRow(r) },
       r.cwd ? { label: '複製資料夾路徑', onSelect: () => copyText(r.cwd).then(() => toast('已複製')) } : null,
       { separator: true },
       reachable || !r.hub ? { label: '刪除…', destructive: true, disabled: !reachable, onSelect: () => deleteRow(r, mid, kid) } : { label: '從中控台移除…', destructive: true, onSelect: () => forgetRow(r) },
@@ -440,6 +441,7 @@ function claudeRowMenu(r, anchor) {
     [
       { label: '在新分頁開啟', onSelect: () => window.open(`${location.pathname}#/s/${r.hub.id}`, '_blank', 'noopener') },
       { label: '重新命名…', onSelect: () => renameClaude(r.hub) },
+      { label: '分叉', onSelect: () => forkRow(r) },
       r.cwd ? { label: '複製資料夾路徑', onSelect: () => copyText(r.cwd).then(() => toast('已複製')) } : null,
       { separator: true },
       { label: '刪除…', destructive: true, onSelect: () => deleteClaude(r.hub) },
@@ -477,6 +479,27 @@ async function renameRow(r, mid, kid) {
     await post(`/machines/${mid}/kimi/${kid}/title`, { title: title.trim() });
   } catch (err) {
     fail(err);
+  }
+}
+
+// 分叉: the conversation copied into a new one, opened right away. One that
+// Kimi has but the Hub has not taken over yet is taken over first, so the fork
+// is made the same way as from an open conversation.
+const forking = new Set();
+async function forkRow(r) {
+  const key = r.hub?.id || r.kimi?.id;
+  if (!key || forking.has(key)) return;
+  forking.add(key);
+  try {
+    const id = r.hub?.id || (await post(`/machines/${r.machine.id}/kimi/${r.kimi.id}/attach`)).id;
+    const { session } = await post(`/sessions/${id}/command`, { name: 'fork', args: '' });
+    if (!session?.id) throw new Error('分叉沒有回傳新的對話');
+    toast('已分叉成新對話');
+    go(`#/s/${session.id}`);
+  } catch (err) {
+    fail(err);
+  } finally {
+    forking.delete(key);
   }
 }
 
@@ -1743,6 +1766,7 @@ function updateComposer() {
     // vocabularies is the server's (permissions.js), never done here.
     permission: meta.permission || '',
     planMode: Boolean(meta.planMode),
+    swarmMode: Boolean(meta.swarmMode),
     // This turn's own values while one runs (null/absent when idle, and equal to
     // the next turn's when no snapshot exists yet); the chips only compare them.
     turnModel: turn?.model || '',
@@ -2259,9 +2283,36 @@ async function configure(change) {
     const leaf = leafFromResponse(r);
     if (leaf) await applyProviderLeaf(s, leaf);
     else updateComposer();
+    if (typeof change.swarmMode === 'boolean') swarmToast(change.swarmMode, (leaf || r)?.meta);
+    return true;
   } catch (err) {
     fail(err);
+    return false;
   }
+}
+
+// What a person should know when swarm mode is turned on (Kimi's own notice in
+// its terminal says the same), and a plain confirmation when it is turned off.
+function swarmToast(on, meta) {
+  if (!on) return toast('Swarm 模式已關閉');
+  const ask = (meta?.permission || 'manual') === 'manual' ? ' 目前權限是「每次詢問」，子代理可能停下來等你核准。' : '';
+  toast(`Swarm 模式已開啟：用量可能是一般的好幾倍，用完請 /swarm off。${ask}`);
+}
+
+// /swarm: on / off / nothing (switch) / a task (turn it on, then send the task;
+// it stays on until it is turned off - the hub cannot ask Kimi for the one-shot
+// "task" swarm Kimi's own terminal has).
+async function swarmCommand(s, args) {
+  const on = Boolean(s.meta?.swarmMode);
+  const word = args.trim().toLowerCase();
+  if (word === '' || word === 'on' || word === 'off') {
+    const next = word === '' ? !on : word === 'on';
+    if (next === on) return toast(on ? 'Swarm 模式已經是開的' : 'Swarm 模式已經是關的');
+    await configure({ swarmMode: next });
+    return;
+  }
+  if (!on && !(await configure({ swarmMode: true }))) return;
+  return sendMessage({ text: args.trim(), images: [] });
 }
 
 async function respond(ev, optionId, extra = {}) {
@@ -2296,6 +2347,8 @@ async function sessionCommand(name, args) {
       return;
     case 'plan':
       return configure({ planMode: !meta.planMode });
+    case 'swarm':
+      return swarmCommand(s, args);
     case 'yolo':
     case 'auto':
     case 'manual':
@@ -2340,7 +2393,7 @@ async function sessionCommand(name, args) {
       return accountDialog(s.machineId, [
         ['模型', model?.name || meta.model || 'Kimi 的預設模型'],
         meta.effort ? ['思考強度', EFFORT_LABELS[meta.effort] || meta.effort] : null,
-        ['權限', `${PERMISSION_LABELS[meta.permission] || PERMISSION_LABELS.manual}${meta.planMode ? ' · 計畫模式' : ''}`],
+        ['權限', `${PERMISSION_LABELS[meta.permission] || PERMISSION_LABELS.manual}${meta.planMode ? ' · 計畫模式' : ''}${meta.swarmMode ? ' · Swarm 模式' : ''}`],
         ctx?.size ? ['Context', `${Math.round((ctx.used / ctx.size) * 100)}% · ${fmtK(ctx.used)} / ${fmtK(ctx.size)} tokens`] : null,
         ['資料夾', s.cwd || '—'],
         meta.owner === 'tui' ? ['執行在', meta.controllable ? '終端機（可控；Hub 的輸入會打進那個終端機）' : '終端機（Hub 經 Kimi Server API 操作，不會打進那個終端機）'] : null,
@@ -3436,6 +3489,8 @@ async function deepseekDialog() {
   let defaultModel = d0.model;
   const form = h('form', { class: 'settings deepseek-settings' });
   const keyInput = h('input', { class: 'om-input', type: 'password', autocomplete: 'off', spellcheck: false, 'aria-label': 'DeepSeek 閘道的 API key' });
+  // Which gateway a pasted key belongs to: any of them goes into the same list.
+  const addGw = h('select', { class: 'om-input ds-key-gw-select', name: 'keyGateway', 'aria-label': '這把 key 屬於哪個閘道' }, ...(acc.gateways || []).map((g) => h('option', { value: g.id, selected: g.id === gw }, g.label)));
   const keyNote = h('span', { class: 'om-field__help' });
   const keyActions = h('div', { class: 'claude-key-actions' });
   const errBox = h('div', { class: 'om-field__error ds-error', role: 'alert' });
@@ -3503,77 +3558,87 @@ async function deepseekDialog() {
           { class: `gw-item${g.id === gw ? ' on' : ''}` },
           h('input', { type: 'radio', name: 'gateway', value: g.id, checked: g.id === gw, onchange: () => ((gw = g.id), clearError(), fill(testOut), drawGateways(), drawKeyNote(), drawKeys(), drawKeyActions(), drawMachines(), loadModels()) }),
           h('span', { class: 'gw-name' }, g.label),
-          h('span', { class: 'gw-state' }, g.hasKey ? `${g.keyCount || keysOf(g).length} 把 key · 使用中 …${g.keyHint}` : '還沒有 key'),
+          h('span', { class: 'gw-state' }, g.hasKey ? `${g.keyCount || keysOf(g).length} 把 key` : '還沒有 key'),
         ),
       ),
     );
   };
+  const rot = () => (Array.isArray(acc.rotation?.keys) ? acc.rotation.keys : []);
   const drawKeyNote = () => {
-    const g = cur();
-    const n = g.keyCount ?? keysOf(g).length;
-    keyInput.placeholder = n ? '貼上要加入這個閘道的另一把 key' : `貼上 ${g.label} 的 API key`;
+    const n = rot().length;
+    keyInput.placeholder = n ? '貼上要加入清單的另一把 key' : '貼上 API key';
     fill(keyNote, n ? '' : '加入第一把 key 才能使用 DeepSeek。');
   };
   const drawKeyActions = () => {
-    const g = cur();
-    const n = g.keyCount ?? keysOf(g).length;
+    const n = rot().length;
+    const picked = (acc.gateways || []).find((g) => g.id === addGw.value);
     fill(
       keyActions,
-      g.site ? h('a', { class: 'om-btn om-btn--sm', href: g.site, target: '_blank', rel: 'noopener' }, `到 ${g.label} 取得 key`) : null,
+      picked?.site ? h('a', { class: 'om-btn om-btn--sm', href: picked.site, target: '_blank', rel: 'noopener' }, `到 ${picked.label} 取得 key`) : null,
       n ? action('測試使用中的 key', () => test()) : null,
-      n ? action(`清空這 ${n} 把 key…`, clearAll, { destructive: true }) : null,
+      n ? action(`清空全部 ${n} 把 key…`, clearAll, { destructive: true }) : null,
     );
   };
+  // How a key stands, in words; a reset time is shown only when its gateway
+  // stated one, and "unknown" is said as unknown.
+  const keyState = (k) => {
+    if (k.state === 'manual' || k.manual) return { text: '手動標記已滿', badge: 'warning' };
+    if (k.state === 'exhausted' || k.exhaustedAt) {
+      if (k.expiryKnown && k.resetAt) return { text: `已滿，${new Date(k.resetAt).toLocaleString()} 重置`, badge: 'warning' };
+      if (k.resetAt) return { text: '已滿，閘道說的重置時間已過（下一個真實請求會再試）', badge: 'warning' };
+      return { text: '已滿，重置時間未知（下一個真實請求會再試）', badge: 'warning' };
+    }
+    return k.active ? { text: '使用中', badge: 'success' } : { text: '待命', badge: '' };
+  };
   const drawKeys = () => {
-    const g = cur();
-    const keys = keysOf(g);
-    fill(keyHead, h('span', { class: 'om-field__label' }, '這個閘道的 key'), h('span', { class: 'om-toolbar__spacer' }), h('span', { class: 'ds-key-count' }, keys.length ? `${keys.length} 把` : ''));
+    const keys = rot();
+    fill(keyHead, h('span', { class: 'om-field__label' }, '全部 API key（依序使用，用完自動換下一把）'), h('span', { class: 'om-toolbar__spacer' }), h('span', { class: 'ds-key-count' }, keys.length ? `${keys.length} 把` : ''));
     fill(
       keyBox,
       keys.length
-        ? keys.map((k) =>
-            h(
+        ? keys.map((k) => {
+            const st = keyState(k);
+            return h(
               'div',
-              { class: `ds-key${k.active ? ' on' : ''}${k.exhaustedAt ? ' exhausted' : ''}` },
+              { class: `ds-key${k.active ? ' on' : ''}${k.state !== 'ready' ? ' exhausted' : ''}`, 'data-key-id': k.id },
               h(
                 'div',
                 { class: 'ds-key-main' },
+                h('span', { class: 'ds-key-pos' }, `${k.position}`),
+                h('span', { class: 'ds-key-gw' }, k.gatewayLabel || k.gateway),
                 h('span', { class: 'ds-key-hint' }, `…${k.hint || '????'}`),
-                k.active ? h('span', { class: 'om-badge om-badge--success' }, '使用中') : null,
-                k.exhaustedAt ? h('span', { class: 'om-badge om-badge--warning' }, '額度用盡') : null,
+                h('span', { class: `om-badge${st.badge ? ` om-badge--${st.badge}` : ''} ds-key-state` }, st.text),
                 h('span', { class: 'ds-key-added', title: k.addedAt ? new Date(k.addedAt).toLocaleString() : '' }, k.addedAt ? `加入於 ${relTime(k.addedAt)}` : ''),
               ),
               h(
                 'div',
                 { class: 'ds-key-actions' },
-                !k.active && !k.exhaustedAt ? action('指定使用中', () => activate(k)) : null,
-                k.exhaustedAt ? action('重新啟用', () => retry(k)) : null,
+                k.state !== 'ready' ? action('重新啟用', () => retry(k)) : null,
                 action('測試', () => test(k.id)),
                 action('刪除', () => remove(k), { destructive: true }),
               ),
-            ),
-          )
-        : h('p', { class: 'om-field__help' }, '還沒有 key。加入後會顯示尾碼；完整 key 不會再出現在畫面上。'),
+            );
+          })
+        : h('p', { class: 'om-field__help' }, '還沒有 key。加入後會顯示家別與尾碼；完整 key 不會再出現在畫面上。'),
     );
   };
   const drawMachines = () => {
-    const g = cur();
-    const rows = (acc.activity || []).filter((a) => a.gateway === g.id);
+    const rows = acc.activity || [];
     fill(
       machineBox,
       rows.length
         ? rows.map((a) => {
-            const key = keysOf(g).find((k) => k.id === a.activeId);
+            const key = rot().find((k) => k.id === a.activeId);
             return h(
               'div',
               { class: 'ds-machine' },
               icon('computer'),
               h('span', { class: 'ds-machine-name' }, a.machineName || a.machineId),
-              h('span', { class: 'ds-machine-key' }, key ? `…${key.hint || '????'}${key.exhaustedAt ? '（額度用盡）' : ''}` : a.activeId ? '回報的 key 已不在號池' : '尚未回報使用中的 key'),
+              h('span', { class: 'ds-machine-key' }, key ? `${key.gatewayLabel || key.gateway} …${key.hint || '????'}${key.state !== 'ready' ? '（額度用盡）' : ''}` : a.activeId ? '回報的 key 已不在清單' : '尚未回報使用中的 key'),
               h('span', { class: 'ds-machine-rev', title: '這台電腦最近回報的號池版本' }, `v${a.revision}`),
             );
           })
-        : h('p', { class: 'om-field__help' }, '還沒有電腦回報這個閘道實際使用中的 key。連接器 0.10.0 以上會回報；各機可以有自己的使用中 key。'),
+        : h('p', { class: 'om-field__help' }, '還沒有電腦回報實際使用中的 key。連接器 0.10.0 以上會回報；各機可以有自己的使用中 key。'),
     );
   };
   const draw = () => {
@@ -3590,7 +3655,8 @@ async function deepseekDialog() {
     fill(testOut, h('span', { class: 'spinner' }), ' 連線中…');
     testOut.className = 'claude-test';
     try {
-      const r = await post('/deepseek/test', { gateway: gw, ...(keyId ? { keyId } : {}) });
+      const head = acc.rotation?.activeId;
+      const r = await post('/deepseek/test', keyId ? { keyId } : head ? { keyId: head } : { gateway: gw });
       testOut.className = `claude-test ${r.ok ? 'ok' : 'bad'}`;
       fill(testOut, r.message);
       if (!r.ok) showError(r.message);
@@ -3611,7 +3677,9 @@ async function deepseekDialog() {
     fill(testOut, h('span', { class: 'spinner' }), ` ${label}…`);
     testOut.className = 'claude-test';
     try {
-      acc = S.deepseek = await put('/deepseek', { gateway: gw, ...body });
+      // (No `gateway`: the choice of whose model names are used is saved with
+      // the dialog, not by a key operation.)
+      acc = S.deepseek = await put('/deepseek', body);
       S.deepseekModels = null;
       modelCatalogs.clear();
       homeCatalog = null;
@@ -3639,23 +3707,22 @@ async function deepseekDialog() {
       keyInput.focus();
       return;
     }
-    const r = await keyOp({ apiKey: value }, '加入 key');
+    const r = await keyOp({ apiKey: value, keyGateway: addGw.value }, '加入 key');
     if (r) {
       keyInput.value = '';
       keyInput.focus();
     }
   };
-  const activate = (k) => keyOp({ activateKeyId: k.id }, '指定使用中');
   const retry = (k) => keyOp({ retryKeyId: k.id }, '重新啟用');
   const remove = async (k) => {
-    if (!(await confirmDialog({ title: `要刪除 …${k.hint} 這把 key 嗎？`, body: '只會移除這一把；其他同閘道的 key 不受影響。刪到一把不剩時，DeepSeek 對話要等你再加入 key 才能繼續，連接的電腦上 Kimi 裡的 DeepSeek 模型來源也會一併移除。這不會撤銷 key 本身，要撤銷請到閘道的網站。', action: '刪除', destructive: true }))) return;
+    if (!(await confirmDialog({ title: `要刪除 ${k.gatewayLabel || ''} …${k.hint} 這把 key 嗎？`, body: '只會移除這一把；清單裡其他的 key 不受影響。刪到一把不剩時，DeepSeek 對話要等你再加入 key 才能繼續，連接的電腦上 Kimi 裡的 DeepSeek 模型來源也會一併移除。這不會撤銷 key 本身，要撤銷請到閘道的網站。', action: '刪除', destructive: true }))) return;
     await keyOp({ removeKeyId: k.id }, '刪除 key');
   };
   const clearAll = async () => {
-    const g = cur();
-    const n = g.keyCount ?? keysOf(g).length;
-    if (!(await confirmDialog({ title: `要清空 ${g.label} 的 ${n} 把 key 嗎？`, body: '所有同閘道的 key 都會從中控台與受控 connector 移除。DeepSeek 對話要等你再加入 key 才能繼續。這不會撤銷 key 本身，要撤銷請到閘道的網站。', action: '清空', destructive: true }))) return;
-    await keyOp({ clearKey: true }, '清空 key');
+    const withKeys = (acc.gateways || []).filter((g) => g.keyCount > 0);
+    const n = rot().length;
+    if (!(await confirmDialog({ title: `要清空全部 ${n} 把 key 嗎？`, body: '清單裡所有閘道的 key 都會從中控台與受控 connector 移除。DeepSeek 對話要等你再加入 key 才能繼續。這不會撤銷 key 本身，要撤銷請到閘道的網站。', action: '清空', destructive: true }))) return;
+    for (const g of withKeys) await keyOp({ keyGateway: g.id, clearKey: true }, '清空 key', { quiet: g !== withKeys.at(-1) });
   };
   const save = async (e) => {
     e.preventDefault();
@@ -3698,28 +3765,29 @@ async function deepseekDialog() {
     addKey();
   });
   draw();
+  addGw.addEventListener('change', drawKeyActions);
   fill(
     form,
     h('div', { class: 'dialog-title' }, 'DeepSeek'),
     h(
       'p',
       { class: 'dialog-text settings-lead' },
-      '各閘道各自保存 key；額度用盡自動換同閘道下一把，不切供應商或模型。',
+      'OpenCode 與 Command Code 的 key 放在同一份清單，依序使用：目前這把額度真的用完（閘道回了額度錯誤）就自動換下一把，不論是哪一家；換家時網址、模型名稱與標頭會一起換，對話看不到錯誤。模型仍只有 DeepSeek V4.1 Flash。',
     ),
     configDamagedNote(acc.damaged),
-    h('div', { class: 'dialog-subtitle first' }, '閘道'),
-    gwBox,
-    gwNote,
-    h('div', { class: 'dialog-subtitle' }, 'API key 號池'),
+    h('div', { class: 'dialog-subtitle first' }, 'API key（所有閘道一份清單）'),
     keyHead,
     keyBox,
-    h('div', { class: 'om-field' }, h('span', { class: 'om-field__label' }, '加入 API key'), h('div', { class: 'ds-key-add' }, keyInput, h('button', { class: 'om-btn om-btn--sm om-btn--primary', type: 'button', onclick: addKey }, '加入 key')), keyNote),
+    h('div', { class: 'om-field' }, h('span', { class: 'om-field__label' }, '加入 API key'), h('div', { class: 'ds-key-add' }, addGw, keyInput, h('button', { class: 'om-btn om-btn--sm om-btn--primary', type: 'button', onclick: addKey }, '加入 key')), keyNote),
     keyActions,
     testOut,
     errBox,
     h('p', { class: 'om-field__help ds-note' }, STORAGE_NOTE),
     h('div', { class: 'dialog-subtitle' }, '各機實際 key'),
     machineBox,
+    h('div', { class: 'dialog-subtitle' }, '模型名稱來源'),
+    gwBox,
+    gwNote,
     h('div', { class: 'dialog-subtitle' }, '新對話的預設'),
     field('模型', modelSel),
     field('思考強度', effortSel, 'max 最仔細，也花最多 token'),
@@ -3760,17 +3828,17 @@ function deepseekStatusDialog() {
   const model = (meta.models || []).find((x) => x.id === meta.model);
   const ctx = meta.context;
   const acc = S.deepseek || {};
-  const pool = (acc.gateways || []).find((g) => g.id === acc.gateway);
-  const active = (pool?.keys || []).find((k) => k.active);
+  const list = acc.rotation?.keys || [];
+  const active = list.find((k) => k.active);
   const rows = [
     ['模型', model?.name || meta.model || '—'],
     meta.effort ? ['思考強度', EFFORT_LABELS[meta.effort] || meta.effort] : null,
-    ['權限', `${PERMISSION_LABELS[meta.permission] || PERMISSION_LABELS.manual}${meta.planMode ? ' · 計畫模式' : ''}`],
+    ['權限', `${PERMISSION_LABELS[meta.permission] || PERMISSION_LABELS.manual}${meta.planMode ? ' · 計畫模式' : ''}${meta.swarmMode ? ' · Swarm 模式' : ''}`],
     ctx?.size ? ['Context', `${Math.round((ctx.used / ctx.size) * 100)}% · ${fmtK(ctx.used)} / ${fmtK(ctx.size)} tokens（Kimi 用到約 85% 會自動壓縮）`] : null,
     ['資料夾', s.cwd || '—'],
     ['執行在', `「${machineById(s.machineId)?.name || s.meta?.machineName || '那台電腦'}」的 Kimi Code${meta.kimiVersion ? ` ${meta.kimiVersion}` : ''}`],
-    ['計費', `${dsLabel()} 的 API key，不用 Kimi 訂閱`],
-    ['API key', acc.hasKey ? `${pool?.keyCount || pool?.keys?.length || 1} 把，使用中 …${active?.hint || acc.keyHint}${active?.exhaustedAt ? '（額度用盡）' : ''}` : '還沒有設定'],
+    ['計費', `${active?.gatewayLabel || dsLabel()} 的 API key，不用 Kimi 訂閱`],
+    ['API key', acc.hasKey ? `${list.length || 1} 把（依序使用），使用中 ${active ? `${active.gatewayLabel} …${active.hint}` : '—（全部用盡）'}` : '還沒有設定'],
   ].filter(Boolean);
   const body = h(
     'div',

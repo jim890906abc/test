@@ -33,6 +33,7 @@ let hubWs;
 let upstreamRequests = [];
 let responses = new Map(); // upstream key -> async (req, res, body) => void
 let helloWaiters = [];
+let lastHello = null;
 
 // ------------------------------------------------------------ fake Kimi
 let state;
@@ -323,6 +324,7 @@ before(async () => {
       const m = JSON.parse(d);
       if (m.t === 'hello') {
         hubWs = ws;
+        lastHello = m;
         const waiters = helloWaiters;
         helloWaiters = [];
         for (const r of waiters) r();
@@ -563,8 +565,8 @@ test('a 400 whose message echoes quota words marks no key exhausted and reaches 
   assert.deepEqual(upstreamRequests.map((x) => x.key), [KEY_A]);
 });
 
-test('only 402 and 429 can rotate: 400/401/403/404/409/422/5xx with a quota code do not', async () => {
-  for (const status of [400, 401, 403, 404, 409, 422, 500, 502, 503]) {
+test('401/404/409/422/5xx never rotate, even with a quota code (400 and 403 do: see the credits tests below)', async () => {
+  for (const status of [401, 404, 409, 422, 500, 502, 503]) {
     const out = await poolOutcome(jsonError(status, { code: 'insufficient_quota', type: 'insufficient_quota', message: 'You exceeded your current quota' }));
     assert.equal(out.status, status, `status ${status}`);
     assert.deepEqual(out.upstream, [KEY_A], `status ${status} tried another key`);
@@ -945,4 +947,383 @@ test('the pool and its current key survive a bridge restart; state is private an
   // The subagent default the hub wrote is still Kimi's, not rewritten by the
   // restart.
   assert.deepEqual(state.secondaryModel, { defaultModel: `${DS}/deepseek-v4.1-flash`, defaultEffort: 'max', force: false });
+});
+
+// ======================================================================
+// One rotation order across gateways (2026-10-28): a key that is really out
+// of credit/quota is marked, and the very same request goes to the next key
+// in the order, whichever gateway that key belongs to. The Kimi-facing model
+// name, the address, the model id at that gateway and the gateway-specific
+// session header all change with the key. Nothing is guessed: the reset time
+// is the one the gateway's message states, otherwise "unknown" and a real
+// request finds out.
+// ======================================================================
+const CREDITS_MSG = 'You have insufficient credits to make this request. Please purchase more credits to continue using the service.';
+const CC = 'commandcode';
+const OCG = 'opencode-go';
+const ck = (id, apiKey, gateway, extra = {}) => ({ id, apiKey, gateway, ...extra });
+const MODEL_MAP = { [CC]: { 'deepseek-v4.1-flash': 'deepseek/deepseek-v4.1-flash' }, opencode: { 'deepseek-v4.1-flash': 'deepseek-v4.1-flash', 'deepseek-v4-pro': 'deepseek-v4-pro' } };
+const cross = (keys, over = {}) => ({ revision: 1, activeId: keys[0].id, rotation: 1, modelMap: MODEL_MAP, keys, ...over });
+const chatWith = (body, headers = {}) =>
+  fetch(`${localBase()}/chat/completions`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${localToken()}`, 'content-type': 'application/json', accept: 'text/event-stream', ...headers },
+    body: JSON.stringify(body),
+  });
+const FLASH = { model: 'deepseek-v4.1-flash', reasoning_effort: 'max', stream: true, messages: [{ role: 'user', content: 'rotate me' }] };
+const savedPool = () => JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')).deepseekPool;
+const settle = (ms = 120) => new Promise((r) => setTimeout(r, ms));
+
+// The tests above end on a persisted pool at a high revision; from here on every
+// test starts without one (a hub that has forgotten the connector's pool).
+let crossSection = false;
+beforeEach(async () => {
+  if (crossSection) await ask('kimi.deepseek.remove', {});
+});
+
+test('the hello names the new ability, so a hub knows this connector can rotate across gateways', () => {
+  crossSection = true;
+  assert.ok(lastHello, 'a hello was seen');
+  assert.ok(lastHello.capabilities.includes('pool_cross'), JSON.stringify(lastHello.capabilities));
+  assert.ok(lastHello.capabilities.includes('pool'), 'and still the pool');
+});
+
+test('a 400 that says "insufficient credits" (the 2026-10-24 incident) rotates to the next key; Kimi sees one normal answer', async () => {
+  const cases = [
+    ['json message', jsonError(400, { message: CREDITS_MSG, type: 'invalid_request_error' })],
+    ['json, no type', jsonError(400, { message: CREDITS_MSG })],
+    ['plain text', textError(400, CREDITS_MSG)],
+    ['402 plain text', textError(402, CREDITS_MSG)],
+    ['envelope with a credits error type', (req, res) => (res.writeHead(400, { 'content-type': 'application/json' }), res.end(JSON.stringify({ type: 'error', error: { type: 'CreditsError', message: 'Insufficient balance. Manage your billing here.' } })))],
+  ];
+  for (const [name, handler] of cases) {
+    const out = await poolOutcome(handler);
+    assert.equal(out.status, 200, name);
+    assert.match(out.text, /second key answered/, name);
+    assert.deepEqual(out.upstream, [KEY_A, KEY_B], name);
+    assert.deepEqual(out.exhausted, ['dk_a'], name);
+    assert.deepEqual(out.saved, ['dk_a'], `${name}: persisted`);
+  }
+});
+
+test('400/403 count as quota only for an account-level statement: explicit quota code, or credits/limit wording that is not an echo', async () => {
+  const rotate = [
+    ['400 quota code', jsonError(400, { code: 'insufficient_quota', message: 'x' })],
+    ['403 quota code', jsonError(403, { code: 'usage_limit_reached', message: 'x' })],
+    ['403 usage limit message', jsonError(403, { message: "You've reached your monthly usage limit for this key." })],
+    ['400 monthly limit', jsonError(400, { message: 'Monthly limit reached' })],
+    ['429 command code usage limit', jsonError(429, { message: "You've reached your 5-hour usage limit for your plan. Your limit resets at 3:00 PM." })],
+    ['429 subscription quota with a long wait', jsonError(429, { type: 'SubscriptionUsageLimitError', message: 'Subscription quota exceeded. Retry in 2hr 3min.' })],
+  ];
+  for (const [name, handler] of rotate) {
+    const out = await poolOutcome(handler);
+    assert.equal(out.status, 200, name);
+    assert.deepEqual(out.upstream, [KEY_A, KEY_B], name);
+    assert.deepEqual(out.exhausted, ['dk_a'], name);
+  }
+  const stay = [
+    ['400 reasoning must be passed back', 400, jsonError(400, { code: 'invalid_request_error', message: 'The reasoning_content in the thinking mode must be passed back to the API.' })],
+    ['400 plain bad request', 400, jsonError(400, { message: 'Invalid value for messages[3].content: expected a string' })],
+    ['400 context too long', 400, jsonError(400, { message: "This model's maximum context length is 1000000 tokens. However, your messages resulted in 1200000 tokens." })],
+    ['400 echoed words', 400, jsonError(400, { code: 'invalid_request_error', message: 'Your request mentioned insufficient credits and a monthly limit reached in the prompt' })],
+    ['403 plan refusal', 403, jsonError(403, { code: 'upgrade_required', message: 'Your plan has no API access; upgrade to add credits' })],
+    ['403 plain forbidden', 403, jsonError(403, { message: 'Forbidden' })],
+    ['429 per minute', 429, jsonError(429, { message: 'Rate limit: you have exceeded your usage limit per minute, retry in 3 seconds' })],
+    ['400 credits wording in a code that names rate limiting', 400, jsonError(400, { code: 'rate_limit_exceeded', message: 'insufficient credits for this burst' })],
+  ];
+  for (const [name, status, handler] of stay) {
+    const out = await poolOutcome(handler);
+    assert.equal(out.status, status, name);
+    assert.deepEqual(out.upstream, [KEY_A], `${name}: no other key was tried`);
+    assert.deepEqual(out.exhausted, [], name);
+  }
+});
+
+test('OpenCode Go -> Command Code: the same request goes to the next gateway with its address, model id, session header and key', async () => {
+  responses.set(KEY_A, jsonError(400, { message: CREDITS_MSG }));
+  responses.set(KEY_B, (req, res) => success(res, 'command code answered'));
+  const r = await provision({ pool: cross([ck('dk_a', KEY_A, OCG), ck('dk_b', KEY_B, CC)]) });
+  assert.equal(r.ok, true, r.error);
+  assert.equal(r.data.pool.revision, 1);
+  assert.match(provider().base_url, /\/opencode-go$/, 'Kimi keeps talking to the one provider it was given');
+  const res = await chatWith(FLASH, { 'x-opencode-session': 'ses_agenthub_0123456789abcdef', 'x-agent-hub-note': 'private' });
+  assert.equal(res.status, 200);
+  assert.match(await res.text(), /command code answered/);
+  assert.equal(upstreamRequests.length, 2);
+  const [first, second] = upstreamRequests;
+  assert.equal(first.url, '/opencode-go/chat/completions');
+  assert.equal(first.key, KEY_A);
+  assert.equal(first.body.model, 'deepseek-v4.1-flash');
+  assert.equal(first.headers['x-opencode-session'], 'ses_agenthub_0123456789abcdef');
+  assert.equal(first.headers['x-session-id'], undefined);
+  assert.equal(second.url, '/commandcode/chat/completions');
+  assert.equal(second.key, KEY_B);
+  assert.equal(second.body.model, 'deepseek/deepseek-v4.1-flash', 'the model id is the one Command Code lists');
+  assert.deepEqual({ ...second.body, model: 'x' }, { ...FLASH, model: 'x' }, 'nothing else in the request changed');
+  assert.equal(second.headers['x-session-id'], 'ses_agenthub_0123456789abcdef', 'the same session id under the name this gateway uses');
+  assert.equal(second.headers['x-opencode-session'], undefined);
+  assert.equal(second.headers['x-agent-hub-note'], undefined);
+  assert.equal(second.headers.authorization, `Bearer ${KEY_B}`);
+  assert.ok(!JSON.stringify(second.headers).includes(localToken()));
+  await settle();
+  const report = reports.filter((x) => x.revision === 1).at(-1);
+  assert.equal(report.rotation, 1);
+  assert.equal(report.activeId, 'dk_b');
+  assert.equal(report.gateway, CC, 'the machine is now on a Command Code key');
+  assert.ok(report.keys.find((k) => k.id === 'dk_a').exhaustedAt);
+  assert.ok(!JSON.stringify(reports).includes(KEY_A) && !JSON.stringify(reports).includes(KEY_B));
+  // The next request starts on the key that works: no wasted call to the dry one.
+  upstreamRequests = [];
+  const again = await chatWith(FLASH, { 'x-opencode-session': 'ses_agenthub_0123456789abcdef' });
+  assert.equal(again.status, 200);
+  await again.text();
+  assert.deepEqual(upstreamRequests.map((x) => [x.url, x.key]), [['/commandcode/chat/completions', KEY_B]]);
+});
+
+test('Command Code -> OpenCode Go: the other direction renames the model and the header back', async () => {
+  const flash = models(['deepseek/deepseek-v4.1-flash']);
+  responses.set(KEY_A, jsonError(429, { message: "You've reached your 5-hour usage limit for your plan." }));
+  responses.set(KEY_B, (req, res) => success(res, 'go answered'));
+  const map = { [OCG]: { 'deepseek/deepseek-v4.1-flash': 'deepseek-v4.1-flash' } };
+  const r = await provision({ gateway: CC, models: flash, pool: cross([ck('dk_a', KEY_A, CC), ck('dk_b', KEY_B, OCG)], { modelMap: map }) });
+  assert.equal(r.ok, true, r.error);
+  assert.match(provider().base_url, /\/commandcode$/);
+  const res = await chatWith({ ...FLASH, model: 'deepseek/deepseek-v4.1-flash' }, { 'x-session-id': 'ses_agenthub_fedcba9876543210' });
+  assert.equal(res.status, 200);
+  assert.match(await res.text(), /go answered/);
+  const [first, second] = upstreamRequests;
+  assert.equal(first.url, '/commandcode/chat/completions');
+  assert.equal(first.body.model, 'deepseek/deepseek-v4.1-flash');
+  assert.equal(first.headers['x-session-id'], 'ses_agenthub_fedcba9876543210');
+  assert.equal(second.url, '/opencode-go/chat/completions');
+  assert.equal(second.body.model, 'deepseek-v4.1-flash');
+  assert.equal(second.headers['x-opencode-session'], 'ses_agenthub_fedcba9876543210');
+  assert.equal(second.headers['x-session-id'], undefined);
+});
+
+test('a key whose gateway has no counterpart of the requested model is skipped without being marked exhausted', async () => {
+  responses.set(KEY_B, (req, res) => success(res, 'must not be reached'));
+  responses.set(KEY_C, (req, res) => success(res, 'go answered the pro model'));
+  const r = await provision({ pool: cross([ck('dk_b', KEY_B, CC), ck('dk_c', KEY_C, OCG)]) });
+  assert.equal(r.ok, true, r.error);
+  const res = await chatWith({ ...FLASH, model: 'deepseek-v4-pro' });
+  assert.equal(res.status, 200);
+  assert.match(await res.text(), /go answered the pro model/);
+  assert.deepEqual(upstreamRequests.map((x) => x.key), [KEY_C], 'Command Code was not asked for a model it was not told about');
+  await settle();
+  assert.deepEqual(reports.filter((x) => x.revision === 1).at(-1).keys.filter((k) => k.exhaustedAt), [], 'skipping is not exhaustion');
+  // Only keys that cannot serve it: a clear answer that is not a quota error.
+  upstreamRequests = [];
+  assert.equal((await provision({ pool: cross([ck('dk_b', KEY_B, CC)], { revision: 2 }) })).ok, true);
+  const none = await chatWith({ ...FLASH, model: 'deepseek-v4-pro' });
+  assert.equal(none.status, 400);
+  const j = JSON.parse(await none.text());
+  assert.equal(j.error.code, 'model_not_available');
+  assert.match(j.error.message, /deepseek-v4-pro/);
+  assert.equal(upstreamRequests.length, 0);
+});
+
+// ---- reset times: only what the message states
+const clock = (ms) => new Date(Date.now() + ms);
+async function resetOf(message, extra = {}) {
+  const out = await poolOutcome(jsonError(429, { message, ...extra }));
+  assert.equal(out.status, 200, message);
+  const report = reports.filter((x) => x.revision === 1).at(-1);
+  const a = report.keys.find((k) => k.id === 'dk_a');
+  assert.ok(a.exhaustedAt, message);
+  const saved = savedPool().keys.find((k) => k.id === 'dk_a');
+  assert.equal(saved.retryAt, a.retryAt, 'persisted the same as reported');
+  return { retryAt: a.retryAt, exhaustedAt: a.exhaustedAt };
+}
+
+test('Command Code "resets at ...170Z" is read as UTC, fraction and all', async () => {
+  const when = clock(3 * 3600_000);
+  when.setUTCMilliseconds(170);
+  const iso = when.toISOString();
+  assert.match(iso, /\.170Z$/);
+  const got = await resetOf(`You've reached your 5-hour usage limit for your plan. Your limit resets at ${iso}.`);
+  assert.equal(got.retryAt, when.getTime());
+  const plus8 = clock(2 * 3600_000);
+  plus8.setUTCMilliseconds(0);
+  const local = new Date(plus8.getTime() + 8 * 3600_000).toISOString().replace('Z', '+08:00');
+  assert.equal((await resetOf(`Usage limit reached. Resets at ${local}`)).retryAt, plus8.getTime());
+});
+
+test('a relative time ("resets in 2 hours 15 minutes", "Retry in 2hr 3min") is counted from now', async () => {
+  const a = await resetOf('Usage limit reached; your limit resets in 2 hours 15 minutes.');
+  assert.ok(Math.abs(a.retryAt - a.exhaustedAt - (2 * 3600 + 15 * 60) * 1000) < 5000, String(a.retryAt - a.exhaustedAt));
+  const b = await resetOf('Subscription quota exceeded. Retry in 2hr 3min.');
+  assert.ok(Math.abs(b.retryAt - b.exhaustedAt - (2 * 3600 + 3 * 60) * 1000) < 5000, String(b.retryAt - b.exhaustedAt));
+});
+
+test('with several "resets at" in one message, the last readable one is taken', async () => {
+  const early = clock(1 * 3600_000);
+  early.setUTCMilliseconds(0);
+  const late = clock(5 * 3600_000);
+  late.setUTCMilliseconds(250);
+  const both = await resetOf(`Usage limit reached. Window A resets at ${early.toISOString()}. Window B resets at ${late.toISOString()}.`);
+  assert.equal(both.retryAt, late.getTime());
+  const garbage = await resetOf(`Usage limit reached. Resets at ${early.toISOString()}. Notes: next window resets at sometime soon`);
+  assert.equal(garbage.retryAt, early.getTime(), 'a later time that cannot be read does not hide an earlier one that can');
+});
+
+test('no stated time, no zone, a past time or an absurd one: the expiry is unknown and nothing is invented', async () => {
+  const noTime = await resetOf('Monthly limit reached');
+  assert.equal(noTime.retryAt, undefined);
+  const noZone = await resetOf(`Usage limit reached. Resets at ${clock(2 * 3600_000).toISOString().slice(0, 19)}`);
+  assert.equal(noZone.retryAt, undefined, 'a time without a zone is not guessed');
+  const timeOfDay = await resetOf("You've reached your 5-hour usage limit. Your limit resets at 3:00 PM.");
+  assert.equal(timeOfDay.retryAt, undefined, 'a clock time with no zone or date is not guessed');
+  const past = await resetOf(`Usage limit reached. Resets at ${clock(-3600_000).toISOString()}`);
+  assert.equal(past.retryAt, undefined);
+  const far = await resetOf(`Usage limit reached. Resets at ${clock(400 * 86_400_000).toISOString()}`);
+  assert.equal(far.retryAt, undefined);
+});
+
+test('Retry-After and the reset fields still win, ahead of the message', async () => {
+  const body = JSON.stringify({ error: { code: 'usage_limit_reached', message: `Usage limit reached. Resets at ${clock(9 * 3600_000).toISOString()}` } });
+  const out = await poolOutcome((req, res) => (res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '3600' }), res.end(body)));
+  assert.equal(out.status, 200);
+  const a = reports.filter((x) => x.revision === 1).at(-1).keys.find((k) => k.id === 'dk_a');
+  assert.ok(Math.abs(a.retryAt - a.exhaustedAt - 3600_000) < 5000);
+});
+
+test('a key with an unknown expiry is found healthy by a real request after the probe gap, no time invented in between', async () => {
+  await withBridgeEnv(RETRY_ENV);
+  let dry = true;
+  responses.set(KEY_A, (req, res) => (dry ? jsonError(400, { message: 'Monthly limit reached' })(req, res) : success(res, 'a is back')));
+  responses.set(KEY_B, (req, res) => quota(res, 402, 'insufficient_quota'));
+  assert.equal((await provision({ pool: pool([key('dk_a', KEY_A), key('dk_b', KEY_B)]) })).ok, true);
+  const go = () => chat(FLASH).then(async (res) => ({ status: res.status, text: await res.text() }));
+  assert.equal((await go()).status, 402, 'both are out');
+  await settle();
+  const out = reports.filter((x) => x.revision === 1).at(-1);
+  assert.ok(out.keys.every((k) => k.exhaustedAt && k.retryAt === undefined), 'nothing claims to know when they come back');
+  dry = false;
+  upstreamRequests = [];
+  assert.equal((await go()).status, 402, 'inside the gap nobody is asked');
+  assert.equal(upstreamRequests.length, 0);
+  await new Promise((r) => setTimeout(r, 900));
+  const back = await go();
+  assert.equal(back.status, 200);
+  assert.match(back.text, /a is back/);
+  await settle();
+  const a = reports.filter((x) => x.revision === 1).at(-1).keys.find((k) => k.id === 'dk_a');
+  assert.equal(a.exhaustedAt, undefined);
+  assert.ok(a.recoveredAt);
+  await withBridgeEnv({});
+});
+
+test('a stated reset time keeps its key aside until then; when it has passed, the next real request that needs it uses it', async () => {
+  await withBridgeEnv({});
+  const when = clock(1500);
+  when.setUTCMilliseconds(0);
+  let reset = false;
+  responses.set(KEY_A, (req, res) => (reset ? success(res, 'a after its reset') : jsonError(429, { message: `Usage limit reached. Resets at ${when.toISOString()}` })(req, res)));
+  responses.set(KEY_B, (req, res) => (reset ? quota(res, 402, 'insufficient_quota') : success(res, 'b answered')));
+  assert.equal((await provision({ pool: pool([key('dk_a', KEY_A), key('dk_b', KEY_B)]) })).ok, true);
+  assert.match(await (await chat(FLASH)).text(), /b answered/);
+  reset = true;
+  upstreamRequests = [];
+  // b is now dry too, a's stated time has not come: nobody is probed early.
+  const early = await chat(FLASH);
+  assert.equal(early.status, 402);
+  await early.text();
+  assert.deepEqual(upstreamRequests.map((x) => x.key), [KEY_B], 'a was not touched before its stated time');
+  await new Promise((r) => setTimeout(r, Math.max(0, when.getTime() - Date.now()) + 300));
+  upstreamRequests = [];
+  const late = await chat(FLASH);
+  assert.equal(late.status, 200);
+  assert.match(await late.text(), /a after its reset/);
+});
+
+test('every key out: one clear error that lists each key by gateway and last four characters, with the states and the earliest known reset', async () => {
+  await withBridgeEnv({});
+  const when = clock(2 * 3600_000);
+  when.setUTCMilliseconds(0);
+  responses.set(KEY_A, jsonError(429, { message: `You've reached your 5-hour usage limit. Resets at ${when.toISOString()}` }));
+  responses.set(KEY_B, jsonError(400, { message: 'Monthly limit reached' }));
+  const r = await provision({ pool: cross([ck('dk_a', KEY_A, CC), ck('dk_b', KEY_B, OCG), ck('dk_c', KEY_C, OCG, { exhaustedAt: Date.now() - 1000, manual: true })]) });
+  assert.equal(r.ok, true, r.error);
+  const res = await chatWith(FLASH);
+  assert.equal(res.status, 402);
+  const j = JSON.parse(await res.text());
+  assert.equal(j.error.code, 'insufficient_quota');
+  const text = j.error.message;
+  assert.match(text, /Command Code[^\n]*…1111[^\n]*重置/, text);
+  assert.match(text, /OpenCode Go[^\n]*…2222[^\n]*(到期未知|重置時間未知)/, text);
+  assert.match(text, /OpenCode Go[^\n]*…3333[^\n]*手動標記/, text);
+  assert.match(text, /自動再試/);
+  assert.match(text, /重新啟用|清除/, 'says how to recover now');
+  assert.equal(j.error.retry_at > Date.now(), true, 'the next try that can happen is machine-readable');
+  for (const k of [KEY_A, KEY_B, KEY_C]) assert.ok(!JSON.stringify(j).includes(k), 'no key value in the error');
+  assert.deepEqual(upstreamRequests.map((x) => x.key), [KEY_A, KEY_B], 'the manually marked key is never tried');
+  // Quiet afterwards: the stated time is not due, and the unknown one waits out the gap.
+  upstreamRequests = [];
+  assert.equal((await chatWith(FLASH)).status, 402);
+  assert.ok(!upstreamRequests.some((x) => x.key === KEY_C));
+});
+
+test('a manually marked key is never used or probed, however long ago it was marked; the other keys carry on', async () => {
+  await withBridgeEnv(RETRY_ENV);
+  responses.set(KEY_A, (req, res) => success(res, 'must stay untouched'));
+  responses.set(KEY_B, (req, res) => success(res, 'b answered'));
+  assert.equal((await provision({ pool: pool([key('dk_a', KEY_A, Date.now() - 3600_000), key('dk_b', KEY_B)].map((k, i) => (i === 0 ? { ...k, manual: true } : k)), 1, 'dk_b') })).ok, true);
+  assert.match(await (await chat(FLASH)).text(), /b answered/);
+  responses.set(KEY_B, (req, res) => quota(res, 402, 'insufficient_quota'));
+  await new Promise((r) => setTimeout(r, 900));
+  upstreamRequests = [];
+  const dry = await chat(FLASH);
+  assert.equal(dry.status, 402);
+  await dry.text();
+  assert.deepEqual(upstreamRequests.map((x) => x.key), [KEY_B], 'only the non-manual key is probed');
+  await settle();
+  const a = reports.filter((x) => x.revision === 1).at(-1).keys.find((k) => k.id === 'dk_a');
+  assert.ok(a.exhaustedAt, 'still reported as exhausted');
+  assert.equal(savedPool().keys.find((k) => k.id === 'dk_a').manual, true, 'and still manual after being saved');
+  await withBridgeEnv({});
+});
+
+test('a cross-gateway pool is remembered across a restart: keys, their gateways and the model table', async () => {
+  responses.set(KEY_A, jsonError(400, { message: CREDITS_MSG }));
+  responses.set(KEY_B, (req, res) => success(res, 'after restart, command code'));
+  assert.equal((await provision({ pool: cross([ck('dk_a', KEY_A, OCG), ck('dk_b', KEY_B, CC)], { revision: 5 }) })).ok, true);
+  const saved = savedPool();
+  assert.deepEqual(saved.keys.map((k) => [k.id, k.gateway]), [['dk_a', OCG], ['dk_b', CC]]);
+  assert.deepEqual(saved.modelMap[CC], MODEL_MAP[CC]);
+  const base = localBase();
+  const token = localToken();
+  await restartBridge({});
+  upstreamRequests = [];
+  const res = await fetch(`${base}/chat/completions`, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify(FLASH) });
+  assert.equal(res.status, 200);
+  assert.match(await res.text(), /after restart, command code/);
+  assert.deepEqual(upstreamRequests.map((x) => [x.url, x.key, x.body.model]), [['/opencode-go/chat/completions', KEY_A, 'deepseek-v4.1-flash'], ['/commandcode/chat/completions', KEY_B, 'deepseek/deepseek-v4.1-flash']]);
+});
+
+test('a provision that names a gateway the connector does not know, or a bad model table, is refused whole', async () => {
+  const bad = [
+    cross([ck('dk_a', KEY_A, 'evil.example')]),
+    cross([ck('dk_a', KEY_A, OCG)], { modelMap: { 'evil.example': { 'deepseek-v4.1-flash': 'x' } } }),
+    cross([ck('dk_a', KEY_A, OCG)], { modelMap: { [CC]: { 'deepseek-v4.1-flash': '../../etc/passwd' } } }),
+    cross([ck('dk_a', KEY_A, OCG)], { modelMap: { [CC]: ['x'] } }),
+  ];
+  for (const p of bad) {
+    const r = await provision({ pool: p });
+    assert.equal(r.ok, false, JSON.stringify(p));
+  }
+});
+
+test('a pool without per-key gateways behaves exactly as before: same gateway, no rotation flag in its reports', async () => {
+  responses.set(KEY_A, (req, res) => quota(res, 402, 'insufficient_quota'));
+  responses.set(KEY_B, (req, res) => success(res, 'old shape'));
+  assert.equal((await provision({ pool: pool([key('dk_a', KEY_A), key('dk_b', KEY_B)]) })).ok, true);
+  const res = await chat(FLASH);
+  assert.equal(res.status, 200);
+  await res.text();
+  assert.deepEqual(upstreamRequests.map((x) => x.url), ['/opencode-go/chat/completions', '/opencode-go/chat/completions']);
+  await settle();
+  const report = reports.filter((x) => x.revision === 1).at(-1);
+  assert.equal(report.rotation, undefined);
+  assert.equal(report.gateway, 'opencode-go');
 });

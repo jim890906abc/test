@@ -111,13 +111,14 @@ docker logs agent-hub    # 啟動訊息裡有登入密碼
 - **統一模型選單**：只有一個首頁與一個對話清單；輸入框旁的選單依 Kimi／Claude／DeepSeek 分組，新舊對話都能改選，不需要切「模式」。所選的供應商、模型或 key 不可用時明確報錯，不會偷偷改用另一家。
 - **接續鏈**：在 Kimi ↔ Claude 之間切換時，Hub 建立接續節點並帶上可讀歷史，側欄仍是同一個聊天室；原本的原生對話不會被刪除或改寫。
 - **子代理預設與 broker**：每個對話可指定新子代理的供應商、模型與思考強度（預設 DeepSeek V4.1 Flash + max）；Kimi／DeepSeek 用原生 `Agent`／`AgentSwarm`，跨供應商的組合走 Hub 的 broker，卡片顯示實際模型與進度。
-- **DeepSeek 號池**：支援三個閘道（OpenCode Go、OpenCode、Command Code），每個閘道可存多把 key，額度用盡時自動換同閘道的下一把，用盡的 key 之後會自己回來。
+- **DeepSeek 號池**：支援三個閘道（OpenCode Go、OpenCode、Command Code），所有閘道的 key 放在同一份清單、依序使用；目前這把額度真的用完就自動換下一把，不論是哪一家，換家時網址、模型 id 與標頭一起換，對話看不到錯誤。用盡的 key 只在閘道明說的時間或之後的真實請求確認時才回來，不靠猜。
 - **長對話不卡**：打開對話只送最新一段視窗（預設最近 6 個回合、300 KB、500 個事件），往上捲再載入更早的；過長的欄位先給預覽，要看再取全文。視窗外的東西照樣看得到：Artifact 面板列出整個對話做過的所有頁面，「目前問題」置頂與忙碌計時不受視窗影響，視窗之前開始的子代理卡也還在（見「[開啟長對話：視窗與分頁](#開啟長對話視窗與分頁)」）。
 - **損壞對話檔救援**：對話檔因當機損壞時，原檔先原封不動備份到 `data/sessions-damaged/`；能修的修好再載入，側欄與對話頂部有「曾損壞並已修復」徽章；不能修的列在 `GET /api/damaged-sessions`，並在側欄頂端以橫幅提醒，不會靜默略過（見「[對話檔損壞時](#對話檔損壞時)」）。
 - **設定檔損壞不默默重來**：登入權杖與連接金鑰（`hub.json`）、已登記電腦清單（`machines.json`）、已刪除的 Claude 對話清單（`claude-deleted.json`）、Claude 與 DeepSeek 的 API key／金鑰池（`claude.json`、`deepseek.json`）、agents 與設定（`agents.json`、`settings.json`）讀不進來時，原檔備份到 `data/damaged-config/`、啟動日誌警告，不再悄悄產生新的權杖或把金鑰檔改寫成空的（見「[設定檔損壞時](#設定檔損壞時)」）。
 - **模型飄移提示**：Hub 記錄的模型和原生對話實際在用的不同時（例如在終端機或全域設定改過），輸入框改顯示「實際：…」並提供「改回」。
 - **終端機並存**：終端機裡的 Kimi 與 Hub 可以同時操作同一個對話，不需要 `/web` 或 `kimi-hub`；兩邊同時寫入可能互相覆蓋，這是已接受的取捨。
 - **自動暫停與定時送出**：Kimi 的 5 小時額度用到設定的 % 時自動「優雅暫停」，額度恢復後「繼續」；另有 `/later` 定時送出與 `/bg` 移到背景。（DeepSeek 對話沒有 5 小時額度，不適用自動暫停。）
+- **Swarm 模式**（Kimi 與 DeepSeek 對話）：主模型呼叫 AgentSwarm 一次派出一群子代理，Kimi 只在使用者開啟 swarm 模式時才讓它跑（沒開時回「Swarm mode is off」）。輸入 `/swarm` 切換、`/swarm on`／`/swarm off`，或在「權限」選單勾選「Swarm 模式」；開啟時輸入框旁有「Swarm」標籤，點一下關閉。`/swarm <任務>` 會先開啟再送出任務，之後**保持開啟**直到你關掉（Hub 沒辦法要求 Kimi 做終端機那種「任務結束自動關閉」）。Swarm 用量可能是一般對話的好幾倍；在「每次詢問」權限下子代理可能停下來等核准。終端機裡由中控台操作的 Kimi 會收到 Kimi 自己的 `/swarm`，Hub 不會替你把權限改成「全部自動」。Claude 沒有 swarm 模式。
 - **Artifact 即時預覽**：agent 寫出的 HTML 頁面在側邊面板的沙盒 iframe 裡即時顯示。
 - **GitHub 與 Google Drive**：Claude／Kimi 對話可綁定 GitHub repo（獨立分支，每輪結束檢查未 commit／push 的變更）；`/backup` 用 rclone 把專案資料夾備份到你的 Google Drive。
 - **多台電腦**：連接器從各電腦主動連回中控台（不用開埠、可在 NAT 後面），那台電腦的 Kimi 與 Claude 對話自動出現。
@@ -196,19 +197,19 @@ Claude 的對話由一個獨立的 **Claude 背景程式** 執行（跟 Kimi 的
 
 在統一模型選單選 DeepSeek，對話就用 DeepSeek 模型，費用算在你的 DeepSeek 閘道 API key 上，**不用 Kimi 訂閱**。它不是另一套 agent：DeepSeek 對話就是那台電腦上 Kimi Code 裡的一般 Kimi 對話，只是模型換成 DeepSeek，所以 Kimi 的自動壓縮（用到約 85% 的 context 時）、reasoning 回放、子代理、計畫模式、插隊、待辦都照常運作。側欄有「DeepSeek」標籤；是否使用藍白外觀由使用者自己決定。
 
-1. 左下角「⋯」→「DeepSeek…」選閘道、加入 API key。每個閘道有自己的 key 號池：可以加入多把、刪除、指定使用中、重新啟用已用盡的 key；同一把重複貼上只保留一筆。中控台加入前會先用該把 key 向閘道讀模型清單確認有效（只保留 DeepSeek 的模型；讀不到清單時用內建清單）。畫面只顯示尾碼；key 保存在中控台與需要它的受控 connector，完整 key 不會回傳瀏覽器。
+1. 左下角「⋯」→「DeepSeek…」加入 API key（選這把屬於哪個閘道）。所有閘道的 key 在同一份清單、依加入的順序使用：可以加入多把、刪除、重新啟用已用盡的 key；同一把重複貼上只保留一筆。「模型名稱來源」只決定新對話的模型清單取自哪個閘道。中控台加入前會先用該把 key 向閘道讀模型清單確認有效（只保留 DeepSeek 的模型；讀不到清單時用內建清單）。畫面只顯示尾碼；key 保存在中控台與需要它的受控 connector，完整 key 不會回傳瀏覽器。
 2. 閘道：**OpenCode Go**（訂閱）、**OpenCode**（按量計費，原本的 Zen）、**Command Code**（要有含 API 存取的方案；Go 方案會被拒絕，`upgrade_required`）。預設模型是各閘道的 DeepSeek V4.1 Flash（沒有的話用清單裡的第一個），思考強度 low／high／max，預設 max；每個模型 1M context、最多 384k 輸出。
 3. 在首頁選電腦和資料夾，和 Kimi 一樣；開第一個 DeepSeek 對話時，連接器（0.11.0 以上，舊的請重新執行連接指令）會在那台電腦的 Kimi 裡新增一個叫 `agent-hub-deepseek` 的模型來源，之後的對話直接用。中控台也會在連接器連上、Kimi 伺服器之後才啟動、或換 key 時補做這件事；失敗會以退避（5 秒、30 秒、2 分、10 分）重試，最近一次的結果與原因記在該電腦的狀態上（`provision`）。連接器會在該電腦開一個只聽 loopback 的 OpenAI 相容 proxy，Kimi 的模型來源指向它，Kimi 設定裡只放隨機的本機憑證、不放上游 key。因此使用這個號池 proxy 的 DeepSeek 對話需要那台電腦的連接器在線，proxy 才存在；Kimi 與 Claude 對話不依賴它。
 
 **多把 key 與自動輪替**
 
-- 目前這把 key 遇到額度用盡時，連接器會自動改用同一個閘道的下一把可用 key；只會在同閘道內輪替，不會切到 Kimi、Claude、另一個閘道或另一個模型。
-- 只有在上游還沒送出任何回覆、且錯誤明確是額度／點數／餘額用盡（HTTP 402/429，並由錯誤物件自己的 code／type／message 欄位明說；不是對整個回應內容找關鍵字，上游回聲的請求內容不算）時才輪替；400、一般 401、403 方案不符、409、短暫 429 限流、網路錯誤、逾時與 5xx 不會盲目換 key。已經開始串流的請求不會重跑，避免重複文字、工具或檔案副作用。
+- 目前這把 key 遇到額度用盡時，連接器會自動改用清單裡的下一把可用 key，不論它在 OpenCode Go、OpenCode 或 Command Code（用戶 2026-10-28 裁示）；換家時請求的網址、模型 id（OpenCode Go 的 `deepseek-v4.1-flash`、Command Code 的 `deepseek/deepseek-v4.1-flash`）與 session 標頭名稱（`x-opencode-session`／`x-session-id`，同一個值）一起換，Kimi 看到的仍是同一個模型來源與模型名稱。不會切到 Kimi、Claude 或另一個模型；這把 key 所在的閘道沒有這次要求的模型時，該把 key 直接跳過（不算用盡）。
+- 只有在上游還沒送出任何回覆、且錯誤明確是額度／點數／餘額／用量上限用盡（HTTP 400、402、403、429，並由錯誤物件自己的 code／type／message 欄位明說：例如 400 `You have insufficient credits to make this request`、Command Code 的 `usage limit … resets at …`、`Monthly limit reached`、`CreditsError`；不是對整個回應內容找關鍵字）時才輪替。400／403 還要求訊息是在說帳戶（不是上游回聲你的請求內容，例如「Your request mentioned insufficient credits」），403 `upgrade_required`、`reasoning_content must be passed back` 這類 400、一般 401、404、409、422、短暫 429 限流（每秒／每分鐘）、網路錯誤、逾時與 5xx 不會換 key。已經開始串流的請求不會重跑，避免重複文字、工具或檔案副作用。
 - 連接器對閘道有逾時：從送出請求到收到第一個內容位元組預設 120 秒（`AGENT_HUB_DEEPSEEK_FIRST_BYTE_MS`），串流開始後兩段資料間最久靜默 300 秒（`AGENT_HUB_DEEPSEEK_IDLE_MS`）；逾時回 504 `upstream_timeout`，不換 key。
 - 同一台電腦的並行請求共用 key 狀態，但用失敗的 key id 比對，避免多個失敗請求一次跳過好幾把。不同電腦可以有各自實際使用中的 key，中控台顯示各機最近回報，不會強行把它們改成同一把。
-- 全部 key 都用盡時會明確報錯（說明最早何時會自動再試，以及現在要怎麼恢復），不會無限循環或假稱成功；加入、刪除、指定使用中與重新啟用都會更新並推到 online Kimi，讓原生 DeepSeek 子代理也能使用。
-- **用盡的 key 會自己回來**：被標用盡的 key 先等一段時間（閘道自己回報的 `Retry-After`／重置時間；沒有就等 10 分鐘，可用 `AGENT_HUB_DEEPSEEK_RETRY_MS` 調整）；等完之後，只有在沒有健康 key 可用時，下一個真正的請求才會試它，這個請求本身就是探測（不另外送測試流量）。成功才清除標記，並向中控台回報「在用盡時間之後成功過」的證據；又遇到額度錯誤就重新計時。中控台只在三種情況清除用盡標記：連接器送來這個證據、較新 revision 的明確重置、設定頁「重新啟用」成功（會真的送一次很小的請求確認，不是只讀 `/models`）。另一台電腦的報告沒提到這把 key，不等於它健康，不會清除。
-- 舊 connector 只有一把 key 時可沿用原本的直連模式；同一個閘道加入第二把時會明確要求更新連接器（0.10.0 以上才有號池），不會靜默只使用第一把。連接器從 0.11.0 起在 hello 的 `capabilities` 宣告自己真的支援的能力（`pool`、`secondary_model`、`broker`、`handoff`）；中控台只看這個欄位，不用版本字串猜，舊連接器沒有這個欄位就視為沒有。
+- 全部 key 都用盡時會明確報錯：逐把列出家別與尾碼（不顯示 key）和狀態、最早已知的重置時間，以及現在要怎麼恢復，不會無限循環或假稱成功；加入、刪除與重新啟用都會更新並推到 online Kimi，讓原生 DeepSeek 子代理也能使用。
+- **用盡的 key 會自己回來，但時間只採閘道明說的**：重置時間只來自 `Retry-After`、回應的重置欄位，或訊息明寫的時間（`resets at 2026-10-21T12:25:07.170Z` 要帶時區，小數秒也認得；`resets in 2 hours 15 minutes`；有多處取最後一處讀得出來的）。沒寫、沒帶時區、已過或離譜（超過 35 天）就記「到期未知」，不自己猜、不套固定窗口、不用用量估算；到期未知的 key 在沒有健康 key 可用時，由距上次標記至少 `AGENT_HUB_DEEPSEEK_RETRY_MS`（預設 30 秒，只是兩次探測的間隔，不是回升時間的推測）之後的真實請求去試。已知重置時間的 key 到時間後同樣由下一個真正的請求試它，這個請求本身就是探測（不另外送測試流量）。成功才清除標記，並向中控台回報「在用盡時間之後成功過」的證據；又遇到額度錯誤就重新計時。中控台只在三種情況清除用盡標記：連接器送來這個證據、較新 revision 的明確重置、設定頁「重新啟用」成功（會真的送一次很小的請求確認，不是只讀 `/models`）。另一台電腦的報告沒提到這把 key，不等於它健康，不會清除。
+- 舊 connector 只有一把 key 時可沿用原本的直連模式；同一個閘道加入第二把時會明確要求更新連接器（0.10.0 以上才有號池），不會靜默只使用第一把。連接器從 0.11.0 起在 hello 的 `capabilities` 宣告自己真的支援的能力（`pool`、`pool_cross`、`secondary_model`、`broker`、`handoff`）；宣告 `pool_cross` 的連接器拿到整份跨家的清單，舊的 `pool` 連接器仍只拿「模型名稱來源」那個閘道的 key、只在那一家裡換；中控台只看這個欄位，不用版本字串猜，舊連接器沒有這個欄位就視為沒有。
 
 **不會動到你的 Kimi 訂閱**
 

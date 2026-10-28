@@ -3853,6 +3853,17 @@ pre.tail {
   font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
 }
+.ds-key-pos {
+  min-width: 16px;
+  color: var(--ink-secondary);
+  font-variant-numeric: tabular-nums;
+}
+.ds-key-gw {
+  font-weight: 600;
+}
+.ds-key-state {
+  white-space: normal;
+}
 .ds-key-added {
   color: var(--ink-secondary);
 }
@@ -3869,6 +3880,11 @@ pre.tail {
 .ds-key-add .om-input {
   flex: 1;
   min-width: 0;
+}
+.ds-key-add .ds-key-gw-select {
+  flex: 0 0 auto;
+  width: auto;
+  max-width: 45%;
 }
 .ds-error {
   margin: 0 0 var(--space-2);

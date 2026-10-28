@@ -29,7 +29,8 @@
 // DeepSeek key pool (the loopback proxy), environment, all optional:
 //   AGENT_HUB_DEEPSEEK_FIRST_BYTE_MS  wait for a gateway's first byte (default 120000)
 //   AGENT_HUB_DEEPSEEK_IDLE_MS        longest silence inside a stream (default 300000)
-//   AGENT_HUB_DEEPSEEK_RETRY_MS       wait before an exhausted key is tried again (default 600000)
+//   AGENT_HUB_DEEPSEEK_RETRY_MS       gap between real requests that look again at an exhausted key whose
+//                                     gateway stated no reset time (default 30000)
 //   AGENT_HUB_DAEMON_RECHECK_MS       how often a stale Claude daemon is looked at (default 15000)
 // The hello names what this version supports (`capabilities`); a Claude daemon
 // that lacks what the hub's features need is replaced as soon as it is idle.
@@ -816,15 +817,49 @@ const DS_PROXY_MAX_BODY = 64 * 1024 * 1024;
 const DS_PROXY_MAX_ERROR = 1024 * 1024;
 const DS_LOCAL_TOKEN = /^ah_local_[0-9a-f]{32}$/;
 const dsBad = (m) => Object.assign(new Error(m), { status: 400 });
-// Error codes that say a key's quota/credit/balance is gone, and the ones that
-// say only "slow down" (see proxy.quota).
-const DS_QUOTA_CODES = /^(insufficient_quota|quota_exceeded|quota_exhausted|usage_limit|usage_limit_reached|usage_limit_exceeded|insufficient_credits?|credits?_exhausted|insufficient_balance|balance_exhausted|out_of_credits?)$/i;
-const DS_RATE_CODES = /^(rate_limit|rate_limited|rate_limit_exceeded|rate_limit_error|too_many_requests|requests|tokens|throttled|overloaded)$/i;
-const DS_QUOTA_PHRASE = /insufficient[_\s-]*(quota|credits?|balance|funds)|\b(quota|credits?|balance)\b[\s\S]{0,12}\b(exceeded|exhausted|depleted|used up)\b|exceeded (?:your|the) (?:current )?quota|out of credits?|\bno (?:remaining )?credits?\b|balance (?:is )?(?:too low|insufficient|exhausted|zero)/i;
+// What a gateway's error says about THIS KEY's money or allowance (see
+// proxy.quota). Codes are compared with case, spaces, "_" and "-" taken out, so
+// `insufficient_quota`, `InsufficientQuota` and OpenCode's `CreditsError` are one
+// spelling each.
+const dsCodeKey = (c) => String(c).toLowerCase().replace(/[^a-z0-9]/g, '');
+const DS_QUOTA_CODES = /^(insufficientquota|quotaexceeded|quotaexhausted|usagelimit(?:reached|exceeded)?(?:error)?|insufficientcredits?|credits?exhausted|creditserror|insufficientbalance|balanceexhausted|outofcredits?|monthlylimit(?:reached|exceeded)?(?:error)?|(?:subscription|free|user|workspace)(?:usage)?limit(?:error)?)$/;
+const DS_RATE_CODES = /^(ratelimit|ratelimited|ratelimitexceeded|ratelimiterror|toomanyrequests|requests|tokens|throttled|overloaded)$/;
 // Envelope types that name no cause (OpenAI's invalid_request_error, Anthropic's
-// {type:'error'}): the message decides then.
-const DS_GENERIC_TYPES = /^(error|invalid_request_error|api_error)$/i;
-const DS_RATE_PHRASE = /per[-\s]?(?:second|minute|min|sec)\b|retry (?:in|after) \d+|too many requests|rate[-\s]?limit/i;
+// {type:'error'}, a bare HTTP status): the message decides then.
+const DS_GENERIC_TYPES = /^(error|invalidrequesterror|apierror|badrequest|invalidrequest|\d{3})$/;
+// The wording of an account-level statement: this key has no credit, quota,
+// balance or usage allowance left.
+const DS_QUOTA_PHRASE = new RegExp(
+  [
+    String.raw`insufficient[_\s-]*(?:quota|credits?|balance|funds)`,
+    String.raw`\b(?:quota|credits?|balance)\b[\s\S]{0,12}\b(?:exceeded|exhausted|depleted|used up)\b`,
+    String.raw`\bexceed(?:ed|s)? (?:your|the) (?:current )?(?:quota|usage limit|spending limit)`,
+    String.raw`out of credits?`,
+    String.raw`\bno (?:remaining )?credits?\b`,
+    String.raw`balance (?:is )?(?:too low|insufficient|exhausted|zero)`,
+    String.raw`\b(?:purchase|buy|add) (?:more )?credits\b`,
+    String.raw`\b(?:usage|monthly|weekly|daily|hourly|spend(?:ing)?|5[- ]?hour|subscription)[ _-]?(?:limit|quota)\b[\s\S]{0,40}\b(?:reached|exceeded|hit)\b`,
+    String.raw`\b(?:reached|hit|exceeded)\b[\s\S]{0,30}\b(?:usage|monthly|weekly|daily|hourly|spend(?:ing)?|5[- ]?hour|subscription)[ _-]?(?:limit|quota)\b`,
+  ].join('|'),
+  'i',
+);
+// "Slow down" wording: a per-second/minute limit is not an empty account.
+const DS_RATE_PHRASE = /per[-\s]?(?:second|minute|min|sec)\b|too many requests|rate[-\s]?limit|retry (?:in|after) \d+(?:\.\d+)?\s*(?:ms|s|secs?|seconds?)\b/i;
+// Words that make a quota phrase an echo of the refused request, not a
+// statement about the account ("Your request mentioned insufficient credits").
+const DS_ECHO_VERB = String.raw`(?:mention(?:s|ed|ing)?|contain(?:s|ed|ing)?|includ(?:e|es|ed|ing)|echo(?:es|ed|ing)?|quot(?:e|es|ed|ing)|refer(?:s|red|ring)?)`;
+const DS_ECHO_PHRASE = new RegExp(String.raw`\b(?:request|prompt|input|message|content|text)\b[^.]{0,40}\b${DS_ECHO_VERB}\b|\b${DS_ECHO_VERB}\b[^.]{0,40}\b(?:request|prompt|input|message|content)\b`, 'i');
+// Statuses a gateway uses to say a key is out: 402 and 429 by the book; 400
+// (OpenCode: "You have insufficient credits to make this request") and 403 are
+// also plain bad requests and plan refusals, so there the wording must be an
+// account-level statement and not an echo.
+const DS_QUOTA_STATUSES = new Set([400, 402, 403, 429]);
+const DS_STRICT_STATUSES = new Set([400, 403]);
+const DS_LABELS = { 'opencode-go': 'OpenCode Go', opencode: 'OpenCode', commandcode: 'Command Code' };
+// The time zone a stated reset time must carry (Z, UTC, GMT, +08:00): without it
+// the time is not read, never guessed.
+const DS_ISO_RESET = /(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:[.,](\d+))?)?\s*(Z\b|UTC\b|GMT\b|[+-]\d{2}:?\d{2}\b)/i;
+const DS_SESSION_NAMES = [...new Set(Object.values(DS_SESSION_HEADERS))];
 
 
 // The address of a gateway, or null. Only the fixed table (and the loopback
@@ -838,9 +873,16 @@ function dsBase(gateway) {
 
 const dsKeyOk = (key) => typeof key === 'string' && key.length > 0 && key.length <= 500 && !/\s/.test(key);
 
-// The hub's {revision, activeId, keys:[{id, apiKey, exhaustedAt?}]}, rebuilt
-// field by field. This is the only place a pool enters the connector.
-function cleanPool(raw) {
+// A model name the connector may put in a request or a table (a gateway's own
+// ids: letters, digits and . / : - _, no empty, "." or ".." parts).
+const dsModelOk = (m) => typeof m === 'string' && /^[\w.\/:-]{1,100}$/.test(m) && !/(^|\/)\.{0,2}(\/|$)/.test(m);
+
+// The hub's {revision, activeId, keys:[{id, apiKey, gateway?, exhaustedAt?}],
+// rotation?, modelMap?}, rebuilt field by field. This is the only place a pool
+// enters the connector. A key's `gateway` (a hub that rotates across gateways
+// names one per key) defaults to the pool's own; `modelMap` is the hub's table
+// { gateway: { the model id Kimi uses -> that gateway's id for the same model } }.
+function cleanPool(raw, defaultGateway = '') {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw dsBad('號池格式不正確');
   const revision = Number(raw.revision);
   if (!Number.isInteger(revision) || revision < 1) throw dsBad('號池的 revision 不正確');
@@ -852,6 +894,11 @@ function cleanPool(raw) {
     ids.add(item.id);
     if (!dsKeyOk(item.apiKey)) throw dsBad('號池裡的 API key 不能是空的、超過 500 字，或含有空白與換行');
     const key = { id: item.id, apiKey: item.apiKey };
+    const gateway = item.gateway === undefined || item.gateway === null ? defaultGateway : item.gateway;
+    if (gateway) {
+      if (typeof gateway !== 'string' || !Object.hasOwn(DS_GATEWAYS, gateway)) throw dsBad(`號池裡的 key 指定了不支援的閘道：${String(gateway).slice(0, 40)}`);
+      key.gateway = gateway;
+    }
     if (item.exhaustedAt !== undefined && item.exhaustedAt !== null) {
       const at = Number(item.exhaustedAt);
       if (!Number.isFinite(at) || at <= 0) throw dsBad('號池裡的 exhaustedAt 不正確');
@@ -859,6 +906,8 @@ function cleanPool(raw) {
       // When the gateway said it comes back (optional; see proxy.resetAt).
       const retry = Number(item.retryAt);
       if (item.retryAt != null && Number.isFinite(retry) && retry > 0) key.retryAt = retry;
+      // A person marked it full: it stays aside until a person clears the mark.
+      if (item.manual === true) key.manual = true;
     }
     // A real request succeeded on a key that had been exhausted: when, and
     // which exhaustion that proved wrong. Reported to the hub as evidence.
@@ -873,10 +922,26 @@ function cleanPool(raw) {
   let activeId = typeof raw.activeId === 'string' ? raw.activeId : '';
   if (activeId && !ids.has(activeId)) throw dsBad('號池的 activeId 不在 key 清單裡');
   if (!activeId) activeId = keys.find((k) => !k.exhaustedAt)?.id || keys[0].id;
-  // How long an exhausted key waits before a real request tries it again.
+  // How long an exhausted key whose gateway named no reset time waits before a
+  // real request looks again (a gap between probes, not a guess of the reset).
   const wait = Number(raw.retryMs);
   const retryMs = Number.isFinite(wait) && wait >= 1000 && wait <= 35 * 86_400_000 ? Math.round(wait) : undefined;
-  return { revision, activeId, keys, ...(retryMs ? { retryMs } : {}) };
+  let modelMap;
+  if (raw.modelMap !== undefined && raw.modelMap !== null) {
+    if (typeof raw.modelMap !== 'object' || Array.isArray(raw.modelMap)) throw dsBad('號池的 modelMap 格式不正確');
+    modelMap = {};
+    for (const [gw, table] of Object.entries(raw.modelMap)) {
+      if (!Object.hasOwn(DS_GATEWAYS, gw)) throw dsBad(`modelMap 指定了不支援的閘道：${gw.slice(0, 40)}`);
+      if (!table || typeof table !== 'object' || Array.isArray(table) || Object.keys(table).length > 50) throw dsBad(`modelMap 的 ${gw} 項目格式不正確`);
+      const out = Object.create(null);
+      for (const [from, to] of Object.entries(table)) {
+        if (!dsModelOk(from) || !dsModelOk(to)) throw dsBad(`modelMap 裡的模型名稱不合法：${from.slice(0, 40)}`);
+        out[from] = to;
+      }
+      modelMap[gw] = out;
+    }
+  }
+  return { revision, activeId, keys, ...(retryMs ? { retryMs } : {}), ...(raw.rotation === 1 || raw.rotation === true ? { rotation: true } : {}), ...(modelMap ? { modelMap } : {}) };
 }
 
 // ---- toml:begin
@@ -1278,7 +1343,7 @@ const deepseek = {
     const out = models.map((m) => {
       const model = m?.model;
       // Letters, digits and . / : - _ (a gateway's own ids): no empty, "." or ".." parts.
-      if (typeof model !== 'string' || !/^[\w.\/:-]{1,100}$/.test(model) || /(^|\/)\.{0,2}(\/|$)/.test(model)) throw bad(`模型名稱不合法：${String(model).slice(0, 40)}`);
+      if (!dsModelOk(model)) throw bad(`模型名稱不合法：${String(model).slice(0, 40)}`);
       if (seen.has(model)) throw bad(`模型重複：${model}`);
       seen.add(model);
       const size = (v, what, min, max) => {
@@ -1298,7 +1363,7 @@ const deepseek = {
       }
       return entry;
     });
-    return { base, key: pool === undefined || pool === null ? apiKey : null, models: out, pool: pool === undefined || pool === null ? null : cleanPool(pool) };
+    return { base, key: pool === undefined || pool === null ? apiKey : null, models: out, pool: pool === undefined || pool === null ? null : cleanPool(pool, gateway) };
   },
 
   // One call to Kimi's server (the bridge's own paths: not through ALLOW).
@@ -1813,7 +1878,7 @@ const proxy = {
     if (!base) return this.clear();
     let pool;
     try {
-      pool = cleanPool({ revision: saved.revision, activeId: saved.activeId, keys: saved.keys, retryMs: saved.retryMs });
+      pool = cleanPool({ revision: saved.revision, activeId: saved.activeId, keys: saved.keys, retryMs: saved.retryMs, rotation: saved.rotation, modelMap: saved.modelMap }, saved.gateway);
     } catch {
       return this.clear();
     }
@@ -1860,10 +1925,13 @@ const proxy = {
       activeId: route.pool.activeId,
       models: this.models,
       ...(route.pool.retryMs ? { retryMs: route.pool.retryMs } : {}),
+      ...(route.pool.rotation ? { rotation: 1 } : {}),
+      ...(route.pool.modelMap ? { modelMap: route.pool.modelMap } : {}),
       keys: route.pool.keys.map((k) => ({
         id: k.id,
         apiKey: k.apiKey,
-        ...(k.exhaustedAt ? { exhaustedAt: k.exhaustedAt, ...(k.retryAt ? { retryAt: k.retryAt } : {}) } : {}),
+        ...(k.gateway ? { gateway: k.gateway } : {}),
+        ...(k.exhaustedAt ? { exhaustedAt: k.exhaustedAt, ...(k.retryAt ? { retryAt: k.retryAt } : {}), ...(k.manual ? { manual: true } : {}) } : {}),
         ...(k.recoveredAt ? { recoveredAt: k.recoveredAt, ...(k.recoveredFrom ? { recoveredFrom: k.recoveredFrom } : {}) } : {}),
       })),
     };
@@ -1874,10 +1942,14 @@ const proxy = {
   report(force = false) {
     const route = this.route;
     if (!route) return;
+    const active = route.pool.keys.find((k) => k.id === route.pool.activeId) || null;
     const msg = {
       t: 'deepseek.pool',
-      gateway: route.gateway,
-      activeId: route.pool.keys.some((k) => k.id === route.pool.activeId) ? route.pool.activeId : null,
+      // A pool that rotates across gateways says which gateway the key in use is
+      // on (and that it is one); the old shape says the pool's own.
+      gateway: route.pool.rotation ? active?.gateway || route.gateway : route.gateway,
+      ...(route.pool.rotation ? { rotation: 1 } : {}),
+      activeId: active ? active.id : null,
       revision: route.pool.revision,
       // Health is only ever said when there is something to say: a key with
       // no field is "this connector has no news", not "healthy" (the hub
@@ -1972,7 +2044,9 @@ const proxy = {
 
   // Only the headers a gateway needs, rebuilt: the upstream key replaces the
   // local one, and nothing about the hub or the client's cookies is passed on.
-  upstreamHeaders(req, key) {
+  // The session id Kimi sends (under the name of the gateway its provider was made
+  // for) goes on under the name of the gateway THIS key belongs to.
+  upstreamHeaders(req, key, route) {
     const out = {};
     const allow = /^(content-type|accept|user-agent|openai-[\w-]+|anthropic-[\w-]+|x-[\w-]+)$/i;
     const drop = new Set(['x-api-key', 'api-key', 'openai-api-key', 'x-goog-api-key', 'x-auth-token', 'cookie']);
@@ -1980,9 +2054,39 @@ const proxy = {
       if (!allow.test(name) || drop.has(name.toLowerCase()) || /^x-agent-hub/i.test(name) || value === undefined) continue;
       out[name] = Array.isArray(value) ? value.join(', ') : value;
     }
+    let session = '';
+    for (const name of DS_SESSION_NAMES) {
+      if (out[name] === undefined) continue;
+      session ||= out[name];
+      delete out[name];
+    }
+    const own = DS_SESSION_HEADERS[key.gateway || route.gateway];
+    if (session && own) out[own] = session;
     out.authorization = `Bearer ${key.apiKey}`;
     out['accept-encoding'] = 'identity';
     return out;
+  },
+
+  // What goes to this key's gateway: its address and the request body with the
+  // model's name as that gateway spells it. null: this key cannot serve this
+  // request (its gateway has no counterpart of the model), which is not an
+  // exhaustion and marks nothing.
+  prepare(route, key, body) {
+    const gateway = key.gateway || route.gateway;
+    const base = gateway === route.gateway ? route.base : dsBase(gateway);
+    if (!base) return null;
+    if (gateway === route.gateway || !body?.length) return { base, body };
+    let j;
+    try {
+      j = JSON.parse(body.toString('utf8'));
+    } catch {
+      return { base, body };
+    }
+    if (!j || typeof j !== 'object' || Array.isArray(j) || typeof j.model !== 'string') return { base, body };
+    const table = route.pool.modelMap?.[gateway];
+    const to = table && Object.hasOwn(table, j.model) ? table[j.model] : null;
+    if (!to) return null;
+    return to === j.model ? { base, body } : { base, body: Buffer.from(JSON.stringify({ ...j, model: to })) };
   },
 
   downHeaders(headers) {
@@ -2006,21 +2110,24 @@ const proxy = {
     });
   },
 
-  // Whether an upstream error says THIS KEY's quota/credit/balance is gone
-  // (spec 13.2). Decided from the error's own fields and status only:
-  //   - status must be 402 or 429. 400/401/403/404/409/422/5xx are plan,
-  //     credential, request or server problems: they reach Kimi unchanged;
+  // Whether an upstream error says THIS KEY's quota/credit/balance/usage
+  // allowance is gone. Decided from the error's own fields and status only:
+  //   - status must be 402, 429, or 400/403 (see DS_QUOTA_STATUSES). 401, 404,
+  //     409, 422 and 5xx are credential, request or server problems: they reach
+  //     Kimi unchanged;
   //   - an explicit quota code (insufficient_quota, quota_exceeded,
-  //     usage_limit(_reached), insufficient_credits, credit_exhausted, ...) in
-  //     error.code / error.type / code / type is enough on its own;
-  //   - a rate-limit code is never quota, whatever the message says;
-  //   - with no code, the error's message field (or a short plain-text body)
-  //     must carry a quota/credit/balance phrase and no per-second/minute
-  //     rate-limit phrase.
+  //     usage_limit(_reached), insufficient_credits, CreditsError, MonthlyLimit
+  //     Error, ...) in error.code / error.type / code / type is enough on its own;
+  //   - a rate-limit code is never quota, whatever the message says, and neither
+  //     is upgrade_required (a plan without API access);
+  //   - otherwise the error's message field (or a short plain-text body) must
+  //     carry a quota/credit/balance/usage-limit phrase and no per-second/minute
+  //     rate-limit phrase; on 400 and 403 (also plain bad requests and plan
+  //     refusals) it must also not read as an echo of the refused request.
   // Words elsewhere in the body (an upstream echoing the refused request) are
   // never looked at.
   quota(status, text) {
-    if (status !== 402 && status !== 429) return false;
+    if (!DS_QUOTA_STATUSES.has(status)) return false;
     let j;
     try {
       j = JSON.parse(text);
@@ -2029,23 +2136,54 @@ const proxy = {
     }
     const obj = j && typeof j === 'object' && !Array.isArray(j) ? j : null;
     const err = obj && typeof obj.error === 'object' && obj.error ? obj.error : null;
-    const codes = [err?.code, err?.type, obj?.code, obj?.type].filter((x) => typeof x === 'string' && x && !DS_GENERIC_TYPES.test(x));
-    if (codes.some((c) => DS_RATE_CODES.test(c) || /upgrade_required/i.test(c))) return false;
+    const codes = [err?.code, err?.type, obj?.code, obj?.type].filter((x) => typeof x === 'string' && x).map(dsCodeKey).filter((c) => c && !DS_GENERIC_TYPES.test(c));
+    if (codes.some((c) => DS_RATE_CODES.test(c) || c === 'upgraderequired')) return false;
     if (codes.some((c) => DS_QUOTA_CODES.test(c))) return true;
-    // A code that names something else (payment_required, invalid_request, ...)
-    // is that other thing: no guessing from the message.
-    if (codes.length) return false;
     const message = obj ? [err?.message, typeof obj.error === 'string' ? obj.error : '', obj.message].find((x) => typeof x === 'string' && x) || '' : String(text || '').trim();
     const short = message.slice(0, 500);
-    if (!short || DS_RATE_PHRASE.test(short)) return false;
-    return DS_QUOTA_PHRASE.test(short);
+    if (!short || DS_RATE_PHRASE.test(short) || !DS_QUOTA_PHRASE.test(short)) return false;
+    return !(DS_STRICT_STATUSES.has(status) && DS_ECHO_PHRASE.test(short));
+  },
+
+  // A time a message STATES: "resets at 2026-10-21T12:25:07.170Z" (the zone must
+  // be there), "resets in 2 hours 15 minutes", "Retry in 2hr 3min". With several
+  // the last one that can be read wins; one that cannot be read (no zone, a clock
+  // time alone, nonsense) is left out, never guessed. null: none.
+  messageReset(message, now = Date.now()) {
+    const hits = [];
+    for (const m of message.matchAll(/\bresets?\s+(?:at|on)\s+/gi)) hits.push({ pos: m.index, absolute: true, tail: message.slice(m.index + m[0].length, m.index + m[0].length + 80).split('\n')[0] });
+    for (const m of message.matchAll(/\b(?:resets?|retry|try again)\s+(?:in|after)\s+/gi)) hits.push({ pos: m.index, absolute: false, tail: message.slice(m.index + m[0].length, m.index + m[0].length + 60).split(/[.\n]/)[0] });
+    hits.sort((a, b) => b.pos - a.pos);
+    for (const hit of hits) {
+      let t = null;
+      if (hit.absolute) {
+        const iso = DS_ISO_RESET.exec(hit.tail);
+        if (iso) {
+          const [, y, mo, d, hh, mi, ss, frac, zone] = iso;
+          const ms = Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(hh), Number(mi), Number(ss || 0), Number(String(frac || '0').slice(0, 3).padEnd(3, '0')));
+          const z = /^[+-]/.test(zone) ? /^([+-])(\d{2}):?(\d{2})$/.exec(zone) : null;
+          const offset = z ? (z[1] === '-' ? -1 : 1) * (Number(z[2]) * 60 + Number(z[3])) * 60_000 : 0;
+          t = Number.isFinite(ms) ? ms - offset : null;
+        }
+      } else {
+        let secs = 0;
+        for (const [, num, unit] of hit.tail.matchAll(/(\d+(?:\.\d+)?)\s*(d(?:ays?)?|h(?:ou)?rs?|h|m(?:in(?:ute)?s?)?|s(?:ec(?:ond)?s?)?)\b/gi)) {
+          const u = unit.toLowerCase();
+          secs += Number(num) * (u.startsWith('d') ? 86400 : u.startsWith('h') ? 3600 : u.startsWith('m') ? 60 : 1);
+        }
+        t = secs > 0 ? now + secs * 1000 : null;
+      }
+      if (t != null && Number.isFinite(t) && t > now && t <= now + 35 * 86_400_000) return Math.round(t);
+    }
+    return null;
   },
 
   // When the gateway says the exhausted key comes back: a Retry-After header
-  // (seconds or an HTTP date) or a reset field of the error object (epoch
-  // seconds/ms, ISO date, or seconds from now). null when it says nothing
-  // believable (in the past, or more than 35 days away): the default wait
-  // applies then.
+  // (seconds or an HTTP date), a reset field of the error object (epoch
+  // seconds/ms, ISO date, or seconds from now), or a time its message states
+  // (see messageReset). null when it says nothing believable (in the past, or
+  // more than 35 days away): the expiry is then unknown, and a real request
+  // finds out (no time is made up).
   resetAt(headers, text, now = Date.now()) {
     const sane = (t) => (Number.isFinite(t) && t > now && t <= now + 35 * 86_400_000 ? Math.round(t) : null);
     const fromNumber = (n, unit) => (unit === 'delta-s' ? now + n * 1000 : unit === 'delta-ms' ? now + n : n > 1e11 ? n : n * 1000);
@@ -2060,10 +2198,11 @@ const proxy = {
     try {
       j = JSON.parse(text);
     } catch {
-      return null;
+      j = undefined;
     }
-    const err = j && typeof j === 'object' && typeof j.error === 'object' && j.error ? j.error : {};
-    for (const src of [err, j && typeof j === 'object' ? j : {}]) {
+    const obj = j && typeof j === 'object' && !Array.isArray(j) ? j : null;
+    const err = obj && typeof obj.error === 'object' && obj.error ? obj.error : {};
+    for (const src of [err, obj || {}]) {
       for (const [field, unit] of [['resets_at', 'abs'], ['reset_at', 'abs'], ['resetsAt', 'abs'], ['resets_in_seconds', 'delta-s'], ['retry_after', 'delta-s'], ['retry_after_seconds', 'delta-s'], ['retry_after_ms', 'delta-ms']]) {
         const v = src[field];
         if (v == null) continue;
@@ -2072,7 +2211,8 @@ const proxy = {
         if (ok) return ok;
       }
     }
-    return null;
+    const message = obj ? [err.message, typeof obj.error === 'string' ? obj.error : '', obj.message].find((x) => typeof x === 'string' && x) || '' : String(text || '');
+    return this.messageReset(message.slice(0, 2000), now);
   },
 
   // The order this request tries keys in: the active one first, then the rest
@@ -2099,17 +2239,22 @@ const proxy = {
     return null;
   },
 
-  // Pool-wide wait before an exhausted key is tried again by a real request:
-  // the hub's `retryMs` for this pool, else AGENT_HUB_DEEPSEEK_RETRY_MS, else
-  // 10 minutes. A gateway that names its own reset time (Retry-After, a reset
-  // field) overrides this for that key.
+  // The gap between real requests that look again at an exhausted key whose
+  // gateway named no reset time: the hub's `retryMs` for this pool, else
+  // AGENT_HUB_DEEPSEEK_RETRY_MS, else 30 seconds. It is how often a probe may
+  // happen, not a guess of when the key comes back (that is only ever a time
+  // the gateway stated): the next real request after the gap finds out.
   retryMs(route) {
-    return route.pool.retryMs || this.ms('AGENT_HUB_DEEPSEEK_RETRY_MS', 600_000);
+    return route.pool.retryMs || this.ms('AGENT_HUB_DEEPSEEK_RETRY_MS', 30_000);
   },
 
-  // When this exhausted key may be tried again.
+  // When this exhausted key may be looked at again: the time its gateway
+  // stated, else after the gap since it was marked; never, for a key a person
+  // marked full (only a person clears that).
   retryAt(route, key) {
-    return key.exhaustedAt ? key.retryAt || key.exhaustedAt + this.retryMs(route) : 0;
+    if (!key.exhaustedAt) return 0;
+    if (key.manual) return Infinity;
+    return key.retryAt || key.exhaustedAt + this.retryMs(route);
   },
 
   // An exhausted key whose time has come. The next real request that finds
@@ -2181,7 +2326,7 @@ const proxy = {
     return Number.isInteger(n) && n >= 50 && n <= 3_600_000 ? n : fallback;
   },
 
-  async attempt(req, res, route, key, rest, body) {
+  async attempt(req, res, route, key, target, rest) {
     const method = String(req.method || 'GET').toUpperCase();
     const was = key.exhaustedAt || 0;
     const firstByte = this.ms('AGENT_HUB_DEEPSEEK_FIRST_BYTE_MS', 120_000);
@@ -2209,15 +2354,15 @@ const proxy = {
     const timeoutReply = () => {
       if (res.headersSent || res.destroyed) return;
       const secs = Math.max(1, Math.round((timedOut === 'idle' ? idle : firstByte) / 1000));
-      this.json(res, 504, 'upstream_timeout', `DeepSeek 閘道（${route.gateway}）${timedOut === 'idle' ? `傳輸中斷了 ${secs} 秒沒有新資料` : `${secs} 秒內沒有回應`}，已停止等待；沒有換 key。`);
+      this.json(res, 504, 'upstream_timeout', `DeepSeek 閘道（${key.gateway || route.gateway}）${timedOut === 'idle' ? `傳輸中斷了 ${secs} 秒沒有新資料` : `${secs} 秒內沒有回應`}，已停止等待；沒有換 key。`);
     };
     arm(firstByte, 'first_byte');
     let upstream;
     try {
-      upstream = await fetch(route.base + rest, {
+      upstream = await fetch(target.base + rest, {
         method,
-        headers: this.upstreamHeaders(req, key),
-        body: method === 'GET' || method === 'HEAD' ? undefined : body,
+        headers: this.upstreamHeaders(req, key, route),
+        body: method === 'GET' || method === 'HEAD' ? undefined : target.body,
         redirect: 'manual',
         signal: controller.signal,
       });
@@ -2225,7 +2370,7 @@ const proxy = {
       finish();
       if (timedOut) return timeoutReply(), { done: true };
       // A network error is not a quota signal: no other key is tried.
-      if (!res.headersSent && !res.destroyed) this.json(res, 502, 'upstream_unreachable', `連不到 DeepSeek 閘道：${route.gateway}`);
+      if (!res.headersSent && !res.destroyed) this.json(res, 502, 'upstream_unreachable', `連不到 DeepSeek 閘道：${key.gateway || route.gateway}`);
       return { done: true };
     }
 
@@ -2278,7 +2423,7 @@ const proxy = {
     } catch {
       finish();
       if (timedOut) return timeoutReply(), { done: true };
-      if (!res.headersSent && !res.destroyed) this.json(res, 502, 'upstream_unreachable', `讀不到 DeepSeek 閘道的錯誤回應：${route.gateway}`);
+      if (!res.headersSent && !res.destroyed) this.json(res, 502, 'upstream_unreachable', `讀不到 DeepSeek 閘道的錯誤回應：${key.gateway || route.gateway}`);
       return { done: true };
     }
     finish();
@@ -2290,6 +2435,35 @@ const proxy = {
     res.writeHead(upstream.status, headers);
     res.end(errBody);
     return { done: true };
+  },
+
+  // Every key was tried, is waiting, or cannot serve this request: one answer
+  // that lists each key by gateway and last four characters (never a key) with
+  // its state, and the earliest time the gateways stated, so the conversation
+  // says what is going on.
+  allOut(res, route, order, skipped, model = '') {
+    const now = Date.now();
+    const when = (t) => new Date(t).toLocaleString('zh-TW', { hour12: false });
+    const usable = order.filter((k) => !skipped.has(k.id));
+    if (!usable.length) {
+      const names = order.map((k) => DS_LABELS[k.gateway || route.gateway] || k.gateway || route.gateway);
+      return this.json(res, 400, 'model_not_available', `號池裡的 key（${[...new Set(names)].join('、')}）都沒有這次要求的模型${model ? ` ${model.slice(0, 80)}` : ''}，沒有送出請求。`);
+    }
+    const lines = order.map((k, i) => {
+      const gw = DS_LABELS[k.gateway || route.gateway] || k.gateway || route.gateway;
+      let state;
+      if (skipped.has(k.id)) state = `這個閘道沒有這次要求的模型${model ? ` ${model.slice(0, 80)}` : ''}`;
+      else if (k.manual) state = '手動標記已滿';
+      else if (k.exhaustedAt && k.retryAt && k.retryAt > now) state = `已滿，${when(k.retryAt)} 重置`;
+      else if (k.exhaustedAt) state = '已滿，重置時間未知（有請求時會再試）';
+      else state = '可用';
+      return `${i + 1}. ${gw} …${String(k.apiKey).slice(-4)}：${state}`;
+    });
+    const stated = order.filter((k) => k.exhaustedAt && !k.manual && k.retryAt && k.retryAt > now).map((k) => k.retryAt);
+    const next = Math.min(...order.filter((k) => k.exhaustedAt && !k.manual).map((k) => this.retryAt(route, k)).filter(Number.isFinite));
+    const earliest = stated.length ? `；最早已知的重置時間 ${when(Math.min(...stated))}` : '';
+    const text = [`DeepSeek 的 API key 都已用盡（共 ${order.length} 把）${earliest}。`, ...lines, '有請求時會自動再試：已知重置時間的 key 到時間才試，重置時間未知的 key 下一個真實請求就會再試。要現在恢復：到 Agent Hub「設定」→「DeepSeek…」對那把按「重新啟用」或「清除標記」，或加入新的 key。'].join('\n');
+    this.json(res, 402, 'insufficient_quota', text, Number.isFinite(next) ? { retry_at: next } : {});
   },
 
   async handle(req, res) {
@@ -2310,14 +2484,21 @@ const proxy = {
       const pool = route.pool;
       const order = this.order(pool);
       const tried = new Set();
+      const skipped = new Set(); // keys whose gateway has no counterpart of this request's model
       for (;;) {
         if (this.route !== route) return this.json(res, 409, 'pool_changed', 'DeepSeek 號池已更新，請重試');
         // Healthy keys first; only when none is left, an exhausted key whose
-        // wait is over (this request is its probe).
+        // wait is over (this request is its probe). The order is one list for
+        // every gateway: the next key may be on another one.
         const key = order.find((k) => !tried.has(k.id) && !k.exhaustedAt) || order.find((k) => !tried.has(k.id) && this.due(route, k));
         if (!key) break;
         tried.add(key.id);
-        const result = await this.attempt(req, res, route, key, rest, body);
+        const target = this.prepare(route, key, body);
+        if (!target) {
+          skipped.add(key.id);
+          continue;
+        }
+        const result = await this.attempt(req, res, route, key, target, rest);
         if (result.done) return;
         if (result.quota) {
           this.fail(route, key, result.resetAt);
@@ -2326,9 +2507,13 @@ const proxy = {
         return;
       }
       if (!res.headersSent && !res.destroyed) {
-        const next = Math.min(...pool.keys.filter((k) => k.exhaustedAt).map((k) => this.retryAt(route, k)).filter(Number.isFinite));
-        const when = Number.isFinite(next) ? `；最早 ${new Date(next).toLocaleString('zh-TW', { hour12: false })} 之後有請求時會自動再試` : '';
-        this.json(res, 402, 'insufficient_quota', `這個閘道的 DeepSeek API key 都已用盡（沒有可用的 key）${when}。可以在 Agent Hub「設定」→「DeepSeek…」重新啟用其中一把，或加入新的 key。`, Number.isFinite(next) ? { retry_at: next } : {});
+        let model = '';
+        if (skipped.size) {
+          try {
+            model = String(JSON.parse(body.toString('utf8')).model || '');
+          } catch {}
+        }
+        this.allOut(res, route, order, skipped, model);
       }
     } catch {
       if (!res.headersSent && !res.destroyed) this.json(res, 502, 'proxy_error', '本機 DeepSeek proxy 發生錯誤');
@@ -2450,6 +2635,10 @@ const KEEP = new Set([
   'config.update',
   'permission.set_mode',
   'plan_mode.set',
+  // Swarm mode on and off (Kimi 2.3.3): what makes the Hub's swarm switch
+  // follow a /swarm typed in the terminal itself.
+  'swarm_mode.enter',
+  'swarm_mode.exit',
   'tools.update_store',
   'prompt.steered',
   'prompt.aborted',
@@ -2557,6 +2746,12 @@ function translate(rec, sid, fileAgent = 'main') {
     }
     case 'permission.set_mode':
       return a === 'main' ? [f('agent.status.updated', { permission: rec.mode })] : [];
+    case 'swarm_mode.enter':
+      // The model's own tool call can enter it too ("tool"); Kimi does not
+      // report that as a mode the person turned on, and neither does this.
+      return a === 'main' && rec.trigger !== 'tool' ? [f('agent.status.updated', { swarmMode: true })] : [];
+    case 'swarm_mode.exit':
+      return a === 'main' ? [f('agent.status.updated', { swarmMode: false })] : [];
     case 'tools.update_store':
       return rec.key === 'todo' && a === 'main' ? [f('hub.todos', { todos: rec.value || [] })] : [];
     case 'prompt.steered':
@@ -4027,12 +4222,15 @@ const daemon = {
 // Names are fixed (server/machines.js lists them); only what THIS version really
 // supports is named, and `broker` only while the broker channel is installed.
 //   pool             the DeepSeek key pool's loopback proxy
+//   pool_cross       that pool rotating across gateways: one order of keys, each
+//                    with its own gateway, the model id and session header of
+//                    the gateway the request goes to
 //   secondary_model  setting/repairing Kimi's native subagent default
 //   broker           cross-provider subagents through the local channel
 //   handoff          carrying a continuation's handoff to the Claude daemon, and
 //                    never using a daemon that cannot take it (see daemon.stale)
 function connectorCapabilities() {
-  return ['pool', 'secondary_model', ...(brokerReady ? ['broker'] : []), 'handoff'];
+  return ['pool', 'pool_cross', 'secondary_model', ...(brokerReady ? ['broker'] : []), 'handoff'];
 }
 
 // ------------------------------------------------------------- the hub

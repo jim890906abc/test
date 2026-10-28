@@ -49,6 +49,10 @@ const MAX_IMAGE_URL = 600_000; // history images larger than this become a place
 // journals a change with its next turn, so a quiet native is normal; a native
 // that answers with ANOTHER model is not.
 const PROFILE_CONFIRM_MS = Number(process.env.AGENT_HUB_PROFILE_CONFIRM_MS) || 800;
+// How long a terminal Kimi takes to put up a picker after the command that
+// opens it. A key that comes before the picker is up goes to the input box
+// instead, so this is generous (the real Kimi 2.3.3 takes well under a second).
+const TUI_PICKER_MS = Number(process.env.AGENT_HUB_TUI_PICKER_MS) || 1500;
 // How often a message waiting to cut in (插隊) is offered to Kimi again.
 const CUT_IN_RETRY_MS = 2000;
 // How long an urgent message Kimi has taken in may wait for foreground work
@@ -398,12 +402,13 @@ export class Mirror {
     this.applyStatus({});
   }
 
-  applyStatus({ model, effort, permission, planMode, context, contextTokens }) {
+  applyStatus({ model, effort, permission, planMode, swarmMode, context, contextTokens }) {
     const f = {};
     if (model !== undefined && model !== null) f.model = model || '';
     if (effort !== undefined && effort !== null) f.effort = effort || 'off';
     if (PERMISSIONS.includes(permission)) f.permission = permission;
     if (planMode !== undefined) f.planMode = Boolean(planMode);
+    if (swarmMode !== undefined) f.swarmMode = Boolean(swarmMode);
     // When the native's model last changed (a replayed record carries its own
     // time): how long a disagreement with the Hub's record has stood.
     if (f.model && f.model !== this.session.meta?.model) f.modelAt = this.batchTime || now();
@@ -1030,6 +1035,7 @@ export class Mirror {
             effort: p.thinkingEffort,
             permission: p.permission,
             planMode: p.planMode,
+            swarmMode: p.swarmMode,
             context: p.maxContextTokens ? { used: p.contextTokens || 0, size: p.maxContextTokens } : undefined,
             contextTokens: p.contextTokens,
           });
@@ -1745,7 +1751,7 @@ export class Mirror {
   // word, stays on the conversation as drift); silence is "accepted" - Kimi
   // journals a change with its next turn - and the drift clears or returns
   // with the native's next report.
-  async configure({ model, effort, permission, planMode, confirm }) {
+  async configure({ model, effort, permission, planMode, swarmMode, confirm }) {
     if (this.canDriveTerminal()) {
       // Kimi's own slash commands; /model and /yolo /auto open a picker that
       // is confirmed with Enter. The model first: a new model may not keep
@@ -1755,8 +1761,10 @@ export class Mirror {
       if (typeof planMode === 'boolean') await this.tui({ action: 'command', text: `/plan ${planMode ? 'on' : 'off'}` });
       if (permission === 'yolo' || permission === 'auto') await this.tui({ action: 'command', text: `/${permission}`, confirm: true });
       else if (permission) throw Object.assign(new Error('要改回「每次詢問」，請在終端機的 Kimi 裡輸入 /permission'), { status: 400 });
+      // After the permission: whether Kimi asks about approvals depends on it.
+      if (typeof swarmMode === 'boolean') await this.swarmInTerminal(swarmMode, PERMISSIONS.includes(permission) ? permission : this.session.meta?.permission);
       // Kimi journals these with its next turn; show them now.
-      this.applyStatus({ model: model || undefined, effort, permission, planMode });
+      this.applyStatus({ model: model || undefined, effort, permission, planMode, swarmMode: typeof swarmMode === 'boolean' ? swarmMode : undefined });
       return;
     }
     const agentConfig = {};
@@ -1764,6 +1772,7 @@ export class Mirror {
     if (typeof effort === 'string' && effort) agentConfig.thinking = effort;
     if (PERMISSIONS.includes(permission)) agentConfig.permission_mode = permission;
     if (typeof planMode === 'boolean') agentConfig.plan_mode = planMode;
+    if (typeof swarmMode === 'boolean') agentConfig.swarm_mode = swarmMode;
     if (!Object.keys(agentConfig).length) throw Object.assign(new Error('沒有要變更的設定'), { status: 400 });
     const waiting = confirm && agentConfig.model ? this.statusAfter(PROFILE_CONFIRM_MS) : null;
     try {
@@ -1778,8 +1787,45 @@ export class Mirror {
         throw Object.assign(new Error(`Kimi 收下了設定，但回報這個原生對話用的是「${said}」，不是「${agentConfig.model}」`), { status: 502 });
       }
     }
+    // A Kimi that predates swarm mode takes the key without a word and does
+    // nothing with it. Its own status says whether it took it, so a switch
+    // that did not happen is never shown as one that did.
+    if (typeof agentConfig.swarm_mode === 'boolean') await this.confirmSwarm(agentConfig.swarm_mode);
     // Kimi echoes the change in agent.status.updated; reflect it right away.
-    this.applyStatus({ model: agentConfig.model, effort: agentConfig.thinking, permission: agentConfig.permission_mode, planMode: agentConfig.plan_mode });
+    this.applyStatus({ model: agentConfig.model, effort: agentConfig.thinking, permission: agentConfig.permission_mode, planMode: agentConfig.plan_mode, swarmMode: agentConfig.swarm_mode });
+  }
+
+  async confirmSwarm(wanted) {
+    // Unreadable is not a refusal: the native's own report follows either way.
+    const status = await this.api('GET', this.path('/status')).catch(() => null);
+    if (!status) return;
+    if (typeof status.swarm_mode !== 'boolean') {
+      throw Object.assign(new Error('這台電腦的 Kimi 沒有 swarm 模式（它的狀態裡沒有 swarm_mode）：請更新那台電腦的 Kimi Code'), { status: 502 });
+    }
+    if (status.swarm_mode !== wanted) {
+      // Kimi's word wins over the Hub's record.
+      this.applyStatus({ swarmMode: status.swarm_mode });
+      throw Object.assign(new Error(`Kimi 收下了設定，但回報 swarm 模式仍是「${status.swarm_mode ? '開' : '關'}」`), { status: 502 });
+    }
+  }
+
+  // Kimi's own /swarm on|off, in the terminal. It is sent pasted, the way a
+  // message is, not as the bridge's `command` (typed, then Enter 60 ms later):
+  // Kimi 2.3.3 takes a burst of typing followed that fast by Enter as a paste
+  // and the Enter as a new line, so that command is never submitted.
+  //
+  // Turning it on while approvals are "ask every time" opens a picker ("Start
+  // a swarm task with approvals on?") whose first choice, the one Enter takes,
+  // switches the terminal to Never Ask. The Hub never changes the permission a
+  // person did not ask it to change, so it takes the third choice, "Start in
+  // Always Ask": two Downs, then the Enter the bridge adds to a command. When
+  // Kimi is not asking (already in Never Ask or Ask When Needed, or already
+  // on) the keys land in an empty input box and do nothing.
+  async swarmInTerminal(on, permission) {
+    await this.tui({ action: 'send', text: `/swarm ${on ? 'on' : 'off'}`, mode: 'enter' });
+    if (!on || permission === 'yolo' || permission === 'auto') return;
+    await new Promise((r) => setTimeout(r, TUI_PICKER_MS));
+    await this.tui({ action: 'command', text: '\x1b[B\x1b[B' });
   }
 
   async command(name, args = '') {
@@ -1787,6 +1833,11 @@ export class Mirror {
       // Archiving cannot be typed into a terminal; the hub refuses it while
       // it drives that terminal. An uncontrollable one archives over the API.
       if (name === 'archive') throw Object.assign(new Error('這個對話正在終端機執行。先關掉那個 Kimi，再從這裡刪除'), { status: 409 });
+      // A /fork typed into the terminal moves THAT terminal onto the fork and
+      // makes no Hub conversation, so nothing would open here and the person's
+      // terminal would silently be somewhere else. (Kimi's own :fork over the
+      // API on a conversation a terminal holds is refused after the first try.)
+      if (name === 'fork') throw Object.assign(new Error('這個對話正在終端機執行：分叉會讓那個終端機換到新的對話。先關掉那個 Kimi 再分叉，或直接在終端機輸入 /fork'), { status: 409 });
       await this.tui({ action: 'command', text: `/${name}${args ? ` ${args}` : ''}` });
       return {};
     }

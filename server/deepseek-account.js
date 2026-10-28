@@ -95,19 +95,22 @@ function listUrl(gateway) {
 export const isGateway = (id) => Object.hasOwn(GATEWAYS, id);
 
 const newKeyId = () => `dk_${crypto.randomBytes(8).toString('hex')}`;
-// How long an exhausted key waits before it is tried again when its gateway
-// named no reset time (milliseconds; AGENT_HUB_DEEPSEEK_RETRY_MS, default 10
-// minutes). The same number goes to every connector in a provision, so the hub
-// and the proxies agree on when a key is due.
+// The gap between real requests that look again at an exhausted key whose
+// gateway named no reset time (milliseconds; AGENT_HUB_DEEPSEEK_RETRY_MS, default
+// 30 seconds). It is how often a probe may happen, never a guess of when the
+// key comes back: that is only ever a time the gateway STATED (retryAt). The
+// same number goes to every connector in a provision, so the hub and the
+// proxies agree on when a key may be looked at again.
 export const retryMs = () => {
   const n = Number(process.env.AGENT_HUB_DEEPSEEK_RETRY_MS);
-  return Number.isInteger(n) && n >= 1000 && n <= 35 * 86_400_000 ? n : 600_000;
+  return Number.isInteger(n) && n >= 1000 && n <= 35 * 86_400_000 ? n : 30_000;
 };
-// When an exhausted key is tried again (0: it is not exhausted).
-export const retryAtOf = (k) => (k?.exhaustedAt ? k.retryAt || k.exhaustedAt + retryMs() : 0);
+// When an exhausted key may be looked at again (0: it is not exhausted; Infinity:
+// a person marked it full, only a person clears that).
+export const retryAtOf = (k) => (k?.exhaustedAt ? (k.manual ? Infinity : k.retryAt || k.exhaustedAt + retryMs()) : 0);
 // A key a request may use: healthy, or exhausted with its wait over (the
-// connector's next real request is then the probe).
-const isUsable = (k, now = Date.now()) => !k.exhaustedAt || retryAtOf(k) <= now;
+// connector's next real request is then the probe). Never one a person marked.
+const isUsable = (k, now = Date.now()) => !k.exhaustedAt || (!k.manual && retryAtOf(k) <= now);
 const firstUsable = (keys, now = Date.now()) => keys.find((k) => !k.exhaustedAt) || keys.find((k) => isUsable(k, now)) || keys[0] || null;
 
 // One gateway's keys: the old single string (one key) and the current
@@ -133,6 +136,7 @@ function normalizePool(raw) {
         if (item.retryAt != null && Number.isFinite(retryAt) && retryAt > 0) out.retryAt = retryAt;
         const exhaustedRev = Number(item.exhaustedRev);
         if (Number.isInteger(exhaustedRev) && exhaustedRev > 0) out.exhaustedRev = exhaustedRev;
+        if (item.manual === true) out.manual = true;
       }
       pool.keys.push(out);
     }
@@ -158,6 +162,28 @@ function normalizeSaved(raw) {
   if (JSON.stringify(rawPools) !== JSON.stringify(pools)) dirty = true;
   data.keys = pools;
 
+  // The one order the keys are used in, across gateways. A file from before it
+  // existed (one pool per gateway) becomes one list in the order it already had:
+  // the gateway that was in use first, the others after it, each gateway's keys
+  // in their own order. A key the saved order does not name goes to the end;
+  // a name that is no key any more is dropped. No key is lost or changed.
+  const selected = isGateway(data.gateway) ? data.gateway : DEFAULT_GATEWAY;
+  const gatewayOrder = [selected, ...Object.keys(GATEWAYS).filter((g) => g !== selected)];
+  const order = [];
+  const have = new Set(gatewayOrder.flatMap((g) => (pools[g]?.keys || []).map((k) => k.id)));
+  if (Array.isArray(data.order)) for (const id of data.order) if (typeof id === 'string' && have.has(id) && !order.includes(id)) order.push(id);
+  for (const g of gatewayOrder) for (const k of pools[g]?.keys || []) if (!order.includes(k.id)) order.push(k.id);
+  // (A file that has no order yet is not rewritten for it: the same order comes
+  // out of the same file next time, and the first change saves it.)
+  if (Array.isArray(data.order) && JSON.stringify(data.order) !== JSON.stringify(order)) dirty = true;
+  data.order = order;
+  // Moves that belong to no gateway's pool (a new order, a person's mark) count
+  // here, so the whole list has a revision that only goes up.
+  const epoch = Number(data.epoch);
+  const cleanEpoch = Number.isInteger(epoch) && epoch > 0 ? epoch : 0;
+  if (data.epoch !== undefined && data.epoch !== cleanEpoch) dirty = true;
+  data.epoch = cleanEpoch;
+
   // Each machine's latest report, kept across a hub restart. Only known
   // gateways, revisions and string ids get this far; no key material.
   const activity = {};
@@ -171,6 +197,7 @@ function normalizeSaved(raw) {
       activeId: typeof a.activeId === 'string' ? a.activeId.slice(0, 64) : null,
       revision,
       at: Number(a.at) || Date.now(),
+      ...(a.rotation === true ? { rotation: true } : {}),
     };
   }
   if (JSON.stringify(rawActivity) !== JSON.stringify(activity)) dirty = true;
@@ -224,7 +251,11 @@ export function reload() {
   retries.clear();
 }
 
-// The gateway in use. A key saved without choosing one goes to OpenCode Go.
+// The gateway whose model names conversations use (Kimi's provider is made from
+// its list; a request to a key on another gateway gets that gateway's spelling
+// of the same model, see modelMapFor). It is not the gateway "in use": the keys
+// are used in one order across gateways. A key saved without choosing one goes
+// to OpenCode Go.
 export const gateway = () => (isGateway(saved.gateway) ? saved.gateway : DEFAULT_GATEWAY);
 
 // ------------------------------------------------------------- the keys
@@ -244,12 +275,67 @@ export const poolOf = (gw = gateway()) => (isGateway(gw) ? saved.keys?.[gw] || n
 export const poolRevision = (gw = gateway()) => poolOf(gw)?.revision || 0;
 export const keyById = (gw, id) => poolOf(gw)?.keys.find((k) => k.id === id) || null;
 
+// ---- one list across gateways
+// The keys live in one pool per gateway (what an older connector gets), and are
+// USED in one order across them: `saved.order`, ids only. Every entry is
+// { gw, k }; `k` is the stored key (secret included: never serialize it).
+export function rotationEntries() {
+  const found = new Map();
+  for (const gw of Object.keys(GATEWAYS)) for (const k of saved.keys?.[gw]?.keys || []) found.set(k.id, { gw, k });
+  const out = [];
+  for (const id of saved.order || []) {
+    const e = found.get(id);
+    if (e) {
+      out.push(e);
+      found.delete(id);
+    }
+  }
+  return [...out, ...found.values()];
+}
+// The gateway a key is on, or null.
+export const gatewayOfKey = (id) => rotationEntries().find((e) => e.k.id === id)?.gw || null;
+// The revision of the whole list: it goes up with every change to any pool and
+// with every change that belongs to none (an order, a person's mark).
+export const rotationRevision = () => Object.values(saved.keys || {}).reduce((n, p) => n + (p.revision || 0), 0) + (saved.epoch || 0);
+const syncOrder = () => {
+  saved.order = rotationEntries().map((e) => e.k.id);
+};
+const bumpEpoch = () => {
+  saved.epoch = (saved.epoch || 0) + 1;
+};
+const hasCap = (machine, name) => Array.isArray(machine?.capabilities) && machine.capabilities.includes(name);
+// { catalog gateway's model id -> the id of the same model at gateway g }, for
+// the gateways other than the catalog's that hold a key. The same model is the
+// one whose last name part is the same (`deepseek/deepseek-v4.1-flash` and
+// `deepseek-v4.1-flash`); a model with no counterpart, or two, is left out and
+// the connector never sends it there.
+function modelMapFor(catalog, catalogIds, gateways) {
+  const last = (id) => String(id).toLowerCase().replace(/^.*\//, '');
+  const out = {};
+  for (const g of gateways) {
+    if (g === catalog) continue;
+    const theirs = modelIds(g);
+    const table = {};
+    for (const id of catalogIds) {
+      const same = theirs.filter((x) => last(x) === last(id));
+      if (same.length === 1) table[id] = same[0];
+    }
+    out[g] = table;
+  }
+  return out;
+}
+
 // The key old callers mean: the gateway's preferred active key (even when it
 // is marked exhausted; ensureProvider says so with pool_exhausted instead).
-export function apiKey(gw = gateway()) {
-  const pool = poolOf(gw);
-  if (!pool) return '';
-  return (pool.keys.find((k) => k.id === pool.activeId) || firstUsable(pool.keys))?.key || '';
+export function apiKey(gw) {
+  const of = (g) => {
+    const pool = poolOf(g);
+    return pool ? (pool.keys.find((k) => k.id === pool.activeId) || firstUsable(pool.keys))?.key || '' : '';
+  };
+  if (gw !== undefined) return of(gw);
+  // Without a gateway: "is there a key" - the model names' gateway's preferred
+  // one, else the first key of the list (keys are used across gateways).
+  return of(gateway()) || rotationEntries().find((e) => isUsable(e.k))?.k.key || rotationEntries()[0]?.k.key || '';
 }
 
 const keyForAttempt = (gw) => {
@@ -289,10 +375,16 @@ export function setKey(gw, key) {
     return existing.id;
   }
   const id = newKeyId();
+  // The first key there is decides which gateway's model names conversations use.
+  const first = rotationEntries().length === 0;
   pool.keys.push({ id, key: text, addedAt: Date.now() });
   pool.activeId = id;
   pool.revision += 1;
   putPool(gw, pool);
+  if (first) saved.gateway = gw;
+  // A new key goes to the end of the order: it is used when the keys before it
+  // are out (move it up to use it first).
+  saved.order = [...rotationEntries().map((e) => e.k.id).filter((x) => x !== id), id];
   save({ explicit: true });
   return id;
 }
@@ -319,6 +411,7 @@ export function removeKey(gw, id) {
   pool.keys.splice(i, 1);
   if (pool.activeId === id) pool.activeId = firstUsable(pool.keys)?.id || '';
   pool.revision += 1;
+  syncOrder();
   if (!pool.keys.length) {
     // Keep the (empty) pool so its revision stays ahead of every connector's
     // last one; a new key can never look like an older, already-seen state.
@@ -392,6 +485,7 @@ export async function retryKey(gw, id) {
   delete now.exhaustedAt;
   delete now.retryAt;
   delete now.exhaustedRev;
+  delete now.manual;
   const live = poolOf(gw);
   live.activeId = now.id;
   live.revision += 1;
@@ -408,23 +502,87 @@ export function clearKey(gw) {
   saved.keys = { ...(saved.keys || {}), [gw]: { revision: pool.revision + 1, activeId: '', keys: [] } };
   if (saved.models) delete saved.models[gw];
   for (const [machineId, a] of Object.entries(saved.activity || {})) if (a.gateway === gw) delete saved.activity[machineId];
+  syncOrder();
   save();
+}
+
+// ---- what a person can say about a key (the "user marked it" signal)
+const locateKey = (id) => {
+  const e = rotationEntries().find((x) => x.k.id === id);
+  if (!e) throw Object.assign(new Error('找不到這把 API key'), { status: 404 });
+  return e;
+};
+
+// Mark a key full by hand: it is set aside, never used and never probed, until
+// a person clears the mark (or re-enables it with a real request). True when
+// something changed.
+export function markFull(id) {
+  const { k } = locateKey(id);
+  if (k.exhaustedAt && k.manual) return false;
+  k.exhaustedAt = Date.now();
+  delete k.retryAt;
+  delete k.exhaustedRev;
+  k.manual = true;
+  bumpEpoch();
+  save();
+  return true;
+}
+
+// Clear a key's full mark by hand, a gateway's own or a person's, without asking
+// the gateway: the next real request that uses it finds out (and it is marked
+// again, with whatever the gateway says, if it is still out). True when
+// something changed.
+export function clearMark(id) {
+  const { k } = locateKey(id);
+  if (!k.exhaustedAt) return false;
+  delete k.exhaustedAt;
+  delete k.retryAt;
+  delete k.exhaustedRev;
+  delete k.manual;
+  bumpEpoch();
+  save();
+  return true;
+}
+
+// Move a key in the order the keys are used in: 'up', 'down' or 'top'. True
+// when it moved.
+export function moveKey(id, direction) {
+  if (!['up', 'down', 'top'].includes(direction)) throw Object.assign(new Error('direction 要是 up、down 或 top'), { status: 400 });
+  locateKey(id);
+  const order = rotationEntries().map((e) => e.k.id);
+  const from = order.indexOf(id);
+  const to = direction === 'top' ? 0 : direction === 'up' ? from - 1 : from + 1;
+  if (to < 0 || to >= order.length || to === from) return false;
+  order.splice(from, 1);
+  order.splice(to, 0, id);
+  saved.order = order;
+  bumpEpoch();
+  save();
+  return true;
 }
 
 // A connector's {t:'deepseek.pool'} report: only known gateways and key ids,
 // never secret material or an address. `activeId` is that machine's actual
 // key, not the hub's preferred one: it never rewrites the pool's activeId.
 // A report older than the pool must not undo a newer key change.
+// A connector that rotates across gateways says `rotation: 1`: its report is
+// about the whole list (its revision is rotationRevision(), `gateway` is the
+// gateway of the key it is on, ids are looked up in every pool). An older one
+// reports on the one gateway it was given.
 export function applyPoolReport(machineId, msg) {
   if (!machineId || !msg || typeof msg !== 'object') return false;
   const gw = msg.gateway;
   if (!isGateway(gw)) return false;
   const revision = Number(msg.revision);
   if (!Number.isInteger(revision) || revision < 1) return false;
+  const rotation = msg.rotation === 1;
   const activeId = typeof msg.activeId === 'string' ? msg.activeId.slice(0, 64) : null;
   const pool = poolOf(gw);
-  if (!pool) return false;
-  const known = new Map(pool.keys.map((k) => [k.id, k]));
+  if (!rotation && !pool) return false;
+  const entries = rotation ? rotationEntries() : pool.keys.map((k) => ({ gw, k }));
+  if (!entries.length) return false;
+  const known = new Map(entries.map((e) => [e.k.id, e.k]));
+  const current = rotation ? rotationRevision() : pool.revision;
   let changed = false;
 
   const id = String(machineId).slice(0, 64);
@@ -432,9 +590,9 @@ export function applyPoolReport(machineId, msg) {
   // The newest report by revision wins for a machine's activity. A different
   // gateway is a new fact even when its revision counter is lower (another
   // gateway has its own counter).
-  if (!prev || prev.gateway !== gw || revision >= prev.revision) {
-    const next = { gateway: gw, activeId: known.has(activeId) ? activeId : null, revision, at: Date.now() };
-    if (!prev || prev.gateway !== next.gateway || prev.activeId !== next.activeId || prev.revision !== next.revision) {
+  if (!prev || prev.gateway !== gw || Boolean(prev.rotation) !== rotation || revision >= prev.revision) {
+    const next = { gateway: gw, activeId: known.has(activeId) ? activeId : null, revision, at: Date.now(), ...(rotation ? { rotation: true } : {}) };
+    if (!prev || prev.gateway !== next.gateway || prev.activeId !== next.activeId || prev.revision !== next.revision || Boolean(prev.rotation) !== rotation) {
       saved.activity = { ...(saved.activity || {}), [id]: next };
       changed = true;
     }
@@ -443,6 +601,7 @@ export function applyPoolReport(machineId, msg) {
   // Key health only from a report that matches the hub's current revision, and
   // only what a report actually SAYS about a key:
   //   - { exhaustedAt[, retryAt] }  the newest exhaustion any computer saw wins;
+  //     retryAt is only ever a time a gateway stated;
   //   - { recoveredAt, recoveredFrom }  a real request succeeded on that key;
   //     it clears the exhaustion only if it is later than the exhaustion (and
   //     not from the future: a wrong clock is not evidence);
@@ -450,12 +609,13 @@ export function applyPoolReport(machineId, msg) {
   //     newer than the one the exhaustion was recorded at;
   //   - no field at all  this computer has no news about the key. That is not
   //     "healthy": another computer's view must never undo an exhaustion.
-  if (revision === pool.revision && Array.isArray(msg.keys)) {
+  // A key a person marked full is theirs to clear: no report touches it.
+  if (revision === current && Array.isArray(msg.keys)) {
     const now = Date.now();
     for (const item of msg.keys.slice(0, 100)) {
       if (!item || typeof item.id !== 'string') continue;
       const key = known.get(item.id);
-      if (!key) continue;
+      if (!key || key.manual) continue;
       const exhaustedAt = Number(item.exhaustedAt);
       const recoveredAt = Number(item.recoveredAt);
       if (item.exhaustedAt != null) {
@@ -538,10 +698,29 @@ export function publicAccount() {
     ...[...headerWarnings].map(([id, text]) => ({ machineId: id, machineName: machines.getMachine(id)?.name || id, text: `DeepSeek session 標頭未設定：${text}（閘道可能限流）` })),
     ...[...provisionWarnings].map(([id, text]) => ({ machineId: id, machineName: machines.getMachine(id)?.name || id, text: `原生 DeepSeek 子代理尚未就緒：${text}` })),
   ];
+  const now = Date.now();
+  // How a key stands, said plainly and without a made-up time:
+  //   resetAt     the reset time its gateway STATED (null: none was)
+  //   expiryKnown true only with a stated time; an exhausted key without one is
+  //               looked at again by the next real request after a short gap
+  //   manual      a person marked it full (and only a person clears that)
+  //   retryAt     when a real request may next look at it (null: healthy, or manual)
+  const keyView = (k, pool) => ({
+    id: k.id,
+    hint: hint(k.key),
+    addedAt: k.addedAt,
+    active: k.id === pool?.activeId,
+    exhaustedAt: k.exhaustedAt ?? null,
+    retryAt: k.exhaustedAt && !k.manual ? retryAtOf(k) : null,
+    resetAt: k.exhaustedAt && !k.manual && k.retryAt ? k.retryAt : null,
+    expiryKnown: Boolean(k.exhaustedAt && !k.manual && k.retryAt && k.retryAt > now),
+    manual: Boolean(k.exhaustedAt && k.manual),
+  });
   const gateways = Object.entries(GATEWAYS).map(([id, g]) => {
     const pool = poolOf(id);
     const keys = pool?.keys || [];
     const active = keys.find((k) => k.id === pool?.activeId) || null;
+    const nextTries = keys.map(retryAtOf).filter(Number.isFinite);
     return {
       id,
       label: g.label,
@@ -554,16 +733,35 @@ export function publicAccount() {
       // retryAt: when an exhausted key is next tried automatically (null for a
       // healthy key). allExhausted/nextRetryAt: the whole gateway is out, and
       // the earliest automatic try.
-      keys: keys.map((k) => ({ id: k.id, hint: hint(k.key), addedAt: k.addedAt, active: k.id === pool.activeId, exhaustedAt: k.exhaustedAt ?? null, retryAt: k.exhaustedAt ? retryAtOf(k) : null })),
+      keys: keys.map((k) => keyView(k, pool)),
       allExhausted: keys.length > 0 && keys.every((k) => k.exhaustedAt),
-      nextRetryAt: keys.some((k) => k.exhaustedAt) && keys.every((k) => k.exhaustedAt) ? Math.min(...keys.map(retryAtOf)) : null,
+      nextRetryAt: keys.some((k) => k.exhaustedAt) && keys.every((k) => k.exhaustedAt) && nextTries.length ? Math.min(...nextTries) : null,
     };
   });
+  // The one list the keys are used in, across gateways: each key with its
+  // gateway, place and state. `active` is the first key not known to be out.
+  const entries = rotationEntries();
+  const head = entries.find((e) => !e.k.exhaustedAt)?.k.id || null;
+  const stated = entries.filter((e) => e.k.exhaustedAt && !e.k.manual && e.k.retryAt && e.k.retryAt > now).map((e) => e.k.retryAt);
+  const rotation = {
+    revision: rotationRevision(),
+    activeId: head,
+    keys: entries.map((e, i) => ({
+      ...keyView(e.k, poolOf(e.gw)),
+      gateway: e.gw,
+      gatewayLabel: GATEWAYS[e.gw].label,
+      position: i + 1,
+      active: e.k.id === head,
+      state: e.k.exhaustedAt ? (e.k.manual ? 'manual' : 'exhausted') : 'ready',
+    })),
+    allExhausted: entries.length > 0 && entries.every((e) => e.k.exhaustedAt),
+    nextResetAt: stated.length ? Math.min(...stated) : null,
+  };
   const cur = gateways.find((g) => g.id === gw);
   // Each computer's latest actual key. This is not the hub's preferred one:
   // the hub must not force every computer back onto the same key.
   const activity = Object.entries(saved.activity || {})
-    .map(([machineId, a]) => ({ machineId, machineName: machines.getMachine(machineId)?.name || machineId, gateway: a.gateway, activeId: a.activeId, revision: a.revision }))
+    .map(([machineId, a]) => ({ machineId, machineName: machines.getMachine(machineId)?.name || machineId, gateway: a.gateway, activeId: a.activeId, revision: a.revision, ...(a.rotation ? { rotation: true } : {}) }))
     .sort((a, b) => a.machineId.localeCompare(b.machineId));
   // What each computer's Kimi actually has as [secondary_model], as the
   // bridge last reported it. This is the real value (model, effort, force),
@@ -571,7 +769,7 @@ export function publicAccount() {
   const secondaryModels = [...secondary]
     .map(([machineId, s]) => ({ machineId, machineName: machines.getMachine(machineId)?.name || machineId, ...s }))
     .sort((a, b) => a.machineId.localeCompare(b.machineId));
-  return { gateway: gw, hasKey: cur.hasKey, keyHint: cur.keyHint, gateways, defaults: settings(gw).defaults, warnings, activity, secondaryModels, damaged: keyFile.public() };
+  return { gateway: gw, hasKey: cur.hasKey || rotation.keys.length > 0, keyHint: cur.keyHint, gateways, rotation, defaults: settings(gw).defaults, warnings, activity, secondaryModels, damaged: keyFile.public() };
 }
 
 // -------------------------------------------------------------- models
@@ -706,18 +904,30 @@ function provisionWarning(err) {
 
 // The gateway's own revision and model list: a runtime key report does not
 // change this, so it must not make every computer provision again.
-const sigOf = (gw, revision, ids) => crypto.createHash('sha256').update(JSON.stringify([gw, revision, ids])).digest('hex');
+const sigOf = (gw, revision, ids, map = null) => crypto.createHash('sha256').update(JSON.stringify(map ? [gw, revision, ids, map] : [gw, revision, ids])).digest('hex');
 
 // An older bridge does not know the op.
 const tooOld = (err, m) => (/未知的操作/.test(err?.message || '') ? Object.assign(new Error(`「${m?.name || '這台電腦'}」的連接器太舊，不支援 DeepSeek 模式。在那台電腦重新執行連接指令（左下角「連接電腦…」）後再試。`), { status: 409, code: 'connector_old' }) : err);
 
 const noKey = () => Object.assign(new Error('還沒有設定 DeepSeek 的 API key。在「設定」→「DeepSeek…」貼上閘道的 API key。'), { status: 409, code: 'no_key' });
-// Every key is out of quota and none is due yet. Says when the connectors try
-// again by themselves and what to do right now; `retryAt` is that time.
-const poolExhausted = (pool) => {
-  const retryAt = Math.min(...(pool?.keys || []).map(retryAtOf).filter((t) => t > 0));
-  const when = Number.isFinite(retryAt) ? `最早 ${new Date(retryAt).toLocaleString('zh-TW', { hour12: false })} 之後會自動再試` : '';
-  return Object.assign(new Error(`這個閘道的 API key 都已用盡${when ? `（${when}）` : ''}。要現在恢復：在「設定」→「DeepSeek…」對其中一把按「重新啟用」（會用一次很小的請求確認額度回來了），或加入新的 key。`), {
+// Every key is out of quota and none may be looked at yet. Lists each key by
+// gateway and last four characters (never the key) with its state, says the
+// earliest reset time a gateway STATED, when a real request tries again by
+// itself and what to do right now. `retryAt` is the earliest such try.
+// `entries` are { gw, k } in the order the keys are used in.
+const poolExhausted = (entries) => {
+  const now = Date.now();
+  const when = (t) => new Date(t).toLocaleString('zh-TW', { hour12: false });
+  const tries = entries.map((e) => retryAtOf(e.k)).filter((t) => Number.isFinite(t) && t > 0);
+  const retryAt = tries.length ? Math.min(...tries) : NaN;
+  const stated = entries.filter((e) => e.k.exhaustedAt && !e.k.manual && e.k.retryAt && e.k.retryAt > now).map((e) => e.k.retryAt);
+  const lines = entries.map((e, i) => {
+    const state = e.k.manual ? '手動標記已滿' : e.k.retryAt && e.k.retryAt > now ? `已滿，${when(e.k.retryAt)} 重置` : '已滿，重置時間未知（下一個真實請求會再試）';
+    return `${i + 1}. ${GATEWAYS[e.gw].label} …${hint(e.k.key)}：${state}`;
+  });
+  const head = `DeepSeek 的 API key 都已用盡（共 ${entries.length} 把）${stated.length ? `；最早已知的重置時間 ${when(Math.min(...stated))}` : ''}。`;
+  const auto = Number.isFinite(retryAt) ? '有請求時會自動再試：已知重置時間的 key 到時間才試，重置時間未知的 key 下一個真實請求就會再試。' : '沒有可以自動再試的 key（都是手動標記）。';
+  return Object.assign(new Error(`${head}\n${lines.join('\n')}\n${auto}要現在恢復：在「設定」→「DeepSeek…」對其中一把按「重新啟用」（會用一次很小的請求確認額度回來了）或「清除標記」，或加入新的 key。`), {
     status: 409,
     code: 'pool_exhausted',
     ...(Number.isFinite(retryAt) ? { retryAt } : {}),
@@ -747,32 +957,69 @@ function keyForMachine(machineId, gw, pool) {
 // The gateway, pool and revision may have changed while an older request was
 // out; that older request must not be sent again, and its answer must not be
 // taken for the current state.
+//   - a connector with `pool_cross` gets every key of every gateway in the one
+//     order they are used in, each with its gateway, and the table of the
+//     model's names at the other gateways; it starts on the first key not known
+//     to be out (the order is the priority);
+//   - an older `pool` connector gets the keys of the gateway whose model names
+//     conversations use, as before (keys a person marked full are left out: it
+//     cannot know the mark);
+//   - an older one still gets exactly one key, never silently one of several.
 function planFor(machineId) {
   const gw = gateway();
-  const pool = poolOf(gw);
-  if (!pool?.keys.length) throw noKey();
-  if (!keyForAttempt(gw)) throw poolExhausted(pool);
-  const ids = modelIds(gw);
-  const sig = sigOf(gw, pool.revision, ids);
   const machine = machines.getMachine(machineId);
+  const all = rotationEntries();
+  if (!all.length) throw noKey();
+  const ids = modelIds(gw);
   let args;
-  if ((Number(machine?.pool) || 0) >= 1) {
+  let sig;
+  if (hasCap(machine, 'pool_cross')) {
+    const now = Date.now();
+    if (!all.some((e) => isUsable(e.k, now))) throw poolExhausted(all);
+    const map = modelMapFor(gw, ids, new Set(all.map((e) => e.gw)));
+    const revision = rotationRevision();
+    sig = sigOf(gw, revision, ids, map);
+    const first = all.find((e) => !e.k.exhaustedAt) || all.find((e) => isUsable(e.k, now));
     args = {
       gateway: gw,
       models: ids.map(kimiModel),
       pool: {
-        revision: pool.revision,
-        activeId: keyForMachine(machineId, gw, pool),
+        revision,
+        activeId: first.k.id,
         retryMs: retryMs(),
-        keys: pool.keys.map((k) => ({ id: k.id, apiKey: k.key, ...(k.exhaustedAt ? { exhaustedAt: k.exhaustedAt, ...(k.retryAt ? { retryAt: k.retryAt } : {}) } : {}) })),
+        rotation: 1,
+        modelMap: map,
+        keys: all.map((e) => ({ id: e.k.id, apiKey: e.k.key, gateway: e.gw, ...(e.k.exhaustedAt ? { exhaustedAt: e.k.exhaustedAt, ...(e.k.retryAt ? { retryAt: e.k.retryAt } : {}), ...(e.k.manual ? { manual: true } : {}) } : {}) })),
+      },
+    };
+    return { sig, ids, args, machine };
+  }
+  // (An older connector: one gateway's keys. The model names' gateway, or the
+  // first gateway that has keys when that one has none.)
+  const own = poolOf(gw)?.keys.length ? gw : all[0].gw;
+  const pool = poolOf(own);
+  if (!pool?.keys.length) throw noKey();
+  if (!keyForAttempt(own)) throw poolExhausted(pool.keys.map((k) => ({ gw: own, k })));
+  const legacyIds = modelIds(own);
+  sig = sigOf(own, pool.revision, legacyIds);
+  if ((Number(machine?.pool) || 0) >= 1) {
+    const keys = pool.keys.filter((k) => !k.manual);
+    args = {
+      gateway: own,
+      models: legacyIds.map(kimiModel),
+      pool: {
+        revision: pool.revision,
+        activeId: keyForMachine(machineId, own, { ...pool, keys }),
+        retryMs: retryMs(),
+        keys: keys.map((k) => ({ id: k.id, apiKey: k.key, ...(k.exhaustedAt ? { exhaustedAt: k.exhaustedAt, ...(k.retryAt ? { retryAt: k.retryAt } : {}) } : {}) })),
       },
     };
   } else {
     if (pool.keys.length > 1) throw poolUnsupported(machine);
-    const key = keyForAttempt(gw);
-    args = { gateway: gw, apiKey: key.key, models: ids.map(kimiModel) };
+    const key = keyForAttempt(own);
+    args = { gateway: own, apiKey: key.key, models: legacyIds.map(kimiModel) };
   }
-  return { sig, ids, args, machine };
+  return { sig, ids: legacyIds, args, machine };
 }
 
 // One machine's operations run one after another; different machines do not
@@ -965,7 +1212,7 @@ function scheduleRetry(machineId, err, rpc) {
     cur.timer = null;
     const m = machines.getMachine(machineId);
     if (!m?.online || !m.kimi?.server || !apiKey()) return retries.delete(machineId);
-    provisionOne(machineId, { rpc, sig: sigOf(gateway(), poolRevision(), modelIds()), throttle: false }).catch(() => {});
+    provisionOne(machineId, { rpc, sig: sigOf(gateway(), rotationRevision(), modelIds()), throttle: false }).catch(() => {});
   }, retryDelays[attempt]);
   timer.unref?.();
   retries.set(machineId, { attempt, timer, at });
@@ -982,7 +1229,7 @@ export function retryProvision(machineId, { rpc = machines.rpc } = {}) {
   const m = machines.getMachine(machineId);
   if (!m?.online || !m.kimi?.server) return Promise.resolve({ machineId, ok: false, error: '這台電腦現在連不上 Kimi 伺服器' });
   if (!apiKey()) return Promise.resolve({ machineId, ok: false, error: '還沒有設定 DeepSeek 的 API key' });
-  return provisionOne(machineId, { rpc, sig: sigOf(gateway(), poolRevision(), modelIds()), throttle: false });
+  return provisionOne(machineId, { rpc, sig: sigOf(gateway(), rotationRevision(), modelIds()), throttle: false });
 }
 
 // Best-effort provisioning for native DeepSeek subagents. Only the automatic
@@ -991,7 +1238,7 @@ export async function provisionOnline({ rpc = machines.rpc, list = machines.list
   if (!apiKey()) return [];
   const wanted = ids && new Set(ids);
   const online = list().filter((m) => m.online && m.kimi?.server && (!wanted || wanted.has(m.id)));
-  const sig = sigOf(gateway(), poolRevision(), modelIds());
+  const sig = sigOf(gateway(), rotationRevision(), modelIds());
   return Promise.all(online.map((m) => provisionOne(m.id, { rpc, sig, throttle: true })));
 }
 
@@ -1001,7 +1248,7 @@ export async function reprovision({ rpc = machines.rpc, list = machines.listMach
   if (!apiKey()) return [];
   const online = list().filter((m) => m.online && m.kimi?.server).map((m) => m.id);
   const ids = new Set([...provisioned.keys(), ...jobs.keys(), ...online]);
-  const sig = sigOf(gateway(), poolRevision(), modelIds());
+  const sig = sigOf(gateway(), rotationRevision(), modelIds());
   const results = await Promise.all([...ids].map((id) => provisionOne(id, { rpc, sig, throttle: false })));
   return results.filter((r) => r.ok && !r.cached).map((r) => r.machineId);
 }

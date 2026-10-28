@@ -475,7 +475,7 @@ test('Chromium shows the real native subagent and concise settings', { skip: SKI
   await until(() => evaluate(`[...document.querySelectorAll('.om-menu__item')].some((e) => e.textContent.includes('DeepSeek…'))`), 5000, 'settings menu');
   await evaluate(`[...document.querySelectorAll('.om-menu__item')].find((e) => e.textContent.includes('DeepSeek…'))?.click()`);
   const deepseekText = await until(() => evaluate(`document.querySelector('.deepseek-settings')?.innerText.includes('各機原生子代理') && document.querySelector('.deepseek-settings').innerText`), 10000, 'DeepSeek settings');
-  assert.match(deepseekText, /各閘道各自保存 key；額度用盡自動換同閘道下一把，不切供應商或模型/);
+  assert.match(deepseekText, /OpenCode 與 Command Code 的 key 放在同一份清單，依序使用/);
   assert.match(deepseekText, /各機實際 key/);
   assert.match(deepseekText, /agent-hub-deepseek\/deepseek-v4\.1-flash · 思考 max/);
   assert.doesNotMatch(deepseekText, /DeepSeek 對話是在你電腦上的|中控台不會更動這個設定/);

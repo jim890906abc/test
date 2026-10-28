@@ -152,7 +152,7 @@ after(async () => {
 
 test('the hello names only what this connector really supports, and the version says where that started', () => {
   const h = hellos.at(-1);
-  assert.deepEqual(h.capabilities, ['pool', 'secondary_model', 'handoff'], 'no broker: it was started with --no-broker');
+  assert.deepEqual(h.capabilities, ['pool', 'pool_cross', 'secondary_model', 'handoff'], 'no broker: it was started with --no-broker');
   assert.equal(h.bridgeVersion, '0.11.0');
   assert.equal(h.pool, 1);
   assert.equal(h.broker, 0, 'the numeric flag agrees with the capability');

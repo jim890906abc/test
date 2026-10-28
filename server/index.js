@@ -204,7 +204,7 @@ app.get('/api/claude/models', wrap(async () => ({ defaultModel: claudeAccount.DE
 // sent here, never back) and the defaults for new DeepSeek conversations.
 app.get('/api/deepseek', wrap(() => deepseekAccount.publicAccount()));
 
-const DEEPSEEK_PUT_FIELDS = new Set(['gateway', 'apiKey', 'clearKey', 'activateKeyId', 'removeKeyId', 'retryKeyId', 'defaults']);
+const DEEPSEEK_PUT_FIELDS = new Set(['gateway', 'keyGateway', 'apiKey', 'clearKey', 'activateKeyId', 'removeKeyId', 'retryKeyId', 'markFullKeyId', 'clearMarkKeyId', 'moveKeyId', 'direction', 'defaults']);
 const DEEPSEEK_TEST_FIELDS = new Set(['gateway', 'keyId']);
 
 function deepseekBody(req, allowed) {
@@ -214,26 +214,34 @@ function deepseekBody(req, allowed) {
   return body;
 }
 
-// `apiKey` adds a key (the old single-key call), the *KeyId fields act on one
-// key of the gateway's pool, and `clearKey` removes the whole pool. Exactly
-// one operation per request keeps the revision and the computers in step.
+// The keys are one list used in one order across gateways. `apiKey` adds a key
+// (to `keyGateway`, else `gateway`, else the gateway in use; only `gateway`
+// changes which gateway's model names conversations use), the *KeyId fields act
+// on one key by its id (whatever gateway it is on), `markFullKeyId` and
+// `clearMarkKeyId` are a person saying a key is full / is fine, `moveKeyId`
+// moves a key in the order (`direction`: up, down or top), and `clearKey`
+// removes a whole gateway's keys. Exactly one operation per request keeps the
+// revision and the computers in step.
 app.put('/api/deepseek', wrap(async (req) => {
   const body = deepseekBody(req, DEEPSEEK_PUT_FIELDS);
-  const { gateway: chosen, apiKey, clearKey, activateKeyId, removeKeyId, retryKeyId, defaults } = body;
+  const { gateway: chosen, keyGateway, apiKey, clearKey, activateKeyId, removeKeyId, retryKeyId, markFullKeyId, clearMarkKeyId, moveKeyId, direction, defaults } = body;
   if (chosen !== undefined && !deepseekAccount.isGateway(chosen)) throw Object.assign(new Error('不支援的閘道'), { status: 400 });
-  const gw = chosen ?? deepseekAccount.gateway();
-  for (const [name, id] of [['activateKeyId', activateKeyId], ['removeKeyId', removeKeyId], ['retryKeyId', retryKeyId]]) {
+  if (keyGateway !== undefined && !deepseekAccount.isGateway(keyGateway)) throw Object.assign(new Error('不支援的閘道'), { status: 400 });
+  const gw = keyGateway ?? chosen ?? deepseekAccount.gateway();
+  const byId = [['activateKeyId', activateKeyId], ['removeKeyId', removeKeyId], ['retryKeyId', retryKeyId], ['markFullKeyId', markFullKeyId], ['clearMarkKeyId', clearMarkKeyId], ['moveKeyId', moveKeyId]];
+  for (const [name, id] of byId) {
     if (id !== undefined && (typeof id !== 'string' || !id)) throw Object.assign(new Error(`${name} 要是 API key 的 id`), { status: 400 });
   }
   if (apiKey !== undefined && typeof apiKey !== 'string') throw Object.assign(new Error('apiKey 要是字串'), { status: 400 });
+  if (direction !== undefined && moveKeyId === undefined) throw Object.assign(new Error('direction 要搭配 moveKeyId'), { status: 400 });
   const ops = [
     typeof apiKey === 'string' && apiKey.trim() ? 'apiKey' : '',
-    activateKeyId !== undefined ? 'activateKeyId' : '',
-    removeKeyId !== undefined ? 'removeKeyId' : '',
-    retryKeyId !== undefined ? 'retryKeyId' : '',
+    ...byId.filter(([, id]) => id !== undefined).map(([name]) => name),
     clearKey ? 'clearKey' : '',
   ].filter(Boolean);
-  if (ops.length > 1) throw Object.assign(new Error('一次只能新增、啟用、移除、重新啟用或清除一組 key'), { status: 400 });
+  if (ops.length > 1) throw Object.assign(new Error('一次只能新增、啟用、移除、重新啟用、標記、移動或清除一組 key'), { status: 400 });
+  // A key is named by its id, which is one across gateways.
+  const ownerOf = (id) => deepseekAccount.gatewayOfKey(id) || gw;
 
   const beforeGateway = deepseekAccount.gateway();
   if (ops[0] === 'apiKey') {
@@ -243,9 +251,12 @@ app.put('/api/deepseek', wrap(async (req) => {
     const r = await deepseekAccount.refreshModels(gw, apiKey.trim());
     deepseekAccount.setKey(gw, apiKey);
     if (r.note) console.warn(`[deepseek] ${r.note}`);
-  } else if (ops[0] === 'activateKeyId') deepseekAccount.activateKey(gw, activateKeyId);
-  else if (ops[0] === 'removeKeyId') deepseekAccount.removeKey(gw, removeKeyId);
-  else if (ops[0] === 'retryKeyId') await deepseekAccount.retryKey(gw, retryKeyId);
+  } else if (ops[0] === 'activateKeyId') deepseekAccount.activateKey(ownerOf(activateKeyId), activateKeyId);
+  else if (ops[0] === 'removeKeyId') deepseekAccount.removeKey(ownerOf(removeKeyId), removeKeyId);
+  else if (ops[0] === 'retryKeyId') await deepseekAccount.retryKey(ownerOf(retryKeyId), retryKeyId);
+  else if (ops[0] === 'markFullKeyId') deepseekAccount.markFull(markFullKeyId);
+  else if (ops[0] === 'clearMarkKeyId') deepseekAccount.clearMark(clearMarkKeyId);
+  else if (ops[0] === 'moveKeyId') deepseekAccount.moveKey(moveKeyId, direction ?? 'up');
   else if (ops[0] === 'clearKey') deepseekAccount.clearKey(gw);
   deepseekAccount.setSettings({ gateway: chosen, defaults });
 
@@ -262,9 +273,10 @@ app.put('/api/deepseek', wrap(async (req) => {
 
 app.post('/api/deepseek/test', wrap(async (req) => {
   const body = deepseekBody(req, DEEPSEEK_TEST_FIELDS);
-  const gw = body.gateway ?? deepseekAccount.gateway();
-  if (!deepseekAccount.isGateway(gw)) throw Object.assign(new Error('不支援的閘道'), { status: 400 });
   if (body.keyId !== undefined && (typeof body.keyId !== 'string' || !body.keyId)) throw Object.assign(new Error('keyId 要是 API key 的 id'), { status: 400 });
+  // A key is named by its id, which is one across gateways: its own gateway wins.
+  const gw = (body.keyId && deepseekAccount.gatewayOfKey(body.keyId)) || body.gateway || deepseekAccount.gateway();
+  if (!deepseekAccount.isGateway(gw)) throw Object.assign(new Error('不支援的閘道'), { status: 400 });
   const chosen = body.keyId ? deepseekAccount.keyById(gw, body.keyId) : null;
   if (body.keyId && !chosen) throw Object.assign(new Error('找不到這把 API key'), { status: 404 });
   const key = chosen?.key || (!body.keyId ? deepseekAccount.apiKey(gw) : '');
