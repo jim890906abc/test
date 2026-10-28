@@ -3853,6 +3853,16 @@ pre.tail {
   font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
 }
+.ds-all-out-box:empty {
+  display: none;
+}
+.ds-all-out-box {
+  margin-bottom: var(--space-2);
+}
+.ds-machine-old {
+  margin-left: 4px;
+  color: var(--ink-secondary);
+}
 .ds-key-pos {
   min-width: 16px;
   color: var(--ink-secondary);

@@ -138,10 +138,9 @@ test('deleting a key removes just that key and keeps the order of the others', {
   await b.waitFor(`document.querySelector('.alert .om-btn--destructive')`, { timeout: 5000 });
   assert.match(await b.eval(`document.querySelector('.alert').innerText`), /Command Code …/, 'the confirmation names the gateway');
   await b.eval(`document.querySelector('.alert .om-btn--destructive').click()`);
-  // (A confirmation replaces the settings dialog, as it always did: look again.)
-  const end = Date.now() + 8000;
-  while (Date.now() < end && JSON.parse(fs.readFileSync(path.join(hub.data, 'deepseek.json'), 'utf8')).keys.commandcode.keys.length !== 1) await sleep(100);
-  await openDeepseek();
+  // (The confirmation opened over the settings, so the list refreshes where it is.)
+  await b.waitFor(`document.querySelectorAll('.deepseek-settings .ds-key').length === 3`, { timeout: 8000 });
+  assert.equal(JSON.parse(fs.readFileSync(path.join(hub.data, 'deepseek.json'), 'utf8')).keys.commandcode.keys.length, 1);
   const list = await rows();
   assert.deepEqual(list.map((r) => r.pos), ['1', '2', '3'], 'positions close up');
   assert.deepEqual(list.map((r) => r.id).filter((id) => id.startsWith('k_')), ['k_go1', 'k_go2']);

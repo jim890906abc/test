@@ -3165,14 +3165,18 @@ function changesTree(files) {
 
 let dialogClose = null;
 
-function dialog(content, { wide = false, onClose } = {}) {
-  dialogClose?.();
+// `over`: open on top of the dialog that is open (a confirmation asked while
+// editing something) instead of replacing it. Escape and the backdrop close the
+// top one only, and the one underneath is the open dialog again afterwards.
+function dialog(content, { wide = false, onClose, over = false } = {}) {
+  const below = over ? dialogClose : null;
+  if (!over) dialogClose?.();
   const box = h('div', { class: `dialog${wide ? ' wide' : ''}`, role: 'dialog', 'aria-modal': 'true' }, content);
   const back = h('div', { class: 'om dialog-back', onclick: (e) => e.target === back && close() }, box);
   const prevFocus = document.activeElement;
   function close() {
     back.remove();
-    dialogClose = null;
+    dialogClose = below;
     onClose?.();
     prevFocus?.focus?.();
   }
@@ -3182,7 +3186,7 @@ function dialog(content, { wide = false, onClose } = {}) {
   return { box, close };
 }
 
-function confirmDialog({ title, body, action, destructive }) {
+function confirmDialog({ title, body, action, destructive, over = false }) {
   return new Promise((resolve) => {
     let done = false;
     const finish = (v) => {
@@ -3199,7 +3203,7 @@ function confirmDialog({ title, body, action, destructive }) {
         body ? h('p', { class: 'om-alert__body' }, body) : null,
         h('div', { class: 'dialog-actions' }, h('button', { class: 'om-btn', type: 'button', onclick: () => finish(false) }, '取消'), h('button', { class: `om-btn ${destructive ? 'om-btn--destructive' : 'om-btn--primary'}`, type: 'button', autofocus: true, onclick: () => finish(true) }, action)),
       ),
-      { onClose: () => finish(false) },
+      { onClose: () => finish(false), over },
     );
   });
 }
@@ -3498,6 +3502,7 @@ async function deepseekDialog() {
   const gwBox = h('div', { class: 'gw-list', role: 'radiogroup', 'aria-label': '閘道' });
   const keyHead = h('div', { class: 'ds-key-head' });
   const keyBox = h('div', { class: 'ds-key-list' });
+  const allOutBox = h('div', { class: 'ds-all-out-box' });
   const machineBox = h('div', { class: 'ds-machines' });
   const modelSel = h('select', { class: 'om-input', name: 'model' });
   const effortSel = h('select', { class: 'om-input', name: 'effort' });
@@ -3525,7 +3530,7 @@ async function deepseekDialog() {
   const clearError = () => {
     errBox.textContent = '';
   };
-  const action = (label, onclick, { destructive = false } = {}) => h('button', { class: `om-btn om-btn--sm${destructive ? ' om-btn--destructive' : ''}`, type: 'button', onclick }, label);
+  const action = (label, onclick, { destructive = false, act, title } = {}) => h('button', { class: `om-btn om-btn--sm${destructive ? ' om-btn--destructive' : ''}`, type: 'button', onclick, ...(act ? { 'data-act': act } : {}), ...(title ? { title, 'aria-label': title } : {}) }, label);
 
   const drawModels = () => {
     const keep = modelSel.value || defaultModel;
@@ -3590,17 +3595,28 @@ async function deepseekDialog() {
     }
     return k.active ? { text: '使用中', badge: 'success' } : { text: '待命', badge: '' };
   };
+  // Every key out: say whether any gateway named a time, and how to get going.
+  const allOutText = () => {
+    const keys = rot();
+    const r = acc.rotation || {};
+    const head = `全部 ${keys.length} 把 key 都用盡了。`;
+    if (keys.every((k) => k.state === 'manual')) return `${head}都是你手動標記的，不會自動再試；按「清除標記」才會再用，或加入新的 key。`;
+    const when = r.nextResetAt ? `閘道說過最早的重置時間是 ${new Date(r.nextResetAt).toLocaleString()}。` : '沒有任何閘道說過重置時間。';
+    return `${head}${when}重置時間未知的 key 下一個真實請求會再試；現在要恢復：對那把按「重新啟用」（會真的送一次很小的請求確認）或「清除標記」，或加入新的 key。`;
+  };
   const drawKeys = () => {
     const keys = rot();
     fill(keyHead, h('span', { class: 'om-field__label' }, '全部 API key（依序使用，用完自動換下一把）'), h('span', { class: 'om-toolbar__spacer' }), h('span', { class: 'ds-key-count' }, keys.length ? `${keys.length} 把` : ''));
+    fill(allOutBox, ...(keys.length && acc.rotation?.allExhausted ? [h('div', { class: 'callout small ds-all-out', role: 'status' }, icon('alert'), h('div', { class: 'callout-text' }, allOutText()))] : []));
     fill(
       keyBox,
       keys.length
-        ? keys.map((k) => {
+        ? keys.map((k, i) => {
             const st = keyState(k);
+            const out = k.state !== 'ready';
             return h(
               'div',
-              { class: `ds-key${k.active ? ' on' : ''}${k.state !== 'ready' ? ' exhausted' : ''}`, 'data-key-id': k.id },
+              { class: `ds-key${k.active ? ' on' : ''}${out ? ' exhausted' : ''}`, 'data-key-id': k.id },
               h(
                 'div',
                 { class: 'ds-key-main' },
@@ -3613,9 +3629,13 @@ async function deepseekDialog() {
               h(
                 'div',
                 { class: 'ds-key-actions' },
-                k.state !== 'ready' ? action('重新啟用', () => retry(k)) : null,
-                action('測試', () => test(k.id)),
-                action('刪除', () => remove(k), { destructive: true }),
+                i > 0 ? action('移到最前', () => move(k, 'top'), { act: 'top', title: `把 …${k.hint} 移到最前面（最先使用）` }) : null,
+                i > 0 ? action('↑', () => move(k, 'up'), { act: 'up', title: `把 …${k.hint} 往前移一位` }) : null,
+                i < keys.length - 1 ? action('↓', () => move(k, 'down'), { act: 'down', title: `把 …${k.hint} 往後移一位` }) : null,
+                out ? action('清除標記', () => clearMark(k), { act: 'clear', title: '不問閘道，直接當作可用；下一個真實請求會確認，還是用盡就會再標記' }) : action('標記已滿', () => markFull(k), { act: 'mark', title: '你知道這把用完了：先放一邊，不會被使用也不會被探測，直到你清除標記' }),
+                out ? action('重新啟用', () => retry(k), { act: 'retry', title: '真的送一次很小的請求確認額度回來了，成功才恢復' }) : null,
+                action('測試', () => test(k.id), { act: 'test' }),
+                action('刪除', () => remove(k), { destructive: true, act: 'remove' }),
               ),
             );
           })
@@ -3624,21 +3644,29 @@ async function deepseekDialog() {
   };
   const drawMachines = () => {
     const rows = acc.activity || [];
+    const label = (id) => (acc.gateways || []).find((g) => g.id === id)?.label || id;
     fill(
       machineBox,
       rows.length
         ? rows.map((a) => {
             const key = rot().find((k) => k.id === a.activeId);
+            const out = key && key.state !== 'ready' ? (key.state === 'manual' ? '（手動標記已滿）' : '（額度用盡）') : '';
             return h(
               'div',
               { class: 'ds-machine' },
               icon('computer'),
               h('span', { class: 'ds-machine-name' }, a.machineName || a.machineId),
-              h('span', { class: 'ds-machine-key' }, key ? `${key.gatewayLabel || key.gateway} …${key.hint || '????'}${key.state !== 'ready' ? '（額度用盡）' : ''}` : a.activeId ? '回報的 key 已不在清單' : '尚未回報使用中的 key'),
-              h('span', { class: 'ds-machine-rev', title: '這台電腦最近回報的號池版本' }, `v${a.revision}`),
+              h(
+                'span',
+                { class: 'ds-machine-key' },
+                key ? `${key.gatewayLabel || key.gateway} …${key.hint || '????'}${out}` : a.activeId ? '回報的 key 已不在清單' : '尚未回報使用中的 key',
+                // A connector from before keys rotated across gateways only rotates inside one.
+                a.rotation ? null : h('span', { class: 'ds-machine-old' }, `（舊版連接器，只在 ${label(a.gateway)} 內換；重新執行連接指令更新後才會跨家）`),
+              ),
+              h('span', { class: 'ds-machine-rev', title: '這台電腦最近回報的清單版本（清單有變動就會增加）' }, `v${a.revision}`),
             );
           })
-        : h('p', { class: 'om-field__help' }, '還沒有電腦回報實際使用中的 key。連接器 0.10.0 以上會回報；各機可以有自己的使用中 key。'),
+        : h('p', { class: 'om-field__help' }, '還沒有電腦回報實際使用中的 key。換 key、加入 key 或電腦重新連上後，連接器會回報；沒回報的電腦不代表沒在用。'),
     );
   };
   const draw = () => {
@@ -3655,7 +3683,7 @@ async function deepseekDialog() {
     fill(testOut, h('span', { class: 'spinner' }), ' 連線中…');
     testOut.className = 'claude-test';
     try {
-      const head = acc.rotation?.activeId;
+      const head = acc.rotation?.activeId || rot()[0]?.id;
       const r = await post('/deepseek/test', keyId ? { keyId } : head ? { keyId: head } : { gateway: gw });
       testOut.className = `claude-test ${r.ok ? 'ok' : 'bad'}`;
       fill(testOut, r.message);
@@ -3672,7 +3700,18 @@ async function deepseekDialog() {
       showError(err);
     }
   };
+  let opBusy = false;
   const keyOp = async (body, label, { quiet = false } = {}) => {
+    // One operation at a time: a second click while one is out would act on a list that is about to change.
+    if (opBusy) return null;
+    opBusy = true;
+    try {
+      return await keyOpNow(body, label, { quiet });
+    } finally {
+      opBusy = false;
+    }
+  };
+  const keyOpNow = async (body, label, { quiet = false } = {}) => {
     clearError();
     fill(testOut, h('span', { class: 'spinner' }), ` ${label}…`);
     testOut.className = 'claude-test';
@@ -3714,14 +3753,17 @@ async function deepseekDialog() {
     }
   };
   const retry = (k) => keyOp({ retryKeyId: k.id }, '重新啟用');
+  const move = (k, direction) => keyOp({ moveKeyId: k.id, direction }, '調整順序', { quiet: true });
+  const markFull = (k) => keyOp({ markFullKeyId: k.id }, '標記已滿', { quiet: true });
+  const clearMark = (k) => keyOp({ clearMarkKeyId: k.id }, '清除標記', { quiet: true });
   const remove = async (k) => {
-    if (!(await confirmDialog({ title: `要刪除 ${k.gatewayLabel || ''} …${k.hint} 這把 key 嗎？`, body: '只會移除這一把；清單裡其他的 key 不受影響。刪到一把不剩時，DeepSeek 對話要等你再加入 key 才能繼續，連接的電腦上 Kimi 裡的 DeepSeek 模型來源也會一併移除。這不會撤銷 key 本身，要撤銷請到閘道的網站。', action: '刪除', destructive: true }))) return;
+    if (!(await confirmDialog({ title: `要刪除 ${k.gatewayLabel || ''} …${k.hint} 這把 key 嗎？`, body: '只會移除這一把；清單裡其他的 key 不受影響。刪到一把不剩時，DeepSeek 對話要等你再加入 key 才能繼續，連接的電腦上 Kimi 裡的 DeepSeek 模型來源也會一併移除。這不會撤銷 key 本身，要撤銷請到閘道的網站。', action: '刪除', destructive: true, over: true }))) return;
     await keyOp({ removeKeyId: k.id }, '刪除 key');
   };
   const clearAll = async () => {
     const withKeys = (acc.gateways || []).filter((g) => g.keyCount > 0);
     const n = rot().length;
-    if (!(await confirmDialog({ title: `要清空全部 ${n} 把 key 嗎？`, body: '清單裡所有閘道的 key 都會從中控台與受控 connector 移除。DeepSeek 對話要等你再加入 key 才能繼續。這不會撤銷 key 本身，要撤銷請到閘道的網站。', action: '清空', destructive: true }))) return;
+    if (!(await confirmDialog({ title: `要清空全部 ${n} 把 key 嗎？`, body: '清單裡所有閘道的 key 都會從中控台與受控 connector 移除。DeepSeek 對話要等你再加入 key 才能繼續。這不會撤銷 key 本身，要撤銷請到閘道的網站。', action: '清空', destructive: true, over: true }))) return;
     for (const g of withKeys) await keyOp({ keyGateway: g.id, clearKey: true }, '清空 key', { quiet: g !== withKeys.at(-1) });
   };
   const save = async (e) => {
@@ -3777,6 +3819,7 @@ async function deepseekDialog() {
     configDamagedNote(acc.damaged),
     h('div', { class: 'dialog-subtitle first' }, 'API key（所有閘道一份清單）'),
     keyHead,
+    allOutBox,
     keyBox,
     h('div', { class: 'om-field' }, h('span', { class: 'om-field__label' }, '加入 API key'), h('div', { class: 'ds-key-add' }, addGw, keyInput, h('button', { class: 'om-btn om-btn--sm om-btn--primary', type: 'button', onclick: addKey }, '加入 key')), keyNote),
     keyActions,
