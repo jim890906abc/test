@@ -37,6 +37,7 @@ const CLUSTER_DIR = path.join(store.DATA_DIR, 'clusters');
 
 const clusters = new Map(); // cluster id -> record (see create())
 const workerIndex = new Map(); // conversation id -> cluster id
+const cleaning = new Set(); // cluster ids being cleaned up right now (in memory only: a restart ends it)
 let broadcast = () => {};
 export function setBroadcast(fn) {
   broadcast = fn;
@@ -164,11 +165,22 @@ export function publicCluster(rec) {
         swarm: Boolean(s?.meta?.swarmMode),
         progress: progressOf(s),
         finishedAt: w.finishedAt || null,
+        // Taken off the sidebar by a clean-up (the conversation itself is kept).
+        hidden: Boolean(s?.clusterHidden),
       };
     }),
     memory: { path: rec.memory.path, bytes: rec.memory.bytes ?? 0, updatedAt: rec.memory.updatedAt ?? null },
     merge: rec.merge || null,
+    cleanup: publicCleanup(rec),
   };
+}
+
+// What the last clean-up did. Whether a conversation is hidden is read from the
+// conversation (the one place it is kept), not from what was written then: a
+// person may have put it back since.
+function publicCleanup(rec) {
+  if (!rec.cleanup) return null;
+  return { at: rec.cleanup.at, auto: rec.cleanup.auto, results: rec.cleanup.results.map((r) => ({ ...r, reasons: [...r.reasons], hidden: isHidden(rec.workers.find((w) => w.sessionId === r.sessionId)) })) };
 }
 
 const lastSent = new Map(); // cluster id -> the JSON last broadcast
@@ -498,6 +510,7 @@ export async function create(parentNode, body) {
     memory: { path: memoryPath, bytes: 0, updatedAt: null },
     workers: [],
     merge: null,
+    cleanup: null,
     stoppedAt: null,
   };
   const made = { memory: false, worktrees: [], sessions: [] };
@@ -676,12 +689,332 @@ export async function stop(cid) {
   return publicCluster(rec);
 }
 
+// ------------------------------------------------------------ clean up
+//
+// After the work is merged the workers' worktrees, branches and sidebar rows
+// are only clutter. Cleaning up takes them away, and takes away nothing that
+// is not somewhere else too (the no-loss rule), worker by worker:
+//
+//   worktree  removed only when it is CLEAN (git's own `worktree remove`, never
+//             --force: nothing modified, nothing untracked) and its branch is
+//             safe to delete too; otherwise kept, with the reason.
+//   branch    deleted only when every commit on it is also in the merged
+//             branch (cluster/<id>/merged) or in the main conversation's HEAD -
+//             that is what `git branch -d` checks, done here against the merged
+//             branch as well and as a compare-and-swap on the tip that was
+//             checked (never -D). A branch checked out anywhere is not touched.
+//   merged    cluster/<id>/merged is never touched; nor is the memory file.
+//   worker    the conversation is neither deleted nor archived: it is taken off
+//             the sidebar (`clusterHidden`) once nothing of it is left to look
+//             after, and the cluster page puts it back on request.
+//
+// A worker whose merge failed, or that is still working, is left whole. A step
+// that fails leaves that worker as it was and the next worker is done.
+const CLEAN_TIMEOUT_MS = 120_000;
+const WHY_RUNNING = '工作者還在跑';
+
+const chainNodes = (leaf) => {
+  try {
+    return store.chainOf(leaf);
+  } catch {
+    return [leaf];
+  }
+};
+const isHidden = (w) => Boolean(w && leafOfWorker(w)?.clusterHidden);
+
+// Hide or show a worker's conversation in the sidebar: on every node of its
+// chain (the row is the leaf's, a later node copies the flag from the one before).
+function setHidden(w, on) {
+  const leaf = leafOfWorker(w);
+  if (!leaf) return false;
+  let changed = false;
+  for (const node of chainNodes(leaf)) {
+    if (Boolean(node.clusterHidden) === on) continue;
+    if (on) node.clusterHidden = true;
+    else delete node.clusterHidden;
+    store.saveSession(node, { touch: false });
+    changed = true;
+  }
+  if (changed) broadcast({ t: 'session', session: runner.summarize(leaf) });
+  return changed;
+}
+
+// What a computer says of one worker's worktree and branch. Read only.
+async function inspectWorker(rec, w) {
+  const q = mem.quote;
+  const script = [
+    `top=${q(rec.repo.top)}; wt=${q(w.worktree)}; br=${q(w.branch)}; mergedbr=${q(`cluster/${rec.id}/merged`)}; main=${q(rec.cwd)}`,
+    'real=$(cd "$wt" 2>/dev/null && pwd -P)',
+    'echo "AHC_WTDIR=$([ -d "$wt" ] && echo 1 || echo 0)"',
+    'echo "AHC_REAL=$real"',
+    'list=$(git -C "$top" worktree list --porcelain 2>/dev/null)',
+    'reg=0',
+    'printf "%s\\n" "$list" | grep -Fxq "worktree $wt" && reg=1',
+    '[ -n "$real" ] && printf "%s\\n" "$list" | grep -Fxq "worktree $real" && reg=1',
+    'echo "AHC_WTREG=$reg"',
+    'if [ -d "$wt" ]; then',
+    '  st=$(git -C "$wt" status --porcelain 2>/dev/null); rc=$?',
+    '  if [ $rc -ne 0 ]; then echo "AHC_STATUSERR=$(git -C "$wt" status --porcelain 2>&1 | head -c 200 | tr "\\n" " ")"; else echo "AHC_DIRTY=$(printf "%s\\n" "$st" | grep -c .)"; fi',
+    'fi',
+    'tip=$(git -C "$top" rev-parse --verify -q "refs/heads/$br" 2>/dev/null) || tip=',
+    'echo "AHC_TIP=$tip"',
+    'if [ -n "$tip" ]; then',
+    '  mtip=$(git -C "$top" rev-parse --verify -q "refs/heads/$mergedbr" 2>/dev/null) || mtip=',
+    '  mainhead=$(git -C "$main" rev-parse --verify -q HEAD 2>/dev/null) || mainhead=',
+    '  echo "AHC_MERGEDTIP=$mtip"',
+    '  safe=',
+    '  if [ -n "$mtip" ] && git -C "$top" merge-base --is-ancestor "$tip" "$mtip" 2>/dev/null; then safe=merged',
+    '  elif [ -n "$mainhead" ] && git -C "$top" merge-base --is-ancestor "$tip" "$mainhead" 2>/dev/null; then safe=head; fi',
+    '  echo "AHC_SAFE=$safe"',
+    '  if [ -z "$safe" ]; then',
+    '    args="$tip"; [ -n "$mtip" ] && args="$args ^$mtip"; [ -n "$mainhead" ] && args="$args ^$mainhead"',
+    '    echo "AHC_UNIQUE=$(git -C "$top" rev-list --count $args 2>/dev/null)"',
+    '  fi',
+    '  git -C "$top" worktree list --porcelain 2>/dev/null | awk -v b="branch refs/heads/$br" \'/^worktree /{p=substr($0,10)} $0==b{print "AHC_CHECKEDOUT=" p}\'',
+    'fi',
+  ].join('\n');
+  // (git status of a big worktree can take a while.)
+  const r = await mem.sh(rec.machineId, rec.cwd, script, { timeoutMs: 60_000 });
+  if (r.exitCode !== 0) throw new Error(r.output.trim().slice(0, 200) || `結束碼 ${r.exitCode}`);
+  const own = new Set([w.worktree, mem.field(r.output, 'AHC_REAL')].filter(Boolean));
+  return {
+    dir: mem.field(r.output, 'AHC_WTDIR') === '1',
+    registered: mem.field(r.output, 'AHC_WTREG') === '1',
+    dirty: Number(mem.field(r.output, 'AHC_DIRTY')) || 0,
+    statusError: mem.field(r.output, 'AHC_STATUSERR') || '',
+    tip: mem.field(r.output, 'AHC_TIP') || '',
+    mergedTip: mem.field(r.output, 'AHC_MERGEDTIP') || '',
+    safe: mem.field(r.output, 'AHC_SAFE') || '',
+    unique: Number(mem.field(r.output, 'AHC_UNIQUE')) || 0,
+    // Where else the branch is checked out (its own worktree is not "else").
+    checkedOutAt: [...r.output.matchAll(/^AHC_CHECKEDOUT=(.*)$/gm)].map((m) => m[1].trim()).filter((p) => p && !own.has(p)),
+  };
+}
+
+// What is to be done for one worker, from what the computer said. `keepWhy`:
+// a reason to leave it whole whatever git says (still working, merge failed).
+// → { worktree: 'remove'|'gone'|'keep', branch: 'delete'|'gone'|'keep', safe, reasons }
+function decideWorker(rec, f, keepWhy) {
+  const mergedBranch = `cluster/${rec.id}/merged`;
+  const reasons = [];
+  let worktreeProblem = null; // why the worktree cannot be removed
+  let branchProblem = null; // why the branch cannot be deleted
+  let atRisk = false; // commits on the branch that are nowhere else: the worker is not finished with it
+  if (f.dir) {
+    if (!f.registered) worktreeProblem = 'git 不認得這個資料夾是 worktree，沒有動它';
+    else if (f.statusError) worktreeProblem = `看不到 worktree 的狀態：${f.statusError}`;
+    else if (f.dirty > 0) worktreeProblem = `有 ${f.dirty} 項未提交的修改或未追蹤的檔案`;
+  }
+  if (f.tip && !f.safe) {
+    atRisk = true;
+    branchProblem = f.mergedTip ? `分支有 ${f.unique} 個 commit 沒合進 ${mergedBranch}，也不在主對話目前的 HEAD 上` : `還沒合併過：分支有 ${f.unique} 個 commit 不在主對話目前的 HEAD 上`;
+  } else if (f.tip && f.checkedOutAt.length) {
+    branchProblem = `分支正被 ${f.checkedOutAt[0]} 檢出，沒有動它`;
+  }
+  if (keepWhy) {
+    if (f.dir) worktreeProblem = worktreeProblem || keepWhy;
+    if (f.tip) {
+      branchProblem = branchProblem || keepWhy;
+      atRisk = true;
+    }
+    reasons.push(keepWhy);
+  }
+  for (const why of [worktreeProblem, branchProblem]) if (why && !reasons.includes(why)) reasons.push(why);
+  const worktree = !f.dir ? 'gone' : worktreeProblem || atRisk ? 'keep' : 'remove';
+  let branch;
+  if (!f.tip) branch = 'gone';
+  else if (branchProblem) branch = 'keep';
+  else if (worktree === 'keep') {
+    branch = 'keep';
+    reasons.push('分支還被 worktree 使用中');
+  } else branch = 'delete';
+  if (!f.dir) reasons.push('worktree 資料夾本來就不在了');
+  if (!f.tip) reasons.push('分支本來就不在了');
+  return { worktree, branch, safe: f.safe, reasons };
+}
+
+const gitMessage = (r) => r.output.trim().replace(/\s+/g, ' ').slice(0, 200) || `結束碼 ${r.exitCode}`;
+
+// Does what decideWorker said, step by step; a step that fails is reported and
+// the worker stays as it was after the last step that worked.
+async function applyDecision(rec, w, d) {
+  const out = { worktree: d.worktree === 'keep' ? 'kept' : 'removed', branch: d.branch === 'keep' ? 'kept' : 'deleted', reasons: [...d.reasons], did: { worktree: false, branch: false } };
+  const { machineId, cwd } = rec;
+  const q = mem.quote;
+  if (d.worktree === 'remove') {
+    const r = await mem.sh(machineId, cwd, gitIn(rec.repo.top, `worktree remove ${q(w.worktree)}`), { timeoutMs: CLEAN_TIMEOUT_MS });
+    if (r.exitCode !== 0) {
+      out.worktree = 'kept';
+      out.reasons.push(`git 拒絕移除 worktree：${gitMessage(r)}`);
+      if (d.branch === 'delete') {
+        out.branch = 'kept';
+        out.reasons.push('分支還被 worktree 使用中');
+      }
+      return out;
+    }
+    out.did.worktree = true;
+  } else if (d.worktree === 'gone') {
+    // The folder was deleted by hand: git still lists it, and would not let its branch go.
+    await mem.sh(machineId, cwd, gitIn(rec.repo.top, 'worktree prune', { quiet: true }) + '; true').catch(() => {});
+  }
+  if (d.branch === 'delete') {
+    const script = [
+      `top=${q(rec.repo.top)}; br=${q(w.branch)}; mergedbr=${q(`cluster/${rec.id}/merged`)}; main=${q(cwd)}; kind=${q(d.safe)}`,
+      'tip=$(git -C "$top" rev-parse --verify -q "refs/heads/$br") || { echo "分支已經不在了"; exit 3; }',
+      'if git -C "$top" worktree list --porcelain | grep -Fxq "branch refs/heads/$br"; then echo "分支被某個 worktree 檢出"; exit 3; fi',
+      'if [ "$kind" = merged ]; then ref=$(git -C "$top" rev-parse --verify -q "refs/heads/$mergedbr") || { echo "合併用的分支不見了"; exit 4; }; else ref=$(git -C "$main" rev-parse --verify -q HEAD) || { echo "讀不到主對話的 HEAD"; exit 4; }; fi',
+      'git -C "$top" merge-base --is-ancestor "$tip" "$ref" || { echo "分支上有 commit 不在別處"; exit 4; }',
+      // Compare-and-swap: only if the branch is still at the commit that was checked.
+      'git -C "$top" update-ref -d "refs/heads/$br" "$tip" 2>&1',
+    ].join('\n');
+    const r = await mem.sh(machineId, cwd, script, { timeoutMs: CLEAN_TIMEOUT_MS });
+    if (r.exitCode !== 0) {
+      out.branch = 'kept';
+      out.reasons.push(`沒有刪分支：${gitMessage(r)}`);
+    } else out.did.branch = true;
+  }
+  return out;
+}
+
+// One worker: decide (and, unless `dry`, do) what its clean-up is.
+async function cleanWorker(rec, w, { dry }) {
+  const leaf = leafOfWorker(w);
+  const keepWhy = leaf && WORKING.includes(leaf.status) ? WHY_RUNNING : rec.merge?.results?.some((r) => r.sessionId === w.sessionId && !r.ok) ? '合併時沒合進去（衝突或失敗），分支與 worktree 留給你處理' : '';
+  const base = { sessionId: w.sessionId, worktree: null, branch: null, hidden: false, reasons: [] };
+  let result;
+  let did = { worktree: false, branch: false };
+  if (!rec.repo || !w.worktree) {
+    // Shared folder: nothing to remove.
+    result = { ...base, reasons: keepWhy ? [keepWhy] : [] };
+  } else {
+    try {
+      const f = await inspectWorker(rec, w);
+      const d = decideWorker(rec, f, keepWhy);
+      if (dry) {
+        result = { ...base, worktree: d.worktree === 'keep' ? 'kept' : 'removed', branch: d.branch === 'keep' ? 'kept' : 'deleted', reasons: d.reasons };
+        did = { worktree: d.worktree === 'remove', branch: d.branch === 'delete' };
+      } else {
+        const a = await applyDecision(rec, w, d);
+        did = a.did;
+        result = { ...base, worktree: a.worktree, branch: a.branch, reasons: a.reasons };
+      }
+    } catch (err) {
+      result = { ...base, worktree: 'kept', branch: 'kept', reasons: [...(keepWhy ? [keepWhy] : []), `看不到 git 狀態：${err.message}`] };
+    }
+  }
+  if (!leaf) result.reasons.push('工作者的對話已被刪除');
+  // Off the sidebar once nothing of the worker is left to look after.
+  const settled = result.worktree !== 'kept' && result.branch !== 'kept' && !keepWhy;
+  let newlyHidden = false;
+  if (leaf && settled) {
+    result.hidden = true;
+    // (In a dry run: whether it would be.)
+    newlyHidden = dry ? !leaf.clusterHidden : !leaf.clusterHidden && setHidden(w, true);
+  }
+  return { result, did, newlyHidden };
+}
+
+async function runCleanup(rec, { auto = false, dry = false } = {}) {
+  const results = [];
+  const actions = []; // (a dry run) what would really be done to each worker
+  const counts = { worktrees: 0, branches: 0, hidden: 0 };
+  for (const w of rec.workers) {
+    const one = await cleanWorker(rec, w, { dry });
+    results.push(one.result);
+    actions.push({ sessionId: w.sessionId, removeWorktree: one.did.worktree, deleteBranch: one.did.branch, hide: one.newlyHidden });
+    if (one.did.worktree) counts.worktrees++;
+    if (one.did.branch) counts.branches++;
+    if (one.newlyHidden) counts.hidden++;
+  }
+  if (dry) return { dryRun: true, results, actions };
+  if (rec.repo) await mem.sh(rec.machineId, rec.cwd, `rmdir ${mem.quote(rec.repo.container)} 2>/dev/null; true`).catch(() => {});
+  rec.cleanup = { at: now(), auto, results };
+  persist(rec);
+  announceCleanup(rec, counts);
+  announce(rec, { force: true });
+  return { dryRun: false, results };
+}
+
+function checkCleanable(rec) {
+  if (rec.phase) throw fail(409, rec.phase === 'merging' ? '正在合併中，等它完成再清理' : '叢集還在建立中');
+  if (cleaning.has(rec.id)) throw fail(409, '正在清理中');
+  if (rec.workers.some((w) => WORKING.includes(leafOfWorker(w)?.status))) throw fail(409, '工作者還在跑，先全部停止');
+  if (rec.repo && !machines.getMachine(rec.machineId)?.online) throw fail(409, `機器「${machines.getMachine(rec.machineId)?.name || rec.machineId}」目前離線：請在那台機器上執行連接器`);
+}
+
+// By hand (the 清理 button).
+export async function cleanup(cid) {
+  const rec = getRecord(cid);
+  checkCleanable(rec);
+  cleaning.add(rec.id);
+  try {
+    await runCleanup(rec, { auto: false });
+  } finally {
+    cleaning.delete(rec.id);
+  }
+  return publicCluster(rec);
+}
+
+// What 清理 would do now, without doing any of it (the confirmation lists it).
+export async function cleanupPlan(cid) {
+  const rec = getRecord(cid);
+  checkCleanable(rec);
+  cleaning.add(rec.id);
+  try {
+    return await runCleanup(rec, { dry: true });
+  } finally {
+    cleaning.delete(rec.id);
+  }
+}
+
+// After a merge in which every worker went in. A worker still at work is left
+// whole (and says so); a clean-up that goes wrong never undoes the merge.
+async function autoCleanup(rec) {
+  if (!rec.merge || !rec.workers.length || rec.merge.results.length !== rec.workers.length || !rec.merge.results.every((r) => r.ok)) return;
+  if (cleaning.has(rec.id)) return;
+  cleaning.add(rec.id);
+  try {
+    await runCleanup(rec, { auto: true });
+  } catch (err) {
+    console.warn(`[cluster] ${rec.id}: automatic clean-up failed: ${err.message}`);
+  } finally {
+    cleaning.delete(rec.id);
+  }
+}
+
+// 放回側欄: one worker (by its session id) or all of them.
+export function unhide(cid, sessionId) {
+  const rec = getRecord(cid);
+  const targets = sessionId === undefined || sessionId === null ? rec.workers : rec.workers.filter((w) => w.sessionId === sessionId);
+  if (!targets.length) throw fail(404, '這個叢集沒有這個工作者');
+  for (const w of targets) setHidden(w, false);
+  persist(rec);
+  announce(rec, { force: true });
+  return publicCluster(rec);
+}
+
+// A system line in the main conversation, like the merge's.
+function announceCleanup(rec, counts) {
+  const parent = store.getSession(rec.parentId);
+  if (!parent) return;
+  const leaf = store.leafOf(parent) || parent;
+  const label = (r) => `w${rec.workers.find((w) => w.sessionId === r.sessionId)?.n ?? '?'}`;
+  const left = rec.cleanup.results.filter((r) => r.worktree === 'kept' || r.branch === 'kept');
+  const text = [
+    `叢集 ${rec.id} 已清理${rec.cleanup.auto ? '（合併全部成功後自動執行）' : ''}：移除 ${counts.worktrees} 個 worktree、刪除 ${counts.branches} 個分支、從側欄收起 ${counts.hidden} 個工作者對話。`,
+    left.length ? `保留：${left.map((r) => `${label(r)}（${(r.reasons[0] || '').slice(0, 60)}）`).join('、')}。` : '',
+    `${rec.merge ? `${rec.merge.branch} 與` : ''}叢集記憶檔都還在；工作者的對話沒有刪，在叢集頁可以開啟，或放回側欄。`,
+  ].filter(Boolean).join('');
+  runner.liveContext(leaf).emit({ type: 'info', text });
+}
+
 // --------------------------------------------------------------- merge
 
 export async function merge(cid) {
   const rec = getRecord(cid);
   if (!rec.isolate || !rec.repo) throw fail(409, '只有「每個工作者獨立 worktree」的 git 叢集才能合併');
   if (rec.phase) throw fail(409, rec.phase === 'merging' ? '正在合併中' : '叢集還在建立中');
+  if (cleaning.has(rec.id)) throw fail(409, '正在清理中，等它完成再合併');
   const machine = machines.getMachine(rec.machineId);
   if (!machine?.online) throw fail(409, `機器「${machine?.name || rec.machineId}」目前離線：請在那台機器上執行連接器`);
   const { machineId } = rec;
@@ -745,7 +1078,6 @@ export async function merge(cid) {
     persist(rec);
     announceMerge(rec, head.output.trim());
     announce(rec, { force: true });
-    return publicCluster(rec);
   } catch (err) {
     // Half a merge is not kept: what this attempt made goes, so it can be tried again.
     await run(`${created.tree ? `${gitIn(dir, `worktree remove --force ${mem.quote(tree)}`, { quiet: true })}; ` : ''}${gitIn(dir, 'worktree prune', { quiet: true })}; ${gitIn(dir, `branch -D ${mem.quote(branch)}`, { quiet: true })}; true`).catch(() => {});
@@ -753,6 +1085,10 @@ export async function merge(cid) {
     announce(rec, { force: true });
     throw err.status ? err : fail(502, err.message || String(err));
   }
+  // Outside the try above: whatever happens in the clean-up must never take the
+  // merged branch away with it. Only a merge in which every worker went in cleans up by itself.
+  await autoCleanup(rec);
+  return publicCluster(rec);
 }
 
 // A system line in the main conversation (an info event: not a message from

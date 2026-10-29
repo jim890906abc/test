@@ -99,3 +99,77 @@ test('a cluster survives a Hub restart: record, workers, what each worker was to
   // The merge result is kept on the record.
   assert.deepEqual((await second.api('GET', `/clusters/${c.id}`)).merge, merged.merge);
 });
+
+test('a clean-up survives a Hub restart: what was cleaned and what was kept, the workers still off the sidebar, and a second clean-up after the restart finishes the one that was kept', async () => {
+  const first = await start('cluster-cleanup-restart-1');
+  const repo = path.join(first.TMP, 'repo');
+  fs.mkdirSync(repo, { recursive: true });
+  git(repo, 'init', '-q', '-b', 'main');
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'x\n');
+  git(repo, 'add', '-A');
+  git(repo, 'commit', '-q', '-m', 'first');
+  const { groups } = await first.api('GET', '/models?machine=m_fake');
+  const m = groups.find((g) => g.provider === 'kimi').models[0];
+  const parent = await first.api('POST', '/sessions', { provider: 'kimi', machineId: 'm_fake', cwd: repo, model: m.id, effort: m.efforts[0], permission: 'auto' });
+  const { cluster: c } = await first.api('POST', `/sessions/${parent.id}/cluster`, { tasks: [{ title: '甲', prompt: '做甲' }, { title: '乙', prompt: '做乙' }] });
+  await until(async () => (await first.api('GET', `/clusters/${c.id}`)).status === 'done', 15000, 'done');
+  const [w1, w2] = c.workers;
+  fs.writeFileSync(path.join(w1.worktree, 'one.txt'), 'from w1\n');
+  git(w1.worktree, 'add', '-A');
+  git(w1.worktree, 'commit', '-q', '-m', 'w1');
+  fs.writeFileSync(path.join(w2.worktree, 'scratch.txt'), 'not committed\n'); // keeps w2's worktree
+  const merged = await first.api('POST', `/clusters/${c.id}/merge`);
+  assert.equal(merged.cleanup.auto, true, 'the premise: it cleaned up by itself');
+  assert.deepEqual(merged.cleanup.results.map((r) => [r.worktree, r.branch, r.hidden]), [['removed', 'deleted', true], ['kept', 'kept', false]]);
+
+  await first.halt();
+  const keep = fs.mkdtempSync(path.join(os.tmpdir(), 'cluster-cleanup-keep-'));
+  fs.cpSync(first.DATA, keep, { recursive: true });
+  const second = await start('cluster-cleanup-restart-2', keep);
+  fs.rmSync(keep, { recursive: true, force: true });
+  for (const [sid, st] of first.machine.sessions.entries()) second.machine.add(sid, { ...st, history: (st.history || []).map((h) => ({ ...h })) });
+  second.machine.pushSessions();
+  await until(async () => (await second.api('GET', '/sessions')).some((s) => s.id === w1.sessionId), 10000, 'the conversations back');
+
+  const back = await second.api('GET', `/clusters/${c.id}`);
+  assert.deepEqual(back.cleanup, merged.cleanup, 'the record of the clean-up is what it was');
+  assert.deepEqual(back.workers.map((w) => w.hidden), [true, false]);
+  assert.equal((await snap(second, w1.sessionId)).clusterHidden, true, 'the conversation itself is still hidden');
+  assert.equal(Boolean((await snap(second, w2.sessionId)).clusterHidden), false);
+  assert.deepEqual((await second.api('GET', '/sessions')).filter((s) => s.clusterRole === 'worker').map((s) => [s.id, s.clusterHidden]).sort(), [[w1.sessionId, true], [w2.sessionId, false]].sort());
+
+  // After the restart the person cleans the scratch file away and presses 清理 again.
+  fs.rmSync(path.join(w2.worktree, 'scratch.txt'));
+  const again = await second.api('POST', `/clusters/${c.id}/cleanup`);
+  assert.equal(again.cleanup.auto, false);
+  assert.deepEqual(again.cleanup.results.map((r) => [r.worktree, r.branch, r.hidden]), [['removed', 'deleted', true], ['removed', 'deleted', true]]);
+  assert.equal((await snap(second, w2.sessionId)).clusterHidden, true);
+  assert.equal(git(repo, 'branch', '--list', 'cluster/*', '--format=%(refname:short)'), `cluster/${c.id}/merged`);
+});
+
+test('a clean-up is on disk as soon as it is done, not only when the Hub is stopped: a Hub that is killed does not lose what was cleaned or which conversations were hidden', async () => {
+  const hub = await start('cluster-cleanup-disk');
+  const repo = path.join(hub.TMP, 'repo');
+  fs.mkdirSync(repo, { recursive: true });
+  git(repo, 'init', '-q', '-b', 'main');
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'x\n');
+  git(repo, 'add', '-A');
+  git(repo, 'commit', '-q', '-m', 'first');
+  const { groups } = await hub.api('GET', '/models?machine=m_fake');
+  const m = groups.find((g) => g.provider === 'kimi').models[0];
+  const parent = await hub.api('POST', '/sessions', { provider: 'kimi', machineId: 'm_fake', cwd: repo, model: m.id, effort: m.efforts[0], permission: 'auto' });
+  const { cluster: c } = await hub.api('POST', `/sessions/${parent.id}/cluster`, { tasks: [{ title: '甲', prompt: '做甲' }] });
+  await until(async () => (await hub.api('GET', `/clusters/${c.id}`)).status === 'done', 15000, 'done');
+  const file = path.join(hub.DATA, 'clusters', `${c.id}.json`);
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).cleanup ?? null, null, 'the premise: nothing cleaned yet on disk');
+
+  const done = await hub.api('POST', `/clusters/${c.id}/cleanup`);
+  assert.equal(done.cleanup.results[0].hidden, true);
+  // The cluster's record, at once (a cluster's own file is written when it changes) ...
+  const onDisk = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(onDisk.cleanup.auto, false);
+  assert.deepEqual(onDisk.cleanup.results.map((r) => [r.worktree, r.branch]), [['removed', 'deleted']]);
+  // ... and the conversation's own flag, once the Hub's short write delay has passed (nothing waits for the Hub to be stopped).
+  const sessionFile = path.join(hub.DATA, 'sessions', `${c.workers[0].sessionId}.json`);
+  await until(async () => JSON.parse(fs.readFileSync(sessionFile, 'utf8')).clusterHidden === true, 8000, 'the hidden flag on disk');
+});

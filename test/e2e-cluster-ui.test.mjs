@@ -1373,7 +1373,7 @@ test('on a phone (390) the dispatch dialog, the cluster page with its time bars 
   assert.ok(o.page <= 0 && o.body <= 0, `no sideways scroll: ${JSON.stringify(o)}`);
   assert.deepEqual(o.wide, [], 'nothing sticks out past the right edge');
   const buttons = await b.eval(`[...document.querySelectorAll('.cluster-actions button')].map((e) => { const r = e.getBoundingClientRect(); return { text: e.innerText.trim(), w: Math.round(r.width), h: Math.round(r.height), inside: r.left >= 0 && r.right <= innerWidth }; })`);
-  assert.equal(buttons.length, 2);
+  assert.equal(buttons.length, 3, '全部停止, 合併, 清理');
   for (const bt of buttons) assert.ok(bt.inside && bt.h >= 24, `${bt.text} is whole and at least the 24 px a finger target needs (WCAG 2.2): ${JSON.stringify(bt)}`);
   await shot('18-cluster-page-390-light.png');
   await b.eval(`document.querySelector('.cluster-merge').scrollIntoView()`);

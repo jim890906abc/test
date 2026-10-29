@@ -18,6 +18,9 @@ import {
   clusterStatusLabel,
   contextWarnings,
   mergeAvailability,
+  cleanupAvailability,
+  cleanupPlanView,
+  cleanupResultView,
   memoryNote,
   fmtBytes,
   MEMORY_MAX_CHARS,
@@ -209,4 +212,71 @@ test('a memory the Hub cut to its end says where the shown part starts; a whole 
   assert.match(memoryNote({ text: 'x', truncated: true }), /只顯示最後一段/, 'without the figures it still says so');
   assert.equal(MEMORY_MAX_CHARS, 20_000);
   assert.deepEqual([0, 512, 1500, 250_000, 2_500_000].map(fmtBytes), ['0 B', '512 B', '1.5 KB', '250.0 KB', '2.5 MB']);
+});
+
+// ---------------------------------------------------------------- clean up
+
+test('清理: not while a worker works or the cluster is being made or merged, not twice over, and says what it will and will not do', () => {
+  const w = (patch = {}) => ({ sessionId: 's_w', branch: 'cluster/c/w1', finishedAt: 1, status: 'idle', hidden: false, ...patch });
+  const c = (patch = {}) => ({ id: 'c_1', isolate: true, status: 'done', merge: { branch: 'cluster/c_1/merged', results: [] }, cleanup: null, workers: [w(), w({ sessionId: 's_x' })], ...patch });
+  const ok = cleanupAvailability(c());
+  assert.equal(ok.ok, true);
+  assert.match(ok.why, /移除乾淨的 worktree.*收起.*保留/, 'after a merge');
+  assert.match(cleanupAvailability(c({ merge: null })).why, /還沒合併過.*沒有任何新 commit.*有 commit 的會保留/, 'before any merge it says what is different');
+  assert.match(cleanupAvailability(c({ isolate: false, merge: null })).why, /共用同一個資料夾.*只把工作者對話從側欄收起/, 'with no worktrees it only tidies the sidebar, and says so');
+  // The Hub refuses while a worker works (409); the button does not offer what it would refuse.
+  const busy = cleanupAvailability(c({ status: 'running', workers: [w(), w({ status: 'running', finishedAt: null })] }));
+  assert.equal(busy.ok, false);
+  assert.match(busy.why, /工作者還在跑，先全部停止/);
+  assert.equal(cleanupAvailability(c({ workers: [w({ status: 'awaiting_permission' })] })).ok, false);
+  // ... but a cluster that reads "進行中" with nothing working (a worker that never started) can be cleaned: the Hub allows it.
+  assert.equal(cleanupAvailability(c({ status: 'running', workers: [w({ finishedAt: null })] })).ok, true);
+  assert.equal(cleanupAvailability(c({ status: 'merging' })).ok, false);
+  assert.equal(cleanupAvailability(c({ status: 'starting' })).ok, false);
+  assert.equal(cleanupAvailability(c(), true).ok, false, 'while another request is out');
+  assert.equal(cleanupAvailability(c({ workers: [] })).ok, false);
+  // Everything was cleaned and nothing is left over: nothing to do again. A worker put back on the sidebar, or one that was kept, can be done.
+  const res = (patch = {}) => ({ sessionId: 's_w', worktree: 'removed', branch: 'deleted', hidden: true, reasons: [], ...patch });
+  const cleaned = c({ cleanup: { at: 1, auto: true, results: [res(), res({ sessionId: 's_x' })] }, workers: [w({ hidden: true }), w({ sessionId: 's_x', hidden: true })] });
+  assert.equal(cleanupAvailability(cleaned).ok, false);
+  assert.match(cleanupAvailability(cleaned).why, /已經清理乾淨/);
+  assert.equal(cleanupAvailability({ ...cleaned, cleanup: { ...cleaned.cleanup, results: [res(), res({ sessionId: 's_x', worktree: 'kept', branch: 'kept', hidden: false })] } }).ok, true, 'something was kept');
+  assert.equal(cleanupAvailability({ ...cleaned, cleanup: { ...cleaned.cleanup, results: [res(), res({ sessionId: 's_x', hidden: false })] } }).ok, true, 'one was put back on the sidebar');
+  assert.equal(cleanupAvailability(c({ workers: [w({ hidden: true }), w({ sessionId: 's_x', status: 'deleted' })], cleanup: { at: 1, auto: true, results: [res(), res({ sessionId: 's_x', hidden: false })] } })).ok, false, 'a deleted conversation is not "left over"');
+});
+
+test('the plan the Hub sends is laid out for the confirmation: what will be done per worker, what is kept and why, and the counts only of what will really happen', () => {
+  const workers = [{ sessionId: 's1', title: '改登入' }, { sessionId: 's2', title: '改註冊' }, { sessionId: 's3', title: '只讀' }];
+  const plan = {
+    dryRun: true,
+    results: [
+      { sessionId: 's1', worktree: 'removed', branch: 'deleted', hidden: true, reasons: [] },
+      { sessionId: 's2', worktree: 'kept', branch: 'kept', hidden: false, reasons: ['有 2 項未提交的修改或未追蹤的檔案', '分支還被 worktree 使用中'] },
+      { sessionId: 's3', worktree: 'removed', branch: 'deleted', hidden: true, reasons: ['worktree 資料夾本來就不在了'] },
+    ],
+    actions: [
+      { sessionId: 's1', removeWorktree: true, deleteBranch: true, hide: true },
+      { sessionId: 's2', removeWorktree: false, deleteBranch: false, hide: false },
+      { sessionId: 's3', removeWorktree: false, deleteBranch: true, hide: true },
+    ],
+  };
+  const v = cleanupPlanView(plan, workers);
+  assert.deepEqual(v.rows.map((r) => [r.title, r.will, r.keeps]), [['改登入', ['移除 worktree', '刪除分支', '從側欄收起對話'], false], ['改註冊', [], true], ['只讀', ['刪除分支', '從側欄收起對話'], false]]);
+  assert.deepEqual(v.rows[1].reasons, ['有 2 項未提交的修改或未追蹤的檔案', '分支還被 worktree 使用中']);
+  assert.deepEqual(v.totals, { worktrees: 1, branches: 2, hidden: 2, kept: 1 }, 'a worktree that was already gone is not "removed" by this');
+  assert.equal(v.nothing, false);
+  const none = cleanupPlanView({ dryRun: true, results: [plan.results[1]], actions: [plan.actions[1]] }, workers);
+  assert.equal(none.nothing, true);
+  assert.deepEqual(cleanupPlanView(null, workers).rows, [], 'no plan, no rows');
+});
+
+test('the result of a worker\'s clean-up is said in the words of the screen: worktree and branch each removed / kept / not there, whether it is off the sidebar, and why anything was kept', () => {
+  assert.deepEqual(cleanupResultView({ sessionId: 's', worktree: 'removed', branch: 'deleted', hidden: true, reasons: [] }), { worktree: { text: '已移除', kept: false }, branch: { text: '已刪除', kept: false }, hidden: true, reasons: [], kept: false });
+  const kept = cleanupResultView({ sessionId: 's', worktree: 'kept', branch: 'kept', hidden: false, reasons: ['有 1 項未提交的修改或未追蹤的檔案'] });
+  assert.deepEqual([kept.worktree, kept.branch, kept.hidden, kept.kept], [{ text: '保留', kept: true }, { text: '保留', kept: true }, false, true]);
+  assert.deepEqual(kept.reasons, ['有 1 項未提交的修改或未追蹤的檔案']);
+  const shared = cleanupResultView({ sessionId: 's', worktree: null, branch: null, hidden: true, reasons: [] });
+  assert.equal(shared.worktree, null, 'a worker with no worktree of its own has nothing to say about one');
+  assert.equal(shared.branch, null);
+  assert.equal(cleanupResultView(null), null);
 });

@@ -122,3 +122,28 @@ test('a native row that the hub does not follow is labelled by what the machine 
   const v = rowProviderView({ hub: null, provider: 'deepseek', status: 'idle' });
   assert.equal(v.text, 'DeepSeek');
 });
+
+// ------------------------------------------- workers a cluster clean-up hid
+
+test('a worker the cluster clean-up hid (clusterHidden) has no row, whichever way the sidebar would have found it; one that is not hidden still has', () => {
+  const worker = (id, patch = {}) => hubSession(id, { provider: 'kimi', agentId: 'kimi@m1', machineId: 'm1', kimiSessionId: `n${id}`, clusterId: 'c_0123456789ab', clusterRole: 'worker', ...patch });
+  const native = (id) => ({ id, title: 'worker', cwd: '/x', updatedAt: NOWS + 20 });
+  const sessions = [worker('w1', { clusterHidden: true }), worker('w2', { clusterHidden: false }), hubSession('main', { provider: 'kimi', agentId: 'kimi@m1', machineId: 'm1', kimiSessionId: 'nmain' })];
+
+  // The machine lists the worker's native session too: that must not bring the row back as an external one.
+  const withMachine = buildRows({ sessions, machines: [machine([native('nw1'), native('nw2'), native('nmain')])] });
+  assert.deepEqual(withMachine.map((r) => r.conversationId).sort(), ['main', 'w2']);
+  assert.ok(!withMachine.some((r) => r.kimi?.id === 'nw1'), 'and not as a session the hub does not know');
+
+  // The computer is not listed at all (offline, not yet reported): the hub's own record must not bring it back either.
+  const noMachine = buildRows({ sessions, machines: [] });
+  assert.deepEqual(noMachine.map((r) => r.conversationId).sort(), ['main', 'w2']);
+
+  // Put back: the flag is false, the row is there again.
+  const back = buildRows({ sessions: sessions.map((s) => (s.id === 'w1' ? { ...s, clusterHidden: false } : s)), machines: [machine([native('nw1'), native('nw2'), native('nmain')])] });
+  assert.deepEqual(back.map((r) => r.conversationId).sort(), ['main', 'w1', 'w2']);
+
+  // A search does not find a hidden worker either.
+  const { list } = sidebarSections(withMachine, { query: 'w1' });
+  assert.deepEqual(list.map((r) => r.conversationId), []);
+});

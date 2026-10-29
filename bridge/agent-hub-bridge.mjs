@@ -31,6 +31,9 @@
 //   AGENT_HUB_DEEPSEEK_IDLE_MS        longest silence inside a stream (default 300000)
 //   AGENT_HUB_DEEPSEEK_RETRY_MS       gap between real requests that look again at an exhausted key whose
 //                                     gateway stated no reset time (default 30000)
+//   AGENT_HUB_DEEPSEEK_AUTH_RETRY_MS  gap before a real request looks again at a key the gateway refused with
+//                                     HTTP 401 (default 60000); it doubles with every new refusal ...
+//   AGENT_HUB_DEEPSEEK_AUTH_RETRY_MAX_MS  ... up to this (default 3600000). A probing gap, not a reset time.
 //   AGENT_HUB_DAEMON_RECHECK_MS       how often a stale Claude daemon is looked at (default 15000)
 // The hello names what this version supports (`capabilities`); a Claude daemon
 // that lacks what the hub's features need is replaced as soon as it is idle.
@@ -855,6 +858,13 @@ const DS_ECHO_PHRASE = new RegExp(String.raw`\b(?:request|prompt|input|message|c
 // account-level statement and not an echo.
 const DS_QUOTA_STATUSES = new Set([400, 402, 403, 429]);
 const DS_STRICT_STATUSES = new Set([400, 403]);
+// HTTP 401 is the gateway refusing the key itself (revoked, wrong, not allowed).
+// It is not an empty account: the key is set aside as "refused" (authFailedAt),
+// never as exhausted, and the very same request goes to the next key. Nothing
+// else about the answer is read - not its words, not a time in them.
+const DS_AUTH_STATUS = 401;
+// Refusals counted in a row are capped so the doubling gap cannot overflow.
+const DS_AUTH_MAX_FAILURES = 60;
 const DS_LABELS = { 'opencode-go': 'OpenCode Go', opencode: 'OpenCode', commandcode: 'Command Code' };
 // The time zone a stated reset time must carry (Z, UTC, GMT, +08:00): without it
 // the time is not read, never guessed.
@@ -925,10 +935,25 @@ function cleanPool(raw, defaultGateway = '') {
       // A person marked it full: it stays aside until a person clears the mark.
       if (item.manual === true) key.manual = true;
     }
-    // A real request succeeded on a key that had been exhausted: when, and
-    // which exhaustion that proved wrong. Reported to the hub as evidence.
+    // A key the gateway refused with HTTP 401 (its own state, never "exhausted"):
+    // when, and how many refusals in a row (the count only sets the probing gap).
+    // A key is refused or out of quota, never both: the later of the two stands,
+    // and a person's mark (manual) is never replaced.
+    if (item.authFailedAt !== undefined && item.authFailedAt !== null) {
+      const at = Number(item.authFailedAt);
+      if (!Number.isFinite(at) || at <= 0) throw dsBad('號池裡的 authFailedAt 不正確');
+      if (!key.manual && !(key.exhaustedAt && key.exhaustedAt >= at)) {
+        delete key.exhaustedAt;
+        delete key.retryAt;
+        key.authFailedAt = at;
+        const n = Number(item.authFailures);
+        key.authFailures = Number.isFinite(n) ? Math.min(DS_AUTH_MAX_FAILURES, Math.max(1, Math.round(n))) : 1;
+      }
+    }
+    // A real request succeeded on a key that had been exhausted (or refused):
+    // when, and which failure that proved wrong. Reported to the hub as evidence.
     const recovered = Number(item.recoveredAt);
-    if (item.recoveredAt != null && Number.isFinite(recovered) && recovered > 0 && !key.exhaustedAt) {
+    if (item.recoveredAt != null && Number.isFinite(recovered) && recovered > 0 && !key.exhaustedAt && !key.authFailedAt) {
       key.recoveredAt = recovered;
       const from = Number(item.recoveredFrom);
       if (Number.isFinite(from) && from > 0) key.recoveredFrom = from;
@@ -937,7 +962,7 @@ function cleanPool(raw, defaultGateway = '') {
   });
   let activeId = typeof raw.activeId === 'string' ? raw.activeId : '';
   if (activeId && !ids.has(activeId)) throw dsBad('號池的 activeId 不在 key 清單裡');
-  if (!activeId) activeId = keys.find((k) => !k.exhaustedAt)?.id || keys[0].id;
+  if (!activeId) activeId = keys.find((k) => !k.exhaustedAt && !k.authFailedAt)?.id || keys[0].id;
   // How long an exhausted key whose gateway named no reset time waits before a
   // real request looks again (a gap between probes, not a guess of the reset).
   const wait = Number(raw.retryMs);
@@ -2055,6 +2080,7 @@ const proxy = {
         apiKey: k.apiKey,
         ...(k.gateway ? { gateway: k.gateway } : {}),
         ...(k.exhaustedAt ? { exhaustedAt: k.exhaustedAt, ...(k.retryAt ? { retryAt: k.retryAt } : {}), ...(k.manual ? { manual: true } : {}) } : {}),
+        ...(k.authFailedAt && !k.exhaustedAt ? { authFailedAt: k.authFailedAt, authFailures: k.authFailures || 1 } : {}),
         ...(k.recoveredAt ? { recoveredAt: k.recoveredAt, ...(k.recoveredFrom ? { recoveredFrom: k.recoveredFrom } : {}) } : {}),
       })),
     };
@@ -2077,13 +2103,18 @@ const proxy = {
       // Health is only ever said when there is something to say: a key with
       // no field is "this connector has no news", not "healthy" (the hub
       // never clears an exhaustion from silence). Evidence of recovery is a
-      // successful real request after the exhaustion it names.
+      // successful real request after the exhaustion it names. A key the gateway
+      // refused (HTTP 401) says so in its own fields: when, how many in a row, and
+      // when a real request will look at it again (our probing schedule, never a
+      // time the gateway stated).
       keys: route.pool.keys.map((k) =>
         k.exhaustedAt
           ? { id: k.id, exhaustedAt: k.exhaustedAt, ...(k.retryAt ? { retryAt: k.retryAt } : {}) }
-          : k.recoveredAt
-            ? { id: k.id, recoveredAt: k.recoveredAt, ...(k.recoveredFrom ? { recoveredFrom: k.recoveredFrom } : {}) }
-            : { id: k.id },
+          : k.authFailedAt
+            ? { id: k.id, authFailedAt: k.authFailedAt, authFailures: k.authFailures || 1, authRetryAt: this.retryAt(route, k) }
+            : k.recoveredAt
+              ? { id: k.id, recoveredAt: k.recoveredAt, ...(k.recoveredFrom ? { recoveredFrom: k.recoveredFrom } : {}) }
+              : { id: k.id },
       ),
     };
     const json = JSON.stringify(msg);
@@ -2240,9 +2271,10 @@ const proxy = {
 
   // Whether an upstream error says THIS KEY's quota/credit/balance/usage
   // allowance is gone. Decided from the error's own fields and status only:
-  //   - status must be 402, 429, or 400/403 (see DS_QUOTA_STATUSES). 401, 404,
-  //     409, 422 and 5xx are credential, request or server problems: they reach
-  //     Kimi unchanged;
+  //   - status must be 402, 429, or 400/403 (see DS_QUOTA_STATUSES). 401 is a
+  //     refused key (see failAuth: the request moves on, but the key is not
+  //     "exhausted"); 404, 409, 422 and 5xx are request or server problems: they
+  //     reach Kimi unchanged;
   //   - an explicit quota code (insufficient_quota, quota_exceeded,
   //     usage_limit(_reached), insufficient_credits, CreditsError, MonthlyLimit
   //     Error, ...) in error.code / error.type / code / type is enough on its own;
@@ -2362,9 +2394,27 @@ const proxy = {
     if (i < 0) i = 0;
     for (let j = 1; j <= n; j++) {
       const key = pool.keys[(i + j) % n];
-      if (!key.exhaustedAt) return key;
+      if (!this.blocked(key)) return key;
     }
     return null;
+  },
+
+  // A key a request must not use now: out of quota (exhaustedAt) or refused by
+  // its gateway with HTTP 401 (authFailedAt). The two are never both set.
+  blocked(key) {
+    return Boolean(key.exhaustedAt || key.authFailedAt);
+  },
+
+  // How long a refused key waits before a real request may look at it again:
+  // AGENT_HUB_DEEPSEEK_AUTH_RETRY_MS (1 minute) after the first refusal, double
+  // after each new one, never more than AGENT_HUB_DEEPSEEK_AUTH_RETRY_MAX_MS (60
+  // minutes). A 401 says nothing about when the key might work again, so this is
+  // only how often it is probed.
+  authGapMs(failures) {
+    const first = this.ms('AGENT_HUB_DEEPSEEK_AUTH_RETRY_MS', 60_000);
+    const cap = Math.max(first, this.ms('AGENT_HUB_DEEPSEEK_AUTH_RETRY_MAX_MS', 3_600_000));
+    const n = Math.min(Math.max(1, Math.round(Number(failures)) || 1), DS_AUTH_MAX_FAILURES);
+    return Math.min(cap, first * 2 ** Math.min(n - 1, 40));
   },
 
   // The gap between real requests that look again at an exhausted key whose
@@ -2380,6 +2430,7 @@ const proxy = {
   // stated, else after the gap since it was marked; never, for a key a person
   // marked full (only a person clears that).
   retryAt(route, key) {
+    if (key.authFailedAt) return key.authFailedAt + this.authGapMs(key.authFailures);
     if (!key.exhaustedAt) return 0;
     if (key.manual) return Infinity;
     return key.retryAt || key.exhaustedAt + this.retryMs(route);
@@ -2389,7 +2440,7 @@ const proxy = {
   // no healthy key tries it: that request is the probe, so recovery costs no
   // extra traffic and proves the key works before it is trusted again.
   due(route, key, now = Date.now()) {
-    return Boolean(key.exhaustedAt) && this.retryAt(route, key) <= now;
+    return this.blocked(key) && this.retryAt(route, key) <= now;
   },
 
   // Mark a key exhausted (or, for a due key whose retry failed again, exhausted
@@ -2401,10 +2452,38 @@ const proxy = {
     const pool = route.pool;
     const found = pool.keys.find((k) => k.id === key.id);
     if (!found) return false;
-    if (!found.exhaustedAt || this.due(route, found)) {
+    if (!this.blocked(found) || this.due(route, found)) {
       found.exhaustedAt = Date.now();
       if (resetAt) found.retryAt = resetAt;
       else delete found.retryAt;
+      delete found.authFailedAt;
+      delete found.authFailures;
+      delete found.recoveredAt;
+      delete found.recoveredFrom;
+    }
+    if (pool.activeId === found.id) pool.activeId = this.nextUsable(pool, found.id)?.id || '';
+    this.save();
+    this.report();
+    return true;
+  },
+
+  // The gateway refused this key (HTTP 401). Same discipline as fail(): only a key
+  // that is not set aside yet, or whose wait is over (this request was its probe),
+  // gets a new stamp, so parallel requests that all find it refused count one
+  // refusal. The count is the number of refusals in a row; it only sets the gap
+  // before the next probe. A key that was out of quota is refused now instead
+  // (the later fact stands), so none of its exhaustion is kept.
+  failAuth(route, key) {
+    if (this.route !== route) return false;
+    const pool = route.pool;
+    const found = pool.keys.find((k) => k.id === key.id);
+    if (!found) return false;
+    if (!this.blocked(found) || this.due(route, found)) {
+      found.authFailures = found.authFailedAt ? Math.min(DS_AUTH_MAX_FAILURES, (found.authFailures || 1) + 1) : 1;
+      found.authFailedAt = Date.now();
+      delete found.exhaustedAt;
+      delete found.retryAt;
+      delete found.manual;
       delete found.recoveredAt;
       delete found.recoveredFrom;
     }
@@ -2423,12 +2502,14 @@ const proxy = {
     if (this.route !== route) return;
     const found = route.pool.keys.find((k) => k.id === key.id);
     if (!found) return;
-    if (found.exhaustedAt) {
-      if (!was || found.exhaustedAt !== was) return;
+    if (this.blocked(found)) {
+      if (!was || (found.exhaustedAt || found.authFailedAt) !== was) return;
       found.recoveredAt = Date.now();
       found.recoveredFrom = was;
       delete found.exhaustedAt;
       delete found.retryAt;
+      delete found.authFailedAt;
+      delete found.authFailures;
       route.pool.activeId = found.id;
       this.save();
       this.report();
@@ -2458,7 +2539,7 @@ const proxy = {
   // first byte, the usage and how the attempt ended, on every way out.
   async attempt(req, res, route, key, target, rest, t) {
     const method = String(req.method || 'GET').toUpperCase();
-    const was = key.exhaustedAt || 0;
+    const was = key.exhaustedAt || key.authFailedAt || 0;
     const firstByte = this.ms('AGENT_HUB_DEEPSEEK_FIRST_BYTE_MS', 120_000);
     const idle = this.ms('AGENT_HUB_DEEPSEEK_IDLE_MS', 300_000);
     const controller = new AbortController();
@@ -2575,6 +2656,13 @@ const proxy = {
     }
     finish();
     const errText = errBody.toString('utf8');
+    // The gateway refuses this key itself: nothing has gone downstream, so the
+    // very same request goes to the next key. (Recorded as an HTTP error with its
+    // status; the answer's words are not looked at, and never reach Kimi.)
+    if (upstream.status === DS_AUTH_STATUS) {
+      t.end('http_error');
+      return { authFailed: true };
+    }
     if (this.quota(upstream.status, errText)) {
       t.end('quota');
       return { quota: true, resetAt: this.resetAt(upstream.headers, errText) };
@@ -2695,7 +2783,10 @@ const proxy = {
   // Every key was tried, is waiting, or cannot serve this request: one answer
   // that lists each key by gateway and last four characters (never a key) with
   // its state, and the earliest time the gateways stated, so the conversation
-  // says what is going on.
+  // says what is going on. Keys the gateway refused (HTTP 401), keys out of quota
+  // and keys a person marked are counted and listed apart: a refused key is not an
+  // empty account, and the time a real request looks at it again is our probing
+  // schedule, not a reset time anybody stated. Only refused keys: a 401.
   allOut(res, route, order, skipped, model = '') {
     const now = Date.now();
     const when = (t) => new Date(t).toLocaleString('zh-TW', { hour12: false });
@@ -2704,21 +2795,40 @@ const proxy = {
       const names = order.map((k) => DS_LABELS[k.gateway || route.gateway] || k.gateway || route.gateway);
       return this.json(res, 400, 'model_not_available', `號池裡的 key（${[...new Set(names)].join('、')}）都沒有這次要求的模型${model ? ` ${model.slice(0, 80)}` : ''}，沒有送出請求。`);
     }
+    const refused = (k) => !skipped.has(k.id) && Boolean(k.authFailedAt) && !k.exhaustedAt;
     const lines = order.map((k, i) => {
       const gw = DS_LABELS[k.gateway || route.gateway] || k.gateway || route.gateway;
       let state;
       if (skipped.has(k.id)) state = `這個閘道沒有這次要求的模型${model ? ` ${model.slice(0, 80)}` : ''}`;
       else if (k.manual) state = '手動標記已滿';
-      else if (k.exhaustedAt && k.retryAt && k.retryAt > now) state = `已滿，${when(k.retryAt)} 重置`;
+      else if (refused(k)) {
+        const at = this.retryAt(route, k);
+        state = `認證失敗（HTTP 401），上次 ${when(k.authFailedAt)}；${at > now ? `${when(at)} 之後的真實請求會再試` : '下一個真實請求會再試'}（這是排好的探測時間，不是供應商給的重置時間）`;
+      } else if (k.exhaustedAt && k.retryAt && k.retryAt > now) state = `已滿，${when(k.retryAt)} 重置`;
       else if (k.exhaustedAt) state = '已滿，重置時間未知（有請求時會再試）';
       else state = '可用';
       return `${i + 1}. ${gw} …${String(k.apiKey).slice(-4)}：${state}`;
     });
+    const nAuth = order.filter(refused).length;
+    const nManual = order.filter((k) => !skipped.has(k.id) && k.exhaustedAt && k.manual).length;
+    const nQuota = order.filter((k) => !skipped.has(k.id) && k.exhaustedAt && !k.manual).length;
+    const nSkipped = order.filter((k) => skipped.has(k.id)).length;
     const stated = order.filter((k) => k.exhaustedAt && !k.manual && k.retryAt && k.retryAt > now).map((k) => k.retryAt);
-    const next = Math.min(...order.filter((k) => k.exhaustedAt && !k.manual).map((k) => this.retryAt(route, k)).filter(Number.isFinite));
+    const next = Math.min(...order.filter((k) => !k.manual && (k.exhaustedAt || k.authFailedAt)).map((k) => this.retryAt(route, k)).filter(Number.isFinite));
     const earliest = stated.length ? `；最早已知的重置時間 ${when(Math.min(...stated))}` : '';
-    const text = [`DeepSeek 的 API key 都已用盡（共 ${order.length} 把）${earliest}。`, ...lines, '有請求時會自動再試：已知重置時間的 key 到時間才試，重置時間未知的 key 下一個真實請求就會再試。要現在恢復：到 Agent Hub「設定」→「DeepSeek…」對那把按「重新啟用」或「清除標記」，或加入新的 key。'].join('\n');
-    this.json(res, 402, 'insufficient_quota', text, Number.isFinite(next) ? { retry_at: next } : {});
+    // With no refused key the words are the ones this answer always had.
+    const head = nAuth
+      ? `DeepSeek 的 API key 都不能用（共 ${order.length} 把）：${[nAuth ? `認證失敗（HTTP 401）${nAuth} 把` : '', nQuota ? `額度用完 ${nQuota} 把` : '', nManual ? `手動標記已滿 ${nManual} 把` : '', nSkipped ? `這次要求的模型它的閘道沒有 ${nSkipped} 把` : ''].filter(Boolean).join('、')}${earliest}。`
+      : `DeepSeek 的 API key 都已用盡（共 ${order.length} 把）${earliest}。`;
+    const dur = (ms) => (ms >= 60_000 ? `${Math.round(ms / 60_000)} 分鐘` : `${Math.max(1, Math.round(ms / 1000))} 秒`);
+    const tail = nAuth
+      ? `有請求時會自動再試：認證失敗的 key 在失敗 ${dur(this.authGapMs(1))}後由真實請求探測，每再失敗一次間隔加倍、最長 ${dur(this.authGapMs(DS_AUTH_MAX_FAILURES))}；${nQuota ? '已知重置時間的 key 到時間才試，重置時間未知的 key 下一個真實請求就會再試。' : ''}認證失敗通常是 key 失效、被撤銷或貼錯，請到供應商確認。要現在恢復：到 Agent Hub「設定」→「DeepSeek…」對那把按「重新啟用」或「清除標記」，或加入新的 key。`
+      : '有請求時會自動再試：已知重置時間的 key 到時間才試，重置時間未知的 key 下一個真實請求就會再試。要現在恢復：到 Agent Hub「設定」→「DeepSeek…」對那把按「重新啟用」或「清除標記」，或加入新的 key。';
+    const text = [head, ...lines, tail].join('\n');
+    const extra = Number.isFinite(next) ? { retry_at: next } : {};
+    // Only refused keys: the account is not empty, the keys are not accepted.
+    if (nAuth && !nQuota && !nManual) return this.json(res, 401, 'upstream_auth_failed', text, extra);
+    this.json(res, 402, 'insufficient_quota', text, extra);
   },
 
   async handle(req, res) {
@@ -2754,7 +2864,7 @@ const proxy = {
         // Healthy keys first; only when none is left, an exhausted key whose
         // wait is over (this request is its probe). The order is one list for
         // every gateway: the next key may be on another one.
-        const key = order.find((k) => !tried.has(k.id) && !k.exhaustedAt) || order.find((k) => !tried.has(k.id) && this.due(route, k));
+        const key = order.find((k) => !tried.has(k.id) && !this.blocked(k)) || order.find((k) => !tried.has(k.id) && this.due(route, k));
         if (!key) break;
         tried.add(key.id);
         const target = this.prepare(route, key, body);
@@ -2768,6 +2878,11 @@ const proxy = {
         if (result.quota) {
           previous = key.id;
           this.fail(route, key, result.resetAt);
+          continue;
+        }
+        if (result.authFailed) {
+          previous = key.id;
+          this.failAuth(route, key);
           continue;
         }
         return;
@@ -4505,8 +4620,12 @@ const daemon = {
 //                    ({ t: 'deepseek.requests' })
 //   pool_measure     `kimi.deepseek.measure`: one key's concurrency, measured here
 //   event_timing     the journal's step frames carry the model's timing
+//   pool_auth        the proxy moves a request on from a key the gateway refuses (HTTP 401),
+//                    keeps that key aside as "refused" (authFailedAt, authFailures,
+//                    authRetryAt: its own fields, never "exhausted") and probes it again with
+//                    real requests at doubling gaps; the Hub may send and read those fields
 function connectorCapabilities() {
-  return ['pool', 'pool_cross', 'secondary_model', ...(brokerReady ? ['broker'] : []), 'handoff', 'pool_timing', 'pool_measure', 'event_timing'];
+  return ['pool', 'pool_cross', 'secondary_model', ...(brokerReady ? ['broker'] : []), 'handoff', 'pool_timing', 'pool_measure', 'event_timing', 'pool_auth'];
 }
 
 // ------------------------------------------------------------- the hub

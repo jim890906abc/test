@@ -15,6 +15,9 @@ import {
   CLUSTER_MAX_TASKS,
   CLUSTER_DEFAULTS,
   CLUSTER_MODES,
+  cleanupAvailability,
+  cleanupPlanView,
+  cleanupResultView,
   clusterStatusLabel,
   contextWarnings,
   draftProblems,
@@ -111,6 +114,7 @@ export function drawClusterNote(slot, summary) {
           { class: 'callout-text' },
           h('strong', null, '這是叢集的工作者對話'),
           ' 它的任務、進度與合併都在叢集頁。',
+          summary.clusterHidden ? '清理之後它已從側欄收起，在叢集頁可以放回。' : null,
           h('a', { class: 'linklike', href: clusterHash(summary.clusterId) }, '查看叢集'),
           parent ? h('a', { class: 'linklike', href: `#/s/${parent}` }, '回主對話') : null,
         ),
@@ -333,7 +337,7 @@ export class ClusterPage {
     this.timings = new Map(); // worker session id -> { timing } | { error }
     this.cards = new Map(); // worker session id -> { el, sig, state, progress, timingSlot, shown }
     this.sigs = {}; // what each part of the page was last drawn from
-    this.busy = null; // 'stop' | 'merge' while that request is out
+    this.busy = null; // 'stop' | 'merge' | 'cleanup' | 'unhide' while that request is out
     this.actionError = ''; // what the Hub said to the last stop / merge it refused
     this.started = false; // the first cluster has come in: the time and the memory are then read
     this.memSeen = null; // { bytes, updatedAt } of the memory file as last read
@@ -345,6 +349,7 @@ export class ClusterPage {
     this.workers = h('div', { class: 'cluster-workers' });
     this.count = h('span', { class: 'muted' });
     this.mergeBox = h('div', { class: 'cluster-merge-slot' });
+    this.cleanupBox = h('div', { class: 'cluster-cleanup-slot' });
     this.memoryBox = h('section', { class: 'cluster-section cluster-memory' });
     this.body = h('div', { class: 'cluster-body' });
     this.el = h('div', { class: 'cluster-page' }, this.body);
@@ -423,6 +428,7 @@ export class ClusterPage {
         this.warns,
         h('section', { class: 'cluster-section' }, h('div', { class: 'cluster-section-title' }, h('span', null, '工作者'), this.count), this.workers),
         this.mergeBox,
+        this.cleanupBox,
         this.memoryBox,
       );
       this.sigs = {};
@@ -431,6 +437,7 @@ export class ClusterPage {
     this.drawWarnings();
     this.drawWorkers();
     this.drawMerge();
+    this.drawCleanup();
   }
 
   changed(part, value) {
@@ -444,11 +451,12 @@ export class ClusterPage {
     const c = this.cluster;
     const { done, total, failed, deleted } = progressOf(c);
     const merge = mergeAvailability(c, Boolean(this.busy));
+    const cleanup = cleanupAvailability(c, Boolean(this.busy));
     const stoppable = isStoppable(c) && !this.busy;
     const parentTitle = c.parentId ? this.ctx.parentTitle?.(c.parentId) : '';
     this.count.textContent = `${total} 個`;
     // The "x minutes ago" moves on by itself, so it is part of what this is drawn from.
-    if (!this.changed('head', [c.status, done, total, failed, deleted, c.mode, c.isolate, c.swarm, c.parentId, parentTitle, merge, stoppable, this.busy, this.actionError, Math.floor(Date.now() / 60_000)])) return;
+    if (!this.changed('head', [c.status, done, total, failed, deleted, c.mode, c.isolate, c.swarm, c.parentId, parentTitle, merge, cleanup, stoppable, this.busy, this.actionError, Math.floor(Date.now() / 60_000)])) return;
     const parent = c.parentId;
     fill(
       this.head,
@@ -474,6 +482,7 @@ export class ClusterPage {
         { class: 'cluster-actions' },
         h('button', { class: 'om-btn om-btn--destructive', type: 'button', dataset: { action: 'stop' }, disabled: !stoppable, title: stoppable ? '中斷每個工作者目前這一輪（對話、分支與 worktree 都保留）' : '叢集已經不在跑了', onclick: () => this.stop() }, icon('stop'), '全部停止'),
         h('button', { class: 'om-btn om-btn--primary', type: 'button', dataset: { action: 'merge' }, disabled: !merge.ok, title: merge.why, onclick: () => this.merge() }, icon('branch'), '合併工作者分支'),
+        h('button', { class: 'om-btn', type: 'button', dataset: { action: 'cleanup' }, disabled: !cleanup.ok, title: cleanup.why, onclick: () => this.cleanup() }, icon('trash'), '清理'),
       ),
     );
   }
@@ -510,6 +519,7 @@ export class ClusterPage {
     const state = h('span', { class: 'om-badge cluster-worker-state' });
     const progress = h('p', { class: 'cluster-worker-progress' });
     const timingSlot = h('div', { class: 'cluster-timing-slot' });
+    const cleanupSlot = h('div', { class: 'cluster-worker-cleanup' });
     const deleted = w.status === 'deleted';
     const el = h(
       'article',
@@ -531,9 +541,10 @@ export class ClusterPage {
         : null,
       h('div', { class: 'cluster-worker-meta' }, nativeSwarm(w.swarm), deleted ? null : h('a', { class: 'om-btn om-btn--sm', href: `#/s/${w.sessionId}`, dataset: { action: 'open-worker' } }, '開啟對話')),
       progress,
+      cleanupSlot,
       timingSlot,
     );
-    return { el, sig, state, progress, timingSlot, shown: null, stateKey: '', progressText: null };
+    return { el, sig, state, progress, timingSlot, cleanupSlot, shown: null, stateKey: '', progressText: null, cleanupKey: null };
   }
 
   updateCard(card, w) {
@@ -550,6 +561,14 @@ export class ClusterPage {
       card.progress.className = `cluster-worker-progress${text ? '' : ' muted'}`;
       card.progress.title = text;
       card.progress.textContent = text || '還沒有進度';
+    }
+    // What the clean-up did to this worker, and the way back to the sidebar.
+    const view = cleanupResultView(this.cluster.cleanup?.results?.find((r) => r.sessionId === w.sessionId));
+    const cleanupKey = JSON.stringify([view, w.status === 'deleted']);
+    if (card.cleanupKey !== cleanupKey) {
+      card.cleanupKey = cleanupKey;
+      card.cleanupSlot.hidden = !view;
+      fill(card.cleanupSlot, view ? this.cleanupState(view, w) : null);
     }
     const got = w.status === 'deleted' ? DELETED_TIMING : this.timings.get(w.sessionId) || null;
     if (card.shown !== got) {
@@ -595,6 +614,62 @@ export class ClusterPage {
     );
   }
 
+  // The three facts about one worker after a clean-up, why anything was kept, and the button that puts it back.
+  cleanupState(view, w) {
+    const chip = (field, text, tone) => h('span', { class: `om-badge ${tone}`, dataset: { field } }, text);
+    const part = (field, label, p) => (p ? chip(field, `${label}${p.text}`, p.kept ? 'om-badge--warning' : 'om-badge--success') : null);
+    return [
+      h('div', { class: 'cluster-cleanup-state' }, part('cleanup-worktree', 'worktree ', view.worktree), part('cleanup-branch', '分支', view.branch), chip('cleanup-hidden', view.hidden ? '已從側欄收起' : '在側欄', view.hidden ? '' : 'cluster-badge-busy')),
+      view.reasons.length ? h('ul', { class: 'cluster-cleanup-reasons om-field__help' }, view.reasons.map((r) => h('li', null, r))) : null,
+      view.worktree && !view.worktree.kept ? h('div', { class: 'om-field__help cluster-cleanup-gone' }, '它的 worktree 已移除：對話的紀錄還在，要接著改檔請另開對話。') : null,
+      view.hidden && w.status !== 'deleted' ? h('button', { class: 'om-btn om-btn--sm', type: 'button', dataset: { action: 'unhide', session: w.sessionId }, onclick: () => this.unhide(w.sessionId) }, '放回側欄') : null,
+    ];
+  }
+
+  drawCleanup() {
+    const c = this.cluster;
+    const cl = c.cleanup;
+    const workers = c.workers || [];
+    if (!this.changed('cleanup', [cl, workers.map((w) => [w.sessionId, w.title, w.worktree, w.status === 'deleted']), Math.floor(Date.now() / 60_000), Boolean(this.busy)])) return;
+    if (!cl) return fill(this.cleanupBox);
+    const views = (cl.results || []).map((r) => ({ v: cleanupResultView(r), w: workers.find((x) => x.sessionId === r.sessionId) })).filter((x) => x.v);
+    const count = (f) => views.filter(f).length;
+    const kept = views.filter((x) => x.v.kept);
+    const summary = [`${count((x) => x.v.worktree && !x.v.worktree.kept)} 個 worktree 已移除`, `${count((x) => x.v.branch && !x.v.branch.kept)} 個分支已刪除`, `${count((x) => x.v.hidden)} 個對話已從側欄收起`, kept.length ? `${kept.length} 個工作者有東西保留` : null].filter(Boolean).join(' · ');
+    const anyHidden = views.some((x) => x.v.hidden && x.w?.status !== 'deleted');
+    fill(
+      this.cleanupBox,
+      h(
+        'section',
+        { class: 'cluster-section cluster-cleanup' },
+        h('div', { class: 'cluster-section-title' }, h('span', null, '清理結果'), h('span', { class: 'muted' }, `${cl.auto ? '合併全部成功後自動執行' : '手動'} · ${relTime(cl.at)}`)),
+        h('div', { class: 'cluster-cleanup-summary', dataset: { field: 'cleanup-summary' } }, summary),
+        h('div', { class: 'om-field__help' }, `${c.merge ? `${c.merge.branch} 與` : ''}叢集記憶檔都沒有動。工作者的對話沒有刪：從各工作者卡片的「開啟對話」進去；收起的可以放回側欄。`),
+        kept.length
+          ? h(
+              'div',
+              { class: 'cluster-cleanup-kept' },
+              h('div', { class: 'cluster-cleanup-kept-title' }, '留下來的（沒有動，請你處理）'),
+              h(
+                'ul',
+                null,
+                kept.map(({ v, w }) =>
+                  h(
+                    'li',
+                    { dataset: { session: w?.sessionId || '' } },
+                    h('span', { class: 'cluster-merge-name' }, w?.title || ''),
+                    w?.worktree ? h('code', null, w.worktree) : null,
+                    h('ul', { class: 'cluster-cleanup-reasons om-field__help' }, v.reasons.map((r) => h('li', null, r))),
+                  ),
+                ),
+              ),
+            )
+          : null,
+        anyHidden ? h('div', { class: 'cluster-cleanup-actions' }, h('button', { class: 'om-btn om-btn--sm', type: 'button', dataset: { action: 'unhide-all' }, onclick: () => this.unhide() }, '全部放回側欄')) : null,
+      ),
+    );
+  }
+
   // ---- time
 
   async loadTimings() {
@@ -625,17 +700,85 @@ export class ClusterPage {
     if (this.busy) return;
     const c = this.cluster;
     const unfinished = (c.workers || []).filter((w) => !w.finishedAt && w.status !== 'deleted').length;
-    const body = `會從主對話目前的 HEAD 開新分支 cluster/${c.id}/merged，依工作者的順序合併各自的分支；只會合進各分支上已 commit 的內容。不動主對話正在用的分支與工作樹。有衝突的工作者會跳過並列出檔案，其餘照常合併。${unfinished ? `\n\n還有 ${unfinished} 個工作者沒做完，它們之後才 commit 的內容不會在這次合併裡。` : ''}`;
+    const body = `會從主對話目前的 HEAD 開新分支 cluster/${c.id}/merged，依工作者的順序合併各自的分支；只會合進各分支上已 commit 的內容。不動主對話正在用的分支與工作樹。有衝突的工作者會跳過並列出檔案，其餘照常合併。\n\n如果全部工作者都合併成功，會接著自動清理：移除乾淨的 worktree、刪除已經併進去的工作者分支、把工作者對話從側欄收起（對話不會刪）；有未提交修改、或沒合進去的工作者會原封不動留著。${unfinished ? `\n\n還有 ${unfinished} 個工作者沒做完，它們之後才 commit 的內容不會在這次合併裡。` : ''}`;
     const ok = await this.ctx.confirmDialog({ title: '要合併各工作者的分支嗎？', body, action: '合併' });
     if (ok) await this.run('merge');
   }
 
-  async run(what) {
+  // 清理: ask the Hub what it would do (a dry run), list it, and only then do it.
+  async cleanup() {
+    if (this.busy) return;
+    this.busy = 'cleanup';
+    this.actionError = '';
+    this.drawHead();
+    let plan;
+    try {
+      plan = await get(`/clusters/${this.id}/cleanup/plan`);
+    } catch (err) {
+      this.busy = null;
+      this.actionError = err.message || String(err);
+      this.drawHead();
+      return;
+    }
+    this.busy = null;
+    this.drawHead();
+    if (this.dead) return;
+    if (await this.confirmCleanup(plan)) await this.run('cleanup');
+  }
+
+  confirmCleanup(plan) {
+    const c = this.cluster;
+    const view = cleanupPlanView(plan, c.workers);
+    const t = view.totals;
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (v) => {
+        if (done) return;
+        done = true;
+        d.close();
+        resolve(v);
+      };
+      const summary = view.nothing
+        ? `現在沒有可以清理的東西${t.kept ? '：有東西要保留的工作者都列在下面，原因寫在旁邊' : ''}。`
+        : `會移除 ${t.worktrees} 個 worktree、刪除 ${t.branches} 個分支、從側欄收起 ${t.hidden} 個工作者對話；保留 ${t.kept} 個工作者。`;
+      const rows = view.rows.map((r) => {
+        const path = c.workers.find((w) => w.sessionId === r.sessionId)?.worktree;
+        return h(
+          'li',
+          { dataset: { session: r.sessionId, keeps: String(r.keeps) } },
+          h('div', { class: 'cluster-merge-row' }, h('span', { class: 'cluster-merge-name' }, r.title), h('span', { class: `om-badge ${r.keeps ? 'om-badge--warning' : r.will.length ? 'om-badge--success' : ''}` }, r.keeps ? '保留' : r.will.length ? '清理' : '沒有要做的')),
+          r.will.length ? h('div', { class: 'om-field__help' }, r.will.join('、')) : null,
+          r.keeps ? [path ? h('code', null, path) : null, h('ul', { class: 'cluster-cleanup-reasons om-field__help' }, r.reasons.map((x) => h('li', null, x)))] : null,
+        );
+      });
+      const d = this.ctx.dialog(
+        h(
+          'div',
+          { class: 'alert cluster-cleanup-dialog' },
+          h('div', { class: 'om-alert__title' }, '要清理這個叢集嗎？'),
+          h('p', { class: 'cluster-cleanup-summary' }, summary),
+          h('p', { class: 'om-field__help cluster-cleanup-note' }, `${c.merge ? `合併用的分支 ${c.merge.branch} 與` : ''}叢集記憶檔都會保留。對話不會刪，只是從側欄收起，之後可以在這一頁開啟（看紀錄），或「放回側欄」；worktree 移除後，要接著改檔請另開對話。`),
+          h('p', { class: 'om-field__help cluster-cleanup-note' }, '只有乾淨的 worktree（沒有未提交的修改、沒有未追蹤的檔案）會移除；被 .gitignore 忽略的檔案（例如 node_modules）會跟著 worktree 一起移除。分支要它的 commit 都已經在合併分支或主對話的 HEAD 上才會刪。'),
+          h('ul', { class: 'cluster-cleanup-list' }, rows),
+          h('div', { class: 'dialog-actions' }, h('button', { class: 'om-btn', type: 'button', onclick: () => finish(false) }, '取消'), h('button', { class: 'om-btn om-btn--destructive', type: 'button', disabled: view.nothing, onclick: () => finish(true) }, '清理')),
+        ),
+        { wide: true, onClose: () => finish(false) },
+      );
+    });
+  }
+
+  // 放回側欄: one worker's conversation, or (no id) all of them.
+  async unhide(sessionId) {
+    if (this.busy) return;
+    await this.run('unhide', sessionId ? { sessionId } : {});
+  }
+
+  async run(what, body) {
     this.busy = what;
     this.actionError = '';
     this.drawHead();
     try {
-      const r = await post(`/clusters/${this.id}/${what}`);
+      const r = await post(`/clusters/${this.id}/${what}`, body);
       const next = r?.cluster || (r?.id === this.id ? r : null) || (await get(`/clusters/${this.id}`));
       this.busy = null;
       this.update(next);

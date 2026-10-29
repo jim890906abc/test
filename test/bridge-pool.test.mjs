@@ -480,8 +480,8 @@ test('all keys exhausted: a clear 402, each key tried once, and no further upstr
 });
 
 test('non-quota failures never move the pool', async () => {
+  // (401 is not in this list any more: since 2026-10-29 it moves to the next key as a refused key, see the HTTP 401 tests at the end.)
   const cases = [
-    [401, 'invalid_api_key', 'Unauthorized'],
     [402, 'payment_required', 'Payment required'],
     [403, 'upgrade_required', 'This plan has no API access'],
     [429, 'rate_limit_exceeded', 'Rate limit reached for requests'],
@@ -565,8 +565,8 @@ test('a 400 whose message echoes quota words marks no key exhausted and reaches 
   assert.deepEqual(upstreamRequests.map((x) => x.key), [KEY_A]);
 });
 
-test('401/404/409/422/5xx never rotate, even with a quota code (400 and 403 do: see the credits tests below)', async () => {
-  for (const status of [401, 404, 409, 422, 500, 502, 503]) {
+test('404/409/422/5xx never rotate, even with a quota code (400 and 403 do: see the credits tests below; 401 moves on as a refused key, not as quota: see the HTTP 401 tests at the end)', async () => {
+  for (const status of [404, 409, 422, 500, 502, 503]) {
     const out = await poolOutcome(jsonError(status, { code: 'insufficient_quota', type: 'insufficient_quota', message: 'You exceeded your current quota' }));
     assert.equal(out.status, status, `status ${status}`);
     assert.deepEqual(out.upstream, [KEY_A], `status ${status} tried another key`);
@@ -1326,4 +1326,435 @@ test('a pool without per-key gateways behaves exactly as before: same gateway, n
   const report = reports.filter((x) => x.revision === 1).at(-1);
   assert.equal(report.rotation, undefined);
   assert.equal(report.gateway, 'opencode-go');
+});
+
+// ======================================================================
+// HTTP 401 (2026-10-29): a key the gateway REFUSES is not a key that is out of
+// quota. Whatever the body says, a 401 before any byte went to Kimi moves the
+// very same request to the next key in the order (its gateway's address, model
+// id and headers when that is another gateway). The key is set aside as "refused"
+// with its own fields (authFailedAt, authFailures, authRetryAt), never as
+// exhausted, and no reset time is made up for it: a real request looks at it
+// again 1 minute after the failure, then after gaps that double on every new
+// failure up to 60 minutes (a probing gap, not a recovery time); a success
+// clears it and is proven to the Hub. Other statuses (403, 404, 5xx) are as before.
+// ======================================================================
+const unauthorized = jsonError(401, { code: 'invalid_api_key', message: 'Incorrect API key provided' });
+const lastReportOf = async (rev = 1) => (await settle(), reports.filter((x) => x.revision === rev).at(-1));
+const keyOf = (report, id) => report.keys.find((k) => k.id === id);
+const nap = (ms) => new Promise((r) => setTimeout(r, ms));
+const go = () => chat(FLASH).then(async (res) => ({ status: res.status, text: await res.text() }));
+
+test('the hello names the HTTP 401 ability, so a Hub knows this connector understands a refused key', () => {
+  assert.ok(lastHello.capabilities.includes('pool_auth'), JSON.stringify(lastHello.capabilities));
+});
+
+test('a 401 moves the same request to the next key and Kimi sees one normal answer; the key is "refused", not "out of quota"', async () => {
+  await withBridgeEnv({});
+  responses.set(KEY_A, unauthorized);
+  responses.set(KEY_B, (req, res) => success(res, 'b answered'));
+  assert.equal((await provision({ pool: pool([key('dk_a', KEY_A), key('dk_b', KEY_B)]) })).ok, true);
+  const res = await chat(FLASH);
+  assert.equal(res.status, 200);
+  assert.match(await res.text(), /b answered/);
+  assert.deepEqual(upstreamRequests.map((x) => x.key), [KEY_A, KEY_B]);
+  assert.deepEqual(upstreamRequests[0].body, FLASH);
+  assert.deepEqual(upstreamRequests[1].body, FLASH, 'the very same request');
+  const report = await lastReportOf();
+  const a = keyOf(report, 'dk_a');
+  assert.equal(a.exhaustedAt, undefined, 'a refused key is not an exhausted one');
+  assert.equal(a.retryAt, undefined, 'and no reset time is made up for it');
+  assert.ok(a.authFailedAt <= Date.now() && a.authFailedAt > Date.now() - 10_000, 'when it was refused');
+  assert.equal(a.authFailures, 1);
+  assert.equal(a.authRetryAt - a.authFailedAt, 60_000, 'a real request may look at it again 1 minute later');
+  assert.deepEqual(Object.keys(a).sort(), ['authFailedAt', 'authFailures', 'authRetryAt', 'id']);
+  assert.deepEqual(keyOf(report, 'dk_b'), { id: 'dk_b' }, 'the key that answered says nothing');
+  assert.equal(report.activeId, 'dk_b');
+  assert.ok(!JSON.stringify(reports).includes('sk-pool'));
+  const saved = savedPool().keys.find((k) => k.id === 'dk_a');
+  assert.deepEqual([saved.authFailedAt, saved.authFailures, saved.exhaustedAt], [a.authFailedAt, 1, undefined], 'remembered across a restart');
+  // The next request starts on the key that works.
+  upstreamRequests = [];
+  assert.equal((await go()).status, 200);
+  assert.deepEqual(upstreamRequests.map((x) => x.key), [KEY_B]);
+});
+
+test('a 401 is never taken for quota, whatever its body says: no exhaustion, no reset time read out of its words', async () => {
+  await withBridgeEnv({});
+  const when = clock(2 * 3600_000);
+  when.setUTCMilliseconds(0);
+  responses.set(KEY_A, jsonError(401, { code: 'insufficient_quota', type: 'insufficient_quota', message: `You exceeded your current quota. Resets at ${when.toISOString()}` }));
+  responses.set(KEY_B, (req, res) => success(res, 'b answered'));
+  assert.equal((await provision({ pool: pool([key('dk_a', KEY_A), key('dk_b', KEY_B)]) })).ok, true);
+  assert.equal((await go()).status, 200);
+  const a = keyOf(await lastReportOf(), 'dk_a');
+  assert.equal(a.exhaustedAt, undefined);
+  assert.equal(a.retryAt, undefined);
+  assert.ok(a.authFailedAt);
+  assert.ok(a.authRetryAt - a.authFailedAt <= 60_000, 'the probe gap is ours, not the 2 hours the words mention');
+  assert.deepEqual(savedPool().keys.filter((k) => k.exhaustedAt).map((k) => k.id), []);
+});
+
+test('OpenCode Go -> Command Code on a 401: the next request carries that gateway\'s address, model id, session header and key', async () => {
+  await withBridgeEnv({});
+  responses.set(KEY_A, unauthorized);
+  responses.set(KEY_B, (req, res) => success(res, 'command code answered'));
+  const r = await provision({ pool: cross([ck('dk_a', KEY_A, OCG), ck('dk_b', KEY_B, CC)]) });
+  assert.equal(r.ok, true, r.error);
+  const res = await chatWith(FLASH, { 'x-opencode-session': 'ses_agenthub_0123456789abcdef', 'x-agent-hub-note': 'private' });
+  assert.equal(res.status, 200);
+  assert.match(await res.text(), /command code answered/);
+  assert.equal(upstreamRequests.length, 2);
+  const [first, second] = upstreamRequests;
+  assert.equal(first.url, '/opencode-go/chat/completions');
+  assert.equal(first.key, KEY_A);
+  assert.equal(first.body.model, 'deepseek-v4.1-flash');
+  assert.equal(first.headers['x-opencode-session'], 'ses_agenthub_0123456789abcdef');
+  assert.equal(second.url, '/commandcode/chat/completions');
+  assert.equal(second.key, KEY_B);
+  assert.equal(second.body.model, 'deepseek/deepseek-v4.1-flash', 'the model id is the one Command Code lists');
+  assert.deepEqual({ ...second.body, model: 'x' }, { ...FLASH, model: 'x' }, 'nothing else in the request changed');
+  assert.equal(second.headers['x-session-id'], 'ses_agenthub_0123456789abcdef');
+  assert.equal(second.headers['x-opencode-session'], undefined);
+  assert.equal(second.headers['x-agent-hub-note'], undefined);
+  assert.equal(second.headers.authorization, `Bearer ${KEY_B}`);
+  const report = await lastReportOf();
+  assert.equal(report.rotation, 1);
+  assert.equal(report.gateway, CC, 'the machine is now on a Command Code key');
+  assert.ok(keyOf(report, 'dk_a').authFailedAt);
+  assert.equal(keyOf(report, 'dk_a').exhaustedAt, undefined);
+});
+
+test('the other direction too: a refused Command Code key hands the request to OpenCode Go with the model and header renamed back', async () => {
+  await withBridgeEnv({});
+  const flash = models(['deepseek/deepseek-v4.1-flash']);
+  responses.set(KEY_A, unauthorized);
+  responses.set(KEY_B, (req, res) => success(res, 'go answered'));
+  const map = { [OCG]: { 'deepseek/deepseek-v4.1-flash': 'deepseek-v4.1-flash' } };
+  const r = await provision({ gateway: CC, models: flash, pool: cross([ck('dk_a', KEY_A, CC), ck('dk_b', KEY_B, OCG)], { modelMap: map }) });
+  assert.equal(r.ok, true, r.error);
+  const res = await chatWith({ ...FLASH, model: 'deepseek/deepseek-v4.1-flash' }, { 'x-session-id': 'ses_agenthub_fedcba9876543210' });
+  assert.equal(res.status, 200);
+  assert.match(await res.text(), /go answered/);
+  const [first, second] = upstreamRequests;
+  assert.equal(first.url, '/commandcode/chat/completions');
+  assert.equal(second.url, '/opencode-go/chat/completions');
+  assert.equal(second.body.model, 'deepseek-v4.1-flash');
+  assert.equal(second.headers['x-opencode-session'], 'ses_agenthub_fedcba9876543210');
+  assert.equal(second.headers['x-session-id'], undefined);
+});
+
+test('other statuses are as before: 403, 404 and 5xx reach Kimi untouched and mark no key refused', async () => {
+  await withBridgeEnv({});
+  for (const [status, error] of [[403, { code: 'upgrade_required', message: 'This plan has no API access' }], [404, { code: 'not_found', message: 'no such model' }], [500, { code: 'server_error', message: 'boom' }]]) {
+    const out = await poolOutcome(jsonError(status, error));
+    assert.equal(out.status, status, `status ${status}`);
+    assert.deepEqual(out.upstream, [KEY_A], `status ${status} tried another key`);
+    const last = reports.filter((x) => x.revision === 1).at(-1);
+    assert.deepEqual((last?.keys || []).filter((k) => k.authFailedAt), [], `status ${status} marked a key refused`);
+    assert.deepEqual(savedPool().keys.filter((k) => k.authFailedAt), []);
+  }
+});
+
+test('a refused key is looked at again by a real request after 1 minute, then at doubling gaps up to 60 minutes; nobody is asked inside a gap', async () => {
+  // (The real gaps are 60 s, 120 s ... 3600 s; here the first gap is 500 ms and the cap 1000 ms so it can be watched.)
+  await withBridgeEnv({ AGENT_HUB_DEEPSEEK_AUTH_RETRY_MS: '500', AGENT_HUB_DEEPSEEK_AUTH_RETRY_MAX_MS: '1000' });
+  let refusing = true;
+  responses.set(KEY_A, (req, res) => (refusing ? unauthorized(req, res) : success(res, 'a is back')));
+  assert.equal((await provision({ pool: pool([key('dk_a', KEY_A)]) })).ok, true);
+  const gaps = [];
+  const note = async () => {
+    const a = keyOf(await lastReportOf(), 'dk_a');
+    gaps.push([a.authFailures, a.authRetryAt - a.authFailedAt]);
+    return a;
+  };
+  // Wait until the gap the connector itself reported is over.
+  const untilDue = (a) => nap(Math.max(0, a.authRetryAt - Date.now()) + 60);
+  assert.equal((await go()).status, 401, 'the only key is refused: the 401 reaches Kimi, as it always did');
+  let a = await note();
+  upstreamRequests = [];
+  assert.equal((await go()).status, 401);
+  assert.equal(upstreamRequests.length, 0, 'inside the gap the gateway is not asked again');
+  for (let i = 0; i < 4; i++) {
+    await untilDue(a);
+    upstreamRequests = [];
+    assert.equal((await go()).status, 401);
+    assert.equal(upstreamRequests.length, 1, 'once the gap is over, one request is the probe');
+    a = await note();
+  }
+  assert.deepEqual(gaps, [[1, 500], [2, 1000], [3, 1000], [4, 1000], [5, 1000]], 'the gap doubles on every new failure and stops at the cap');
+  assert.equal(a.retryAt, undefined, 'at no point is it called a reset time');
+
+  // The gateway accepts the key again: the first request after the gap proves it.
+  const failedAt = a.authFailedAt;
+  refusing = false;
+  await untilDue(a);
+  upstreamRequests = [];
+  const back = await go();
+  assert.equal(back.status, 200);
+  assert.match(back.text, /a is back/);
+  const healed = keyOf(await lastReportOf(), 'dk_a');
+  assert.equal(healed.authFailedAt, undefined, 'the mark is gone');
+  assert.equal(healed.authFailures, undefined);
+  assert.ok(healed.recoveredAt > failedAt, 'the proof is later than the failure');
+  assert.equal(healed.recoveredFrom, failedAt, 'and names the failure it disproves');
+  const persisted = savedPool().keys.find((k) => k.id === 'dk_a');
+  assert.equal(persisted.authFailedAt, undefined);
+  assert.equal(persisted.authFailures, undefined);
+  upstreamRequests = [];
+  assert.equal((await go()).status, 200);
+  assert.deepEqual(upstreamRequests.map((x) => x.key), [KEY_A], 'a healthy key again, with no gap to wait');
+  await withBridgeEnv({});
+});
+
+test('with the real timings the gaps are 1, 2, 4 ... minutes and never over 60; a key not yet due is not asked', async () => {
+  await withBridgeEnv({});
+  responses.set(KEY_A, unauthorized);
+  const MIN = 60_000;
+  // [failures so far, how long ago the last one was, the gap after the probe fails again]
+  const cases = [[1, 61_000, 2 * MIN], [2, 2 * MIN + 1000, 4 * MIN], [3, 4 * MIN + 1000, 8 * MIN], [5, 16 * MIN + 1000, 32 * MIN], [6, 32 * MIN + 1000, 60 * MIN], [7, 61 * MIN, 60 * MIN], [40, 61 * MIN, 60 * MIN]];
+  let revision = 0;
+  for (const [failures, age, gap] of cases) {
+    revision++;
+    upstreamRequests = [];
+    const stamp = Date.now() - age;
+    const p = pool([{ ...key('dk_a', KEY_A), authFailedAt: stamp, authFailures: failures }], revision);
+    assert.equal((await provision({ pool: p })).ok, true);
+    assert.equal((await go()).status, 401);
+    assert.equal(upstreamRequests.length, 1, `failures ${failures}: one probe`);
+    const a = keyOf(await lastReportOf(revision), 'dk_a');
+    assert.equal(a.authFailures, failures + 1, `failures ${failures}`);
+    assert.equal(a.authRetryAt - a.authFailedAt, gap, `failures ${failures}: the next gap`);
+    assert.ok(a.authFailedAt > stamp, 'a new failure is stamped');
+  }
+  // Not yet due: no traffic, and the state is untouched.
+  revision++;
+  upstreamRequests = [];
+  const recent = Date.now() - 30_000;
+  assert.equal((await provision({ pool: pool([{ ...key('dk_a', KEY_A), authFailedAt: recent, authFailures: 1 }], revision) })).ok, true);
+  assert.equal((await go()).status, 401);
+  assert.equal(upstreamRequests.length, 0, 'the first minute is not over');
+  const a = keyOf(await lastReportOf(revision), 'dk_a');
+  assert.deepEqual([a.authFailedAt, a.authFailures, a.authRetryAt], [recent, 1, recent + MIN]);
+});
+
+test('parallel requests that find the same key refused count one failure, and all of them move on', async () => {
+  await withBridgeEnv({});
+  responses.set(KEY_A, async (req, res) => {
+    await nap(150);
+    unauthorized(req, res);
+  });
+  responses.set(KEY_B, (req, res) => success(res, 'b answered'));
+  assert.equal((await provision({ pool: pool([key('dk_a', KEY_A), key('dk_b', KEY_B)]) })).ok, true);
+  const all = await Promise.all([go(), go(), go()]);
+  assert.deepEqual(all.map((x) => x.status), [200, 200, 200]);
+  assert.equal(upstreamRequests.filter((x) => x.key === KEY_A).length, 3, 'all three had started on the first key');
+  assert.equal(upstreamRequests.filter((x) => x.key === KEY_B).length, 3);
+  const a = keyOf(await lastReportOf(), 'dk_a');
+  assert.equal(a.authFailures, 1, 'one refusal, not three');
+  assert.equal(a.authRetryAt - a.authFailedAt, 60_000);
+});
+
+test('a key is refused or out of quota, never both: whichever the gateway said last decides', async () => {
+  await withBridgeEnv({});
+  // Out of quota and due; the probe is refused.
+  responses.set(KEY_A, unauthorized);
+  assert.equal((await provision({ pool: pool([{ ...key('dk_a', KEY_A, Date.now() - 120_000), retryAt: Date.now() - 1000 }]) })).ok, true);
+  assert.equal((await go()).status, 401);
+  let a = keyOf(await lastReportOf(), 'dk_a');
+  assert.ok(a.authFailedAt);
+  assert.equal(a.authFailures, 1, 'a new kind of failure starts the count');
+  assert.equal(a.exhaustedAt, undefined);
+  assert.equal(a.retryAt, undefined);
+  let p = savedPool().keys.find((k) => k.id === 'dk_a');
+  assert.deepEqual([p.exhaustedAt, p.retryAt, p.manual], [undefined, undefined, undefined]);
+  // Refused and due; the probe finds it out of quota instead, with a reset time the gateway states (an hour away).
+  responses.set(KEY_A, (req, res) => {
+    const body = JSON.stringify({ error: { code: 'insufficient_quota', message: 'You exceeded your current quota' } });
+    res.writeHead(402, { 'content-type': 'application/json', 'retry-after': '3600', 'content-length': Buffer.byteLength(body) });
+    res.end(body);
+  });
+  assert.equal((await provision({ pool: pool([{ ...key('dk_a', KEY_A), authFailedAt: Date.now() - 120_000, authFailures: 1 }], 2) })).ok, true);
+  assert.equal((await go()).status, 402);
+  a = keyOf(await lastReportOf(2), 'dk_a');
+  assert.ok(a.exhaustedAt);
+  assert.ok(Math.abs(a.retryAt - a.exhaustedAt - 3600_000) < 5000, 'the time the gateway stated');
+  assert.equal(a.authFailedAt, undefined);
+  assert.equal(a.authFailures, undefined);
+  assert.equal(a.authRetryAt, undefined);
+  p = savedPool().keys.find((k) => k.id === 'dk_a');
+  assert.deepEqual([p.authFailedAt, p.authFailures], [undefined, undefined]);
+  upstreamRequests = [];
+  assert.equal((await go()).status, 402);
+  assert.equal(upstreamRequests.length, 0, 'the old refusal\'s schedule is gone: the stated hour decides, nobody probes before it');
+  // Refused and due; the probe works: proven, and nothing of the refusal is left.
+  responses.set(KEY_A, (req, res) => success(res, 'a is accepted again'));
+  const stamp = Date.now() - 125_000;
+  assert.equal((await provision({ pool: pool([{ ...key('dk_a', KEY_A), authFailedAt: stamp, authFailures: 2 }], 3) })).ok, true);
+  const ok = await go();
+  assert.equal(ok.status, 200);
+  assert.match(ok.text, /accepted again/);
+  a = keyOf(await lastReportOf(3), 'dk_a');
+  assert.equal(a.authFailedAt, undefined);
+  assert.equal(a.recoveredFrom, stamp);
+});
+
+test('a refused key is not used while its gap lasts, other keys carry on, and it is remembered across a restart', async () => {
+  await withBridgeEnv({});
+  responses.set(KEY_A, unauthorized);
+  responses.set(KEY_B, (req, res) => success(res, 'b answered'));
+  assert.equal((await provision({ pool: pool([key('dk_a', KEY_A), key('dk_b', KEY_B)]) })).ok, true);
+  assert.equal((await go()).status, 200);
+  const before = savedPool().keys.find((k) => k.id === 'dk_a');
+  assert.ok(before.authFailedAt && before.authFailures === 1);
+  await restartBridge({});
+  upstreamRequests = [];
+  assert.equal((await go()).status, 200);
+  assert.deepEqual(upstreamRequests.map((x) => x.key), [KEY_B], 'after a restart the refused key is still set aside');
+  const after = savedPool().keys.find((k) => k.id === 'dk_a');
+  assert.deepEqual([after.authFailedAt, after.authFailures], [before.authFailedAt, 1]);
+  const report = await lastReportOf();
+  assert.equal(keyOf(report, 'dk_a').authFailedAt, before.authFailedAt, 'and reported to the Hub again');
+});
+
+test('a Hub that sends a refused key (authFailedAt, authFailures) has it set aside until its gap is over; bad values are refused whole', async () => {
+  await withBridgeEnv({});
+  responses.set(KEY_A, (req, res) => success(res, 'must stay untouched'));
+  responses.set(KEY_B, (req, res) => success(res, 'b answered'));
+  const sent = Date.now() - 5000;
+  assert.equal((await provision({ pool: pool([{ ...key('dk_a', KEY_A), authFailedAt: sent, authFailures: 3 }, key('dk_b', KEY_B)]) })).ok, true);
+  assert.match((await go()).text, /b answered/);
+  assert.deepEqual(upstreamRequests.map((x) => x.key), [KEY_B]);
+  const a = keyOf(await lastReportOf(), 'dk_a');
+  assert.deepEqual([a.authFailedAt, a.authFailures, a.authRetryAt - a.authFailedAt], [sent, 3, 4 * 60_000], 'the third failure waits 4 minutes');
+  for (const bad of [{ authFailedAt: -1 }, { authFailedAt: 'soon' }, { authFailedAt: 0 }]) {
+    const r = await provision({ pool: pool([{ ...key('dk_a', KEY_A), ...bad }], 9) });
+    assert.equal(r.ok, false, JSON.stringify(bad));
+  }
+  // A missing or silly count is one failure, not a made-up long wait.
+  upstreamRequests = [];
+  responses.set(KEY_A, (req, res) => success(res, 'a probe worked'));
+  assert.equal((await provision({ pool: pool([{ ...key('dk_a', KEY_A), authFailedAt: Date.now() - 90_000, authFailures: 'many' }], 10) })).ok, true);
+  assert.match((await go()).text, /a probe worked/);
+  assert.deepEqual(upstreamRequests.map((x) => x.key), [KEY_A], 'one failure: a minute is over, so it is probed and works');
+});
+
+test('every key unusable: refused keys, keys out of quota and keys marked by hand are counted and listed apart; no key value, no reset time for a refused one', async () => {
+  await withBridgeEnv({});
+  responses.set(KEY_A, unauthorized);
+  responses.set(KEY_B, jsonError(402, { code: 'insufficient_quota', message: 'x' }));
+  const r = await provision({ pool: cross([ck('dk_a', KEY_A, CC), ck('dk_b', KEY_B, OCG), ck('dk_c', KEY_C, OCG, { exhaustedAt: Date.now() - 1000, manual: true })]) });
+  assert.equal(r.ok, true, r.error);
+  const res = await chatWith(FLASH);
+  assert.equal(res.status, 402, 'something is out of quota: the answer is the one for an empty account');
+  const j = JSON.parse(await res.text());
+  assert.equal(j.error.code, 'insufficient_quota');
+  const text = j.error.message;
+  const lines = text.split('\n');
+  assert.match(lines[0], /都不能用（共 3 把）/, text);
+  assert.match(lines[0], /認證失敗（HTTP 401）1 把/, text);
+  assert.match(lines[0], /額度用完 1 把/, text);
+  assert.match(lines[0], /手動標記已滿 1 把/, text);
+  assert.match(lines[1], /^1\. Command Code …1111：認證失敗（HTTP 401）/, text);
+  assert.match(lines[2], /^2\. OpenCode Go …2222：已滿，重置時間未知/, text);
+  assert.match(lines[3], /^3\. OpenCode Go …3333：手動標記已滿/, text);
+  assert.doesNotMatch(lines[1].replace('不是供應商給的重置時間', ''), /重置/, 'a refused key is given no reset time');
+  assert.match(text, /不是供應商給的重置時間/, 'the retry time of a refused key is said to be ours');
+  assert.match(text, /重新啟用|清除標記/, 'says how to recover now');
+  assert.ok(j.error.retry_at > Date.now(), 'the next try that can happen is machine-readable');
+  for (const k of [KEY_A, KEY_B, KEY_C]) assert.ok(!JSON.stringify(j).includes(k), 'no key value in the error');
+  assert.deepEqual(upstreamRequests.map((x) => x.key), [KEY_A, KEY_B], 'the manually marked key is never tried');
+  // Quiet afterwards, and the answer is the same.
+  upstreamRequests = [];
+  const again = await chatWith(FLASH);
+  assert.equal(again.status, 402);
+  assert.match(JSON.parse(await again.text()).error.message.split('\n')[0], /認證失敗（HTTP 401）1 把/);
+  assert.equal(upstreamRequests.length, 0);
+});
+
+test('when every key is refused the answer is a 401 that says so, not an empty-account error', async () => {
+  await withBridgeEnv({});
+  responses.set(KEY_A, unauthorized);
+  responses.set(KEY_B, unauthorized);
+  assert.equal((await provision({ pool: pool([key('dk_a', KEY_A), key('dk_b', KEY_B)]) })).ok, true);
+  const res = await chat(FLASH);
+  assert.equal(res.status, 401);
+  const j = JSON.parse(await res.text());
+  assert.equal(j.error.code, 'upstream_auth_failed');
+  const lines = j.error.message.split('\n');
+  assert.match(lines[0], /都不能用（共 2 把）/);
+  assert.match(lines[0], /認證失敗（HTTP 401）2 把/);
+  assert.doesNotMatch(j.error.message, /額度用完|已用盡/, 'no quota is claimed');
+  assert.match(lines[1], /^1\. OpenCode Go …1111：認證失敗（HTTP 401）/);
+  assert.match(lines[2], /^2\. OpenCode Go …2222：認證失敗（HTTP 401）/);
+  assert.deepEqual(upstreamRequests.map((x) => x.key), [KEY_A, KEY_B]);
+  for (const k of [KEY_A, KEY_B]) assert.ok(!JSON.stringify(j).includes(k));
+  assert.ok(j.error.retry_at > Date.now());
+});
+
+// The two halves together, in one process: the pool the Hub builds for a connector
+// that says `pool_auth`, the real connector's report after a real 401, and what the
+// Hub makes of that report - so a field one side spells differently is caught here.
+test('contract with the Hub: its provision reaches the connector, the connector\'s 401 report shows up on the Hub as a refused key, and clearing it there reaches the connector', async () => {
+  await withBridgeEnv({});
+  const data = fs.mkdtempSync(path.join(TMP, 'hub-'));
+  process.env.AGENT_HUB_DATA = data;
+  process.env.AGENT_HUB_WORKSPACES = path.join(data, 'ws');
+  fs.writeFileSync(
+    path.join(data, 'deepseek.json'),
+    JSON.stringify({
+      gateway: 'opencode-go',
+      keys: { 'opencode-go': { revision: 2, activeId: 'k_a', keys: [{ id: 'k_a', key: KEY_A, addedAt: 1 }, { id: 'k_b', key: KEY_B, addedAt: 2 }] } },
+      order: ['k_a', 'k_b'],
+      activity: {},
+    }),
+    { mode: 0o600 },
+  );
+  const account = await import('../server/deepseek-account.js');
+  const machines = await import('../server/machines.js');
+  const { EventEmitter } = await import('node:events');
+  const ws = new EventEmitter();
+  ws.readyState = 1;
+  ws.close = () => {};
+  ws.send = () => {};
+  machines.attachBridge(ws);
+  ws.emit('message', JSON.stringify({ t: 'hello', machineId: 'm_contract', name: 'm_contract', platform: 'test', home: TMP, bridgeVersion: lastHello.bridgeVersion, status: { available: true, server: false }, pool: 1, capabilities: lastHello.capabilities }));
+  const planned = async () => {
+    let seen;
+    await account.ensureProvider('m_contract', { rpc: async (id, op, args) => ((seen = args), { ok: true, models: [] }) });
+    return seen;
+  };
+  const sendToConnector = async (args) => {
+    const r = await provision(args);
+    assert.equal(r.ok, true, r.error);
+  };
+  const view = () => account.publicAccount().rotation.keys;
+
+  responses.set(KEY_A, unauthorized);
+  responses.set(KEY_B, (req, res) => success(res, 'b answered'));
+  await sendToConnector(await planned());
+  assert.equal((await go()).status, 200);
+  assert.deepEqual(upstreamRequests.map((x) => x.key), [KEY_A, KEY_B]);
+  const sent = (await lastReportOf(account.rotationRevision())).keys.find((k) => k.id === 'k_a');
+  assert.ok(sent.authFailedAt, JSON.stringify(sent));
+  // The Hub reads exactly that report.
+  const real = reports.filter((x) => x.revision === account.rotationRevision()).at(-1);
+  assert.equal(account.applyPoolReport('m_contract', real), true);
+  const a = view().find((k) => k.id === 'k_a');
+  assert.deepEqual([a.state, a.authFailed, a.authFailedAt, a.authFailures, a.authRetryAt, a.exhaustedAt, a.resetAt], ['auth_failed', true, sent.authFailedAt, 1, sent.authRetryAt, null, null]);
+  assert.equal(view().find((k) => k.id === 'k_b').state, 'ready');
+  assert.equal(account.publicAccount().rotation.activeId, 'k_b');
+  assert.ok(!JSON.stringify(account.publicAccount()).includes('sk-pool'));
+
+  // A person clears it on the Hub: the connector is given the new list and asks the key again.
+  assert.equal(account.clearMark('k_a'), true);
+  assert.equal(view().find((k) => k.id === 'k_a').state, 'ready');
+  const again = await planned();
+  assert.ok(again.pool.keys.every((k) => !('authFailedAt' in k) && !('exhaustedAt' in k)), 'the cleared key goes out without a mark');
+  await sendToConnector(again);
+  upstreamRequests = [];
+  assert.equal((await go()).status, 200);
+  assert.deepEqual(upstreamRequests.map((x) => x.key), [KEY_A, KEY_B], 'the first key is asked again at once, and refused again');
+  const second = (await lastReportOf(account.rotationRevision())).keys.find((k) => k.id === 'k_a');
+  assert.equal(second.authFailures, 1, 'a clear starts the count again');
 });

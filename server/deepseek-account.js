@@ -105,13 +105,56 @@ export const retryMs = () => {
   const n = Number(process.env.AGENT_HUB_DEEPSEEK_RETRY_MS);
   return Number.isInteger(n) && n >= 1000 && n <= 35 * 86_400_000 ? n : 30_000;
 };
-// When an exhausted key may be looked at again (0: it is not exhausted; Infinity:
+// A key its gateway REFUSES (HTTP 401, 2026-10-29) is not a key that is out of
+// quota: it has its own fields - authFailedAt, authFailures (refusals in a row)
+// and authRetryAt (when a real request may look at it again, as the connector
+// scheduled it) - and no reset time, because a 401 says nothing about when a key
+// might work again. The gaps are the connector's: 1 minute after the first
+// refusal, double with each new one, 60 minutes at most. They are only how often
+// the key is probed. A key is refused or exhausted, never both.
+const MIN_MS = 60_000;
+const AUTH_FIRST_GAP_MS = 60_000;
+const AUTH_MAX_GAP_MS = 3_600_000;
+const AUTH_MAX_FAILURES = 60;
+export const authGapMs = (failures) => {
+  const n = Math.min(Math.max(1, Math.round(Number(failures)) || 1), AUTH_MAX_FAILURES);
+  return Math.min(AUTH_MAX_GAP_MS, AUTH_FIRST_GAP_MS * 2 ** Math.min(n - 1, 40));
+};
+// Out of use: exhausted (quota, a gateway's word or a person's mark) or refused.
+const isBlocked = (k) => Boolean(k?.exhaustedAt || k?.authFailedAt);
+// Refused by its gateway (and not, since, exhausted).
+const isRefused = (k) => Boolean(k?.authFailedAt && !k.exhaustedAt);
+const dropAuth = (k) => {
+  delete k.authFailedAt;
+  delete k.authFailures;
+  delete k.authRetryAt;
+};
+const dropExhaustion = (k) => {
+  delete k.exhaustedAt;
+  delete k.retryAt;
+  delete k.exhaustedRev;
+};
+// When a blocked key may be looked at again (0: it is not out of use; Infinity:
 // a person marked it full, only a person clears that).
-export const retryAtOf = (k) => (k?.exhaustedAt ? (k.manual ? Infinity : k.retryAt || k.exhaustedAt + retryMs()) : 0);
-// A key a request may use: healthy, or exhausted with its wait over (the
+export const retryAtOf = (k) => {
+  if (isRefused(k)) return k.authRetryAt || k.authFailedAt + authGapMs(k.authFailures);
+  return k?.exhaustedAt ? (k.manual ? Infinity : k.retryAt || k.exhaustedAt + retryMs()) : 0;
+};
+// A key a request may use: healthy, or out of use with its wait over (the
 // connector's next real request is then the probe). Never one a person marked.
-const isUsable = (k, now = Date.now()) => !k.exhaustedAt || (!k.manual && retryAtOf(k) <= now);
-const firstUsable = (keys, now = Date.now()) => keys.find((k) => !k.exhaustedAt) || keys.find((k) => isUsable(k, now)) || keys[0] || null;
+const isUsable = (k, now = Date.now()) => !isBlocked(k) || (!k.manual && retryAtOf(k) <= now);
+const firstUsable = (keys, now = Date.now()) => keys.find((k) => !isBlocked(k)) || keys.find((k) => isUsable(k, now)) || keys[0] || null;
+
+const cleanFailures = (v) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.min(AUTH_MAX_FAILURES, Math.max(1, Math.round(n))) : 1;
+};
+// The connector's schedule for the next real try of a refused key, or 0 when it
+// is not believable (not after the failure, or further away than the longest gap).
+const cleanAuthRetryAt = (v, failedAt) => {
+  const t = Number(v);
+  return Number.isFinite(t) && t >= failedAt && t <= failedAt + AUTH_MAX_GAP_MS ? Math.round(t) : 0;
+};
 
 // One gateway's keys: the old single string (one key) and the current
 // { revision, activeId, keys[] } both load into the same shape, so an update
@@ -137,6 +180,16 @@ function normalizePool(raw) {
         const exhaustedRev = Number(item.exhaustedRev);
         if (Number.isInteger(exhaustedRev) && exhaustedRev > 0) out.exhaustedRev = exhaustedRev;
         if (item.manual === true) out.manual = true;
+      }
+      // A refused key (see isRefused): the later of the two facts stands, and a
+      // person's mark is never replaced.
+      const authFailedAt = Number(item.authFailedAt);
+      if (Number.isFinite(authFailedAt) && authFailedAt > 0 && !out.manual && !(out.exhaustedAt && out.exhaustedAt >= authFailedAt)) {
+        dropExhaustion(out);
+        out.authFailedAt = authFailedAt;
+        out.authFailures = cleanFailures(item.authFailures);
+        const authRetryAt = cleanAuthRetryAt(item.authRetryAt, authFailedAt);
+        if (authRetryAt) out.authRetryAt = authRetryAt;
       }
       pool.keys.push(out);
     }
@@ -343,7 +396,7 @@ const keyForAttempt = (gw) => {
   if (!pool) return null;
   const now = Date.now();
   const usable = pool.keys.filter((k) => isUsable(k, now));
-  return usable.find((k) => k.id === pool.activeId && !k.exhaustedAt) || usable.find((k) => !k.exhaustedAt) || usable[0] || null;
+  return usable.find((k) => k.id === pool.activeId && !isBlocked(k)) || usable.find((k) => !isBlocked(k)) || usable[0] || null;
 };
 
 // The last four characters: all a page is ever told of a key.
@@ -482,9 +535,8 @@ export async function retryKey(gw, id) {
   // The pool may have moved while the probe was out.
   const now = poolOf(gw)?.keys.find((k) => k.id === id);
   if (!now) throw Object.assign(new Error('找不到這把 API key'), { status: 404 });
-  delete now.exhaustedAt;
-  delete now.retryAt;
-  delete now.exhaustedRev;
+  dropExhaustion(now);
+  dropAuth(now);
   delete now.manual;
   const live = poolOf(gw);
   live.activeId = now.id;
@@ -522,22 +574,23 @@ export function markFull(id) {
   k.exhaustedAt = Date.now();
   delete k.retryAt;
   delete k.exhaustedRev;
+  dropAuth(k);
   k.manual = true;
   bumpEpoch();
   save();
   return true;
 }
 
-// Clear a key's full mark by hand, a gateway's own or a person's, without asking
-// the gateway: the next real request that uses it finds out (and it is marked
-// again, with whatever the gateway says, if it is still out). True when
+// Clear a key's mark by hand - out of quota as a gateway said it, refused by its
+// gateway (HTTP 401), or marked full by a person - without asking the gateway:
+// the next real request that uses it finds out (and it is marked again, with
+// whatever the gateway says, if it is still out or still refused). True when
 // something changed.
 export function clearMark(id) {
   const { k } = locateKey(id);
-  if (!k.exhaustedAt) return false;
-  delete k.exhaustedAt;
-  delete k.retryAt;
-  delete k.exhaustedRev;
+  if (!isBlocked(k)) return false;
+  dropExhaustion(k);
+  dropAuth(k);
   delete k.manual;
   bumpEpoch();
   save();
@@ -602,9 +655,12 @@ export function applyPoolReport(machineId, msg) {
   // only what a report actually SAYS about a key:
   //   - { exhaustedAt[, retryAt] }  the newest exhaustion any computer saw wins;
   //     retryAt is only ever a time a gateway stated;
+  //   - { authFailedAt, authFailures[, authRetryAt] }  the gateway refused the key
+  //     (HTTP 401): its own state, not an exhaustion, with no reset time; the
+  //     newest of exhaustion and refusal any computer saw is the one that stands;
   //   - { recoveredAt, recoveredFrom }  a real request succeeded on that key;
-  //     it clears the exhaustion only if it is later than the exhaustion (and
-  //     not from the future: a wrong clock is not evidence);
+  //     it clears the exhaustion (or refusal) only if it is later than that and
+  //     not from the future: a wrong clock is not evidence;
   //   - { exhaustedAt: null }  an explicit reset, honoured only from a revision
   //     newer than the one the exhaustion was recorded at;
   //   - no field at all  this computer has no news about the key. That is not
@@ -617,21 +673,35 @@ export function applyPoolReport(machineId, msg) {
       const key = known.get(item.id);
       if (!key || key.manual) continue;
       const exhaustedAt = Number(item.exhaustedAt);
+      const authFailedAt = Number(item.authFailedAt);
       const recoveredAt = Number(item.recoveredAt);
+      // The newest word about this key so far, whichever kind.
+      const standing = Math.max(key.exhaustedAt || 0, key.authFailedAt || 0);
       if (item.exhaustedAt != null) {
-        if (Number.isFinite(exhaustedAt) && exhaustedAt > 0 && exhaustedAt >= (key.exhaustedAt || 0) && (key.exhaustedAt !== exhaustedAt || (item.retryAt != null && key.retryAt !== Number(item.retryAt)))) {
+        if (Number.isFinite(exhaustedAt) && exhaustedAt > 0 && exhaustedAt >= standing && (key.exhaustedAt !== exhaustedAt || (item.retryAt != null && key.retryAt !== Number(item.retryAt)))) {
           const retryAt = Number(item.retryAt);
           key.exhaustedAt = exhaustedAt;
           if (item.retryAt != null && Number.isFinite(retryAt) && retryAt > 0) key.retryAt = retryAt;
           else delete key.retryAt;
           key.exhaustedRev = revision;
+          dropAuth(key);
+          changed = true;
+        }
+      } else if (item.authFailedAt != null) {
+        const failures = cleanFailures(item.authFailures);
+        const retryAt = cleanAuthRetryAt(item.authRetryAt, authFailedAt);
+        if (Number.isFinite(authFailedAt) && authFailedAt > 0 && authFailedAt >= standing && (key.authFailedAt !== authFailedAt || key.authFailures !== failures || (key.authRetryAt || 0) !== retryAt)) {
+          dropExhaustion(key);
+          key.authFailedAt = authFailedAt;
+          key.authFailures = failures;
+          if (retryAt) key.authRetryAt = retryAt;
+          else delete key.authRetryAt;
           changed = true;
         }
       } else if (item.recoveredAt != null) {
-        if (key.exhaustedAt && Number.isFinite(recoveredAt) && recoveredAt > key.exhaustedAt && recoveredAt <= now + 60_000) {
-          delete key.exhaustedAt;
-          delete key.retryAt;
-          delete key.exhaustedRev;
+        if (standing && Number.isFinite(recoveredAt) && recoveredAt > standing && recoveredAt <= now + 60_000) {
+          dropExhaustion(key);
+          dropAuth(key);
           changed = true;
         }
       } else if (item.exhaustedAt === null && key.exhaustedAt && revision > (key.exhaustedRev ?? Infinity)) {
@@ -705,16 +775,24 @@ export function publicAccount() {
   //               looked at again by the next real request after a short gap
   //   manual      a person marked it full (and only a person clears that)
   //   retryAt     when a real request may next look at it (null: healthy, or manual)
+  //   authFailed  the gateway refused the key (HTTP 401): not an exhaustion, and it has no
+  //               reset time; authFailedAt/authFailures say when and how many in a row, and
+  //               authRetryAt is the connector's own schedule for the next real try (a
+  //               probing time of ours, never a time the gateway stated)
   const keyView = (k, pool) => ({
     id: k.id,
     hint: hint(k.key),
     addedAt: k.addedAt,
     active: k.id === pool?.activeId,
     exhaustedAt: k.exhaustedAt ?? null,
-    retryAt: k.exhaustedAt && !k.manual ? retryAtOf(k) : null,
+    retryAt: isBlocked(k) && !k.manual ? retryAtOf(k) : null,
     resetAt: k.exhaustedAt && !k.manual && k.retryAt ? k.retryAt : null,
     expiryKnown: Boolean(k.exhaustedAt && !k.manual && k.retryAt && k.retryAt > now),
     manual: Boolean(k.exhaustedAt && k.manual),
+    authFailed: isRefused(k),
+    authFailedAt: isRefused(k) ? k.authFailedAt : null,
+    authFailures: isRefused(k) ? cleanFailures(k.authFailures) : null,
+    authRetryAt: isRefused(k) ? retryAtOf(k) : null,
   });
   const gateways = Object.entries(GATEWAYS).map(([id, g]) => {
     const pool = poolOf(id);
@@ -734,14 +812,14 @@ export function publicAccount() {
       // healthy key). allExhausted/nextRetryAt: the whole gateway is out, and
       // the earliest automatic try.
       keys: keys.map((k) => keyView(k, pool)),
-      allExhausted: keys.length > 0 && keys.every((k) => k.exhaustedAt),
-      nextRetryAt: keys.some((k) => k.exhaustedAt) && keys.every((k) => k.exhaustedAt) && nextTries.length ? Math.min(...nextTries) : null,
+      allExhausted: keys.length > 0 && keys.every(isBlocked),
+      nextRetryAt: keys.some(isBlocked) && keys.every(isBlocked) && nextTries.length ? Math.min(...nextTries) : null,
     };
   });
   // The one list the keys are used in, across gateways: each key with its
   // gateway, place and state. `active` is the first key not known to be out.
   const entries = rotationEntries();
-  const head = entries.find((e) => !e.k.exhaustedAt)?.k.id || null;
+  const head = entries.find((e) => !isBlocked(e.k))?.k.id || null;
   const stated = entries.filter((e) => e.k.exhaustedAt && !e.k.manual && e.k.retryAt && e.k.retryAt > now).map((e) => e.k.retryAt);
   const rotation = {
     revision: rotationRevision(),
@@ -752,9 +830,9 @@ export function publicAccount() {
       gatewayLabel: GATEWAYS[e.gw].label,
       position: i + 1,
       active: e.k.id === head,
-      state: e.k.exhaustedAt ? (e.k.manual ? 'manual' : 'exhausted') : 'ready',
+      state: e.k.exhaustedAt ? (e.k.manual ? 'manual' : 'exhausted') : isRefused(e.k) ? 'auth_failed' : 'ready',
     })),
-    allExhausted: entries.length > 0 && entries.every((e) => e.k.exhaustedAt),
+    allExhausted: entries.length > 0 && entries.every((e) => isBlocked(e.k)),
     nextResetAt: stated.length ? Math.min(...stated) : null,
   };
   const cur = gateways.find((g) => g.id === gw);
@@ -910,10 +988,15 @@ const sigOf = (gw, revision, ids, map = null) => crypto.createHash('sha256').upd
 const tooOld = (err, m) => (/未知的操作/.test(err?.message || '') ? Object.assign(new Error(`「${m?.name || '這台電腦'}」的連接器太舊，不支援 DeepSeek 模式。在那台電腦重新執行連接指令（左下角「連接電腦…」）後再試。`), { status: 409, code: 'connector_old' }) : err);
 
 const noKey = () => Object.assign(new Error('還沒有設定 DeepSeek 的 API key。在「設定」→「DeepSeek…」貼上閘道的 API key。'), { status: 409, code: 'no_key' });
-// Every key is out of quota and none may be looked at yet. Lists each key by
+// Every key is out of use (out of quota, refused by its gateway with HTTP 401, or
+// marked full by a person) and none may be looked at yet. Lists each key by
 // gateway and last four characters (never the key) with its state, says the
 // earliest reset time a gateway STATED, when a real request tries again by
-// itself and what to do right now. `retryAt` is the earliest such try.
+// itself and what to do right now. `retryAt` is the earliest such try. Keys out of
+// quota and keys the gateway refused are counted and listed apart: a refused key
+// is not an empty account, and the time a real request looks at it again is our
+// probing schedule, not a reset time anybody stated. With no refused key the
+// words are the ones this message always had.
 // `entries` are { gw, k } in the order the keys are used in.
 const poolExhausted = (entries) => {
   const now = Date.now();
@@ -922,12 +1005,29 @@ const poolExhausted = (entries) => {
   const retryAt = tries.length ? Math.min(...tries) : NaN;
   const stated = entries.filter((e) => e.k.exhaustedAt && !e.k.manual && e.k.retryAt && e.k.retryAt > now).map((e) => e.k.retryAt);
   const lines = entries.map((e, i) => {
-    const state = e.k.manual ? '手動標記已滿' : e.k.retryAt && e.k.retryAt > now ? `已滿，${when(e.k.retryAt)} 重置` : '已滿，重置時間未知（下一個真實請求會再試）';
+    let state;
+    if (e.k.manual) state = '手動標記已滿';
+    else if (isRefused(e.k)) {
+      const at = retryAtOf(e.k);
+      state = `認證失敗（HTTP 401），上次 ${when(e.k.authFailedAt)}；${at > now ? `${when(at)} 之後的真實請求會再試` : '下一個真實請求會再試'}（這是排好的探測時間，不是供應商給的重置時間）`;
+    } else state = e.k.retryAt && e.k.retryAt > now ? `已滿，${when(e.k.retryAt)} 重置` : '已滿，重置時間未知（下一個真實請求會再試）';
     return `${i + 1}. ${GATEWAYS[e.gw].label} …${hint(e.k.key)}：${state}`;
   });
-  const head = `DeepSeek 的 API key 都已用盡（共 ${entries.length} 把）${stated.length ? `；最早已知的重置時間 ${when(Math.min(...stated))}` : ''}。`;
-  const auto = Number.isFinite(retryAt) ? '有請求時會自動再試：已知重置時間的 key 到時間才試，重置時間未知的 key 下一個真實請求就會再試。' : '沒有可以自動再試的 key（都是手動標記）。';
-  return Object.assign(new Error(`${head}\n${lines.join('\n')}\n${auto}要現在恢復：在「設定」→「DeepSeek…」對其中一把按「重新啟用」（會用一次很小的請求確認額度回來了）或「清除標記」，或加入新的 key。`), {
+  const nAuth = entries.filter((e) => isRefused(e.k)).length;
+  const nManual = entries.filter((e) => e.k.exhaustedAt && e.k.manual).length;
+  const nQuota = entries.filter((e) => e.k.exhaustedAt && !e.k.manual).length;
+  const earliest = stated.length ? `；最早已知的重置時間 ${when(Math.min(...stated))}` : '';
+  const head = nAuth
+    ? `DeepSeek 的 API key 都不能用（共 ${entries.length} 把）：${[`認證失敗（HTTP 401）${nAuth} 把`, nQuota ? `額度用完 ${nQuota} 把` : '', nManual ? `手動標記已滿 ${nManual} 把` : ''].filter(Boolean).join('、')}${earliest}。`
+    : `DeepSeek 的 API key 都已用盡（共 ${entries.length} 把）${earliest}。`;
+  const dur = (ms) => (ms >= MIN_MS ? `${Math.round(ms / MIN_MS)} 分鐘` : `${Math.max(1, Math.round(ms / 1000))} 秒`);
+  const auto = Number.isFinite(retryAt)
+    ? nAuth
+      ? `有請求時會自動再試：認證失敗的 key 在失敗 ${dur(AUTH_FIRST_GAP_MS)}後由真實請求探測，每再失敗一次間隔加倍、最長 ${dur(AUTH_MAX_GAP_MS)}；${nQuota ? '已知重置時間的 key 到時間才試，重置時間未知的 key 下一個真實請求就會再試。' : ''}認證失敗通常是 key 失效、被撤銷或貼錯，請到供應商確認。`
+      : '有請求時會自動再試：已知重置時間的 key 到時間才試，重置時間未知的 key 下一個真實請求就會再試。'
+    : '沒有可以自動再試的 key（都是手動標記）。';
+  const confirm = nAuth ? 'key 能用了' : '額度回來了';
+  return Object.assign(new Error(`${head}\n${lines.join('\n')}\n${auto}要現在恢復：在「設定」→「DeepSeek…」對其中一把按「重新啟用」（會用一次很小的請求確認${confirm}）或「清除標記」，或加入新的 key。`), {
     status: 409,
     code: 'pool_exhausted',
     ...(Number.isFinite(retryAt) ? { retryAt } : {}),
@@ -946,11 +1046,11 @@ function keyForMachine(machineId, gw, pool) {
   const recent = saved.activity?.[machineId];
   if (recent?.gateway === gw) {
     const k = pool.keys.find((x) => x.id === recent.activeId);
-    if (k && !k.exhaustedAt) return k.id;
+    if (k && !isBlocked(k)) return k.id;
   }
   const preferred = pool.keys.find((k) => k.id === pool.activeId);
-  if (preferred && !preferred.exhaustedAt) return preferred.id;
-  return pool.keys.find((k) => !k.exhaustedAt)?.id || firstUsable(pool.keys)?.id || '';
+  if (preferred && !isBlocked(preferred)) return preferred.id;
+  return pool.keys.find((k) => !isBlocked(k))?.id || firstUsable(pool.keys)?.id || '';
 }
 
 // Everything a provision needs, read at the moment it is about to be sent.
@@ -979,7 +1079,11 @@ function planFor(machineId) {
     const map = modelMapFor(gw, ids, new Set(all.map((e) => e.gw)));
     const revision = rotationRevision();
     sig = sigOf(gw, revision, ids, map);
-    const first = all.find((e) => !e.k.exhaustedAt) || all.find((e) => isUsable(e.k, now));
+    const first = all.find((e) => !isBlocked(e.k)) || all.find((e) => isUsable(e.k, now));
+    // A refused key (HTTP 401) goes with its own fields to a connector that says
+    // it reads them (`pool_auth`); one that does not gets the key as it always
+    // did, and is still started on a key the Hub does not know to be refused.
+    const auth = hasCap(machine, 'pool_auth');
     args = {
       gateway: gw,
       models: ids.map(kimiModel),
@@ -989,7 +1093,13 @@ function planFor(machineId) {
         retryMs: retryMs(),
         rotation: 1,
         modelMap: map,
-        keys: all.map((e) => ({ id: e.k.id, apiKey: e.k.key, gateway: e.gw, ...(e.k.exhaustedAt ? { exhaustedAt: e.k.exhaustedAt, ...(e.k.retryAt ? { retryAt: e.k.retryAt } : {}), ...(e.k.manual ? { manual: true } : {}) } : {}) })),
+        keys: all.map((e) => ({
+          id: e.k.id,
+          apiKey: e.k.key,
+          gateway: e.gw,
+          ...(e.k.exhaustedAt ? { exhaustedAt: e.k.exhaustedAt, ...(e.k.retryAt ? { retryAt: e.k.retryAt } : {}), ...(e.k.manual ? { manual: true } : {}) } : {}),
+          ...(auth && isRefused(e.k) ? { authFailedAt: e.k.authFailedAt, authFailures: cleanFailures(e.k.authFailures) } : {}),
+        })),
       },
     };
     return { sig, ids, args, machine };

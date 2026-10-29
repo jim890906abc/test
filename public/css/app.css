@@ -3849,6 +3849,13 @@ pre.tail {
 .ds-key.exhausted {
   border-color: var(--warning);
 }
+/* A key its gateway refused: when it failed and when a real request tries again (the Hub's own probing time). */
+.ds-key-auth {
+  color: var(--ink-secondary);
+  font-size: 12px;
+  line-height: 17px;
+  overflow-wrap: anywhere;
+}
 .ds-key-main {
   display: flex;
   align-items: center;
@@ -5172,7 +5179,8 @@ pre.tail {
 }
 .cluster-head,
 .cluster-memory,
-.cluster-merge {
+.cluster-merge,
+.cluster-cleanup {
   padding: var(--space-4);
   border: 1px solid var(--line);
   border-radius: var(--radius-md);
@@ -5675,6 +5683,95 @@ pre.tail {
   align-items: center;
   gap: var(--space-2);
   text-align: center;
+}
+
+/* clean-up: the confirmation, the result under the merge, and the line on each worker's card */
+.cluster-cleanup-summary {
+  margin: 0;
+  font-size: 13px;
+  line-height: 19px;
+  overflow-wrap: anywhere;
+}
+.cluster-cleanup-kept {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.cluster-cleanup-kept-title {
+  font-size: 12px;
+  line-height: 17px;
+  font-weight: 700;
+}
+.cluster-cleanup-kept ul,
+.cluster-cleanup-list,
+.cluster-cleanup-reasons {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.cluster-cleanup-kept > ul,
+.cluster-cleanup-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.cluster-cleanup-kept > ul > li,
+.cluster-cleanup-list > li {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+  padding: var(--space-2) var(--space-3);
+  border-left: 3px solid var(--success);
+  border-radius: var(--radius-sm);
+  background: var(--window);
+  overflow-wrap: anywhere;
+}
+.cluster-cleanup-kept > ul > li,
+.cluster-cleanup-list > li[data-keeps='true'] {
+  border-left-color: var(--warning);
+}
+.cluster-cleanup-kept code,
+.cluster-cleanup-list code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 18px;
+}
+.cluster-cleanup-list {
+  max-height: 46vh;
+  overflow-y: auto;
+}
+.cluster-cleanup-reasons {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.cluster-cleanup-actions {
+  display: flex;
+  justify-content: flex-start;
+}
+.cluster-worker-cleanup {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-1);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--line);
+}
+.cluster-worker-cleanup[hidden] {
+  display: none;
+}
+/* a reason can be one long unbroken path: it wraps inside the card instead of running past it */
+.cluster-worker-cleanup > *,
+.cluster-cleanup-reasons li {
+  max-width: 100%;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.cluster-cleanup-state {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
 }
 
 /* the note on a main conversation and on a worker, the list of clusters, the sidebar tag */

@@ -1061,6 +1061,10 @@ app.get('/api/sessions/:id/clusters', wrap((req) => clusters.listFor(leafOf(req)
 app.get('/api/clusters/:cid', wrap((req) => clusters.get(req.params.cid)));
 app.post('/api/clusters/:cid/stop', wrap((req) => clusters.stop(req.params.cid)));
 app.post('/api/clusters/:cid/merge', wrap((req) => clusters.merge(req.params.cid)));
+// Clean-up after the work is merged (worktrees, worker branches, sidebar rows); the plan is a dry run for the confirmation.
+app.get('/api/clusters/:cid/cleanup/plan', wrap((req) => clusters.cleanupPlan(req.params.cid)));
+app.post('/api/clusters/:cid/cleanup', wrap((req) => clusters.cleanup(req.params.cid)));
+app.post('/api/clusters/:cid/unhide', wrap((req) => clusters.unhide(req.params.cid, req.body?.sessionId)));
 app.get('/api/clusters/:cid/memory', wrap((req) => clusters.readMemoryOf(req.params.cid)));
 app.post('/api/clusters/:cid/memory', wrap((req) => clusters.appendDecision(req.params.cid, req.body?.text)));
 

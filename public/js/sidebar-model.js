@@ -102,7 +102,11 @@ export function buildRows({ sessions, machines, knownChainNative = new Set(), ch
     out.push({ key, hub: s, machine: machineById(s.machineId), title: s.title || '新對話', cwd: s.cwd, status: s.status, provider, conversationId: cid, origin: originOf(s), deepseek: provider === 'deepseek', claude: provider === 'claude', updatedAt: s.updatedAt, offline: provider !== 'claude' && s.machineId ? !machineById(s.machineId)?.online : false, childWaiting: flag(s) });
     added.add(cid);
   }
-  return out.sort((a, b) => b.updatedAt - a.updatedAt);
+  // A worker the cluster's clean-up took off the sidebar (clusterHidden): its
+  // conversation is kept and the cluster page opens it, but it gets no row. It
+  // stays in the passes above so its native session cannot come back as an
+  // external row.
+  return out.filter((r) => !r.hub?.clusterHidden).sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
 // ------------------------------------------------------------ the two groups

@@ -249,7 +249,7 @@ Kimi 沒有 per-session `secondary_model`／`default_effort`；原生 DeepSeek �
 
 - 新 connector 對外能力為 `pool: 1`，版本至少 `0.10.0`。Hub 傳 `kimi.deepseek.provision { gateway, models, pool: { revision, activeId, keys: [{ id, apiKey, exhaustedAt? }] } }`。Kimi provider 仍叫 `agent-hub-deepseek`，模型 id、thinking 與 CLI 行為不變，但其 base URL 指向 `127.0.0.1` 的 proxy，Kimi config 只放隨機本機憑證，不放整組上游 key。
 - Proxy 只監聽 loopback、只接受自己的本機憑證，上游只允許既有 `GATEWAYS/DS_GATEWAYS` 白名單。不可讓 Hub 指定任意 URL，不可記錄 Authorization、完整 key 或 prompt。Request body 設合理上限；forward 時只重建必要 headers 並替換成目前上游 key。
-- 每一把請求從當時 active key 開始。上游在**尚未向下游送出任何回覆 bytes 前**回覆可辨識的 quota/credit/balance exhausted 錯誤時，將該 key 標記 exhausted，循序試下一把；同一請求每把最多一次。HTTP 402/429 必須搭配明確 quota/credit/balance 訊號，或錯誤 code 明確是 `insufficient_quota/quota_exceeded/usage_limit` 等；普通 401、403 upgrade_required、短暫 rate limit、網路錯、5xx 不得盲目輪替。
+- 每一把請求從當時 active key 開始。上游在**尚未向下游送出任何回覆 bytes 前**回覆可辨識的 quota/credit/balance exhausted 錯誤時，將該 key 標記 exhausted，循序試下一把；同一請求每把最多一次。HTTP 402/429 必須搭配明確 quota/credit/balance 訊號，或錯誤 code 明確是 `insufficient_quota/quota_exceeded/usage_limit` 等；403 upgrade_required、短暫 rate limit、網路錯、5xx 不得盲目輪替。**HTTP 401 例外（用戶 2026-10-29 裁示：任何一把 key 收到 401 就跳到順序上的下一把）**：尚未向下游送出任何 bytes 時，同一請求改用下一把重送；但 401 是「key 被拒絕」，不是額度用盡：key 進獨立狀態 `authFailedAt/authFailures/authRetryAt`、不編造重置時間、不讀 401 回應的文字；距上次失敗 1 分鐘後由真實請求探測，每再失敗一次間隔加倍、上限 60 分鐘（只是探測間隔，不是回升時間），成功即清除並回報證據；人按「清除標記」立即恢復。全部不能用時，訊息要分開列出認證失敗（HTTP 401）與額度用完。
 - 若上游已開始串流，絕不重新執行該請求，避免重複文字、工具或檔案副作用。可標記已確認用盡的 key 供下一請求避開，但原錯誤必須如實往下游傳。全部 key 都用盡時回清楚的錯誤，不無限循環、不假稱成功。
 - 同一 connector 的並行請求共用 key health 與 active pointer，但以 failed key id 做 compare-and-swap，避免多個失敗請求連續跳過多把。不同電腦可有各自實際 active key，Hub 顯示各機最近回報，不強行把它們寫回成同一把。
 - Bridge 持久保存 pool，讓已設定的 DeepSeek 原生對話沿用；connector 必須在線，loopback proxy 才存在，這項依賴要在 UI／README 說明。Kimi 與 Claude 對話不依賴此 proxy。
@@ -259,7 +259,7 @@ Kimi 沒有 per-session `secondary_model`／`default_effort`；原生 DeepSeek �
 
 - 舊單 key 遷移、增加多把、重複 key、刪除、指定使用中、重新啟用、持久化與權限 `0600`；所有公開輸出掃不到完整 key。
 - 兩把以上時第一把回 `insufficient_quota`，同一個串流 request 由第二把成功，Kimi 只看到一個回合、沒有重複工具或使用者訊息；模型與 max 不變。
-- 並行兩個請求對同一把失效 key 不會把第三把無故跳過；所有 key 用盡時有明確錯誤。401、403、短暫 429 rate-limit、網路錯與 5xx 不輪替。
+- 並行兩個請求對同一把失效 key 不會把第三把無故跳過；所有 key 用盡時有明確錯誤。403、短暫 429 rate-limit、網路錯與 5xx 不輪替；401 輪替但記為認證失敗（不是用盡，見上）。
 - 已送出部分 SSE 後不得重試。proxy 不聽非 loopback、不可指定任意外部位址，request 過大有錯誤，日誌與回報無秘密。
 - 真實 Kimi CLI + fake gateway 驗證目前請求自動成功；舊 connector 多 key 明示升級；重啟後 pool 與目前狀態仍在。
 

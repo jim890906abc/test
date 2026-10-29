@@ -123,6 +123,72 @@ export function mergeAvailability(cluster, busy = false) {
   return { ok: true, why: unfinished ? `還有 ${unfinished} 個工作者沒做完；現在合併只會合進它們已 commit 的內容` : '把各工作者的分支合進一個新分支' };
 }
 
+// --------------------------------------------------------------- clean up
+
+// A worker is working: the Hub refuses to clean up under it (409).
+const isWorking = (w) => w?.status === 'running' || w?.status === 'awaiting_permission';
+
+// Everything the last clean-up was meant to take away is gone and every worker
+// that has a conversation is off the sidebar: pressing it again would do nothing.
+function isCleanedUp(cluster) {
+  const results = cluster?.cleanup?.results;
+  if (!Array.isArray(results) || !results.length) return false;
+  const workers = Array.isArray(cluster.workers) ? cluster.workers : [];
+  return results.every((r) => {
+    const deleted = workers.find((w) => w?.sessionId === r.sessionId)?.status === 'deleted';
+    return r.worktree !== 'kept' && r.branch !== 'kept' && (r.hidden || deleted);
+  });
+}
+
+// Whether the 清理 button works, and what to say either way. What the Hub
+// would refuse is not offered; what it would do is said in the tooltip.
+export function cleanupAvailability(cluster, busy = false) {
+  const workers = Array.isArray(cluster?.workers) ? cluster.workers : [];
+  if (!workers.length) return { ok: false, why: '沒有工作者可以清理' };
+  if (busy) return { ok: false, why: '上一個操作還沒完成' };
+  if (cluster.status === 'starting') return { ok: false, why: '工作者還在啟動' };
+  if (cluster.status === 'merging') return { ok: false, why: '正在合併' };
+  if (workers.some(isWorking)) return { ok: false, why: '工作者還在跑，先全部停止' };
+  if (isCleanedUp(cluster)) return { ok: false, why: '已經清理乾淨了：沒有留下可以再清的 worktree、分支或側欄對話' };
+  if (!cluster.isolate) return { ok: true, why: '工作者共用同一個資料夾，沒有 worktree 或分支要清；只把工作者對話從側欄收起' };
+  return {
+    ok: true,
+    why: cluster.merge ? '移除乾淨的 worktree、刪除已經併進合併分支的工作者分支、把工作者對話從側欄收起；有未提交修改或沒併進去的會保留' : '還沒合併過：只清掉沒有任何新 commit 的 worktree 與分支；有 commit 的會保留',
+  };
+}
+
+// GET /clusters/:id/cleanup/plan laid out for the confirmation: per worker what
+// will be done and what is kept (with why), and the counts of what will really
+// happen (a worktree that was already gone is not "removed" by this).
+export function cleanupPlanView(plan, workers = []) {
+  const results = Array.isArray(plan?.results) ? plan.results : [];
+  const acts = new Map((Array.isArray(plan?.actions) ? plan.actions : []).map((a) => [a.sessionId, a]));
+  const titleOf = (sid) => (Array.isArray(workers) ? workers : []).find((w) => w?.sessionId === sid)?.title || sid;
+  const rows = results.map((r) => {
+    const a = acts.get(r.sessionId) || {};
+    return {
+      sessionId: r.sessionId,
+      title: titleOf(r.sessionId),
+      will: [a.removeWorktree ? '移除 worktree' : null, a.deleteBranch ? '刪除分支' : null, a.hide ? '從側欄收起對話' : null].filter(Boolean),
+      keeps: r.worktree === 'kept' || r.branch === 'kept',
+      reasons: Array.isArray(r.reasons) ? r.reasons : [],
+    };
+  });
+  const count = (key) => [...acts.values()].filter((a) => a[key]).length;
+  const totals = { worktrees: count('removeWorktree'), branches: count('deleteBranch'), hidden: count('hide'), kept: rows.filter((r) => r.keeps).length };
+  return { rows, totals, nothing: !totals.worktrees && !totals.branches && !totals.hidden };
+}
+
+// One worker's entry of cluster.cleanup.results in the words of the screen. A
+// worker with no worktree of its own (a shared folder) has nothing to say about one.
+export function cleanupResultView(r) {
+  if (!r) return null;
+  const part = (state, done) => (state === 'kept' ? { text: '保留', kept: true } : state === done ? { text: done === 'removed' ? '已移除' : '已刪除', kept: false } : null);
+  const worktree = part(r.worktree, 'removed');
+  const branch = part(r.branch, 'deleted');
+  return { worktree, branch, hidden: Boolean(r.hidden), reasons: Array.isArray(r.reasons) ? r.reasons : [], kept: Boolean(worktree?.kept || branch?.kept) };
+}
+
 // The most one decision may be (the Hub answers 400 above it).
 export const MEMORY_MAX_CHARS = 20_000;
 

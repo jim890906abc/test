@@ -144,6 +144,8 @@ export function summarize(s) {
     // switch of the main conversation does not hide them).
     clusterId: s.clusterId || null,
     clusterRole: s.clusterRole || null,
+    // Taken off the sidebar by the cluster's clean-up (the conversation is kept).
+    clusterHidden: Boolean(s.clusterHidden),
     clusterIds: clusterIdsOf(s),
     // A sub-agent is hidden from the sidebar, so a permission it waits on would
     // be invisible: the conversation that owns it carries the flag.
@@ -1670,7 +1672,7 @@ async function createContinuationNode(old, target, { machineId, reason = '使用
     state: { ...(old.state?.subagentExplicit ? { subagentExplicit: true } : {}) },
     // A worker of a cluster (叢集) is still one in its new node: its tag and note
     // on the screen, and the part of the cluster memory it has been told so far.
-    ...(old.clusterId ? { clusterId: old.clusterId, clusterRole: old.clusterRole || 'worker', ...(old.clusterMemo ? { clusterMemo: { ...old.clusterMemo } } : {}) } : {}),
+    ...(old.clusterId ? { clusterId: old.clusterId, clusterRole: old.clusterRole || 'worker', ...(old.clusterMemo ? { clusterMemo: { ...old.clusterMemo } } : {}), ...(old.clusterHidden ? { clusterHidden: true } : {}) } : {}),
   };
   let node = null;
   let native = null;

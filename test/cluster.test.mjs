@@ -195,8 +195,10 @@ test('a brief cluster in a git repo: a worker per task, each in a worktree and a
 
   // Status, the list, the stream.
   const got = await getCluster(c.id);
-  assert.deepEqual(Object.keys(got).sort(), ['createdAt', 'id', 'isolate', 'memory', 'merge', 'mode', 'parentId', 'status', 'swarm', 'warnings', 'workers']);
-  assert.deepEqual(Object.keys(got.workers[0]).sort(), ['branch', 'finishedAt', 'progress', 'sessionId', 'status', 'swarm', 'task', 'title', 'worktree']);
+  assert.deepEqual(Object.keys(got).sort(), ['cleanup', 'createdAt', 'id', 'isolate', 'memory', 'merge', 'mode', 'parentId', 'status', 'swarm', 'warnings', 'workers']);
+  assert.deepEqual(Object.keys(got.workers[0]).sort(), ['branch', 'finishedAt', 'hidden', 'progress', 'sessionId', 'status', 'swarm', 'task', 'title', 'worktree']);
+  assert.equal(got.cleanup, null, 'nothing has been cleaned up yet');
+  assert.equal(got.workers[0].hidden, false);
   assert.deepEqual(Object.keys(got.memory).sort(), ['bytes', 'path', 'updatedAt']);
   assert.equal(got.merge, null);
   assert.deepEqual((await hub.api('GET', `/sessions/${parent.id}/clusters`)).map((x) => x.id), [c.id]);

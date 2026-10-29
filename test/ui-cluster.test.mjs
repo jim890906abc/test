@@ -61,6 +61,7 @@ const SCRIPT = `(() => {
     const F = window.__fake;
     let m;
     if (u === '/api/machines' && F.online !== null) return reply(200, [{ id: 'm1', name: 'box', online: F.online, kimi: { available: F.online } }]);
+    if ((m = u.match(/^\\/api\\/clusters\\/([\\w-]+)\\/cleanup\\/plan$/))) return hit(F.plans || {}, m[1]);
     if ((m = u.match(/^\\/api\\/clusters\\/([\\w-]+)\\/memory$/))) return hit(F.memory, m[1]);
     if ((m = u.match(/^\\/api\\/clusters\\/([\\w-]+)$/))) return hit(F.clusters, m[1]);
     if ((m = u.match(/^\\/api\\/sessions\\/([\\w-]+)\\/clusters$/))) return hit(F.parents, m[1]);
@@ -1157,4 +1158,258 @@ test('the merge result and a banner fit too, at a phone\'s width', { skip }, asy
   assert.ok(banner.left >= 0 && banner.right <= banner.vw, JSON.stringify(banner));
   assert.ok(banner.h <= 72, `the banner stays a banner: ${banner.h}px`);
   if (SHOTS) await b.shot(path.join(SHOTS, 'banner-390-light.png'));
+});
+
+// ---------------------------------------------------------------- clean up
+//
+// After a merge the Hub cleans up by itself, and 清理 does it by hand. What the
+// page owes the person: ask first and list what will be removed and what kept
+// (and why); show what was done, per worker; put a hidden conversation back;
+// and never offer what the Hub would refuse.
+
+const OKS = [1, 2, 3].map((n) => ({ sessionId: `s_w${n}`, branch: `cluster/${CID}/w${n}`, ok: true, conflicts: [] }));
+const DONE = (patch = {}) => CLUSTER({
+  status: 'done',
+  workers: [1, 2, 3].map((n) => W(n, { status: 'idle', finishedAt: T0 - 9000 + n * 1000, swarm: false, progress: `第 ${n} 區做完了` })),
+  merge: { branch: `cluster/${CID}/merged`, at: T0 - 3000, results: OKS },
+  ...patch,
+});
+const KEPT_WHY = ['有 2 項未提交的修改或未追蹤的檔案', '分支還被 worktree 使用中'];
+const RESULTS = [
+  { sessionId: 's_w1', worktree: 'removed', branch: 'deleted', hidden: true, reasons: [] },
+  { sessionId: 's_w2', worktree: 'kept', branch: 'kept', hidden: false, reasons: KEPT_WHY },
+  { sessionId: 's_w3', worktree: 'removed', branch: 'deleted', hidden: true, reasons: [] },
+];
+const CLEANED = (patch = {}) => DONE({
+  workers: [1, 2, 3].map((n) => W(n, { status: 'idle', finishedAt: T0 - 9000 + n * 1000, swarm: false, progress: `第 ${n} 區做完了`, hidden: n !== 2 })),
+  cleanup: { at: T0 - 2000, auto: true, results: RESULTS },
+  ...patch,
+});
+const PLAN = {
+  dryRun: true,
+  results: RESULTS,
+  actions: [
+    { sessionId: 's_w1', removeWorktree: true, deleteBranch: true, hide: true },
+    { sessionId: 's_w2', removeWorktree: false, deleteBranch: false, hide: false },
+    { sessionId: 's_w3', removeWorktree: true, deleteBranch: true, hide: true },
+  ],
+};
+const cleanupBtn = () => b.eval(`(() => { const e = document.querySelector('[data-action="cleanup"]'); return e ? { disabled: e.disabled, title: e.title, text: e.innerText.trim() } : null; })()`);
+const dialogOf = () => b.eval(`document.querySelector('.dialog')?.innerText.replace(/[ \\t]+/g, ' ') ?? ''`);
+
+test('清理 is offered when nothing is working and says what it will do; while a worker works it is off and says to stop first', { skip }, async () => {
+  await openPage();
+  let btn = await cleanupBtn();
+  assert.ok(btn, 'the button is on the page');
+  assert.equal(btn.disabled, true);
+  assert.match(btn.title, /工作者還在跑，先全部停止/);
+
+  await openPage(fullFake({ clusters: { [CID]: DONE() } }));
+  btn = await cleanupBtn();
+  assert.equal(btn.disabled, false);
+  assert.match(btn.title, /移除乾淨的 worktree.*收起.*保留/);
+  assert.equal(btn.text, '清理');
+
+  await openPage(fullFake({ clusters: { [CID]: DONE({ merge: null }) } }));
+  assert.match((await cleanupBtn()).title, /還沒合併過.*沒有任何新 commit.*有 commit 的會保留/, 'before a merge it says what is different');
+
+  // Cleaned already, nothing left over: nothing to press.
+  await openPage(fullFake({ clusters: { [CID]: CLEANED({ cleanup: { at: T0, auto: true, results: RESULTS.map((r) => ({ ...r, worktree: 'removed', branch: 'deleted', hidden: true, reasons: [] })) }, workers: [1, 2, 3].map((n) => W(n, { status: 'idle', finishedAt: T0, hidden: true })) }) } }));
+  btn = await cleanupBtn();
+  assert.equal(btn.disabled, true);
+  assert.match(btn.title, /已經清理乾淨/);
+});
+
+test('清理 asks first, listing what it will remove and what it keeps with the reason and the path; cancelling sends nothing; confirming cleans THIS cluster and the result is drawn', { skip }, async () => {
+  const cleaned = CLEANED({ cleanup: { at: T0, auto: false, results: RESULTS } });
+  await openPage(fullFake({ clusters: { [CID]: DONE() }, plans: { [CID]: PLAN } }));
+  assert.equal(await b.eval(`document.querySelector('.cluster-cleanup')`), null, 'no result before anything was done');
+  await ui.clearCalls();
+  await ui.answer('POST', `/api/clusters/${CID}/cleanup`, 200, { cluster: cleaned });
+  await b.click('[data-action="cleanup"]');
+  await b.waitFor(`document.querySelector('.dialog .cluster-cleanup-list')`);
+  assert.ok((await b.eval(`window.__gets`)).includes(`/api/clusters/${CID}/cleanup/plan`), 'the Hub was asked what it would do');
+  assert.equal((await callsTo(/\/cleanup$/)).length, 0, 'and nothing is done before the answer');
+  const ask = await dialogOf();
+  assert.match(ask, /要清理這個叢集嗎/);
+  assert.match(ask, /移除 2 個 worktree/);
+  assert.match(ask, /刪除 2 個分支/);
+  assert.match(ask, /收起 2 個工作者對話/);
+  assert.match(ask, /保留 1 個工作者/);
+  assert.ok(ask.includes(`cluster/${CID}/merged`), 'the merged branch is said to stay');
+  assert.match(ask, /叢集記憶/, 'and the memory');
+  assert.match(ask, /對話不會刪/, 'the conversations are not deleted');
+  assert.match(ask, /node_modules/, 'ignored files go with the worktree: said');
+  const rows = await b.eval(`[...document.querySelectorAll('.dialog .cluster-cleanup-list > li')].map((li) => ({ session: li.dataset.session, keeps: li.dataset.keeps, text: li.innerText.replace(/\\s+/g, ' ').trim() }))`);
+  assert.deepEqual(rows.map((r) => [r.session, r.keeps]), [['s_w1', 'false'], ['s_w2', 'true'], ['s_w3', 'false']]);
+  assert.match(rows[0].text, /移除 worktree.*刪除分支.*從側欄收起對話/);
+  assert.match(rows[1].text, /保留/);
+  assert.ok(rows[1].text.includes('有 2 項未提交的修改或未追蹤的檔案'), 'why it is kept');
+  assert.ok(rows[1].text.includes(`/home/user/proj-cluster-${CID}/w2`), 'and where it is');
+  if (SHOTS) await b.shot(path.join(SHOTS, 'cleanup-confirm-1280-light.png'));
+
+  // Cancel: nothing is sent.
+  await b.click('.dialog .dialog-actions .om-btn:first-child');
+  await b.waitFor(`!document.querySelector('.dialog')`);
+  assert.equal((await callsTo(/\/cleanup$/)).length, 0);
+
+  await b.click('[data-action="cleanup"]');
+  await b.waitFor(`document.querySelector('.dialog .cluster-cleanup-list')`);
+  await confirmLast();
+  await b.waitFor(`document.querySelector('.cluster-cleanup')`);
+  assert.deepEqual((await callsTo(/\/cleanup$/)).map((c) => [c.url, c.body]), [[`/api/clusters/${CID}/cleanup`, {}]]);
+
+  // The result: the summary, who was kept and why; each card says its own.
+  const sec = await b.eval(`document.querySelector('.cluster-cleanup').innerText.replace(/\\s+/g, ' ')`);
+  assert.match(sec, /清理結果/);
+  assert.match(sec, /手動/);
+  assert.match(sec, /2 個 worktree 已移除/);
+  assert.match(sec, /2 個分支已刪除/);
+  assert.match(sec, /2 個對話已從側欄收起/);
+  assert.ok(sec.includes('有 2 項未提交的修改或未追蹤的檔案') && sec.includes(`/home/user/proj-cluster-${CID}/w2`), 'the kept worker: reason and path');
+  const cards = await b.eval(`[...document.querySelectorAll('.cluster-worker')].map((c) => ({ session: c.dataset.session, worktree: c.querySelector('[data-field="cleanup-worktree"]')?.innerText.trim() ?? null, branch: c.querySelector('[data-field="cleanup-branch"]')?.innerText.trim() ?? null, hidden: c.querySelector('[data-field="cleanup-hidden"]')?.innerText.trim() ?? null, unhide: Boolean(c.querySelector('[data-action="unhide"]')), reasons: [...c.querySelectorAll('.cluster-cleanup-reasons li')].map((l) => l.innerText.trim()) }))`);
+  assert.deepEqual(cards.map((c) => [c.session, c.worktree, c.branch, c.hidden, c.unhide]), [
+    ['s_w1', 'worktree 已移除', '分支已刪除', '已從側欄收起', true],
+    ['s_w2', 'worktree 保留', '分支保留', '在側欄', false],
+    ['s_w3', 'worktree 已移除', '分支已刪除', '已從側欄收起', true],
+  ]);
+  assert.deepEqual(cards[1].reasons, KEPT_WHY);
+  assert.equal(await b.eval(`document.querySelector('[data-action="open-worker"]') !== null`), true, 'the conversation can still be opened from its card');
+  if (SHOTS) {
+    await b.eval(`document.querySelector('.cluster-cleanup').scrollIntoView()`);
+    await b.shot(path.join(SHOTS, 'cleanup-result-1280-light.png'));
+  }
+  await ui.stopAnswering();
+});
+
+test('the merge confirmation says that a merge in which every worker went in cleans up by itself, and what stays', { skip }, async () => {
+  await openPage(fullFake({ clusters: { [CID]: DONE({ merge: null }) } }));
+  await b.click('[data-action="merge"]');
+  await b.waitFor(`document.querySelector('.dialog')`);
+  const ask = await dialogOf();
+  assert.match(ask, /全部.*合併成功.*自動清理/);
+  assert.match(ask, /未提交|沒合進去/, 'and what it will not touch');
+  await b.click('.dialog .dialog-actions .om-btn:first-child');
+});
+
+test('a plan with nothing to do says so and cannot be confirmed; a refusal of the plan or of the clean-up is shown where the buttons are', { skip }, async () => {
+  const nothing = { dryRun: true, results: [RESULTS[1]], actions: [PLAN.actions[1]] };
+  await openPage(fullFake({ clusters: { [CID]: DONE() }, plans: { [CID]: nothing } }));
+  await b.click('[data-action="cleanup"]');
+  await b.waitFor(`document.querySelector('.dialog .cluster-cleanup-list')`);
+  assert.match(await dialogOf(), /現在沒有可以清理的東西/);
+  assert.equal(await b.eval(`document.querySelector('.dialog .dialog-actions .om-btn:last-child').disabled`), true, 'nothing to confirm');
+  await b.click('.dialog .dialog-actions .om-btn:first-child');
+  await b.waitFor(`!document.querySelector('.dialog')`);
+
+  // The Hub refuses the plan (a worker started again, the computer went off).
+  await openPage(fullFake({ clusters: { [CID]: DONE() }, plans: { [CID]: { __error: { status: 409, message: '工作者還在跑，先全部停止' } } } }));
+  await b.click('[data-action="cleanup"]');
+  await b.waitFor(`document.querySelector('.cluster-head .cluster-error')`);
+  assert.equal(await b.eval(`document.querySelector('.cluster-head .cluster-error').innerText.trim()`), '工作者還在跑，先全部停止');
+  assert.equal(await b.eval(`Boolean(document.querySelector('.dialog'))`), false, 'no dialog for a refusal');
+
+  // The plan is fine; the clean-up itself is refused.
+  await openPage(fullFake({ clusters: { [CID]: DONE() }, plans: { [CID]: PLAN } }));
+  await ui.answer('POST', `/api/clusters/${CID}/cleanup`, 409, { error: '機器「box」目前離線：請在那台機器上執行連接器' });
+  await b.click('[data-action="cleanup"]');
+  await b.waitFor(`document.querySelector('.dialog .cluster-cleanup-list')`);
+  await confirmLast();
+  await b.waitFor(`document.querySelector('.cluster-head .cluster-error')`);
+  assert.match(await b.eval(`document.querySelector('.cluster-head .cluster-error').innerText`), /目前離線/);
+  assert.equal(await b.eval(`document.querySelector('.cluster-cleanup')`), null, 'and nothing is drawn as done');
+  await ui.stopAnswering();
+});
+
+test('放回側欄: one worker or all, sent to THIS cluster, and the card and the result follow what the Hub answers', { skip }, async () => {
+  await openPage(fullFake({ clusters: { [CID]: CLEANED() } }));
+  await ui.clearCalls();
+  const afterOne = CLEANED({ workers: [1, 2, 3].map((n) => W(n, { status: 'idle', finishedAt: T0 - 9000 + n * 1000, swarm: false, hidden: n === 3 })), cleanup: { at: T0 - 2000, auto: true, results: RESULTS.map((r) => ({ ...r, hidden: r.sessionId === 's_w3' })) } });
+  await ui.answer('POST', `/api/clusters/${CID}/unhide`, 200, { cluster: afterOne });
+  await b.click('.cluster-worker[data-session="s_w1"] [data-action="unhide"]');
+  await b.waitFor(`document.querySelector('.cluster-worker[data-session="s_w1"] [data-field="cleanup-hidden"]').innerText.trim() === '在側欄'`);
+  assert.deepEqual((await callsTo(/\/unhide$/)).map((c) => [c.url, c.body]), [[`/api/clusters/${CID}/unhide`, { sessionId: 's_w1' }]]);
+  assert.equal(await b.eval(`Boolean(document.querySelector('.cluster-worker[data-session="s_w1"] [data-action="unhide"]'))`), false, 'nothing left to put back on that card');
+  assert.equal(await b.eval(`document.querySelector('.cluster-worker[data-session="s_w3"] [data-field="cleanup-hidden"]').innerText.trim()`), '已從側欄收起');
+  assert.match(await b.eval(`document.querySelector('.cluster-cleanup').innerText`), /1 個對話已從側欄收起/);
+  await ui.stopAnswering();
+
+  // All at once, from the result.
+  await ui.clearCalls();
+  const none = CLEANED({ workers: [1, 2, 3].map((n) => W(n, { status: 'idle', finishedAt: T0, swarm: false, hidden: false })), cleanup: { at: T0 - 2000, auto: true, results: RESULTS.map((r) => ({ ...r, hidden: false })) } });
+  await ui.answer('POST', `/api/clusters/${CID}/unhide`, 200, { cluster: none });
+  await b.click('.cluster-cleanup [data-action="unhide-all"]');
+  await b.waitFor(`!document.querySelector('.cluster-cleanup [data-action="unhide-all"]')`);
+  assert.deepEqual((await callsTo(/\/unhide$/)).map((c) => [c.url, c.body]), [[`/api/clusters/${CID}/unhide`, {}]]);
+  assert.match(await b.eval(`document.querySelector('.cluster-cleanup').innerText`), /0 個對話已從側欄收起/);
+  await ui.stopAnswering();
+});
+
+test('the sidebar has no row for a worker the clean-up hid, and gets it back live when it is put back; the worker\'s own page says where it went', { skip }, async () => {
+  await setFake({}, { s_ds: { clusterId: CID, clusterRole: 'worker', clusterHidden: true } });
+  await ui.openApp('#/s/s_kimi');
+  await b.waitFor(`document.querySelector('.composer-input')`);
+  assert.equal(await b.eval(`[...document.querySelectorAll('.side-row')].some((r) => r.innerText.includes('DeepSeek chat'))`), false, 'no row for the hidden worker');
+  assert.equal(await b.eval(`[...document.querySelectorAll('.side-row')].some((r) => r.innerText.includes('Kimi'))`), true, 'the others are there');
+
+  // Its own page still opens (from the cluster page's 開啟對話) and says why it is not in the list.
+  await ui.openApp('#/s/s_ds');
+  await b.waitFor(`document.querySelector('.cluster-worker-note')`);
+  assert.match(await b.eval(`document.querySelector('.cluster-worker-note').innerText`), /已從側欄收起/);
+  assert.equal(await b.eval(`[...document.querySelectorAll('.side-row')].some((r) => r.innerText.includes('DeepSeek chat'))`), false, 'opened, still not listed');
+
+  // Put back: the Hub says so down the socket, and the row is there without a reload.
+  await b.eval(`(async () => { const s = await (await fetch('/api/sessions/s_ds')).json(); window.__emit({ t: 'session', session: { ...s, clusterHidden: false } }); })()`);
+  await b.waitFor(`[...document.querySelectorAll('.side-row')].some((r) => r.innerText.includes('DeepSeek chat'))`);
+  assert.equal(await b.eval(`document.querySelector('.cluster-worker-note').innerText.includes('已從側欄收起')`), false, 'the note is gone with it');
+});
+
+test('the clean-up result and the confirmation fit a phone, and nothing in them is hard to read in either look', { skip }, async () => {
+  const cleaned = CLEANED({ cleanup: { at: T0, auto: true, results: RESULTS.map((r) => (r.sessionId === 's_w2' ? { ...r, reasons: [...r.reasons, 'git 拒絕移除 worktree：fatal: cannot remove a locked working tree, lock reason: /very/long/path/that/goes/on/and/on/and/on/to/test/wrapping'] } : r)) } });
+  const SEL = [
+    ['result title', '.cluster-cleanup .cluster-section-title'],
+    ['result summary', '.cluster-cleanup-summary'],
+    ['kept reason', '.cluster-cleanup-kept .om-field__help, .cluster-cleanup-kept li'],
+    ['card chip', '.cluster-worker-cleanup .om-badge'],
+    ['card reason', '.cluster-cleanup-reasons li'],
+  ];
+  for (const cell of CELLS) {
+    await setFake(fullFake({ clusters: { [CID]: cleaned }, plans: { [CID]: PLAN } }));
+    await openCell(cell, `#/cluster/${CID}`);
+    await b.waitFor(`document.querySelector('.cluster-cleanup') && document.querySelectorAll('.cluster-worker-cleanup').length === 3`);
+    let fit = await b.eval(STICKS_OUT('.cluster-page'));
+    assert.deepEqual(fit, { out: [], page: 0, box: 0 }, `${cell.name} page: ${JSON.stringify(fit)}`);
+    const bad = [];
+    for (const [what, sel] of SEL) {
+      const rs = await b.eval(`[...document.querySelectorAll(${JSON.stringify(sel)})].slice(0, 6).map((e) => (${CONTRAST_JS})(e))`);
+      assert.ok(rs.length, `${what} is on the screen`);
+      for (const r of rs) if (r.ratio < AA) bad.push(`${cell.name} ${what} ${r.ratio.toFixed(2)}:1`);
+    }
+    assert.deepEqual(bad, []);
+    // The confirmation.
+    await b.eval(`document.querySelector('[data-action="cleanup"]').scrollIntoView()`);
+    const enabled = await b.eval(`!document.querySelector('[data-action="cleanup"]').disabled`);
+    if (enabled) {
+      await b.click('[data-action="cleanup"]');
+      await b.waitFor(`document.querySelector('.dialog .cluster-cleanup-list')`);
+      fit = await b.eval(STICKS_OUT('.dialog'));
+      assert.deepEqual(fit, { out: [], page: 0, box: 0 }, `${cell.name} confirmation: ${JSON.stringify(fit)}`);
+      const reach = await b.eval(`(() => { const e = document.querySelector('.dialog .dialog-actions .om-btn:last-child'); e.scrollIntoView(); const r = e.getBoundingClientRect(); const d = document.querySelector('.dialog').getBoundingClientRect(); return { inside: r.width > 0 && r.left >= d.left && r.right <= d.right + 1, h: Math.round(r.height) }; })()`);
+      assert.ok(reach.inside && reach.h <= 40, `${cell.name}: the buttons are reachable and whole: ${JSON.stringify(reach)}`);
+      const dbad = [];
+      for (const sel of ['.dialog .om-alert__title', '.dialog .cluster-cleanup-summary', '.dialog .cluster-cleanup-list li', '.dialog .cluster-cleanup-note']) {
+        const rs = await b.eval(`[...document.querySelectorAll(${JSON.stringify(sel)})].slice(0, 4).map((e) => (${CONTRAST_JS})(e))`);
+        assert.ok(rs.length, `${sel} is on the screen`);
+        for (const r of rs) if (r.ratio < AA) dbad.push(`${cell.name} ${sel} ${r.ratio.toFixed(2)}:1`);
+      }
+      assert.deepEqual(dbad, []);
+      if (SHOTS) await b.shot(path.join(SHOTS, `cleanup-confirm-${cell.name.replace(' ', '-')}.png`));
+      await b.click('.dialog .dialog-actions .om-btn:first-child');
+      await b.waitFor(`!document.querySelector('.dialog')`);
+    }
+    if (SHOTS) {
+      await b.eval(`document.querySelector('.cluster-cleanup').scrollIntoView()`);
+      await b.shot(path.join(SHOTS, `cleanup-result-${cell.name.replace(' ', '-')}.png`));
+    }
+  }
 });

@@ -3679,9 +3679,11 @@ async function deepseekDialog() {
     );
   };
   // How a key stands, in words; a reset time is shown only when its gateway
-  // stated one, and "unknown" is said as unknown.
+  // stated one, and "unknown" is said as unknown. A key its gateway refused
+  // (HTTP 401) is not a key out of quota: it says so, and has no reset time.
   const keyState = (k) => {
     if (k.state === 'manual' || k.manual) return { text: '手動標記已滿', badge: 'warning' };
+    if (k.state === 'auth_failed' || k.authFailed) return { text: '認證失敗（HTTP 401）', badge: 'danger' };
     if (k.state === 'exhausted' || k.exhaustedAt) {
       if (k.expiryKnown && k.resetAt) return { text: `已滿，${new Date(k.resetAt).toLocaleString()} 重置`, badge: 'warning' };
       if (k.resetAt) return { text: '已滿，閘道說的重置時間已過（下一個真實請求會再試）', badge: 'warning' };
@@ -3689,10 +3691,27 @@ async function deepseekDialog() {
     }
     return k.active ? { text: '使用中', badge: 'success' } : { text: '待命', badge: '' };
   };
+  // When a key the gateway refused is looked at again, said as ours: a refused key
+  // has no reset time (the gateway said nothing about one), only the Hub's probing.
+  const authNote = (k) => {
+    const next = k.authRetryAt && k.authRetryAt > Date.now() ? `下次由真實請求再試的時間 ${new Date(k.authRetryAt).toLocaleString()}` : '下次真實請求就會再試';
+    const times = k.authFailures > 1 ? `，連續 ${k.authFailures} 次` : '';
+    return `上次失敗 ${new Date(k.authFailedAt).toLocaleString()}${times}；${next}（這是 Agent Hub 排的探測時間，不是供應商給的重置時間）`;
+  };
   // Every key out: say whether any gateway named a time, and how to get going.
+  // Keys the gateway refused (HTTP 401), keys out of quota and keys marked by hand
+  // are counted apart; with no refused key the words are the ones it always had.
   const allOutText = () => {
     const keys = rot();
     const r = acc.rotation || {};
+    const refused = keys.filter((k) => k.state === 'auth_failed' || k.authFailed);
+    if (refused.length) {
+      const manual = keys.filter((k) => k.state === 'manual' || k.manual);
+      const quota = keys.filter((k) => k.state === 'exhausted');
+      const parts = [`認證失敗（HTTP 401）${refused.length} 把`, quota.length ? `額度用完 ${quota.length} 把` : '', manual.length ? `手動標記已滿 ${manual.length} 把` : ''].filter(Boolean);
+      const stated = quota.length ? (r.nextResetAt ? `額度用完的 key，閘道說過最早的重置時間是 ${new Date(r.nextResetAt).toLocaleString()}。` : '額度用完的 key 沒有任何閘道說過重置時間。') : '';
+      return `全部 ${keys.length} 把 key 都不能用：${parts.join('、')}。${stated}認證失敗的 key 由真實請求在失敗 1 分鐘後探測，每再失敗一次間隔加倍、最長 60 分鐘；這是 Agent Hub 排的探測時間，不是供應商給的重置時間，通常是 key 失效或被撤銷，請到供應商確認。現在要恢復：對那把按「重新啟用」（會真的送一次很小的請求確認）或「清除標記」，或加入新的 key。`;
+    }
     const head = `全部 ${keys.length} 把 key 都用盡了。`;
     if (keys.every((k) => k.state === 'manual')) return `${head}都是你手動標記的，不會自動再試；按「清除標記」才會再用，或加入新的 key。`;
     const when = r.nextResetAt ? `閘道說過最早的重置時間是 ${new Date(r.nextResetAt).toLocaleString()}。` : '沒有任何閘道說過重置時間。';
@@ -3784,6 +3803,7 @@ async function deepseekDialog() {
                 h('span', { class: `om-badge${st.badge ? ` om-badge--${st.badge}` : ''} ds-key-state` }, st.text),
                 h('span', { class: 'ds-key-added', title: k.addedAt ? new Date(k.addedAt).toLocaleString() : '' }, k.addedAt ? `加入於 ${relTime(k.addedAt)}` : ''),
               ),
+              k.state === 'auth_failed' || k.authFailed ? h('div', { class: 'ds-key-auth' }, authNote(k)) : null,
               h(
                 'div',
                 { class: 'ds-key-actions' },
@@ -3810,7 +3830,7 @@ async function deepseekDialog() {
       rows.length
         ? rows.map((a) => {
             const key = rot().find((k) => k.id === a.activeId);
-            const out = key && key.state !== 'ready' ? (key.state === 'manual' ? '（手動標記已滿）' : '（額度用盡）') : '';
+            const out = key && key.state !== 'ready' ? (key.state === 'manual' ? '（手動標記已滿）' : key.state === 'auth_failed' ? '（認證失敗 HTTP 401）' : '（額度用盡）') : '';
             return h(
               'div',
               { class: 'ds-machine' },

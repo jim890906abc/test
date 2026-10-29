@@ -21,11 +21,15 @@ const FILE = path.join(DATA_DIR, 'machines.json');
 //                    reports them ({ t: 'deepseek.requests' }, server/timing.js)
 //   pool_measure     `kimi.deepseek.measure`: how many requests one key takes at once
 //   event_timing     the journal's step frames carry the model's timing
+//   pool_auth        the DeepSeek proxy moves a request on from a key its gateway refuses (HTTP 401),
+//                    keeps it aside as "refused" (authFailedAt, authFailures, authRetryAt; never
+//                    "exhausted") and probes it again with real requests at doubling gaps; the Hub
+//                    sends those fields only to a connector that says so
 // A connector that sends no `capabilities` has none (an empty array): the
 // version string is never used to guess. The first connector that sends the
 // field is CAPABILITY_CONNECTOR_VERSION; older ones must be reconnected with
 // the current command (a message about "upgrade" can name this version).
-export const CAPABILITIES = ['pool', 'pool_cross', 'secondary_model', 'broker', 'handoff', 'pool_timing', 'pool_measure', 'event_timing'];
+export const CAPABILITIES = ['pool', 'pool_cross', 'secondary_model', 'broker', 'handoff', 'pool_timing', 'pool_measure', 'event_timing', 'pool_auth'];
 export const CAPABILITY_CONNECTOR_VERSION = '0.11.0';
 const cleanCapabilities = (raw) => (Array.isArray(raw) ? [...new Set(raw.filter((x) => typeof x === 'string' && /^[a-z][a-z0-9_]{0,31}$/.test(x)))].slice(0, 16) : []);
 const machines = new Map(); // id -> machine
