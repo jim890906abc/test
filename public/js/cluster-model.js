@@ -149,9 +149,19 @@ export const TIMING_PARTS = [
   ['rateLimitWaitMs', '等限流'],
   ['compactMs', '壓縮'],
 ];
-const FIELD_LABELS = { wallMs: '總時間', ...Object.fromEntries(TIMING_PARTS), turns: '回合', requests: '請求', http429: '429 次數', subagents: '子代理', since: '起算時間' };
+const FIELD_LABELS = { wallMs: '總時間', ...Object.fromEntries(TIMING_PARTS), turns: '回合', requests: '請求', http429: '429 次數', subagents: '子代理', since: '起算時間', requestsSince: '請求紀錄起算' };
 
 const isCount = (v) => typeof v === 'number' && Number.isFinite(v) && v >= 0;
+const isMoment = (v) => typeof v === 'number' && Number.isFinite(v) && v > 0 && !Number.isNaN(new Date(v).getTime());
+
+// A moment the Hub sent (epoch milliseconds) as a local date and time to the
+// second, "2026-10-29 14:03:22". The number written as a date, nothing else.
+export function fmtStamp(ms) {
+  if (!isMoment(ms)) return null;
+  const d = new Date(ms);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
 
 // 59.9 秒, 3 分 12 秒, 1 小時 2 分. Never rounds up into the next unit.
 export function fmtMs(ms) {
@@ -180,11 +190,14 @@ function readUnmeasured(list) {
 
 // GET /api/sessions/:id/timing laid out for the bar. `error`: the request failed.
 // → { segments: [{ key, label, ms|null, share|null, reason|null }], total: { ms|null, reason|null },
-//     facts: [[label, count]], notes: [string], failed: string|null }
+//     facts: [[label, count]]  (only the counts the Hub reported: the cluster card's line),
+//     counts: [{ key, label, n|null }]  (every count, null where the Hub did not report it),
+//     coverage: [{ key, label, ms|null }]  (from when the figures, and the request records, cover),
+//     notes: [string], failed: string|null }
 export function timingView(timing, error = null) {
   if (!timing || typeof timing !== 'object') {
     const failed = error ? error.message || String(error) : '伺服器沒有回報這個對話的耗時';
-    return { segments: [], total: { ms: null, reason: failed }, facts: [], notes: [], failed };
+    return { segments: [], total: { ms: null, reason: failed }, facts: [], counts: [], coverage: [], notes: [], failed };
   }
   const { byKey, notes } = readUnmeasured(timing.unmeasured);
   const missing = (v) => (v === undefined ? '伺服器沒有回報這個欄位' : '回報的值不是有效的時間');
@@ -203,12 +216,14 @@ export function timingView(timing, error = null) {
   const whole = total.ms !== null && total.ms >= sum ? total.ms : sum;
   for (const s of segments) s.share = s.ms === null ? null : whole > 0 ? s.ms / whole : 0;
   const sub = timing.subagents && typeof timing.subagents === 'object' ? timing.subagents : {};
-  const facts = [
-    ['回合', timing.turns],
-    ['請求', timing.requests],
-    ['429 次數', timing.http429],
-    ['子代理', sub.spawned],
-    ['子代理限流重排', sub.requeuedForRateLimit],
-  ].filter(([, v]) => isCount(v));
-  return { segments, total, facts, notes, failed: null };
+  const counts = [
+    ['turns', '回合', timing.turns],
+    ['requests', '請求', timing.requests],
+    ['http429', '429 次數', timing.http429],
+    ['spawned', '子代理', sub.spawned],
+    ['requeued', '子代理限流重排', sub.requeuedForRateLimit],
+  ].map(([key, label, v]) => ({ key, label, n: isCount(v) ? v : null }));
+  const facts = counts.filter((c) => c.n !== null).map((c) => [c.label, c.n]);
+  const coverage = ['since', 'requestsSince'].map((key) => ({ key, label: FIELD_LABELS[key], ms: isMoment(timing[key]) ? timing[key] : null }));
+  return { segments, total, facts, counts, coverage, notes, failed: null };
 }

@@ -14,6 +14,7 @@ import { turnStartTs } from './window-state.js';
 import { salvageView, damagedView, damagedHeadline, backupPath, configProblemText, UNSAVED_LABEL, BACKUP_DIR } from './damaged.js';
 import { fadeColors } from './color-fade.js';
 import { buildRows, newChildIndex, rememberChildren, parseSideSections, sidebarSections, rowProviderView } from './sidebar-model.js';
+import { TimingPane, hasTiming } from './timing-panel.js';
 import { ClusterPage, openClusterDialog, openClusterList, drawClusterNote, rememberCluster, loadClustersOf, clusterHash } from './cluster.js';
 import { DEFAULT_SUBAGENT, modeIn, subagentPayload, subagentChoiceText, subagentModeText, providerDefaultsFor as providerDefaultsOf, runWithRollback } from './home-state.js';
 
@@ -28,7 +29,7 @@ const S = {
   modelCatalog: null, // GET /api/models?session=… for the open conversation
   cur: null, // { id, summary, seq, transcript }
   route: null,
-  panel: null, // { tab: 'artifact' | 'changes', path, version, wide }
+  panel: null, // { tab: 'artifact' | 'changes' | 'agents' | 'todos' | 'timing', path, version, wide }
   artifacts: [],
   home: loadHome(),
   query: '',
@@ -1353,7 +1354,7 @@ function watchCurrent() {
 
 function leaveSession() {
   if (!S.cur) return;
-  if (['agents', 'todos'].includes(S.panel?.tab)) hidePanel();
+  if (['agents', 'todos', 'timing'].includes(S.panel?.tab)) hidePanel();
   clearInterval(S.cur.ping);
   S.cur.transcript.destroy();
   S.cur = null;
@@ -1971,7 +1972,7 @@ function renderToolbar() {
       ),
     ),
     h('span', { class: 'om-toolbar__spacer' }),
-    h('button', { class: `om-btn om-btn--toolbar wide${S.panel ? ' on' : ''}`, type: 'button', title: '面板：Artifact、變更、子代理、待辦', onclick: () => (S.panel ? hidePanel() : openPanel()) }, icon('panelRight'), h('span', { class: 'btn-label' }, '面板')),
+    h('button', { class: `om-btn om-btn--toolbar wide${S.panel ? ' on' : ''}`, type: 'button', title: `面板：Artifact、變更、子代理、待辦${hasTiming(providerOf(s)) ? '、耗時' : ''}`, onclick: () => (S.panel ? hidePanel() : openPanel()) }, icon('panelRight'), h('span', { class: 'btn-label' }, '面板')),
     h('button', { class: 'om-btn om-btn--toolbar', type: 'button', title: '更多', 'aria-label': '更多', onclick: (e) => sessionMenu(e.currentTarget) }, icon('dots')),
   );
 }
@@ -2740,6 +2741,8 @@ function panelHead(...right) {
       h('button', { class: 'om-seg__item', type: 'button', 'aria-pressed': String(tab === 'changes'), onclick: showChanges }, '變更'),
       h('button', { class: 'om-seg__item', type: 'button', 'aria-pressed': String(tab === 'agents'), onclick: () => showAgents() }, '子代理', S.cur?.transcript?.agentIds.length ? h('span', { class: 'tab-count' }, String(S.cur.transcript.agentIds.length)) : null),
       h('button', { class: 'om-seg__item', type: 'button', 'aria-pressed': String(tab === 'todos'), onclick: showTodos }, '待辦'),
+      // Only a Kimi or a DeepSeek conversation has Kimi's events to time.
+      S.cur?.summary && hasTiming(providerOf(S.cur.summary)) ? h('button', { class: 'om-seg__item', type: 'button', 'aria-pressed': String(tab === 'timing'), onclick: showTiming }, '耗時') : null,
     ),
     h('span', { class: 'om-toolbar__spacer' }),
     ...right,
@@ -2919,10 +2922,15 @@ function openFileLink(href) {
 // 子代理 tab: every subagent of the conversation, and the steps of the
 // chosen one, live while it works.
 let agentPanel = null; // { id, transcript, list, summary, ids:Set, sig }
+let timingPane = null; // the 耗時 tab: a TimingPane (timing-panel.js)
 
 function closeAgentPanel() {
   agentPanel?.transcript.destroy();
   agentPanel = null;
+  // Every way out of a panel tab comes through here, and the 耗時 tab reads on
+  // a timer that must not outlive it.
+  timingPane?.destroy();
+  timingPane = null;
 }
 
 function showAgents(id) {
@@ -3097,6 +3105,19 @@ function drawTodos() {
       ),
     ),
   );
+}
+
+// 耗時 tab: where the time of the whole conversation went, as the Hub measured it.
+function showTiming() {
+  const s = S.cur?.summary;
+  if (!s || !hasTiming(providerOf(s))) return;
+  artifactView?.destroy();
+  artifactView = null;
+  closeAgentPanel();
+  showPanel('timing');
+  const id = S.cur.id;
+  timingPane = new TimingPane({ id, title: () => S.sessions.get(id)?.title || S.cur?.summary?.title || '', busy: () => S.cur?.id === id && busy(S.cur.summary?.status), toast });
+  fill($panel, $grip, h('div', { class: 'panel-timing' }, panelHead(), timingPane.el));
 }
 
 async function showChanges() {
@@ -5322,6 +5343,10 @@ function upsertSession(summary) {
       S.scheduleDraw?.();
     }
     if (was && busy(was) && !busy(s.status) && S.panel?.tab === 'changes') showChanges();
+    // A turn ended: the figures of its last seconds are read once, the timer is not waited for.
+    if (was && busy(was) && !busy(s.status)) timingPane?.refresh();
+    // A conversation that is no longer a Kimi or DeepSeek one has nothing to time.
+    if (S.panel?.tab === 'timing' && !hasTiming(providerOf(s))) hidePanel();
   }
 }
 

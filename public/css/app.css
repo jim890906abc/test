@@ -2351,7 +2351,8 @@ pre.tail {
   padding: var(--space-3) var(--space-4) var(--space-6);
 }
 .panel-agents,
-.panel-todos {
+.panel-todos,
+.panel-timing {
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -5469,6 +5470,116 @@ pre.tail {
   line-height: 17px;
   color: var(--warning);
   overflow-wrap: anywhere;
+}
+
+/* the 耗時 tab of a conversation's panel: the same time box as a worker card,
+   larger, with every count, from when the data covers, and the Hub's notes */
+.timing-pane {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+.timing-slot {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+}
+.timing-pane .cluster-timing {
+  gap: var(--space-3);
+  padding-top: 0;
+  border-top: 0;
+}
+.timing-pane .cluster-timing-loading {
+  padding: 0;
+  border: 0;
+  font-size: 12px;
+}
+.timing-pane .cluster-timing-head {
+  font-size: 13px;
+  line-height: 20px;
+}
+.timing-pane .cluster-timing-total {
+  font-size: 18px;
+  line-height: 24px;
+}
+.timing-pane .cluster-bar {
+  height: 10px;
+}
+.timing-pane .cluster-legend {
+  gap: 4px var(--space-4);
+  font-size: 13px;
+  line-height: 20px;
+}
+.timing-pane .cluster-reason,
+.timing-pane .cluster-timing-failed,
+.timing-help,
+.timing-stale {
+  margin: 0;
+  font-size: 12px;
+  line-height: 18px;
+  overflow-wrap: anywhere;
+}
+.timing-section-title {
+  margin-top: var(--space-1);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 600;
+  color: var(--ink-secondary);
+}
+.timing-counts,
+.timing-coverage {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 4px var(--space-4);
+  font-size: 13px;
+  line-height: 20px;
+}
+.timing-counts {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.timing-coverage {
+  grid-template-columns: minmax(0, 1fr);
+}
+.timing-counts li,
+.timing-coverage li {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+.timing-label {
+  flex: none;
+  color: var(--ink-secondary);
+}
+.timing-value {
+  margin-left: auto;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.timing-counts li.unmeasured .timing-value,
+.timing-coverage li.unmeasured .timing-value,
+.timing-stale {
+  color: var(--warning);
+}
+.timing-help {
+  color: var(--ink-secondary);
+}
+.timing-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--line);
+}
+.timing-note {
+  font-size: 12px;
+  line-height: 18px;
 }
 
 /* memory and merge */

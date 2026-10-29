@@ -10,6 +10,7 @@
 import { h, fill, icon, relTime, copyText, baseName } from './dom.js';
 import { get, post } from './api.js';
 import { busy as sessionBusy } from './providers.js';
+import { timingBox } from './timing-box.js';
 import {
   CLUSTER_MAX_TASKS,
   CLUSTER_DEFAULTS,
@@ -18,7 +19,6 @@ import {
   contextWarnings,
   draftProblems,
   fmtBytes,
-  fmtMs,
   isActive,
   isStoppable,
   memoryNote,
@@ -26,7 +26,6 @@ import {
   MEMORY_MAX_CHARS,
   progressOf,
   requestBody,
-  timingView,
   workerState,
 } from './cluster-model.js';
 
@@ -555,36 +554,10 @@ export class ClusterPage {
     const got = w.status === 'deleted' ? DELETED_TIMING : this.timings.get(w.sessionId) || null;
     if (card.shown !== got) {
       card.shown = got;
-      fill(card.timingSlot, this.timingBox(got));
+      // The time breakdown of one worker's conversation (spec §5), drawn by the
+      // function the 耗時 tab of a conversation uses too (timing-box.js).
+      fill(card.timingSlot, timingBox(got));
     }
-  }
-
-  // The time breakdown of one worker's conversation (spec §5). What the Hub did
-  // not measure says 量不到 and why; nothing is worked out from the rest.
-  timingBox(got) {
-    if (!got) return h('div', { class: 'cluster-timing-loading muted' }, '耗時讀取中…');
-    const v = timingView(got.timing, got.error);
-    if (v.failed) return h('div', { class: 'cluster-timing' }, h('div', { class: 'cluster-timing-failed' }, `耗時量不到：${v.failed}`));
-    const total = v.total.ms === null ? `量不到` : fmtMs(v.total.ms);
-    return h(
-      'div',
-      { class: 'cluster-timing' },
-      h('div', { class: 'cluster-timing-head' }, h('span', null, '耗時'), h('span', { class: 'cluster-timing-total' }, `總時間 ${total}`)),
-      h(
-        'div',
-        { class: 'cluster-bar', role: 'img', 'aria-label': `耗時拆解：${v.segments.map((s) => `${s.label} ${fmtMs(s.ms) || '量不到'}`).join('、')}` },
-        v.segments.filter((s) => s.share).map((s) => h('span', { class: `cluster-seg part-${s.key}`, dataset: { seg: s.key }, style: { width: `${(s.share * 100).toFixed(1)}%` } })),
-      ),
-      h(
-        'ul',
-        { class: 'cluster-legend' },
-        v.segments.map((s) => h('li', { dataset: { part: s.key }, class: s.ms === null ? 'unmeasured' : '' }, h('span', { class: `cluster-swatch part-${s.key}` }), h('span', { class: 'cluster-legend-label' }, s.label), h('span', { class: 'cluster-legend-value' }, s.ms === null ? '量不到' : fmtMs(s.ms)))),
-      ),
-      ...v.segments.filter((s) => s.ms === null).map((s) => h('p', { class: 'cluster-reason', dataset: { part: s.key } }, `${s.label}：${s.reason}`)),
-      ...(v.total.ms === null ? [h('p', { class: 'cluster-reason', dataset: { part: 'wallMs' } }, `總時間：${v.total.reason}`)] : []),
-      ...v.notes.map((n) => h('p', { class: 'cluster-reason', dataset: { part: 'note' } }, n)),
-      v.facts.length ? h('p', { class: 'cluster-timing-facts' }, v.facts.map(([k, n]) => `${k} ${n}`).join(' · ')) : null,
-    );
   }
 
   drawMerge() {
