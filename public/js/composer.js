@@ -49,6 +49,7 @@ export const COMMANDS = [
   { name: 'effort', description: '調整思考強度' },
   { name: 'plan', description: '開關計畫模式：先規劃，你同意後才動手' },
   { name: 'swarm', description: '開關 swarm 模式：讓 Kimi 一次派出子代理群（用量可能是平常的好幾倍）。/swarm <任務> 會開啟並送出任務，之後保持開啟，直到你關掉', hint: 'on | off | <任務>' },
+  { name: 'cluster', description: '叢集派工：把任務分給幾個工作者對話同時做，各自在獨立的 git worktree 裡改檔，做完可以合併', hint: '[第一個任務]' },
   { name: 'permission', description: '選擇權限模式' },
   { name: 'yolo', description: '需要時詢問：只有風險高的動作才問你' },
   { name: 'auto', description: '全部自動：不再詢問' },

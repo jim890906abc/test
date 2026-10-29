@@ -17,11 +17,15 @@ const FILE = path.join(DATA_DIR, 'machines.json');
 //   broker           cross-provider subagents through the local broker channel
 //   handoff          relays a continuation's handoff to the Claude daemon, and
 //                    refuses to use a daemon that cannot take it
+//   pool_timing      the DeepSeek proxy writes down every upstream request and
+//                    reports them ({ t: 'deepseek.requests' }, server/timing.js)
+//   pool_measure     `kimi.deepseek.measure`: how many requests one key takes at once
+//   event_timing     the journal's step frames carry the model's timing
 // A connector that sends no `capabilities` has none (an empty array): the
 // version string is never used to guess. The first connector that sends the
 // field is CAPABILITY_CONNECTOR_VERSION; older ones must be reconnected with
 // the current command (a message about "upgrade" can name this version).
-export const CAPABILITIES = ['pool', 'pool_cross', 'secondary_model', 'broker', 'handoff'];
+export const CAPABILITIES = ['pool', 'pool_cross', 'secondary_model', 'broker', 'handoff', 'pool_timing', 'pool_measure', 'event_timing'];
 export const CAPABILITY_CONNECTOR_VERSION = '0.11.0';
 const cleanCapabilities = (raw) => (Array.isArray(raw) ? [...new Set(raw.filter((x) => typeof x === 'string' && /^[a-z][a-z0-9_]{0,31}$/.test(x)))].slice(0, 16) : []);
 const machines = new Map(); // id -> machine
@@ -387,8 +391,9 @@ export function attachBridge(ws) {
       // The broker is installed after the hello: the capability follows.
       if (Array.isArray(msg.capabilities)) m.capabilities = cleanCapabilities(msg.capabilities);
       changed(m);
-    } else if (msg.t === 'deepseek.pool') {
-      // The account validates and stores it; listeners only choose to act.
+    } else if (msg.t === 'deepseek.pool' || msg.t === 'deepseek.requests') {
+      // The account validates and stores it (the request records: server/
+      // timing.js); listeners only choose to act.
       for (const fn of messageListeners) fn(m.id, msg);
     } else if (msg.t === 'daemon.state') {
       // The connector's view of its Claude daemon: stale when the daemon

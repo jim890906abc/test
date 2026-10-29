@@ -98,9 +98,10 @@ test('each key offers only the moves and marks that make sense for where it is a
   const list = await rows();
   assert.deepEqual(list.map((r) => r.id), ['k_a', 'k_b', 'k_c']);
   // First: nothing to move up; last: nothing to move down; a key that is fine can be marked, one that is out can be cleared or re-enabled.
-  assert.deepEqual(list[0].acts, ['down', 'mark', 'test', 'remove'], 'first, fine');
-  assert.deepEqual(list[1].acts, ['top', 'up', 'down', 'mark', 'test', 'remove'], 'middle, fine');
-  assert.deepEqual(list[2].acts, ['top', 'up', 'clear', 'retry', 'test', 'remove'], 'last, out');
+  // (Every key can be measured for how many requests it takes at once: ui-deepseek-measure.test.mjs.)
+  assert.deepEqual(list[0].acts, ['down', 'mark', 'test', 'measure', 'remove'], 'first, fine');
+  assert.deepEqual(list[1].acts, ['top', 'up', 'down', 'mark', 'test', 'measure', 'remove'], 'middle, fine');
+  assert.deepEqual(list[2].acts, ['top', 'up', 'clear', 'retry', 'test', 'measure', 'remove'], 'last, out');
   assert.equal(list[0].state, '使用中');
   assert.equal(list[1].state, '待命');
   assert.match(list[2].state, /已滿，重置時間未知/);

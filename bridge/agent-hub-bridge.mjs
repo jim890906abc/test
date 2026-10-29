@@ -860,6 +860,22 @@ const DS_LABELS = { 'opencode-go': 'OpenCode Go', opencode: 'OpenCode', commandc
 // the time is not read, never guessed.
 const DS_ISO_RESET = /(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:[.,](\d+))?)?\s*(Z\b|UTC\b|GMT\b|[+-]\d{2}:?\d{2}\b)/i;
 const DS_SESSION_NAMES = [...new Set(Object.values(DS_SESSION_HEADERS))];
+// The concurrency levels `proxy.measure` goes through unless the hub names others.
+const DS_MEASURE_LEVELS = [1, 2, 4, 8, 16];
+// Nearest-rank percentile of an ascending list of numbers (p in 1..100).
+const dsPercentile = (sorted, p) => sorted[Math.min(sorted.length, Math.max(1, Math.ceil((p / 100) * sorted.length))) - 1];
+// A gateway error's own code or type (letters, digits and _ . -), for saying
+// what a refusal was; never any other text of the body, and never a key.
+function dsErrorCode(text, secret = '') {
+  try {
+    const j = JSON.parse(text);
+    const e = j && typeof j.error === 'object' && j.error ? j.error : j || {};
+    const code = [e.code, e.type, typeof j?.error === 'string' ? j.error : ''].find((x) => typeof x === 'string' && /^[\w.\- ]{1,60}$/.test(x));
+    return code && (!secret || !code.includes(secret)) ? code : '';
+  } catch {
+    return '';
+  }
+}
 
 
 // The address of a gateway, or null. Only the fixed table (and the loopback
@@ -1799,6 +1815,112 @@ const deepseek = {
   },
 };
 
+// ------------------------------------------- what the proxy writes down
+// One record per upstream attempt (a request that moved to the next key leaves
+// one for each key it tried). Only what really happened, from this process's
+// own clock: when the request came in and when it was sent upstream (wall
+// clock), then how many milliseconds later the answer's headers, its first body
+// byte and its end came (monotonic clock, so a clock change cannot bend them).
+// A field that did not happen stays null (no headers when the gateway never
+// answered, no first byte for a client that left first). The key is named by its
+// id, the conversation by the Kimi session id Kimi puts in the request body
+// (prompt_cache_key; Kimi 2.3.3 sends it, and the requests of its subagents
+// carry the same one), never by anything secret. The newest records are kept
+// and reported to the hub ({ t: 'deepseek.requests' }); after a reconnect all
+// of them are sent again and the hub keeps them by `id`.
+const DS_LOG_MAX = 5000;
+const DS_LOG_CHUNK = 200;
+const DS_LOG_TAIL = 8192;
+const dsLog = {
+  boot: crypto.randomBytes(4).toString('hex'),
+  since: Date.now(), // nothing before this was recorded by this process
+  seq: 0,
+  reqSeq: 0,
+  ring: [],
+  unsent: [],
+  timer: null,
+  flight: new Map(), // key id -> attempts open right now
+
+  nextRequest() {
+    return ++this.reqSeq;
+  },
+
+  // `info`: { req, attempt, key, gateway, session, clientRetry, switchedFrom, recvAt }
+  begin(info) {
+    const open = (this.flight.get(info.key) || 0) + 1;
+    this.flight.set(info.key, open);
+    const t0 = performance.now();
+    const ms = () => Math.max(0, Math.round(performance.now() - t0));
+    const rec = {
+      id: `${this.boot}-${++this.seq}`,
+      req: info.req,
+      attempt: info.attempt,
+      key: info.key,
+      gateway: info.gateway,
+      session: info.session ?? null,
+      clientRetry: info.clientRetry ?? null,
+      switchedFrom: info.switchedFrom ?? null,
+      recvAt: info.recvAt,
+      startAt: Date.now(),
+      headersMs: null,
+      firstByteMs: null,
+      endMs: null,
+      status: null,
+      outcome: null,
+      inflight: open,
+      outTokens: null,
+    };
+    let done = false;
+    const self = this;
+    return {
+      headers(status) {
+        rec.status = status;
+        rec.headersMs ??= ms();
+      },
+      firstByte() {
+        rec.firstByteMs ??= ms();
+      },
+      // The usage the answer ends with (OpenAI-style streams and plain JSON
+      // both carry `"completion_tokens": n`); null when the answer has none.
+      tokens(tail) {
+        const all = [...String(tail || '').matchAll(/"completion_tokens"\s*:\s*(\d+)/g)];
+        if (all.length) rec.outTokens = Number(all.at(-1)[1]);
+      },
+      end(outcome) {
+        if (done) return;
+        done = true;
+        rec.endMs = ms();
+        rec.outcome = outcome;
+        const n = (self.flight.get(rec.key) || 1) - 1;
+        if (n > 0) self.flight.set(rec.key, n);
+        else self.flight.delete(rec.key);
+        self.push(rec);
+      },
+    };
+  },
+
+  push(rec) {
+    this.ring.push(rec);
+    if (this.ring.length > DS_LOG_MAX) this.ring.splice(0, this.ring.length - DS_LOG_MAX);
+    this.unsent.push(rec);
+    if (this.unsent.length > DS_LOG_MAX) this.unsent.splice(0, this.unsent.length - DS_LOG_MAX);
+    this.timer ??= setTimeout(() => this.flush(), 400);
+    this.timer.unref?.();
+  },
+
+  // New records (or, after a reconnect, every record still kept). Without a hub
+  // connection they wait; the reconnect sends the whole kept list anyway.
+  flush(all = false) {
+    clearTimeout(this.timer);
+    this.timer = null;
+    if (hub.ws?.readyState !== 1) return;
+    const list = all ? this.ring.slice() : this.unsent;
+    this.unsent = [];
+    if (!list.length && !all) return;
+    for (let i = 0; i === 0 || i < list.length; i += DS_LOG_CHUNK) hub.send({ t: 'deepseek.requests', boot: this.boot, since: this.since, replay: all, records: list.slice(i, i + DS_LOG_CHUNK) });
+  },
+};
+
 // ------------------------------------------------ DeepSeek key pool proxy
 // The connector's loopback-only OpenAI-compatible endpoint. Kimi's provider
 // points at http://127.0.0.1:<random>/<gateway> with a random local token, so
@@ -1815,6 +1937,7 @@ const proxy = {
   models: [],
   starting: null,
   lastReport: '',
+  measuring: false, // a concurrency measure is running (one at a time)
 
   localBase(gateway) {
     return `http://127.0.0.1:${this.port}/${gateway}`;
@@ -2015,7 +2138,8 @@ const proxy = {
     return Buffer.concat(chunks, size);
   },
 
-  async readUpTo(stream, max) {
+  // `onFirst`: called once, when the first byte of the body has arrived.
+  async readUpTo(stream, max, onFirst) {
     if (!stream) return Buffer.alloc(0);
     const reader = stream.getReader();
     const chunks = [];
@@ -2025,6 +2149,10 @@ const proxy = {
         const { value, done } = await reader.read();
         if (done) break;
         const buf = Buffer.from(value);
+        if (onFirst && buf.length) {
+          onFirst();
+          onFirst = null;
+        }
         if (size + buf.length > max) {
           chunks.push(buf.subarray(0, max - size));
           size = max;
@@ -2326,13 +2454,16 @@ const proxy = {
     return Number.isInteger(n) && n >= 50 && n <= 3_600_000 ? n : fallback;
   },
 
-  async attempt(req, res, route, key, target, rest) {
+  // `t`: this attempt's record (see dsLog.begin); it learns the headers, the
+  // first byte, the usage and how the attempt ended, on every way out.
+  async attempt(req, res, route, key, target, rest, t) {
     const method = String(req.method || 'GET').toUpperCase();
     const was = key.exhaustedAt || 0;
     const firstByte = this.ms('AGENT_HUB_DEEPSEEK_FIRST_BYTE_MS', 120_000);
     const idle = this.ms('AGENT_HUB_DEEPSEEK_IDLE_MS', 300_000);
     const controller = new AbortController();
     let timedOut = '';
+    let clientGone = false;
     let timer = null;
     const disarm = () => {
       clearTimeout(timer);
@@ -2345,7 +2476,10 @@ const proxy = {
         controller.abort();
       }, ms);
     };
-    const abort = () => controller.abort();
+    const abort = () => {
+      clientGone = true;
+      controller.abort();
+    };
     res.once('close', abort);
     const finish = () => {
       disarm();
@@ -2368,13 +2502,18 @@ const proxy = {
       });
     } catch {
       finish();
-      if (timedOut) return timeoutReply(), { done: true };
+      if (timedOut) return t.end('timeout'), timeoutReply(), { done: true };
+      t.end(clientGone ? 'aborted' : 'unreachable');
       // A network error is not a quota signal: no other key is tried.
       if (!res.headersSent && !res.destroyed) this.json(res, 502, 'upstream_unreachable', `連不到 DeepSeek 閘道：${key.gateway || route.gateway}`);
       return { done: true };
     }
+    t.headers(upstream.status);
 
     if (upstream.status >= 200 && upstream.status < 300) {
+      // The end of the answer is where its usage is; only that much is kept.
+      let tail = '';
+      let aborted = false;
       try {
         // Nothing goes downstream before the first body byte: a gateway that
         // sends headers and then nothing is a clean 504, not an empty 200.
@@ -2389,21 +2528,28 @@ const proxy = {
           for (;;) {
             const { value, done } = await reader.read();
             if (done) break;
+            t.firstByte();
             if (res.destroyed) {
+              aborted = true;
               await reader.cancel().catch(() => {});
               break;
             }
             start();
             // A slow reader downstream is not a silent gateway.
             disarm();
-            if (!res.write(Buffer.from(value))) await this.drain(res);
+            const chunk = Buffer.from(value);
+            tail = (tail + chunk.toString('latin1')).slice(-DS_LOG_TAIL);
+            if (!res.write(chunk)) await this.drain(res);
             arm(idle, 'idle');
           }
         }
         start();
         res.end();
+        t.tokens(tail);
+        t.end(aborted ? 'aborted' : 'ok');
         this.ok(route, key, was);
       } catch {
+        t.end(timedOut ? 'timeout' : clientGone || res.destroyed ? 'aborted' : 'stream_cut');
         if (timedOut && !res.headersSent) timeoutReply();
         else {
           // Bytes may already be downstream: this request is never replayed.
@@ -2419,22 +2565,131 @@ const proxy = {
 
     let errBody;
     try {
-      errBody = await this.readUpTo(upstream.body, DS_PROXY_MAX_ERROR);
+      errBody = await this.readUpTo(upstream.body, DS_PROXY_MAX_ERROR, () => t.firstByte());
     } catch {
       finish();
+      t.end(timedOut ? 'timeout' : clientGone ? 'aborted' : 'stream_cut');
       if (timedOut) return timeoutReply(), { done: true };
       if (!res.headersSent && !res.destroyed) this.json(res, 502, 'upstream_unreachable', `讀不到 DeepSeek 閘道的錯誤回應：${key.gateway || route.gateway}`);
       return { done: true };
     }
     finish();
     const errText = errBody.toString('utf8');
-    if (this.quota(upstream.status, errText)) return { quota: true, resetAt: this.resetAt(upstream.headers, errText) };
-    if (res.destroyed) return { done: true };
+    if (this.quota(upstream.status, errText)) {
+      t.end('quota');
+      return { quota: true, resetAt: this.resetAt(upstream.headers, errText) };
+    }
+    if (res.destroyed) return t.end('aborted'), { done: true };
     const headers = this.downHeaders(upstream.headers);
     headers['content-length'] = String(errBody.length);
     res.writeHead(upstream.status, headers);
     res.end(errBody);
+    t.end('http_error');
     return { done: true };
+  },
+
+  // The Kimi session a request belongs to, from the `prompt_cache_key` in its
+  // body (Kimi 2.3.3 puts its session id there; the key comes last in its
+  // bodies, so the end is looked at first and a small body is parsed whole).
+  // null when the body names none that looks like a session: such a request
+  // cannot be told apart from another conversation's, and is not guessed at.
+  sessionOf(body) {
+    if (!body?.length) return null;
+    const ok = (v) => (typeof v === 'string' && /^session_[\w-]{4,80}$/.test(v) ? v : null);
+    const tail = body.subarray(Math.max(0, body.length - 4096)).toString('latin1');
+    const m = /"prompt_cache_key"\s*:\s*"([^"\\]{1,100})"/.exec(tail);
+    if (m) return ok(m[1]);
+    if (body.length > 1_048_576) return null;
+    try {
+      return ok(JSON.parse(body.toString('utf8'))?.prompt_cache_key);
+    } catch {
+      return null;
+    }
+  },
+
+  // How many requests one key takes at once, found out by asking it: for each
+  // level in turn (1, 2, 4, 8, 16 unless the hub names others), that many tiny
+  // completions are sent at the same moment on the named key and the level ends
+  // when every one has been answered or has timed out. Per level: how many were
+  // served (2xx), how many got 429, how many failed otherwise, the statuses and
+  // gateway error codes seen, and how long the served ones took (median and 95th
+  // percentile, nearest rank). The hub asks only when a person pressed the button,
+  // having been told how many requests it costs.
+  //
+  // The key is looked up here, in this connector's own pool: the hub names it by
+  // id and sends neither it nor a URL. Nothing is marked in the pool whatever
+  // the gateway says (this is an experiment, not traffic: an exhausted key is
+  // found out by real requests only), and nothing but numbers, statuses and
+  // gateway error codes is returned. A first level that every request is
+  // refused outright (401/402/403: a key that does not work at all) stops the
+  // measure there instead of sending the other levels.
+  async measure(args = {}) {
+    const fail = (status, message) => Object.assign(new Error(message), { status });
+    const route = this.route;
+    if (!route) throw fail(409, '這台電腦還沒有 DeepSeek 號池，沒辦法量測');
+    const keyId = typeof args.keyId === 'string' ? args.keyId : '';
+    const key = route.pool.keys.find((k) => k.id === keyId);
+    if (!key) throw fail(404, '這台電腦的號池裡沒有這把 key（清單可能還沒同步過來）');
+    const levels = args.levels === undefined ? DS_MEASURE_LEVELS : args.levels;
+    if (!Array.isArray(levels) || levels.length < 1 || levels.length > 8 || levels.some((n) => !Number.isInteger(n) || n < 1 || n > 32)) throw fail(400, '並行數要是 1 到 8 個整數，每個 1～32');
+    const total = levels.reduce((a, b) => a + b, 0);
+    if (total > 64) throw fail(400, `總共 ${total} 個請求太多了，最多 64 個`);
+    if (!dsModelOk(args.model)) throw fail(400, '要指定這把 key 的閘道上的模型名稱');
+    const gateway = key.gateway || route.gateway;
+    const base = gateway === route.gateway ? route.base : dsBase(gateway);
+    if (!base) throw fail(409, `這台電腦不認得閘道 ${String(gateway).slice(0, 40)}`);
+    if (this.measuring) throw fail(409, '這台電腦正在量測一把 key，等它跑完再試');
+    this.measuring = true;
+    try {
+      const url = `${base}/chat/completions`;
+      const body = JSON.stringify({ model: args.model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 16, stream: false });
+      const headers = { 'content-type': 'application/json', accept: 'application/json', 'accept-encoding': 'identity', authorization: `Bearer ${key.apiKey}` };
+      // The same session header real traffic carries (some gateways throttle without it).
+      if (DS_SESSION_HEADERS[gateway]) headers[DS_SESSION_HEADERS[gateway]] = deepseek.sessionId();
+      const timeout = this.ms('AGENT_HUB_DEEPSEEK_MEASURE_TIMEOUT_MS', 30_000);
+      const one = async () => {
+        const t0 = performance.now();
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), timeout);
+        try {
+          const r = await fetch(url, { method: 'POST', headers, body, redirect: 'manual', signal: ac.signal });
+          const text = (await this.readUpTo(r.body, 64 * 1024)).toString('utf8');
+          return { status: r.status, ms: performance.now() - t0, code: r.ok ? '' : dsErrorCode(text, key.apiKey) };
+        } catch {
+          return { status: null, ms: performance.now() - t0, code: '' };
+        } finally {
+          clearTimeout(timer);
+        }
+      };
+      const out = [];
+      let stoppedEarly = null;
+      let sent = 0;
+      for (const [i, n] of levels.entries()) {
+        const got = await Promise.all(Array.from({ length: n }, one));
+        sent += n;
+        const served = got.filter((g) => g.status >= 200 && g.status < 300);
+        const statuses = {};
+        for (const g of got) statuses[g.status === null ? 'error' : g.status] = (statuses[g.status === null ? 'error' : g.status] || 0) + 1;
+        const ms = served.map((g) => g.ms).sort((a, b) => a - b);
+        out.push({
+          concurrency: n,
+          requests: n,
+          ok: served.length,
+          http429: got.filter((g) => g.status === 429).length,
+          errors: got.filter((g) => !(g.status >= 200 && g.status < 300) && g.status !== 429).length,
+          statuses,
+          codes: [...new Set(got.map((g) => g.code).filter(Boolean))].slice(0, 5),
+          latencyMs: ms.length ? { p50: Math.round(dsPercentile(ms, 50)), p95: Math.round(dsPercentile(ms, 95)) } : null,
+        });
+        if (i === 0 && got.every((g) => [401, 402, 403].includes(g.status))) {
+          stoppedEarly = `閘道直接拒絕這把 key（HTTP ${got[0].status}），後面的並行數沒有再送`;
+          break;
+        }
+      }
+      return { keyId, gateway, model: args.model, at: Date.now(), totalRequests: sent, levels: out, stoppedEarly };
+    } finally {
+      this.measuring = false;
+    }
   },
 
   // Every key was tried, is waiting, or cannot serve this request: one answer
@@ -2467,6 +2722,7 @@ const proxy = {
   },
 
   async handle(req, res) {
+    const recvAt = Date.now();
     try {
       if (!this.authorized(req)) return this.json(res, 401, 'invalid_local_token', '本機 DeepSeek proxy 的憑證不正確');
       const raw = String(req.url || '');
@@ -2485,6 +2741,14 @@ const proxy = {
       const order = this.order(pool);
       const tried = new Set();
       const skipped = new Set(); // keys whose gateway has no counterpart of this request's model
+      // For the request log: the conversation, how many times the client itself
+      // has retried this very request (the OpenAI SDK counts them in a header),
+      // and which attempt this is.
+      const session = this.sessionOf(body);
+      const retried = Number.parseInt(String(req.headers['x-stainless-retry-count'] ?? ''), 10);
+      const reqNo = dsLog.nextRequest();
+      let attempts = 0;
+      let previous = null;
       for (;;) {
         if (this.route !== route) return this.json(res, 409, 'pool_changed', 'DeepSeek 號池已更新，請重試');
         // Healthy keys first; only when none is left, an exhausted key whose
@@ -2498,9 +2762,11 @@ const proxy = {
           skipped.add(key.id);
           continue;
         }
-        const result = await this.attempt(req, res, route, key, target, rest);
+        const t = dsLog.begin({ req: reqNo, attempt: ++attempts, key: key.id, gateway: key.gateway || route.gateway, session, clientRetry: Number.isInteger(retried) && retried >= 0 ? retried : null, switchedFrom: previous, recvAt });
+        const result = await this.attempt(req, res, route, key, target, rest, t);
         if (result.done) return;
         if (result.quota) {
+          previous = key.id;
           this.fail(route, key, result.resetAt);
           continue;
         }
@@ -2699,7 +2965,12 @@ function translate(rec, sid, fileAgent = 'main') {
       }
       if (e.type === 'tool.call') return [f('tool.call.started', { turnId, toolCallId: e.toolCallId, name: e.name, args: clipArgs(e.args), display: e.display, description: e.description })];
       if (e.type === 'tool.result') return [f('tool.result', { turnId, toolCallId: e.toolCallId, output: clipOutput(e.result?.output), isError: Boolean(e.result?.isError ?? e.result?.is_error) })];
-      if (e.type === 'step.end') return [f('turn.step.completed', { turnId, usage: e.usage, llmStreamDurationMs: e.llmStreamDurationMs })];
+      // The step's own timing as Kimi measured it: from sending the request to the
+      // first token (llmFirstTokenLatencyMs), then from there to the end of the
+      // stream (llmStreamDurationMs). The same fields Kimi's server puts on its
+      // turn.step.completed event; the hub adds them up (server/timing.js) and
+      // never makes up a number for a step that has none (an interrupted one).
+      if (e.type === 'step.end') return [f('turn.step.completed', { turnId, step: e.step, stepId: e.uuid, usage: e.usage, llmFirstTokenLatencyMs: e.llmFirstTokenLatencyMs, llmStreamDurationMs: e.llmStreamDurationMs })];
       return [];
     }
     case 'interaction.request': {
@@ -4229,8 +4500,13 @@ const daemon = {
 //   broker           cross-provider subagents through the local channel
 //   handoff          carrying a continuation's handoff to the Claude daemon, and
 //                    never using a daemon that cannot take it (see daemon.stale)
+//   pool_timing      the proxy writes down every upstream request (times, status,
+//                    key id, the conversation it belongs to) and reports them
+//                    ({ t: 'deepseek.requests' })
+//   pool_measure     `kimi.deepseek.measure`: one key's concurrency, measured here
+//   event_timing     the journal's step frames carry the model's timing
 function connectorCapabilities() {
-  return ['pool', 'pool_cross', 'secondary_model', ...(brokerReady ? ['broker'] : []), 'handoff'];
+  return ['pool', 'pool_cross', 'secondary_model', ...(brokerReady ? ['broker'] : []), 'handoff', 'pool_timing', 'pool_measure', 'event_timing'];
 }
 
 // ------------------------------------------------------------- the hub
@@ -4323,6 +4599,9 @@ const hub = {
         return deepseek.provision(args);
       case 'kimi.deepseek.remove':
         return deepseek.remove();
+      // How many requests one key of the pool takes at once (see proxy.measure).
+      case 'kimi.deepseek.measure':
+        return proxy.measure(args);
       case 'kimi.subscribe':
         server.subscribe(args.sessionIds || []);
         for (const id of args.sessionIds || []) {
@@ -4486,6 +4765,9 @@ const hub = {
       // A restarted bridge tells the hub the pool it still has, without any
       // key material; the hub then knows this machine's actual active key.
       proxy.report(true);
+      // And what the proxy wrote down so far (the hub keeps the records by id,
+      // so a hub that lost them or kept them gets the same answer).
+      dsLog.flush(true);
       this.sent.clear();
       this.pushSessions(true);
     };

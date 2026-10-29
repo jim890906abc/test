@@ -26,7 +26,7 @@ export function startFakeGateway() {
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, url: `http://127.0.0.1:${server.address().port}`, calls, close: () => server.close() })));
 }
 
-export function startFakeMachine({ port, key, id = 'm_fake', name = 'fake-machine' }) {
+export function startFakeMachine({ port, key, id = 'm_fake', name = 'fake-machine', home = '/home/fake' }) {
   const k = {
     id,
     sessions: new Map(), // kimi session id -> { cwd, model, thinking, title, permission, busy }
@@ -39,6 +39,21 @@ export function startFakeMachine({ port, key, id = 'm_fake', name = 'fake-machin
     dsModels: [],
     claudeGate: {}, // op -> a promise: see claude.rpc
     historyGate: null, // a promise: the next kimi.history answer waits for it (its content is read before the wait)
+    // sh.run really runs the command (bash -c, in the given folder) on this
+    // test machine's disk, like the bridge does. `shEnv` adds to its
+    // environment; `shHook(args)` may answer instead: a { output, exitCode }
+    // (a command that fails), or nothing to let it run.
+    shEnv: {},
+    shHook: null,
+    // POST /api/v1/sessions: `createHook(body)` may answer instead (an error
+    // envelope), or nothing to let it create the conversation.
+    createHook: null,
+    // true: Kimi refuses every prompt (an error envelope, nothing recorded).
+    // Or a function (kimi session id, body) => true for the ones to refuse.
+    refusePrompts: false,
+    // false: the subscription model does not think (no thinking-effort choices
+    // at all, as a model of an OpenAI-style provider in the real Kimi).
+    subThinking: true,
     autoRemoveOnArchive: true,
     n: 0,
   };
@@ -51,7 +66,7 @@ export function startFakeMachine({ port, key, id = 'm_fake', name = 'fake-machin
   };
   const entry = (sid) => ({ ...infoOf(sid), updated_at: new Date().toISOString() });
   const modelItems = () => [
-    { model: SUB, display_name: 'kimi-for-coding', max_context_size: 262144, capabilities: ['thinking', 'image_in', 'tool_use'] },
+    { model: SUB, display_name: 'kimi-for-coding', max_context_size: 262144, capabilities: [...(k.subThinking ? ['thinking'] : []), 'image_in', 'tool_use'] },
     ...k.dsModels.map((alias, i) => ({ model: alias, display_name: i === 0 ? 'K3-256k' : alias.split('/').pop(), max_context_size: 1_000_000, capabilities: ['thinking', 'always_thinking', 'tool_use'], support_efforts: ['low', 'high', 'max'] })),
   ];
   // What Kimi has stored of a conversation (its journal), served both as the
@@ -84,6 +99,13 @@ export function startFakeMachine({ port, key, id = 'm_fake', name = 'fake-machin
   };
   // Any frame of the native's event stream, main agent unless said otherwise.
   k.frame = (sid, type, payload = {}) => send({ t: 'kimi.event', frame: { type, session_id: sid, payload: { agentId: 'main', ...payload } } });
+  // The same with Kimi's own time on it: `time` on the frame (what the journal gives) or, with
+  // `inPayload`, in the payload (what Kimi's server gives). `k.send` is any message of the bridge protocol.
+  k.send = send;
+  k.frameAt = (sid, type, time, payload = {}, { inPayload = false, agentId = 'main' } = {}) =>
+    send({ t: 'kimi.event', frame: { type, session_id: sid, ...(inPayload ? {} : { time }), payload: { agentId, ...(inPayload ? { time } : {}), ...payload } } });
+  // op -> async (args) => answer: a bridge operation this machine answers its own way.
+  k.answers = {};
   // How the native answers a /profile change, once it accepted it:
   //   false (default)  silent: Kimi journals a change with its next turn
   //   true             echoes what it took
@@ -112,6 +134,8 @@ export function startFakeMachine({ port, key, id = 'm_fake', name = 'fake-machin
     if (p === '/api/v1/config') return ok({ default_model: SUB });
     if (p === '/api/v1/models') return ok({ items: modelItems() });
     if (method === 'POST' && p === '/api/v1/sessions') {
+      const refused = k.createHook?.(body);
+      if (refused) return refused;
       const sid = `session_new${++k.n}`;
       k.add(sid, { cwd: body.metadata.cwd });
       return ok({ id: sid, metadata: { cwd: body.metadata.cwd } });
@@ -155,6 +179,7 @@ export function startFakeMachine({ port, key, id = 'm_fake', name = 'fake-machin
       return ok({ busy: Boolean(s.busy), model: s.model, thinking_level: s.thinking || 'off', permission: s.permission, plan_mode: Boolean(s.plan), ...(k.swarmUnsupported ? {} : { swarm_mode: Boolean(s.swarm) }), context_tokens: 0 });
     }
     if (m && method === 'POST' && m[2] === '/prompts') {
+      if (typeof k.refusePrompts === 'function' ? k.refusePrompts(m[1], body) : k.refusePrompts) return { code: 50001, msg: 'simulated: the prompt was refused', data: null };
       k.prompts.push({ sid: m[1], body });
       const said = (body.content || []).filter((c) => c.type === 'text' && !c.text.startsWith('<system-reminder>')).map((c) => c.text).join('');
       if (k.autoReply) setTimeout(() => k.reply(m[1], body.prompt_id, said), 20);
@@ -185,7 +210,7 @@ export function startFakeMachine({ port, key, id = 'm_fake', name = 'fake-machin
     return ok({});
   };
   ws.on('open', () => {
-    send({ t: 'hello', machineId: id, name, hostname: os.hostname(), platform: 'test', bridgeVersion: '0.9.0', broker: 1, home: '/home/fake', status });
+    send({ t: 'hello', machineId: id, name, hostname: os.hostname(), platform: 'test', bridgeVersion: '0.9.0', broker: 1, home, status });
     send({ t: 'kimi.sessions', items: [] });
   });
   // The Claude side of this computer: the REAL daemon (server/claude-daemon.js)
@@ -242,6 +267,14 @@ export function startFakeMachine({ port, key, id = 'm_fake', name = 'fake-machin
     const a = m.args || {};
     k.rpcs.push({ op: m.op, args: a });
     let out;
+    if (k.answers[m.op]) {
+      try {
+        out = await k.answers[m.op](a);
+      } catch (err) {
+        return send({ t: 'res', id: m.id, ok: false, error: err.message, status: err.status });
+      }
+      return send({ t: 'res', id: m.id, ok: true, data: out });
+    }
     switch (m.op) {
       case 'claude.rpc': {
         if (!daemon) return send({ t: 'res', id: m.id, ok: false, error: '未知的操作：claude.rpc' });
@@ -293,6 +326,24 @@ export function startFakeMachine({ port, key, id = 'm_fake', name = 'fake-machin
       case 'workspace.create':
         out = { path: '/tmp/agent-hub-workspaces/new' };
         break;
+      case 'sh.run': {
+        const hooked = await k.shHook?.(a);
+        if (hooked) {
+          out = { killedBy: null, ...hooked };
+          break;
+        }
+        out = await new Promise((resolve) => {
+          const child = spawn('bash', ['-c', String(a.command)], { cwd: a.cwd, env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...k.shEnv }, stdio: ['ignore', 'pipe', 'pipe'] });
+          let text = '';
+          child.stdout.setEncoding('utf8');
+          child.stderr.setEncoding('utf8');
+          child.stdout.on('data', (d) => (text += d));
+          child.stderr.on('data', (d) => (text += d));
+          child.on('error', (err) => resolve({ output: err.message, exitCode: -1, killedBy: null }));
+          child.on('close', (code) => resolve({ output: text, exitCode: code ?? -1, killedBy: null }));
+        });
+        break;
+      }
       case 'fs.stat': {
         // This computer's disk is this test machine's disk.
         const st = fs.statSync(path.resolve(a.cwd || '/', a.path || '.'), { throwIfNoEntry: false });

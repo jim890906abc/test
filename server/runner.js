@@ -139,6 +139,12 @@ export function summarize(s) {
     chainLength: store.chainOf(leaf || s).length,
     handoff: s.handoff ? { fromProvider: s.handoff.fromProvider, chainStartProvider: s.handoff.chainStartProvider || s.handoff.fromProvider, chainProviders: s.handoff.chainProviders || null, fromCwd: s.handoff.fromCwd, targetProvider: s.handoff.targetProvider, chars: s.handoff.chars, omitted: s.handoff.omitted, consumedAt: s.handoff.consumedAt || null, notes: s.handoff.notes || [] } : null,
     pendingProvider: s.state?.pendingProvider || null,
+    // 叢集 (cluster): a worker names its cluster; the conversation that
+    // dispatched clusters lists them (every node of its chain, so a runtime
+    // switch of the main conversation does not hide them).
+    clusterId: s.clusterId || null,
+    clusterRole: s.clusterRole || null,
+    clusterIds: clusterIdsOf(s),
     // A sub-agent is hidden from the sidebar, so a permission it waits on would
     // be invisible: the conversation that owns it carries the flag.
     pendingChildPermission: childAwaitsPermission(s),
@@ -152,6 +158,12 @@ export function summarize(s) {
     createdAt: s.createdAt,
     updatedAt: s.updatedAt,
   };
+}
+
+function clusterIdsOf(s) {
+  const out = [];
+  for (const node of store.chainOf(store.leafOf(s) || s)) for (const id of node.clusterIds || []) if (!out.includes(id)) out.push(id);
+  return out;
 }
 
 // Does a sub-agent working for this conversation (any node of its chain, any
@@ -1656,6 +1668,9 @@ async function createContinuationNode(old, target, { machineId, reason = '使用
     provisional: true,
     meta: { ...(Object.hasOwn(old.meta || {}, 'subagent') ? { subagent: old.meta.subagent } : {}) },
     state: { ...(old.state?.subagentExplicit ? { subagentExplicit: true } : {}) },
+    // A worker of a cluster (叢集) is still one in its new node: its tag and note
+    // on the screen, and the part of the cluster memory it has been told so far.
+    ...(old.clusterId ? { clusterId: old.clusterId, clusterRole: old.clusterRole || 'worker', ...(old.clusterMemo ? { clusterMemo: { ...old.clusterMemo } } : {}) } : {}),
   };
   let node = null;
   let native = null;

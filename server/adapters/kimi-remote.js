@@ -12,6 +12,8 @@ import * as modelDrift from '../model-drift.js';
 import { issueToken, revokeSession } from '../subagent-broker.js';
 import * as policy from '../subagent-policy.js';
 import { remoteHost } from './claude-tools.js';
+import * as clusterMemory from '../cluster-memory.js';
+import * as timing from '../timing.js';
 
 export const live = true;
 
@@ -836,6 +838,9 @@ export class Mirror {
   }
 
   onFrame(frame) {
+    // The time of the conversation is added up from the frames as Kimi stamped
+    // them (server/timing.js); a frame seen again changes nothing there.
+    timing.observe(this.session.id, frame);
     const p = frame.payload || {};
     const type = frame.type || p.type;
     const agentId = p.agentId || 'main';
@@ -1491,6 +1496,13 @@ export class Mirror {
       }
     }
 
+    // A worker of a cluster is told what was added to the cluster's memory
+    // file since its last prompt (only that part), the same way a hand-off is:
+    // a system reminder in front of the message, marked as told only once
+    // Kimi took the prompt.
+    const memo = await clusterMemory.pending(this.session);
+    if (memo) body.content.unshift({ type: 'text', text: `<system-reminder>${memo.text.replaceAll('</system-reminder>', '</ system-reminder>')}</system-reminder>` });
+
     // 插隊 from the tray can come before Kimi has the prompt: it waits.
     const post = this.api('POST', this.path('/prompts'), body);
     (this.inflight ??= new Map()).set(promptId, post);
@@ -1501,8 +1513,10 @@ export class Mirror {
         ho.consumedAt = Date.now();
         store.saveSession(this.session);
       }
+      clusterMemory.consumed(this.session, memo);
       return { ok: true, promptId };
     } catch (err) {
+      clusterMemory.release(this.session, memo);
       this.dequeue(promptId);
       this.unjournaled.delete(promptId);
       ctx.emit({ type: 'error', text: err.message });

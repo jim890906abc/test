@@ -9,6 +9,7 @@ import express from 'express';
 import { WebSocketServer } from 'ws';
 import * as store from './store.js';
 import * as runner from './runner.js';
+import * as clusters from './cluster.js';
 import * as workspace from './workspace.js';
 import { ADAPTERS, TYPE_LABELS } from './adapters/index.js';
 import { TEMPLATES } from './adapters/presets.js';
@@ -21,6 +22,7 @@ import { createScheduler, scheduleTimings } from './schedule.js';
 import { mergeQuota, countsOf } from './quota.js';
 import * as claudeAccount from './claude-account.js';
 import * as deepseekAccount from './deepseek-account.js';
+import * as timing from './timing.js';
 import * as github from './github.js';
 import * as gdrive from './gdrive.js';
 import { localHost, remoteHost } from './adapters/claude-tools.js';
@@ -288,6 +290,18 @@ app.post('/api/deepseek/test', wrap(async (req) => {
   } catch (err) {
     return { ok: false, message: err.message };
   }
+}));
+
+// How long things took (server/timing.js): only measured times, null with the
+// reason where none could be. Per key: requests, the most at once, 429s, time to
+// the first byte, tokens per second. The concurrency measure costs real
+// requests on a real key, so it is only for a person who was told how many
+// (`confirmedRequests` is the total of `levels`); the key never leaves the
+// computer whose connector does it.
+app.get('/api/deepseek/keys/timing', wrap(() => timing.keysTiming()));
+app.post('/api/deepseek/keys/:keyId/measure', wrap((req) => {
+  const body = deepseekBody(req, new Set(['levels', 'confirmedRequests', 'machineId']));
+  return timing.measureKey({ keyId: req.params.keyId, levels: body.levels, confirmedRequests: body.confirmedRequests, machineId: body.machineId });
 }));
 
 app.get('/api/deepseek/models', wrap((req) => {
@@ -650,6 +664,13 @@ const wholeNumber = (v, name) => {
   if (!/^\d+$/.test(String(v))) throw badRequest(`${name} 必須是 0 或正整數`);
   return Number(v);
 };
+// Where the time of a conversation went (all of its chain): model, tools,
+// compaction, waiting for a rate limit, requests and 429s - measured only.
+app.get('/api/sessions/:id/timing', wrap((req) => {
+  const leaf = leafOf(req);
+  return timing.sessionTiming(store.chainOf(leaf));
+}));
+
 app.get('/api/sessions/:id/events', wrap((req) => {
   const leaf = leafOf(req);
   const items = store.chainItems(leaf);
@@ -1032,6 +1053,17 @@ app.post('/api/sessions/:id/backup', wrap(async (req) => {
   return r;
 }));
 
+// ---------------------------------------------------------------- 叢集
+// One conversation hands several tasks to several workers (server/cluster.js).
+// Not Kimi's /swarm: a worker may have that mode on, which is Kimi's own.
+app.post('/api/sessions/:id/cluster', wrap((req) => clusters.create(leafOf(req), req.body)));
+app.get('/api/sessions/:id/clusters', wrap((req) => clusters.listFor(leafOf(req))));
+app.get('/api/clusters/:cid', wrap((req) => clusters.get(req.params.cid)));
+app.post('/api/clusters/:cid/stop', wrap((req) => clusters.stop(req.params.cid)));
+app.post('/api/clusters/:cid/merge', wrap((req) => clusters.merge(req.params.cid)));
+app.get('/api/clusters/:cid/memory', wrap((req) => clusters.readMemoryOf(req.params.cid)));
+app.post('/api/clusters/:cid/memory', wrap((req) => clusters.appendDecision(req.params.cid, req.body?.text)));
+
 app.get('/api/machines', wrap(() => machines.listMachines()));
 app.delete('/api/machines/:id', wrap((req) => machines.removeMachine(req.params.id)));
 app.post('/api/machines/:id/refresh', wrap((req) => machines.rpc(req.params.id, 'kimi.status')));
@@ -1326,6 +1358,9 @@ function broadcast(msg) {
       };
     }
   }
+  // A cluster worker's progress line follows what it says, and a worker whose
+  // conversation is deleted reads 已刪除 on the pages that show its cluster.
+  if (msg.sid && (msg.t === 'event' || msg.t === 'patch' || msg.t === 'delta' || msg.t === 'deleted')) clusters.noteActivity(msg.sid);
   const data = JSON.stringify(msg);
   const sid = STREAM.has(msg.t) ? msg.sid : null;
   for (const ws of wss.clients) {
@@ -1348,6 +1383,8 @@ function broadcast(msg) {
 }
 runner.setBroadcast(broadcast);
 machines.setBroadcast(broadcast);
+clusters.setBroadcast(broadcast);
+clusters.load();
 // A connector reports which key of its provisioned pool it is on, and which
 // ones its proxy found exhausted. The account validates it (known gateway
 // and key ids only, never a secret) and the settings pages see it at once.
@@ -1360,6 +1397,7 @@ machines.onBridgeMessage((machineId, msg) => {
   }
 });
 subagentBroker.install();
+timing.install();
 runner.restoreLiveSessions();
 
 // Auto-pause and 定時送出 run here on the hub, whether or not a browser is open.
@@ -1416,6 +1454,7 @@ server.listen(PORT, HOST, () => {
 });
 
 function shutdown() {
+  clusters.flush();
   store.flushAll();
   disposeAll();
   process.exit(0);

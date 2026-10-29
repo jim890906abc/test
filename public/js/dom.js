@@ -91,6 +91,7 @@ const P = {
   bell: '<path d="M6.5 16.5V11a5.5 5.5 0 0 1 11 0v5.5l1.5 2h-14z"/><path d="M10 20.5a2 2 0 0 0 4 0"/>',
   back: '<path d="m14.5 6-6 6 6 6"/>',
   pause: '<path d="M9 6.5v11M15 6.5v11"/>',
+  cluster: '<circle cx="12" cy="6" r="2.3"/><circle cx="5.8" cy="17.5" r="2.3"/><circle cx="18.2" cy="17.5" r="2.3"/><path d="m10.9 8.2-3.9 7.2M13.1 8.2l3.9 7.2M8.2 17.5h7.6"/>',
 };
 
 // Parsed once per icon, then copied: rows are redrawn many times a second

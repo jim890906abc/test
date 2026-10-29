@@ -14,6 +14,7 @@ import { turnStartTs } from './window-state.js';
 import { salvageView, damagedView, damagedHeadline, backupPath, configProblemText, UNSAVED_LABEL, BACKUP_DIR } from './damaged.js';
 import { fadeColors } from './color-fade.js';
 import { buildRows, newChildIndex, rememberChildren, parseSideSections, sidebarSections, rowProviderView } from './sidebar-model.js';
+import { ClusterPage, openClusterDialog, openClusterList, drawClusterNote, rememberCluster, loadClustersOf, clusterHash } from './cluster.js';
 import { DEFAULT_SUBAGENT, modeIn, subagentPayload, subagentChoiceText, subagentModeText, providerDefaultsFor as providerDefaultsOf, runWithRollback } from './home-state.js';
 
 const S = {
@@ -126,6 +127,18 @@ function toast(text, { action, onAction, kind = '' } = {}) {
   setTimeout(() => el.remove(), 4600);
 }
 const fail = (err) => toast(err?.message || String(err), { kind: 'error' });
+// What the cluster screens (cluster.js) use from this page.
+const clusterCtx = {
+  dialog: (...a) => dialog(...a),
+  confirmDialog: (...a) => confirmDialog(...a),
+  toast,
+  fail,
+  go: (hash) => go(hash),
+  parentTitle: (id) => S.sessions.get(id)?.title || '',
+  session: (id) => S.sessions.get(id),
+  onTitle: (c) => renderClusterToolbar(c),
+  onCreated: (c) => S.cur?.id === c.parentId && drawCurrentClusterNote(),
+};
 
 function notify(title, body, onClick) {
   try {
@@ -326,7 +339,7 @@ function drawSidebar() {
     S.query,
     S.machines.some((m) => m.online),
     [sideSections.chat, sideSections.sub],
-    sections.map(([key, , rs, isOpen]) => [key, isOpen, rs.map((r) => [r.key, r.title, r.cwd, r.status, r.offline, r.provider, r.conversationId, rowProviderView(r).text, r.childWaiting, r.kimi?.owner || r.hub?.meta?.owner, r.machine?.name, relTime(r.updatedAt), salvageView(r.hub?.meta?.salvaged)?.title])]),
+    sections.map(([key, , rs, isOpen]) => [key, isOpen, rs.map((r) => [r.key, r.title, r.cwd, r.status, r.offline, r.provider, r.conversationId, rowProviderView(r).text, r.hub?.clusterRole === 'worker' ? r.hub.clusterId : null, r.childWaiting, r.kimi?.owner || r.hub?.meta?.owner, r.machine?.name, relTime(r.updatedAt), salvageView(r.hub?.meta?.salvaged)?.title])]),
   ]);
   if (sig === lastSidebar) return;
   lastSidebar = sig;
@@ -370,6 +383,8 @@ function sideRow(r, current, multi) {
   // A conversation whose file was damaged and repaired says so, where it is listed.
   const repaired = salvageView(r.hub?.meta?.salvaged);
   const repairedTag = repaired ? h('span', { class: `row-tag salvaged${repaired.unsaved ? ' unsaved' : ''}`, title: repaired.title }, repaired.label) : null;
+  // A worker of a cluster (叢集) says so; the cluster page lists its siblings.
+  const clusterTag = r.hub?.clusterRole === 'worker' ? h('span', { class: 'row-tag cluster', title: '叢集的工作者對話：它的任務、進度與合併都在叢集頁' }, '叢集') : null;
   return h(
     'a',
     {
@@ -384,7 +399,7 @@ function sideRow(r, current, multi) {
         rowMenu(r, pointAnchor(e.clientX, e.clientY));
       },
     },
-    h('span', { class: 'row-text' }, h('span', { class: 'row-title' }, r.title), h('span', { class: `row-sub${view.pending ? ' pending' : ''}` }, providerTag, repairedTag, h('span', { class: 'row-sub-text' }, sub || relTime(r.updatedAt)))),
+    h('span', { class: 'row-text' }, h('span', { class: 'row-title' }, r.title), h('span', { class: `row-sub${view.pending ? ' pending' : ''}` }, providerTag, clusterTag, repairedTag, h('span', { class: 'row-sub-text' }, sub || relTime(r.updatedAt)))),
     r.status === 'awaiting_permission'
       ? h('span', { class: 'om-badge om-badge--warning' }, '需要你')
       : r.childWaiting
@@ -642,11 +657,34 @@ async function route() {
   const hash = location.hash || '#/';
   closeMenu();
   $artifactsLink.removeAttribute('aria-current');
+  clusterPage?.destroy();
+  clusterPage = null;
   let m;
   if ((m = hash.match(/^#\/s\/([\w-]+)/))) return openSession(m[1]);
+  if ((m = hash.match(/^#\/cluster\/([\w-]+)/))) return showCluster(m[1]);
   if ((m = hash.match(/^#\/k\/([\w-]+)\/([\w-]+)/))) return attachAndOpen(m[1], m[2]);
   if (hash.startsWith('#/artifacts')) return showArtifacts();
   return showHome();
+}
+
+// A cluster (叢集): its workers, their time, the shared memory, stop and merge.
+let clusterPage = null;
+function showCluster(cid) {
+  applyProvider(null);
+  leaveSession();
+  hidePanel();
+  S.route = `cluster:${cid}`;
+  renderSidebar();
+  renderClusterToolbar(null);
+  clusterPage = new ClusterPage(clusterCtx, cid);
+  fill($view, clusterPage.el);
+  clusterPage.load();
+}
+
+function renderClusterToolbar(c) {
+  if (!S.route?.startsWith('cluster:')) return;
+  const parent = c ? S.sessions.get(c.parentId) : null;
+  fill($toolbar, sidebarToggle(), h('div', { class: 'toolbar-titles' }, h('div', { class: 'om-toolbar__title' }, '叢集'), h('div', { class: 'om-toolbar__subtitle' }, [parent?.title, c?.id].filter(Boolean).join(' · '))));
 }
 
 // All pages Kimi made, across conversations, like Claude's Artifacts list.
@@ -1419,6 +1457,13 @@ function drawChildNote(slot, summary) {
   );
 }
 
+const drawCurrentClusterNote = () => S.cur && drawClusterNote(S.cur.clusterNote, S.cur.summary);
+// The link to the Hub is back: what was said about this conversation's clusters meanwhile (one finished) was missed, so ask again.
+function refreshClusterNote() {
+  const cur = S.cur;
+  if (cur?.summary) loadClustersOf(cur.summary, { force: true }).then((fresh) => fresh && S.cur === cur && drawCurrentClusterNote());
+}
+
 // What the server says changed when this conversation moved to another runtime
 // (summary.handoff.notes), for example a permission mode that had to become
 // stricter. Said as the server gives it; the page maps nothing itself.
@@ -1492,6 +1537,9 @@ async function openSession(id) {  if (S.cur?.id === id) return;
   drawChildNote(cur.childNote, summary);
   cur.handoffNote = h('div', { class: 'child-note-slot handoff-note-slot', hidden: true });
   drawHandoffNote(cur.handoffNote, summary);
+  cur.clusterNote = h('div', { class: 'child-note-slot cluster-note-slot', hidden: true });
+  drawClusterNote(cur.clusterNote, summary);
+  loadClustersOf(summary).then((fresh) => fresh && S.cur === cur && drawCurrentClusterNote());
   // Keeps the conversation followed on the machine while it is open.
   cur.ping = setInterval(() => document.visibilityState === 'visible' && post(`/sessions/${id}/viewing`).catch(() => {}), 60_000);
   cur.transcript = new Transcript({
@@ -1586,7 +1634,7 @@ async function openSession(id) {  if (S.cur?.id === id) return;
   composer.setKey(conversationIdOf(summary) || id);
   composer.update({ agent: summary ? providerOf(summary) : 'kimi', provider: summary ? providerOf(summary) : 'kimi', agentsWorking: 0, foreground: 0 });
   cur.composerSig = '';
-  fill($view, h('div', { class: 'session' }, cur.childNote, cur.handoffNote, cur.transcript.el, h('div', { class: 'composer-dock' }, composer.el)));
+  fill($view, h('div', { class: 'session' }, cur.childNote, cur.handoffNote, cur.clusterNote, cur.transcript.el, h('div', { class: 'composer-dock' }, composer.el)));
   renderToolbar();
   renderSidebar();
   watchCurrent();
@@ -1639,6 +1687,8 @@ async function applySnapshot(full) {
   cur.summary = summary;
   drawChildNote(cur.childNote, summary);
   drawHandoffNote(cur.handoffNote, summary);
+  drawClusterNote(cur.clusterNote, summary);
+  loadClustersOf(summary).then((fresh) => fresh && S.cur === cur && drawCurrentClusterNote());
   cur.seq = seq;
   applyProvider(providerOf(summary));
   cur.loading = true; // pages already there are not "new" while it loads
@@ -2067,6 +2117,21 @@ async function openSubagentDialog({ home = false, session = null } = {}) {
   });
 }
 
+// 叢集派工: only from a Kimi or DeepSeek conversation whose computer is on (the
+// workers are made there). The Hub refuses a Claude one; the menu never offers it.
+const clusterReachable = (s) => {
+  const m = machineById(s.machineId);
+  return Boolean(m?.online && m.kimi?.available);
+};
+const clusterItem = (s) => {
+  const ok = clusterReachable(s);
+  return { label: '叢集派工…', hint: '/cluster', description: ok ? null : '那台電腦離線', disabled: !ok, onSelect: () => clusterCommand(s) };
+};
+function clusterCommand(s, args = '') {
+  if (!clusterReachable(s)) return toast('這個對話的電腦現在離線，叢集要在那台電腦上開工作者；等它連上再派工。', { kind: 'error' });
+  openClusterDialog(clusterCtx, s, { prompt: args });
+}
+
 function sessionMenu(anchor) {
   const s = S.cur?.summary;
   if (!s) return;
@@ -2078,6 +2143,8 @@ function sessionMenu(anchor) {
       { label: '複製成新對話', hint: '/fork', onSelect: () => sessionCommand('fork', '') },
       { label: '壓縮對話', hint: '/compact', onSelect: () => sessionCommand('compact', '') },
       subagentItem(s),
+      clusterItem(s),
+      s.clusterIds?.length ? { label: '查看叢集…', description: `${s.clusterIds.length} 個叢集`, onSelect: () => openClusterList(clusterCtx, s) } : null,
       isDeepseek(s) ? null : { label: '自動暫停…', hint: s.autoPause?.enabled ? `${s.autoPause.threshold}%` : '關', onSelect: autoPauseDialog },
       { label: '定時送出…', hint: s.scheduled?.length ? `${s.scheduled.length} 則` : '/later', onSelect: () => scheduleDialog() },
       backupItem(s),
@@ -2349,6 +2416,8 @@ async function sessionCommand(name, args) {
       return configure({ planMode: !meta.planMode });
     case 'swarm':
       return swarmCommand(s, args);
+    case 'cluster':
+      return clusterCommand(s, args);
     case 'yolo':
     case 'auto':
     case 'manual':
@@ -3479,6 +3548,10 @@ async function claudeDialog() {
 
 // ------------------------------------------------------------- DeepSeek
 
+// The concurrency levels the key measure goes through, one level after the other
+// (the total is what the person is told before anything is sent).
+const MEASURE_LEVELS = [1, 2, 4, 8, 16];
+
 // DeepSeek 設定: which gateway the DeepSeek models come from, that gateway's
 // key pool (added here once, never shown in full again), the defaults for new
 // DeepSeek conversations, and what each computer currently uses.
@@ -3604,6 +3677,70 @@ async function deepseekDialog() {
     const when = r.nextResetAt ? `閘道說過最早的重置時間是 ${new Date(r.nextResetAt).toLocaleString()}。` : '沒有任何閘道說過重置時間。';
     return `${head}${when}重置時間未知的 key 下一個真實請求會再試；現在要恢復：對那把按「重新啟用」（會真的送一次很小的請求確認）或「清除標記」，或加入新的 key。`;
   };
+  // The last concurrency measure of each key (kept here while the dialog is open;
+  // the Hub keeps the latest one, loaded below): { running } | { error } | the result.
+  const measureOf = new Map();
+  const measureView = (k) => {
+    const m = measureOf.get(k.id);
+    if (!m) return null;
+    if (m.running) return h('div', { class: 'ds-measure', role: 'status' }, h('span', { class: 'spinner' }), ` 量測中：依序以 ${MEASURE_LEVELS.join('、')} 個並行送出，共 ${m.total} 個請求（由連接器那台電腦送出）…`);
+    if (m.error) return h('div', { class: 'ds-measure bad', role: 'alert' }, m.error);
+    const cell = (v, cls) => h('td', cls ? { class: cls } : null, v);
+    return h(
+      'div',
+      { class: 'ds-measure' },
+      h('div', { class: 'ds-measure-head' }, `並行上限量測 · 在「${m.machineName || m.machineId}」量 · ${new Date(m.at).toLocaleString()} · 共送出 ${m.totalRequests} 個請求`),
+      h(
+        'div',
+        { class: 'ds-measure-scroll' },
+        h(
+          'table',
+          { class: 'ds-measure-table' },
+          h('thead', null, h('tr', null, ...['並行數', '成功', '429', '其他失敗', '延遲 p50', '延遲 p95'].map((c) => h('th', { scope: 'col' }, c)))),
+          h(
+            'tbody',
+            null,
+            ...m.levels.map((l) =>
+              h(
+                'tr',
+                { 'data-concurrency': String(l.concurrency) },
+                cell(String(l.concurrency)),
+                cell(`${l.ok}／${l.requests}`),
+                cell(String(l.http429), l.http429 ? 'warn' : ''),
+                cell(String(l.errors), l.errors ? 'bad' : ''),
+                cell(l.latencyMs ? `${l.latencyMs.p50} ms` : '—'),
+                cell(l.latencyMs ? `${l.latencyMs.p95} ms` : '—'),
+              ),
+            ),
+          ),
+        ),
+      ),
+      m.stoppedEarly ? h('div', { class: 'ds-measure-note' }, m.stoppedEarly) : null,
+      m.levels.some((l) => l.codes?.length) ? h('div', { class: 'ds-measure-note' }, `閘道回的錯誤代碼：${[...new Set(m.levels.flatMap((l) => l.codes || []))].join('、')}`) : null,
+    );
+  };
+  // Costs real requests on this key, so it asks first and says how many; the
+  // Hub refuses unless it is told that very number. The key itself never
+  // leaves the computer whose connector sends them.
+  const measure = async (k) => {
+    if (measureOf.get(k.id)?.running) return;
+    const total = MEASURE_LEVELS.reduce((a, b) => a + b, 0);
+    const go = await confirmDialog({
+      title: `要量 …${k.hint} 的並行上限嗎？`,
+      body: `會送出共 ${total} 個極小請求、花少量額度：只對這一把 key，依序以 ${MEASURE_LEVELS.join('、')} 個並行送出。請求由連接器那台電腦送出，key 不會離開那台電腦。結果會列出每一級有幾個成功、幾個被擋（HTTP 429）和延遲。`,
+      action: `送出 ${total} 個請求`,
+      over: true,
+    });
+    if (!go) return;
+    measureOf.set(k.id, { running: true, total });
+    drawKeys();
+    try {
+      measureOf.set(k.id, await post(`/deepseek/keys/${encodeURIComponent(k.id)}/measure`, { levels: MEASURE_LEVELS, confirmedRequests: total }));
+    } catch (err) {
+      measureOf.set(k.id, { error: `量測失敗：${err.message}` });
+    }
+    drawKeys();
+  };
   const drawKeys = () => {
     const keys = rot();
     fill(keyHead, h('span', { class: 'om-field__label' }, '全部 API key（依序使用，用完自動換下一把）'), h('span', { class: 'om-toolbar__spacer' }), h('span', { class: 'ds-key-count' }, keys.length ? `${keys.length} 把` : ''));
@@ -3635,8 +3772,10 @@ async function deepseekDialog() {
                 out ? action('清除標記', () => clearMark(k), { act: 'clear', title: '不問閘道，直接當作可用；下一個真實請求會確認，還是用盡就會再標記' }) : action('標記已滿', () => markFull(k), { act: 'mark', title: '你知道這把用完了：先放一邊，不會被使用也不會被探測，直到你清除標記' }),
                 out ? action('重新啟用', () => retry(k), { act: 'retry', title: '真的送一次很小的請求確認額度回來了，成功才恢復' }) : null,
                 action('測試', () => test(k.id), { act: 'test' }),
+                action(measureOf.get(k.id)?.running ? '量測中…' : '量並行上限', () => measure(k), { act: 'measure', title: `對 …${k.hint} 依序以 ${MEASURE_LEVELS.join('、')} 個並行送極小請求，看它同時能收幾個（會花少量額度，送出前會先問你）` }),
                 action('刪除', () => remove(k), { destructive: true, act: 'remove' }),
               ),
+              measureView(k),
             );
           })
         : h('p', { class: 'om-field__help' }, '還沒有 key。加入後會顯示家別與尾碼；完整 key 不會再出現在畫面上。'),
@@ -3848,6 +3987,13 @@ async function deepseekDialog() {
   S.deepseekDraw = draw;
   if (!cur().hasKey) setTimeout(() => keyInput.focus(), 0);
   loadModels();
+  // The last concurrency measure of each key, if one was made (the Hub keeps it).
+  get('/deepseek/keys/timing')
+    .then((t) => {
+      for (const e of t.keys || []) if (e.measure && !measureOf.has(e.id)) measureOf.set(e.id, e.measure);
+      if (measureOf.size) drawKeys();
+    })
+    .catch(() => {});
   // Show each machine's actual native default, including a preserved custom one.
   get('/deepseek/secondary')
     .then((list) => {
@@ -5156,6 +5302,8 @@ function upsertSession(summary) {
     S.cur.conversationId = conversationIdOf(s);
     applyProvider(providerOf(s));
     drawHandoffNote(S.cur.handoffNote, s);
+    drawClusterNote(S.cur.clusterNote, s);
+    loadClustersOf(s).then((fresh) => fresh && S.cur?.id === s.id && drawCurrentClusterNote());
     S.cur.transcript.opts.agentName = nameFor(s);
     const tps = s.meta?.tps || 0;
     if (s.meta?.servedModel?.name !== prev?.meta?.servedModel?.name) S.cur.transcript.setServed(s.meta?.servedModel?.name);
@@ -5181,6 +5329,12 @@ function onMessage(m) {
   switch (m.t) {
     case 'session':
       return upsertSession(m.session);
+    case 'cluster': {
+      if (!m.cluster?.id) return;
+      rememberCluster(m.cluster);
+      clusterPage?.update(m.cluster);
+      return drawCurrentClusterNote();
+    }
     case 'deleted':
       S.sessions.delete(m.sid);
       if (S.cur?.id === m.sid) go('#/');
@@ -5317,6 +5471,8 @@ async function start() {
     S.socketOpen = ok;
     drawFoot();
     if (ok) watchCurrent();
+    if (ok) clusterPage?.load();
+    if (ok) refreshClusterNote();
     if (ok) loadDamaged();
     if (ok && !was) loadSessions().then(loadMachines).catch(() => {});
   });
