@@ -160,6 +160,7 @@ test('a dispatch of 6 tasks to 2 workers: the page lists the queue, each worker 
   const [w1, w2] = S.c.workers;
 
   assert.equal(await b.eval(`document.querySelector('.cluster-progress').innerText.trim()`), '任務 0/6 完成');
+  assert.equal(await b.eval(`document.querySelector('.cluster-workers-count').innerText.trim()`), '2 個', 'the 工作者 heading counts workers, not tasks');
   let r = await rows();
   assert.deepEqual(r.map((x) => x.state), ['進行中', '進行中', '等待中', '等待中', '等待中', '等待中']);
   assert.deepEqual(r.map((x) => x.worker), ['w1', 'w2', null, null, null, null]);

@@ -412,7 +412,7 @@ export class ClusterPage {
     this.head = h('div', { class: 'cluster-head' });
     this.warns = h('div', { class: 'cluster-warns' });
     this.workers = h('div', { class: 'cluster-workers' });
-    this.count = h('span', { class: 'muted' });
+    this.count = h('span', { class: 'muted cluster-workers-count' });
     this.queueBox = h('div', { class: 'cluster-queue-slot' });
     this.mergeBox = h('div', { class: 'cluster-merge-slot' });
     this.cleanupBox = h('div', { class: 'cluster-cleanup-slot' });
@@ -522,7 +522,8 @@ export class ClusterPage {
     const cleanup = cleanupAvailability(c, Boolean(this.busy));
     const stoppable = isStoppable(c) && !this.busy;
     const parentTitle = c.parentId ? this.ctx.parentTitle?.(c.parentId) : '';
-    this.count.textContent = `${total} 個`;
+    // The heading over the worker cards counts workers; `total` counts tasks once a queue is used.
+    this.count.textContent = `${(c.workers || []).length} 個`;
     // The "x minutes ago" moves on by itself, so it is part of what this is drawn from.
     if (!this.changed('head', [c.status, done, total, failed, deleted, c.mode, c.isolate, c.swarm, c.parentId, parentTitle, merge, cleanup, stoppable, this.busy, this.actionError, Math.floor(Date.now() / 60_000)])) return;
     const parent = c.parentId;
