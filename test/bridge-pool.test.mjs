@@ -1758,3 +1758,70 @@ test('contract with the Hub: its provision reaches the connector, the connector\
   const second = (await lastReportOf(account.rotationRevision())).keys.find((k) => k.id === 'k_a');
   assert.equal(second.authFailures, 1, 'a clear starts the count again');
 });
+
+// ------------------------------------------- one key for each conversation
+
+// (The way the split behaves is in bridge-sticky.test.mjs, on a saved pool. Here:
+// how a pool the Hub sends names it, and what a new list does to the split.)
+const converse = (session, extra = {}) => chat({ model: 'deepseek-v4.1-flash', stream: true, messages: [{ role: 'user', content: 'x' }], prompt_cache_key: session, ...extra }).then((r) => r.text().then(() => r.status));
+const stickyKeyOf = (session) => upstreamRequests.filter((u) => u.body?.prompt_cache_key === session).map((u) => u.key);
+
+test('a pool that names distribution "sticky" gives each conversation one key; one that names none, or "relay", does what it always did', async () => {
+  const two = [key('dk_a', KEY_A), key('dk_b', KEY_B)];
+  let r = await provision({ pool: { ...pool(two), distribution: 'sticky' } });
+  assert.equal(r.ok, true, r.error);
+  assert.equal(r.data.pool.distribution, 'sticky');
+  for (const s of ['session_one1', 'session_two2', 'session_three3', 'session_four4']) assert.equal(await converse(s), 200);
+  assert.deepEqual(['session_one1', 'session_two2', 'session_three3', 'session_four4'].map((s) => stickyKeyOf(s)[0]), [KEY_A, KEY_B, KEY_A, KEY_B]);
+
+  upstreamRequests = [];
+  r = await provision({ pool: { ...pool(two, 2), distribution: 'relay' } });
+  assert.equal(r.ok, true, r.error);
+  assert.equal(r.data.pool.distribution, 'relay');
+  for (const s of ['session_one1', 'session_two2']) await converse(s);
+  assert.deepEqual([...new Set(upstreamRequests.map((u) => u.key))], [KEY_A], 'a relay: all on the key in use');
+
+  upstreamRequests = [];
+  r = await provision({ pool: pool(two, 3) });
+  assert.equal(r.ok, true, r.error);
+  assert.equal(r.data.pool.distribution, 'relay', 'none named: a relay');
+  for (const s of ['session_one1', 'session_two2']) await converse(s);
+  assert.deepEqual([...new Set(upstreamRequests.map((u) => u.key))], [KEY_A]);
+
+  // Anything else is refused outright, and nothing changes.
+  r = await provision({ pool: { ...pool(two, 4), distribution: 'round-robin' } });
+  assert.equal(r.ok, false, JSON.stringify(r));
+  assert.match(r.error, /distribution/);
+});
+
+test('a new list from the Hub leaves the conversations where they are while their key is still in it, and moves only those whose key went', async () => {
+  const three = [key('dk_a', KEY_A), key('dk_b', KEY_B), key('dk_c', KEY_C)];
+  const names = ['session_one1', 'session_two2', 'session_three3'];
+  assert.equal((await provision({ pool: { ...pool(three), distribution: 'sticky' } })).ok, true);
+  for (const s of names) await converse(s);
+  assert.deepEqual(names.map((s) => stickyKeyOf(s)[0]), [KEY_A, KEY_B, KEY_C]);
+
+  // The same keys in another order, a higher revision (a person moved a key): nobody moves, so no cache is lost.
+  upstreamRequests = [];
+  assert.equal((await provision({ pool: { ...pool([three[2], three[0], three[1]], 2), distribution: 'sticky' } })).ok, true);
+  for (const s of names) await converse(s);
+  assert.deepEqual(names.map((s) => stickyKeyOf(s).at(-1)), [KEY_A, KEY_B, KEY_C], 'each stayed on its key');
+
+  // A key is taken out of the list: only its conversation is placed again (b has fewer than c's side now: a and c have one each).
+  upstreamRequests = [];
+  assert.equal((await provision({ pool: { ...pool([three[0], three[2]], 3), distribution: 'sticky' } })).ok, true);
+  for (const s of names) await converse(s);
+  assert.deepEqual([stickyKeyOf('session_one1')[0], stickyKeyOf('session_three3')[0]], [KEY_A, KEY_C], 'the two whose keys remain did not move');
+  assert.equal(stickyKeyOf('session_two2')[0], KEY_A, 'the one whose key went is placed on the key with the fewest (a and c level: the first in the list)');
+});
+
+test('a connector report in a sticky pool says how many conversations each key has, and the Hub reads it', async () => {
+  const two = [key('dk_a', KEY_A), key('dk_b', KEY_B)];
+  assert.equal((await provision({ pool: { ...pool(two), distribution: 'sticky' } })).ok, true);
+  for (const s of ['session_one1', 'session_two2', 'session_three3']) await converse(s);
+  await new Promise((r) => setTimeout(r, 150));
+  const last = reports.filter((x) => x.revision === 1).at(-1);
+  assert.equal(last.distribution, 'sticky');
+  assert.deepEqual(Object.fromEntries(last.keys.map((k) => [k.id, k.sessions])), { dk_a: 2, dk_b: 1 });
+  assert.ok(!JSON.stringify(reports).includes('sk-pool') && !JSON.stringify(reports).includes('session_'), 'no key and no conversation id in a report');
+});

@@ -237,6 +237,13 @@ function normalizeSaved(raw) {
   if (data.epoch !== undefined && data.epoch !== cleanEpoch) dirty = true;
   data.epoch = cleanEpoch;
 
+  // How keys are given out (see distribution()): only the two names mean
+  // anything; a file that says something else is read as the default.
+  if (data.distribution !== undefined && data.distribution !== 'sticky' && data.distribution !== 'relay') {
+    delete data.distribution;
+    dirty = true;
+  }
+
   // Each machine's latest report, kept across a hub restart. Only known
   // gateways, revisions and string ids get this far; no key material.
   const activity = {};
@@ -292,6 +299,7 @@ function save({ explicit = false } = {}) {
 export function reload() {
   saved = load().data;
   provisioned.clear();
+  stickyReports.clear();
   headerWarnings.clear();
   jobs.clear();
   tails.clear();
@@ -345,6 +353,12 @@ export function rotationEntries() {
   }
   return [...out, ...found.values()];
 }
+// What a page may be told of a key by its id: its gateway and the last four
+// characters, never the key. null: the Hub has no such key (it was removed).
+export function keyIdentity(id) {
+  const e = rotationEntries().find((x) => x.k.id === id);
+  return e ? { id, gateway: e.gw, gatewayLabel: GATEWAYS[e.gw].label, hint: hint(e.k.key) } : null;
+}
 // The gateway a key is on, or null.
 export const gatewayOfKey = (id) => rotationEntries().find((e) => e.k.id === id)?.gw || null;
 // The revision of the whole list: it goes up with every change to any pool and
@@ -357,6 +371,38 @@ const bumpEpoch = () => {
   saved.epoch = (saved.epoch || 0) + 1;
 };
 const hasCap = (machine, name) => Array.isArray(machine?.capabilities) && machine.capabilities.includes(name);
+
+// ---- how the keys are given out
+//   'sticky'  every conversation keeps one key (the key with the fewest
+//             conversations takes a new one), so the gateway's cache for it is not
+//             lost and the conversations share the keys' throughput; only a key
+//             that runs out or is refused moves its own conversations. The default,
+//             also for a file from before this existed.
+//   'relay'   every conversation uses the key in use, and the next one is taken
+//             only when that runs out (the order of the list).
+// It goes to the connectors with the list, but only to one that says `pool_sticky`;
+// an older one relays whatever is chosen here.
+export const distribution = () => (saved.distribution === 'relay' ? 'relay' : 'sticky');
+
+// True when it changed. A change is a new version of the whole list (like a new
+// order), so every computer is sent it again.
+export function setDistribution(mode) {
+  if (mode !== 'sticky' && mode !== 'relay') throw Object.assign(new Error('key 的分配方式只能是平均分配（sticky：每個對話固定一把）或接力（relay：用完才換下一把）'), { status: 400 });
+  if (distribution() === mode) return false;
+  // A file that cannot be used is not written over for this (the person is told).
+  keyFile.check();
+  saved.distribution = mode;
+  bumpEpoch();
+  save();
+  return true;
+}
+
+// What each connector last said about how many conversations each key has (a
+// connector in a sticky pool says it in its pool report), by computer:
+// { distribution: 'sticky' | 'relay', counts: { key id: n } }. Live numbers: kept
+// in memory only, forgotten when the computer reconnects (it says them again
+// with its next provision) and left out while it is offline.
+const stickyReports = new Map();
 // { catalog gateway's model id -> the id of the same model at gateway g }, for
 // the gateways other than the catalog's that hold a key. The same model is the
 // one whose last name part is the same (`deepseek/deepseek-v4.1-flash` and
@@ -639,6 +685,23 @@ export function applyPoolReport(machineId, msg) {
   let changed = false;
 
   const id = String(machineId).slice(0, 64);
+  // How many conversations each key has on this computer (sticky pools only).
+  // Whole numbers for keys the Hub knows, nothing else; each report replaces the
+  // last one of the computer. Not a fact about the keys, so it needs no revision.
+  const mode = msg.distribution === 'sticky' || msg.distribution === 'relay' ? msg.distribution : null;
+  if (mode) {
+    const counts = {};
+    if (mode === 'sticky' && Array.isArray(msg.keys)) {
+      for (const item of msg.keys.slice(0, 100)) {
+        if (item && typeof item.id === 'string' && known.has(item.id) && Number.isInteger(item.sessions) && item.sessions >= 0 && item.sessions <= 1_000_000) counts[item.id] = item.sessions;
+      }
+    }
+    const next = { distribution: mode, counts };
+    if (JSON.stringify(stickyReports.get(id)) !== JSON.stringify(next)) {
+      stickyReports.set(id, next);
+      changed = true;
+    }
+  } else if (stickyReports.delete(id)) changed = true;
   const prev = saved.activity?.[id];
   // The newest report by revision wins for a machine's activity. A different
   // gateway is a new fact even when its revision counter is lower (another
@@ -760,6 +823,17 @@ export function setSettings({ gateway: gw, defaults } = {}) {
   save();
 }
 
+// The conversations on a key, from the computers that are online and said they
+// give each conversation its own key; null when none has said anything about it.
+function sessionsOn(keyId) {
+  let n = null;
+  for (const [machineId, r] of stickyReports) {
+    if (r.distribution !== 'sticky' || !machines.getMachine(machineId)?.online || !Object.hasOwn(r.counts, keyId)) continue;
+    n = (n || 0) + r.counts[keyId];
+  }
+  return n;
+}
+
 export function publicAccount() {
   const gw = gateway();
   // Session-header and native-subagent provisioning problems stay visible;
@@ -831,6 +905,10 @@ export function publicAccount() {
       position: i + 1,
       active: e.k.id === head,
       state: e.k.exhaustedAt ? (e.k.manual ? 'manual' : 'exhausted') : isRefused(e.k) ? 'auth_failed' : 'ready',
+      // How many conversations are on this key right now, added up over the
+      // computers that are online and give each conversation its own key; null
+      // when none of them has said (not zero: nobody has counted).
+      sessions: sessionsOn(e.k.id),
     })),
     allExhausted: entries.length > 0 && entries.every((e) => isBlocked(e.k)),
     nextResetAt: stated.length ? Math.min(...stated) : null,
@@ -839,7 +917,19 @@ export function publicAccount() {
   // Each computer's latest actual key. This is not the hub's preferred one:
   // the hub must not force every computer back onto the same key.
   const activity = Object.entries(saved.activity || {})
-    .map(([machineId, a]) => ({ machineId, machineName: machines.getMachine(machineId)?.name || machineId, gateway: a.gateway, activeId: a.activeId, revision: a.revision, ...(a.rotation ? { rotation: true } : {}) }))
+    .map(([machineId, a]) => ({
+      machineId,
+      machineName: machines.getMachine(machineId)?.name || machineId,
+      gateway: a.gateway,
+      activeId: a.activeId,
+      revision: a.revision,
+      ...(a.rotation ? { rotation: true } : {}),
+      // Present only when there is something to say: this computer's connector can
+      // give each conversation its own key (`stickyCapable`), and the way it last
+      // said it gives them out (`distribution`). Neither: an older connector.
+      ...(machines.hasCapability(machineId, 'pool_sticky') ? { stickyCapable: true } : {}),
+      ...(stickyReports.get(machineId)?.distribution ? { distribution: stickyReports.get(machineId).distribution } : {}),
+    }))
     .sort((a, b) => a.machineId.localeCompare(b.machineId));
   // What each computer's Kimi actually has as [secondary_model], as the
   // bridge last reported it. This is the real value (model, effort, force),
@@ -847,7 +937,7 @@ export function publicAccount() {
   const secondaryModels = [...secondary]
     .map(([machineId, s]) => ({ machineId, machineName: machines.getMachine(machineId)?.name || machineId, ...s }))
     .sort((a, b) => a.machineId.localeCompare(b.machineId));
-  return { gateway: gw, hasKey: cur.hasKey || rotation.keys.length > 0, keyHint: cur.keyHint, gateways, rotation, defaults: settings(gw).defaults, warnings, activity, secondaryModels, damaged: keyFile.public() };
+  return { gateway: gw, hasKey: cur.hasKey || rotation.keys.length > 0, keyHint: cur.keyHint, gateways, rotation, distribution: distribution(), defaults: settings(gw).defaults, warnings, activity, secondaryModels, damaged: keyFile.public() };
 }
 
 // -------------------------------------------------------------- models
@@ -1093,6 +1183,8 @@ function planFor(machineId) {
         retryMs: retryMs(),
         rotation: 1,
         modelMap: map,
+        // (Only to a connector that says it can: see distribution().)
+        ...(hasCap(machine, 'pool_sticky') ? { distribution: distribution() } : {}),
         keys: all.map((e) => ({
           id: e.k.id,
           apiKey: e.k.key,
@@ -1385,6 +1477,7 @@ export const forgetProvider = (machineId) => {
 // Kimi's server came up on a computer that was already connected (the hello
 // had said it was not up). Both start fresh: no stale backoff or throttle.
 machines.onBridgeHello((id) => {
+  stickyReports.delete(id);
   forgetProvider(id);
   stopRetry(id);
   autoFailures.delete(id);

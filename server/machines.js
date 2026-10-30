@@ -25,11 +25,15 @@ const FILE = path.join(DATA_DIR, 'machines.json');
 //                    keeps it aside as "refused" (authFailedAt, authFailures, authRetryAt; never
 //                    "exhausted") and probes it again with real requests at doubling gaps; the Hub
 //                    sends those fields only to a connector that says so
+//   pool_sticky      the DeepSeek proxy can give each conversation one key for good (the pool's
+//                    `distribution`: 'sticky', or 'relay' for the order of old) and says how many
+//                    conversations each key has; the Hub sends the setting only to a connector
+//                    that says so (an older one relays)
 // A connector that sends no `capabilities` has none (an empty array): the
 // version string is never used to guess. The first connector that sends the
 // field is CAPABILITY_CONNECTOR_VERSION; older ones must be reconnected with
 // the current command (a message about "upgrade" can name this version).
-export const CAPABILITIES = ['pool', 'pool_cross', 'secondary_model', 'broker', 'handoff', 'pool_timing', 'pool_measure', 'event_timing', 'pool_auth'];
+export const CAPABILITIES = ['pool', 'pool_cross', 'secondary_model', 'broker', 'handoff', 'pool_timing', 'pool_measure', 'event_timing', 'pool_auth', 'pool_sticky'];
 export const CAPABILITY_CONNECTOR_VERSION = '0.11.0';
 const cleanCapabilities = (raw) => (Array.isArray(raw) ? [...new Set(raw.filter((x) => typeof x === 'string' && /^[a-z][a-z0-9_]{0,31}$/.test(x)))].slice(0, 16) : []);
 const machines = new Map(); // id -> machine

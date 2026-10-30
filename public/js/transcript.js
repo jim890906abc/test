@@ -10,52 +10,10 @@ import { h, fill, icon, fmtDuration } from './dom.js';
 import { markdownInto, MarkdownStream, renderMarkdown, renderLineDiff, diffStats } from './markdown.js';
 import { artifactOf, collectArtifacts, mergeArtifactIndex, artifactCard } from './artifacts.js';
 import { agentLife, subagentModelView, lifeBadge } from './agent-state.js';
+import { TOOLS, INTERNAL_TITLE, agentName, agentDescription, activityOf, lastShown } from './agent-activity.js';
 
-export const TOOLS = {
-  Bash: ['terminal', '執行'],
-  Shell: ['terminal', '執行'],
-  Read: ['eye', '讀取'],
-  ReadFile: ['eye', '讀取'],
-  Write: ['filePlus', '寫入'],
-  WriteFile: ['filePlus', '寫入'],
-  Edit: ['pencil', '編輯'],
-  MultiEdit: ['pencil', '編輯'],
-  StrReplaceFile: ['pencil', '編輯'],
-  Glob: ['files', '找檔案'],
-  Grep: ['search', '搜尋'],
-  FetchURL: ['globe', '讀取網頁'],
-  WebFetch: ['globe', '讀取網頁'],
-  WebSearch: ['globe', '搜尋網路'],
-  SearchWeb: ['globe', '搜尋網路'],
-  CodeExecution: ['terminal', '雲端執行程式'],
-  Agent: ['agents', '子代理'],
-  AgentSwarm: ['agents', '子代理群'],
-  Task: ['agents', '子代理'],
-  StartConversation: ['agents', '開新對話'],
-  MessageConversation: ['agent', '傳訊息給對話'],
-  ReadConversation: ['eye', '讀對話'],
-  btw: ['question', '順便問'],
-  TodoList: ['todo', '待辦'],
-  TodoWrite: ['todo', '待辦'],
-  SetTodoList: ['todo', '待辦'],
-  AskUserQuestion: ['question', '提問'],
-  EnterPlanMode: ['map', '進入計畫模式'],
-  ExitPlanMode: ['map', '計畫'],
-  Skill: ['bolt', '技能'],
-  TaskList: ['clock', '背景工作'],
-  TaskOutput: ['clock', '背景工作輸出'],
-  TaskStop: ['clock', '停止背景工作'],
-  WaitFor: ['clock', '等待背景工作'],
-  CronCreate: ['clock', '建立排程'],
-  CronList: ['clock', '排程'],
-  CronDelete: ['clock', '刪除排程'],
-  CreateGoal: ['sparkle', '設定目標'],
-  GetGoal: ['sparkle', '目標'],
-  UpdateGoal: ['sparkle', '更新目標'],
-  SetGoalBudget: ['sparkle', '目標預算'],
-  delegate_to_provider: ['agents', '子代理'],
-  'mcp__agent-hub__delegate_to_provider': ['agents', '子代理'],
-};
+// The verbs tool calls are shown with live in agent-activity.js (the cluster page uses them too).
+export { TOOLS };
 
 const ACTIVE = ['pending', 'running', 'awaiting'];
 // Rows drawn right away when a conversation opens (what fills the screen
@@ -80,22 +38,6 @@ const LOOK = /^(Read|ReadFile|ReadMediaFile|Glob|Grep|FetchURL|WebFetch|WebSearc
 const lineCount = (t) => (t ? String(t).replace(/\n+$/, '').split('\n').length : 0);
 const isAgent = (ev) => Boolean(ev.subagent) || /^(Agent|AgentSwarm|Task)$/.test(ev.name) || /(^|__)delegate_to_provider$/.test(ev.name || '');
 const isTodo = (ev) => /^(TodoList|TodoWrite|SetTodoList)$/.test(ev.name);
-const INTERNAL_AGENT = /delegate_to_provider|mcp__agent-hub|agent-hub|(^|[\s·])broker([\s·]|$)/i;
-// Internal tool/connection names must never become a user-facing card title.
-// This one is deliberately broad: a display name such as "agent-hub-broker"
-// or "broker_task" is internal even though it is not a whole word.
-const INTERNAL_TITLE = /delegate_to_provider|mcp__agent-hub|agent-hub|broker/i;
-function agentName(sub) {
-  const name = String(sub?.name || '').trim();
-  return name && !/^(subagent|btw)$/i.test(name) && !INTERNAL_TITLE.test(name) ? name : '';
-}
-function agentDescription(ev, sub = {}) {
-  const input = ev.input && typeof ev.input === 'object' ? ev.input : {};
-  let text = sub.description || input.description || ev.title || input.prompt || input.task || '';
-  if (INTERNAL_AGENT.test(String(text))) text = input.task || input.prompt || sub.description || '';
-  const out = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 120);
-  return INTERNAL_TITLE.test(out) ? '' : out;
-}
 // Claude's web search and fetch (run by the Claude API) come back as
 // "title\n  url" per search result, or "title\nurl" for the fetched page.
 function webLinks(ev) {
@@ -976,14 +918,13 @@ export class Transcript {
       if (onlyRunning && !life.running) continue;
       const sub = ev.subagent || {};
       const kids = this.childrenOf(id);
-      const last = [...kids].reverse().find((k) => k.type === 'tool_use' || (k.type === 'text' && k.text?.trim()));
-      const activity = !last ? '' : last.type === 'tool_use' ? `${(TOOLS[last.name] || [null, last.name])[1]} ${last.title || ''}`.trim() : last.text.trim().split('\n').pop();
+      const activity = activityOf(lastShown(kids));
       out.push({
         id,
         name: agentName(sub),
         // Without a description, the first line of the task it was given.
         description: agentDescription(ev, sub),
-        activity: activity.slice(0, 120),
+        activity,
         steps: this.stepCount(id, kids),
         background: Boolean(sub.background),
         life,

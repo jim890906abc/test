@@ -15,7 +15,7 @@ import { salvageView, damagedView, damagedHeadline, backupPath, configProblemTex
 import { fadeColors } from './color-fade.js';
 import { buildRows, newChildIndex, rememberChildren, parseSideSections, sidebarSections, rowProviderView } from './sidebar-model.js';
 import { TimingPane, hasTiming } from './timing-panel.js';
-import { ClusterPage, openClusterDialog, openClusterList, drawClusterNote, rememberCluster, loadClustersOf, clusterHash } from './cluster.js';
+import { ClusterPage, openClusterDialog, openClusterList, drawClusterNote, rememberCluster, loadClustersOf, clusterHash, createClusterList, loadClusterRows, onClusterRows, clusterTotals } from './cluster.js';
 import { DEFAULT_SUBAGENT, modeIn, subagentPayload, subagentChoiceText, subagentModeText, providerDefaultsFor as providerDefaultsOf, runWithRollback } from './home-state.js';
 
 const S = {
@@ -139,6 +139,15 @@ const clusterCtx = {
   session: (id) => S.sessions.get(id),
   onTitle: (c) => renderClusterToolbar(c),
   onCreated: (c) => S.cur?.id === c.parentId && drawCurrentClusterNote(),
+  // The names a subagent's model is shown with (the same as the conversation's own cards).
+  modelName: (provider, id) => modelNameOf(provider, id) || String(id).split('/').pop(),
+  effortLabel: (e) => EFFORT_LABELS[e] || e,
+  // 在對話中查看: the worker's conversation, with the subagent's card brought up when the conversation has it.
+  focusAgent: (sessionId, eventId) => {
+    S.pendingAgentFocus = eventId || null;
+    S.pendingCardScroll = Boolean(eventId);
+    go(`#/s/${sessionId}`);
+  },
 };
 
 function notify(title, body, onClick) {
@@ -161,6 +170,8 @@ const $foot = h('div', { class: 'side-foot' });
 // Conversation files that are damaged on disk and could not be loaded (see drawDamaged).
 const $damaged = h('div', { class: 'damaged-slot', hidden: true });
 let $artifactsLink;
+let $clustersLink;
+const $clustersCount = h('span', { class: 'om-badge om-badge--count cluster-nav-count', hidden: true, role: 'status' });
 const $sidebar = h(
   'nav',
   { class: 'sidebar om-sidebar', 'aria-label': '對話' },
@@ -173,6 +184,7 @@ const $sidebar = h(
   ),
   h('a', { class: 'om-sidebar__item new-item', href: '#/' }, icon('plus'), '新對話'),
   ($artifactsLink = h('a', { class: 'om-sidebar__item new-item', href: '#/artifacts', onclick: () => closeDrawer() }, icon('artifact'), 'Artifacts')),
+  ($clustersLink = h('a', { class: 'om-sidebar__item new-item', href: '#/clusters', dataset: { nav: 'clusters' }, onclick: () => closeDrawer() }, icon('cluster'), '叢集總覽', $clustersCount)),
   $damaged,
   h('label', { class: 'om-search side-search' }, icon('search'), $search),
   $list,
@@ -658,11 +670,14 @@ async function route() {
   const hash = location.hash || '#/';
   closeMenu();
   $artifactsLink.removeAttribute('aria-current');
+  $clustersLink.removeAttribute('aria-current');
   clusterPage?.destroy();
   clusterPage = null;
+  clusterList = null;
   let m;
   if ((m = hash.match(/^#\/s\/([\w-]+)/))) return openSession(m[1]);
   if ((m = hash.match(/^#\/cluster\/([\w-]+)/))) return showCluster(m[1]);
+  if (/^#\/clusters\/?(\?.*)?$/.test(hash)) return showClusterList();
   if ((m = hash.match(/^#\/k\/([\w-]+)\/([\w-]+)/))) return attachAndOpen(m[1], m[2]);
   if (hash.startsWith('#/artifacts')) return showArtifacts();
   return showHome();
@@ -681,6 +696,37 @@ function showCluster(cid) {
   fill($view, clusterPage.el);
   clusterPage.load();
 }
+
+// Every cluster at a glance: the totals over all of them and one card each.
+let clusterList = null;
+function showClusterList() {
+  applyProvider(null);
+  leaveSession();
+  hidePanel();
+  S.route = 'clusters';
+  $clustersLink.setAttribute('aria-current', 'page');
+  renderSidebar();
+  fill($toolbar, sidebarToggle(), h('div', { class: 'toolbar-titles' }, h('div', { class: 'om-toolbar__title' }, '叢集總覽'), h('div', { class: 'om-toolbar__subtitle' }, '全部叢集的進度與速度')));
+  clusterList = createClusterList(clusterCtx);
+  fill($view, clusterList.el);
+  clusterList.load();
+}
+
+// The number beside the link in the sidebar: subagents working right now, over all clusters.
+function drawClustersEntry() {
+  const t = clusterTotals();
+  const n = t.subagentsRunning;
+  const on = t.active > 0;
+  $clustersCount.hidden = !on;
+  $clustersCount.textContent = on ? String(n) : '';
+  $clustersCount.title = on ? `${t.active} 個叢集進行中，${n} 個子代理正在工作` : '';
+  $clustersCount.setAttribute('aria-label', on ? `${n} 個子代理正在工作` : '');
+  $clustersLink.title = on ? `叢集總覽：${t.active} 個叢集進行中，${n} 個子代理正在工作` : '叢集總覽';
+}
+onClusterRows(() => {
+  drawClustersEntry();
+  clusterList?.draw();
+});
 
 function renderClusterToolbar(c) {
   if (!S.route?.startsWith('cluster:')) return;
@@ -1723,13 +1769,19 @@ async function applySnapshot(full) {
   // not shown as an empty panel.
   const focus = S.pendingAgentFocus;
   S.pendingAgentFocus = null;
+  const cardScroll = S.pendingCardScroll;
+  S.pendingCardScroll = false;
   if (focus) {
     const agent = cur.transcript.agentList().find((a) => {
       if (a.id === focus) return true;
       const ev = cur.transcript.get(a.id);
       return ev?.childSessionId === focus || ev?.subagent?.id === focus || ev?.subagent?.childSessionId === focus;
     });
-    if (agent) showAgents(agent.id);
+    if (agent) {
+      showAgents(agent.id);
+      // Coming from a cluster's tile: the card in the conversation too, when it is there to be brought up.
+      if (cardScroll) cur.transcript.focusAgent(agent.id);
+    } else if (cardScroll) toast('已開啟這個工作者的對話；那張子代理卡片不在目前載入的範圍，往上捲或看「面板」→「子代理」。');
     else toast('已開啟父對話；子代理的即時過程在「面板」→「子代理」裡。');
   }
 }
@@ -3596,6 +3648,9 @@ async function deepseekDialog() {
   const gwBox = h('div', { class: 'gw-list', role: 'radiogroup', 'aria-label': '閘道' });
   const keyHead = h('div', { class: 'ds-key-head' });
   const keyBox = h('div', { class: 'ds-key-list' });
+  // How the keys are given out: each conversation keeps one key, or the old relay.
+  const distBox = h('div', { class: 'gw-list ds-dist', role: 'radiogroup', 'aria-label': 'key 分配方式' });
+  const distNote = h('p', { class: 'om-field__help ds-note ds-dist-note' });
   const allOutBox = h('div', { class: 'ds-all-out-box' });
   const machineBox = h('div', { class: 'ds-machines' });
   const modelSel = h('select', { class: 'om-input', name: 'model' });
@@ -3783,7 +3838,8 @@ async function deepseekDialog() {
   };
   const drawKeys = () => {
     const keys = rot();
-    fill(keyHead, h('span', { class: 'om-field__label' }, '全部 API key（依序使用，用完自動換下一把）'), h('span', { class: 'om-toolbar__spacer' }), h('span', { class: 'ds-key-count' }, keys.length ? `${keys.length} 把` : ''));
+    const relay = acc.distribution === 'relay';
+    fill(keyHead, h('span', { class: 'om-field__label' }, relay ? '全部 API key（依序使用，用完自動換下一把）' : '全部 API key（平均分配：每個對話固定用一把）'), h('span', { class: 'om-toolbar__spacer' }), h('span', { class: 'ds-key-count' }, keys.length ? `${keys.length} 把` : ''));
     fill(allOutBox, ...(keys.length && acc.rotation?.allExhausted ? [h('div', { class: 'callout small ds-all-out', role: 'status' }, icon('alert'), h('div', { class: 'callout-text' }, allOutText()))] : []));
     fill(
       keyBox,
@@ -3801,6 +3857,8 @@ async function deepseekDialog() {
                 h('span', { class: 'ds-key-gw' }, k.gatewayLabel || k.gateway),
                 h('span', { class: 'ds-key-hint' }, `…${k.hint || '????'}`),
                 h('span', { class: `om-badge${st.badge ? ` om-badge--${st.badge}` : ''} ds-key-state` }, st.text),
+                // Only in the even split, and only once a computer has said how many (not 0 before anyone counted).
+                !relay && Number.isInteger(k.sessions) ? h('span', { class: 'ds-key-sessions', 'data-sessions': String(k.sessions), title: '現在固定用這把 key 的對話數（各台電腦加起來）' }, `目前 ${k.sessions} 個對話`) : null,
                 h('span', { class: 'ds-key-added', title: k.addedAt ? new Date(k.addedAt).toLocaleString() : '' }, k.addedAt ? `加入於 ${relTime(k.addedAt)}` : ''),
               ),
               k.state === 'auth_failed' || k.authFailed ? h('div', { class: 'ds-key-auth' }, authNote(k)) : null,
@@ -3842,6 +3900,8 @@ async function deepseekDialog() {
                 key ? `${key.gatewayLabel || key.gateway} …${key.hint || '????'}${out}` : a.activeId ? '回報的 key 已不在清單' : '尚未回報使用中的 key',
                 // A connector from before keys rotated across gateways only rotates inside one.
                 a.rotation ? null : h('span', { class: 'ds-machine-old' }, `（舊版連接器，只在 ${label(a.gateway)} 內換；重新執行連接指令更新後才會跨家）`),
+                // A connector from before each conversation could have its own key relays, whatever is chosen.
+                a.stickyCapable || acc.distribution === 'relay' ? null : h('span', { class: 'ds-machine-old', 'data-note': 'relay-only' }, '（這台電腦的連接器太舊，只能接力；重新執行連接指令更新後才會平均分配）'),
               ),
               h('span', { class: 'ds-machine-rev', title: '這台電腦最近回報的清單版本（清單有變動就會增加）' }, `v${a.revision}`),
             );
@@ -3849,8 +3909,39 @@ async function deepseekDialog() {
         : h('p', { class: 'om-field__help' }, '還沒有電腦回報實際使用中的 key。換 key、加入 key 或電腦重新連上後，連接器會回報；沒回報的電腦不代表沒在用。'),
     );
   };
+  // The two ways, in the words a person chooses by. Choosing is at once, like a key
+  // operation (the computers are sent the new way); the page goes back to what the
+  // Hub says if it refuses.
+  const DISTRIBUTIONS = [
+    ['sticky', '平均分配（每個對話固定一把）', '預設', '每個對話固定用一把 key（它的子代理也用同一把），新對話分給目前對話最少的那一把，所以每把 key 的負擔差不多，DeepSeek 的前綴快取也保得住（快取綁帳號，請求在 key 之間跳來跳去就吃不到）。某把額度用完或被拒絕時，只有用那一把的對話改用別把，其他對話不動。'],
+    ['relay', '接力（用完才換下一把）', '', '所有對話都用清單裡使用中的那一把，額度用完（或被拒絕）才換下一把。'],
+  ];
+  // Computers whose connector cannot give each conversation its own key: it relays whatever is chosen.
+  const relayOnly = () => S.machines.filter((m) => m.online && (m.capabilities || []).includes('pool') && !(m.capabilities || []).includes('pool_sticky')).map((m) => m.name);
+  const setDistribution = async (id) => {
+    await keyOp({ distribution: id }, id === 'sticky' ? '改成平均分配' : '改成接力');
+    drawDistribution();
+  };
+  const drawDistribution = () => {
+    const mode = acc.distribution === 'relay' ? 'relay' : 'sticky';
+    fill(
+      distBox,
+      ...DISTRIBUTIONS.map(([id, name, tag]) =>
+        h(
+          'label',
+          { class: `gw-item${id === mode ? ' on' : ''}`, 'data-dist': id },
+          h('input', { type: 'radio', name: 'distribution', value: id, checked: id === mode, onchange: () => setDistribution(id) }),
+          h('span', { class: 'gw-name' }, name),
+          h('span', { class: 'gw-state' }, tag),
+        ),
+      ),
+    );
+    const old = mode === 'sticky' ? relayOnly() : [];
+    fill(distNote, `${DISTRIBUTIONS.find((d) => d[0] === mode)[3]}${old.length ? ` ${old.map((n) => `「${n}」`).join('')}的連接器太舊，只能接力；重新執行連接指令更新後才會平均分配。` : ''}`);
+  };
   const draw = () => {
     acc = S.deepseek || acc;
+    drawDistribution();
     drawGateways();
     drawKeyNote();
     drawKeys();
@@ -4006,6 +4097,9 @@ async function deepseekDialog() {
     testOut,
     errBox,
     h('p', { class: 'om-field__help ds-note' }, STORAGE_NOTE),
+    h('div', { class: 'dialog-subtitle' }, 'key 分配方式'),
+    distBox,
+    distNote,
     h('div', { class: 'dialog-subtitle' }, '各機實際 key'),
     machineBox,
     h('div', { class: 'dialog-subtitle' }, '模型名稱來源'),
@@ -5510,6 +5604,7 @@ async function start() {
   await loadSessions().catch(fail);
   await loadMachines().catch(fail);
   loadDamaged();
+  loadClusterRows().catch(() => {});
   socket = connect(onMessage, (ok) => {
     const was = S.online;
     S.online = ok;
@@ -5517,6 +5612,8 @@ async function start() {
     drawFoot();
     if (ok) watchCurrent();
     if (ok) clusterPage?.load();
+    // What was said about clusters while the link was down was missed.
+    if (ok && !was) (clusterList ? clusterList.load() : loadClusterRows().catch(() => {}));
     if (ok) refreshClusterNote();
     if (ok) loadDamaged();
     if (ok && !was) loadSessions().then(loadMachines).catch(() => {});

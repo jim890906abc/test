@@ -427,3 +427,224 @@ export function timingView(timing, error = null) {
   const coverage = ['since', 'requestsSince'].map((key) => ({ key, label: FIELD_LABELS[key], ms: isMoment(timing[key]) ? timing[key] : null }));
   return { segments, total, facts, counts, coverage, notes, failed: null };
 }
+
+// ------------------------------------------------------------- subagents
+
+// What a square says about a subagent. `group` is what it is counted with:
+// "失敗或取消" is one group (a subagent that was cut short did not finish
+// either), the squares and the legend say it with a glyph as well as a colour.
+// The words are the conversation's own (agent-state.js lifeBadge).
+export const SUBAGENT_STATES = {
+  running: { group: 'running', label: '執行中', glyph: '' },
+  awaiting: { group: 'awaiting', label: '等你核准', glyph: '!' },
+  done: { group: 'done', label: '完成', glyph: '✓' },
+  failed: { group: 'failed', label: '失敗', glyph: '✕' },
+  cancelled: { group: 'failed', label: '已中斷', glyph: '✕' },
+  unknown: { group: 'unknown', label: '狀態未知', glyph: '?' },
+};
+// The legend, in the order the count line uses.
+export const SUBAGENT_LEGEND = [
+  { group: 'running', label: '執行中', glyph: '' },
+  { group: 'awaiting', label: '等你核准', glyph: '!' },
+  { group: 'done', label: '完成', glyph: '✓' },
+  { group: 'failed', label: '失敗或取消', glyph: '✕' },
+  { group: 'unknown', label: '狀態未知', glyph: '?' },
+];
+export const subagentState = (status) => SUBAGENT_STATES[status] || SUBAGENT_STATES.unknown;
+
+const num = (v) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 0);
+
+// The counts the Hub sends, by group.
+export function groupCounts(counts) {
+  const c = counts && typeof counts === 'object' ? counts : {};
+  return { total: num(c.total), running: num(c.running), awaiting: num(c.awaiting), done: num(c.done), failed: num(c.failed) + num(c.cancelled), unknown: num(c.unknown) };
+}
+
+// "子代理 8：5 執行中・3 完成"; only the groups that have any, in the legend's order.
+export function subagentLine(counts, older = 0) {
+  const g = groupCounts(counts);
+  if (!g.total && !older) return '沒有開過子代理';
+  const parts = SUBAGENT_LEGEND.filter((l) => g[l.group]).map((l) => `${g[l.group]} ${l.label}`);
+  return `子代理 ${g.total}${parts.length ? `：${parts.join('・')}` : ''}${older ? `（另有 ${older} 個更早的不在清單裡）` : ''}`;
+}
+
+// A subagent is at work: running, or waiting for a person's approval (it is alive).
+export const workingSubagents = (counts) => groupCounts(counts).running + groupCounts(counts).awaiting;
+
+// How many squares fit before "+N": the rest are one button away.
+export const SQUARES_SHOWN = 40;
+export function squaresView(list, { all = false, max = SQUARES_SHOWN } = {}) {
+  const items = Array.isArray(list) ? list : [];
+  const shown = all || items.length <= max ? items : items.slice(0, max);
+  return { shown, hidden: items.length - shown.length };
+}
+
+// The aria-label of one square: whose, what state, and the one thing it is doing.
+export function squareLabel(s, i = 0) {
+  const st = subagentState(s?.status);
+  return [`子代理 ${i + 1}`, s?.title ? `「${s.title}」` : '', st.label, s?.lastAction ? `最新動作 ${s.lastAction}` : ''].filter(Boolean).join('，');
+}
+
+// What the detail of a subagent says; `—` for what was not measured, and why in `why`.
+export function subagentDetail(s, { now = Date.now(), modelText = (p, m) => m, effortLabel = (e) => e } = {}) {
+  const st = subagentState(s?.status);
+  const active = st.group === 'running' || st.group === 'awaiting';
+  const started = isMoment(s?.startedAt) ? s.startedAt : null;
+  const ended = isMoment(s?.finishedAt) ? s.finishedAt : null;
+  const span = started && (active ? now - started : ended && ended >= started ? ended - started : null);
+  return {
+    state: st,
+    title: s?.title || s?.name || '子代理',
+    model: s?.model ? `${modelText(s.provider, s.model)}${s.effort ? ` · 思考 ${effortLabel(s.effort)}` : ''}` : null,
+    modelWhy: s?.model ? null : s?.modelReason || '沒有回報',
+    steps: Number.isFinite(s?.steps) ? s.steps : null,
+    lastAction: s?.lastAction || null,
+    startedAt: started,
+    started: fmtStamp(started),
+    finishedAt: ended,
+    finished: fmtStamp(ended),
+    span: span !== null && span >= 0 ? (active ? `已跑 ${fmtMs(span)}` : `跑了 ${fmtMs(span)}`) : null,
+    reason: s?.reason || null,
+    background: Boolean(s?.background),
+    eventId: s?.eventId || null,
+  };
+}
+
+// ----------------------------------------------------------------- speed
+
+// Speeds are what the connector's request records add up to over a time window
+// (the Hub's recentSpeed); null where they cannot say. Nothing here estimates,
+// and nothing here says how long anything will take.
+export function fmtRate(v) {
+  if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) return null;
+  return v >= 100 ? String(Math.round(v)) : v >= 10 ? v.toFixed(0) : v.toFixed(1).replace(/\.0$/, '');
+}
+export const fmtWindow = (ms) => (isCount(ms) && ms > 0 ? (ms < 90_000 ? `${Math.max(1, Math.round(ms / 1000))} 秒` : `${Math.round(ms / 60_000)} 分鐘`) : null);
+
+// One worker's speed as the page draws it: the short text for a small square
+// ("42 tok/s", or "—"), and the longer lines for the drawer.
+export function speedView(speed) {
+  const tps = fmtRate(speed?.tokensPerSecond);
+  const rpm = fmtRate(speed?.requestsPerMinute);
+  const win = fmtWindow(speed?.windowMs);
+  return {
+    measured: tps !== null,
+    text: tps === null ? '—' : `${tps} tok/s`,
+    tokens: tps === null ? null : `最近 ${win || '一段時間'}輸出 ${tps} tok/s`,
+    requests: rpm === null ? null : `請求 ${rpm}／分`,
+    why: tps === null ? speed?.unmeasured || '伺服器沒有回報速度' : null,
+  };
+}
+
+// ------------------------------------------------------ the whole cluster
+
+// The one line the list of clusters (GET /api/clusters) and the page's reading
+// of a pushed cluster are both made from, so the two cannot disagree.
+export function summarizeCluster(c) {
+  const workers = Array.isArray(c?.workers) ? c.workers : [];
+  const p = progressOf(c);
+  const tasks = Array.isArray(c?.tasks) ? c.tasks : [];
+  const have = workers.filter((w) => w?.subagentCounts && typeof w.subagentCounts === 'object');
+  const sum = { total: 0, running: 0, awaiting: 0, done: 0, failed: 0, cancelled: 0, unknown: 0 };
+  let older = 0;
+  for (const w of have) {
+    for (const k of Object.keys(sum)) sum[k] += num(w.subagentCounts[k]);
+    older += num(w.subagentsOlder);
+  }
+  const rates = workers.map((w) => w?.speed).filter((s) => s && fmtRate(s.tokensPerSecond) !== null);
+  const reqRates = workers.map((w) => w?.speed).filter((s) => s && fmtRate(s.requestsPerMinute) !== null);
+  return {
+    id: c?.id,
+    parentId: c?.parentId ?? null,
+    status: c?.status,
+    createdAt: c?.createdAt ?? null,
+    tasks: { done: p.done, total: p.total, failed: p.failed, running: tasks.filter((t) => t?.status === 'running').length, pending: tasks.filter((t) => t?.status === 'pending').length },
+    workers: workers.length,
+    workersRunning: workers.filter((w) => w?.status === 'running' || w?.status === 'awaiting_permission').length,
+    // null when no worker said (an older Hub): not zero.
+    subagents: have.length ? { ...sum, older } : null,
+    speed: {
+      tokensPerSecond: rates.length ? Math.round(rates.reduce((a, s) => a + s.tokensPerSecond, 0) * 10) / 10 : null,
+      requestsPerMinute: reqRates.length ? Math.round(reqRates.reduce((a, s) => a + s.requestsPerMinute, 0) * 10) / 10 : null,
+      workersMeasured: rates.length,
+      workers: workers.length,
+      unmeasured: rates.length ? null : workers.map((w) => w?.speed?.unmeasured).find(Boolean) || '沒有任何工作者量得到速度',
+    },
+  };
+}
+
+// Active clusters first, each group newest first.
+export function sortClusters(list) {
+  return [...(Array.isArray(list) ? list : [])].sort((a, b) => Number(isActive(b)) - Number(isActive(a)) || (b.createdAt || 0) - (a.createdAt || 0));
+}
+
+// The big numbers over all clusters: from the same one-line summaries.
+export function totalsOf(list) {
+  const rows = Array.isArray(list) ? list : [];
+  const active = rows.filter(isActive);
+  const withSub = rows.filter((r) => r.subagents);
+  const speeds = rows.map((r) => r.speed?.tokensPerSecond).filter((v) => fmtRate(v) !== null);
+  return {
+    clusters: rows.length,
+    active: active.length,
+    workersRunning: rows.reduce((a, r) => a + num(r.workersRunning), 0),
+    subagentsRunning: withSub.reduce((a, r) => a + r.subagents.running + r.subagents.awaiting, 0),
+    subagentsOpened: withSub.reduce((a, r) => a + r.subagents.total + r.subagents.older, 0),
+    // Some cluster did not say how many subagents it has: the numbers above are what the others said.
+    subagentsPartial: withSub.length < rows.length,
+    tokensPerSecond: speeds.length ? Math.round(speeds.reduce((a, v) => a + v, 0) * 10) / 10 : null,
+  };
+}
+
+// How long the cluster has been going: since it was made, to now while it works,
+// and to the last moment the Hub saw any of its tasks end once it is over.
+export function clusterElapsed(c, now = Date.now()) {
+  if (!isMoment(c?.createdAt)) return null;
+  if (isActive(c)) return Math.max(0, now - c.createdAt);
+  const ends = [...(Array.isArray(c.tasks) ? c.tasks : []).map((t) => t?.finishedAt), ...(Array.isArray(c.workers) ? c.workers : []).map((w) => w?.finishedAt)].filter(isMoment);
+  return ends.length ? Math.max(0, Math.max(...ends) - c.createdAt) : null;
+}
+
+// The bar over the whole cluster: parts of the tasks (as shares of the total).
+export function taskBar(c) {
+  const tasks = Array.isArray(c?.tasks) ? c.tasks : [];
+  const total = tasks.length || progressOf(c).total;
+  if (!total) return { total: 0, done: 0, running: 0, failed: 0 };
+  if (!tasks.length) {
+    const p = progressOf(c);
+    return { total, done: p.done / total, running: 0, failed: p.failed / total };
+  }
+  const share = (status) => tasks.filter((t) => t?.status === status).length / total;
+  return { total, done: share('done'), running: share('running'), failed: share('failed') };
+}
+
+// A worker's small square: which task it is on, how many it finished, and its share of the whole.
+export function workerSquare(w, cluster) {
+  const tasks = Array.isArray(cluster?.tasks) ? cluster.tasks : [];
+  const total = tasks.length || 0;
+  const done = Number.isInteger(w?.done) ? w.done : 0;
+  const onIndex = Number.isInteger(w?.taskIndex) ? w.taskIndex : null;
+  let place;
+  if (!total) place = null;
+  else if (w?.status === 'deleted') place = '已刪除';
+  else if (onIndex !== null) place = `第 ${onIndex + 1}/${total} 條`;
+  else place = done ? `做完 ${done} 條` : '待命';
+  return { place, share: total ? done / total : 0, working: onIndex !== null, done, total };
+}
+
+// --------------------------------------------------------- the key it uses
+
+// Which key of the DeepSeek pool a worker's requests went out with, as the Hub's
+// timing answer says it (`currentKey`): the name of the gateway and the last four
+// characters, nothing else - not its id, not the computer it ran on, not when.
+// null from here: the Hub does not say (an older one), so the page says nothing.
+const GATEWAY_LABELS = { 'opencode-go': 'OpenCode Go', opencode: 'OpenCode', commandcode: 'Command Code' };
+export function keyView(timing) {
+  if (!timing || typeof timing !== 'object' || !Object.hasOwn(timing, 'currentKey')) return null;
+  const k = timing.currentKey;
+  if (k === null || typeof k !== 'object') return { state: 'none', text: '還沒有請求紀錄', note: null };
+  const label = String(k.gatewayLabel || GATEWAY_LABELS[k.gateway] || k.gateway || '').trim();
+  // The key is no longer in the list, or the Hub has nothing to name it by.
+  if (k.removed || !k.hint) return { state: 'removed', text: 'key 已從清單移除', note: null };
+  return { state: 'ok', text: `${label ? `${label} ` : ''}…${String(k.hint).slice(-4)}`, note: k.distribution === 'sticky' ? '這個對話固定用這一把' : null };
+}

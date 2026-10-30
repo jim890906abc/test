@@ -58,7 +58,17 @@ const shot = async (name) => {
   await b.shot(path.join(SHOTS, name));
 };
 const sidebarHas = (sid) => b.eval(`[...document.querySelectorAll('.sidebar .side-row')].some((r) => r.getAttribute('href') === '#/s/${sid}')`);
-const cards = () => b.eval(`[...document.querySelectorAll('.cluster-worker')].map((c) => ({ session: c.dataset.session, worktree: c.querySelector('[data-field="cleanup-worktree"]')?.innerText.trim() ?? null, branch: c.querySelector('[data-field="cleanup-branch"]')?.innerText.trim() ?? null, hidden: c.querySelector('[data-field="cleanup-hidden"]')?.innerText.trim() ?? null, reasons: [...c.querySelectorAll('.cluster-cleanup-reasons li')].map((l) => l.innerText.trim()) }))`);
+// What the clean-up did to each worker is in its drawer: open it, read it, close it.
+const cards = async () => {
+  const sids = await b.eval(`[...document.querySelectorAll('.cluster-worker')].map((c) => c.dataset.session)`);
+  const out = [];
+  for (const sid of sids) {
+    await page.openDrawer(sid);
+    out.push(await b.eval(`(() => { const c = document.querySelector('.cluster-drawer'); return { session: '${sid}', worktree: c.querySelector('[data-field="cleanup-worktree"]')?.innerText.trim() ?? null, branch: c.querySelector('[data-field="cleanup-branch"]')?.innerText.trim() ?? null, hidden: c.querySelector('[data-field="cleanup-hidden"]')?.innerText.trim() ?? null, reasons: [...c.querySelectorAll('.cluster-cleanup-reasons li')].map((l) => l.innerText.trim()) }; })()`));
+    await page.closeDrawer();
+  }
+  return out;
+};
 
 before(async () => {
   if (skip) return;
@@ -147,19 +157,24 @@ test('merging from the page cleans up by itself: the worktrees and branches that
 test('放回側欄 on a card brings that conversation back into the sidebar, and it opens from the card even while it is hidden', { skip }, async () => {
   const [w1, , w3] = S.c.workers;
   await page.open(`#/cluster/${S.c.id}`);
-  await b.waitFor(`document.querySelector('.cluster-worker[data-session="${w1.sessionId}"] [data-action="unhide"]')`);
+  await page.openDrawer(w1.sessionId);
+  await b.waitFor(`document.querySelector('.cluster-drawer [data-action="unhide"]')`);
+  await page.closeDrawer();
   assert.equal(await sidebarHas(w1.sessionId), false);
 
-  // Opened from its card: the worker's page says it was tucked away.
-  await b.click(`.cluster-worker[data-session="${w3.sessionId}"] [data-action="open-worker"]`);
+  // Opened from its drawer: the worker's page says it was tucked away.
+  await page.openDrawer(w3.sessionId);
+  await b.click('.cluster-drawer [data-action="open-worker"]');
   await b.waitFor(`document.querySelector('.cluster-worker-note')`);
   assert.match(await b.eval(`document.querySelector('.cluster-worker-note').innerText`), /已從側欄收起/);
   assert.equal(await sidebarHas(w3.sessionId), false, 'opened, and still not listed');
   await b.eval('history.back()');
   await b.waitFor(`document.querySelector('.cluster-worker')`);
 
-  await b.click(`.cluster-worker[data-session="${w1.sessionId}"] [data-action="unhide"]`);
-  await b.waitFor(`document.querySelector('.cluster-worker[data-session="${w1.sessionId}"] [data-field="cleanup-hidden"]').innerText.trim() === '在側欄'`);
+  await page.openDrawer(w1.sessionId);
+  await b.click('.cluster-drawer [data-action="unhide"]');
+  await b.waitFor(`document.querySelector('.cluster-drawer [data-field="cleanup-hidden"]').innerText.trim() === '在側欄'`);
+  await page.closeDrawer();
   await b.waitFor(await sidebarHasExpr(w1.sessionId));
   assert.equal(await sidebarHas(w1.sessionId), true, 'the row is back');
   assert.equal(await sidebarHas(w3.sessionId), false, 'only that one');
@@ -225,7 +240,7 @@ test('a cluster that was never merged, cleaned by hand from the page: the worker
   let c;
   try {
     c = await dispatch(parent, ['只讀', '要改']);
-    await b.waitFor(`[...document.querySelectorAll('.cluster-worker-state')].every((e) => e.innerText.trim() === '執行中')`);
+    await b.waitFor(`[...document.querySelectorAll('.cluster-worker .cluster-worker-state')].every((e) => e.innerText.trim() === '執行中')`);
     const busy = await b.eval(`(() => { const e = document.querySelector('[data-action="cleanup"]'); return { disabled: e.disabled, title: e.title }; })()`);
     assert.equal(busy.disabled, true);
     assert.match(busy.title, /工作者還在跑，先全部停止/);

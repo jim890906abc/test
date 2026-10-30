@@ -252,11 +252,14 @@ test('real Kimi: dispatch from the screen, the page shows what Kimi really has (
 
 test('real Kimi: the time bars are what the Hub\'s timing API says about each worker - Kimi\'s own numbers drawn as they are, 量不到 with the Hub\'s reason for the rest', { skip: SKIP }, async () => {
   await open(`#/cluster/${S.c.id}`);
-  await b.waitFor(`document.querySelectorAll('.cluster-worker .cluster-timing').length === 2`, { timeout: 15000 });
+  await b.waitFor(`document.querySelectorAll('.cluster-worker').length === 2`, { timeout: 15000 });
   for (const w of S.c.workers) {
     const t = await api('GET', `/sessions/${w.sessionId}/timing`);
+    // The time breakdown is in the worker's drawer.
+    await page.openDrawer(w.sessionId);
+    await b.waitFor(`!document.querySelector('.cluster-drawer [data-sec="time"] .cluster-timing-loading')`, { timeout: 15000 });
     const dom = await b.eval(`(() => {
-      const c = document.querySelector('.cluster-worker[data-session="${w.sessionId}"]');
+      const c = document.querySelector('.cluster-drawer');
       const part = (k) => c.querySelector('.cluster-legend [data-part="' + k + '"] .cluster-legend-value')?.innerText.trim() ?? null;
       return { total: c.querySelector('.cluster-timing-total')?.innerText.trim() ?? null, failed: c.querySelector('.cluster-timing-failed')?.innerText.trim() ?? null, parts: { wallMs: null, modelMs: part('modelMs'), toolMs: part('toolMs'), rateLimitWaitMs: part('rateLimitWaitMs'), compactMs: part('compactMs') }, reasons: [...c.querySelectorAll('.cluster-reason')].map((p) => p.innerText.trim()), segs: [...c.querySelectorAll('.cluster-bar [data-seg]')].map((s) => s.dataset.seg) };
     })()`);
@@ -279,8 +282,9 @@ test('real Kimi: the time bars are what the Hub\'s timing API says about each wo
     // The model's own time, when Kimi gave it, is at most the turn.
     if (t.modelMs !== null) assert.ok(t.modelMs <= t.wallMs + 50, `model ${t.modelMs} within the turn ${t.wallMs}`);
     for (const k of ['modelMs', 'toolMs', 'rateLimitWaitMs', 'compactMs']) if (t[k] !== null && !dom.segs.includes(k) && t[k] > 0) assert.fail(`${k} missing from the bar`);
+    await shot('k2-time-bars-real-kimi-1280-light.png');
+    await page.closeDrawer();
   }
-  await shot('k2-time-bars-real-kimi-1280-light.png');
 });
 
 test('real Kimi: a decision typed on the page reaches the model of the worker in front of what a person types in that worker\'s conversation, once; the files are committed and merged from the page', { skip: SKIP }, async () => {

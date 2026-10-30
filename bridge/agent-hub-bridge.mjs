@@ -34,6 +34,10 @@
 //   AGENT_HUB_DEEPSEEK_AUTH_RETRY_MS  gap before a real request looks again at a key the gateway refused with
 //                                     HTTP 401 (default 60000); it doubles with every new refusal ...
 //   AGENT_HUB_DEEPSEEK_AUTH_RETRY_MAX_MS  ... up to this (default 3600000). A probing gap, not a reset time.
+//   AGENT_HUB_DEEPSEEK_STICKY_IDLE_MS  how long a conversation may be quiet before the pool forgets which
+//                                     key it was on (default 21600000 = 6 hours); sticky pools only
+//   AGENT_HUB_DEEPSEEK_STICKY_MAX     most conversations remembered at once (default 20000; the one that
+//                                     asked longest ago is forgotten first); sticky pools only
 //   AGENT_HUB_DAEMON_RECHECK_MS       how often a stale Claude daemon is looked at (default 15000)
 // The hello names what this version supports (`capabilities`); a Claude daemon
 // that lacks what the hub's features need is replaced as soon as it is idle.
@@ -904,7 +908,7 @@ const dsKeyOk = (key) => typeof key === 'string' && key.length > 0 && key.length
 const dsModelOk = (m) => typeof m === 'string' && /^[\w.\/:-]{1,100}$/.test(m) && !/(^|\/)\.{0,2}(\/|$)/.test(m);
 
 // The hub's {revision, activeId, keys:[{id, apiKey, gateway?, exhaustedAt?}],
-// rotation?, modelMap?}, rebuilt field by field. This is the only place a pool
+// rotation?, modelMap?, distribution?}, rebuilt field by field. This is the only place a pool
 // enters the connector. A key's `gateway` (a hub that rotates across gateways
 // names one per key) defaults to the pool's own; `modelMap` is the hub's table
 // { gateway: { the model id Kimi uses -> that gateway's id for the same model } }.
@@ -982,7 +986,17 @@ function cleanPool(raw, defaultGateway = '') {
       modelMap[gw] = out;
     }
   }
-  return { revision, activeId, keys, ...(retryMs ? { retryMs } : {}), ...(raw.rotation === 1 || raw.rotation === true ? { rotation: true } : {}), ...(modelMap ? { modelMap } : {}) };
+  // How conversations are given keys (see proxy.stickyKey): 'sticky' (each
+  // conversation keeps one key; the key with the fewest conversations takes a new
+  // one) or 'relay' (every conversation uses the key in use until it runs out).
+  // A pool that names none - a Hub or a saved pool from before this - is a relay,
+  // which is exactly what it always did.
+  let distribution;
+  if (raw.distribution !== undefined && raw.distribution !== null) {
+    if (raw.distribution !== 'sticky' && raw.distribution !== 'relay') throw dsBad('號池的 distribution 要是 sticky 或 relay');
+    distribution = raw.distribution;
+  }
+  return { revision, activeId, keys, ...(retryMs ? { retryMs } : {}), ...(raw.rotation === 1 || raw.rotation === true ? { rotation: true } : {}), ...(modelMap ? { modelMap } : {}), ...(distribution ? { distribution } : {}) };
 }
 
 // ---- toml:begin
@@ -1807,7 +1821,7 @@ const deepseek = {
       models: models.map((m) => `${DS_PROVIDER}/${m.model}`),
       sessionHeader: !noHeader,
       ...(noHeader ? { warning: noHeader } : {}),
-      ...(pool ? { pool: { revision: pool.revision, activeId: proxy.route?.pool.activeId || null } } : {}),
+      ...(pool ? { pool: { revision: pool.revision, activeId: proxy.route?.pool.activeId || null, distribution: proxy.route?.pool.distribution || 'relay' } } : {}),
       ...(secondary ? { secondaryModel: secondary } : {}),
       ...(secondarySet && !secondaryWarning ? { secondaryChanged: true } : {}),
       ...(secondaryWarning ? { secondaryWarning } : {}),
@@ -1963,6 +1977,14 @@ const proxy = {
   starting: null,
   lastReport: '',
   measuring: false, // a concurrency measure is running (one at a time)
+  // Which key each conversation is on, when the pool is 'sticky': Kimi session id
+  // -> { keyId, at } (`at`: its latest request). In memory only, on purpose: a
+  // restarted connector places conversations afresh, which costs one gateway
+  // cache each, never a request, and no conversation id is ever written to disk.
+  // It outlives a re-provision (a new key, a new order): the conversations stay
+  // where they are as long as their key is still in the pool.
+  homes: new Map(),
+  sweepTimer: null,
 
   localBase(gateway) {
     return `http://127.0.0.1:${this.port}/${gateway}`;
@@ -2026,7 +2048,7 @@ const proxy = {
     if (!base) return this.clear();
     let pool;
     try {
-      pool = cleanPool({ revision: saved.revision, activeId: saved.activeId, keys: saved.keys, retryMs: saved.retryMs, rotation: saved.rotation, modelMap: saved.modelMap }, saved.gateway);
+      pool = cleanPool({ revision: saved.revision, activeId: saved.activeId, keys: saved.keys, retryMs: saved.retryMs, rotation: saved.rotation, modelMap: saved.modelMap, distribution: saved.distribution }, saved.gateway);
     } catch {
       return this.clear();
     }
@@ -2039,11 +2061,132 @@ const proxy = {
   commit(route, models) {
     this.route = route;
     this.models = models;
+    // A relay has no conversations to remember; a pool that lost a key forgets
+    // the conversations that were on it (they are placed again when they ask).
+    if (route.pool.distribution !== 'sticky') this.dropHomes();
+    else this.sweepHomes(Date.now());
     this.save();
     this.report(true);
   },
 
+  // ---- one key for each conversation (distribution: 'sticky')
+  // A conversation that has not asked for this long is forgotten (default 6
+  // hours; AGENT_HUB_DEEPSEEK_STICKY_IDLE_MS, 50 ms to 7 days).
+  stickyIdleMs() {
+    const n = Number(process.env.AGENT_HUB_DEEPSEEK_STICKY_IDLE_MS);
+    return Number.isInteger(n) && n >= 50 && n <= 7 * 86_400_000 ? n : 6 * 3_600_000;
+  },
+
+  // How many conversations are remembered at most (default 20000; the oldest
+  // request's conversation goes first when there are more) - a bound, never a
+  // limit anyone should meet: a conversation forgotten early is only placed again.
+  stickyMax() {
+    const n = Number(process.env.AGENT_HUB_DEEPSEEK_STICKY_MAX);
+    return Number.isInteger(n) && n >= 2 && n <= 1_000_000 ? n : 20_000;
+  },
+
+  isSticky(route = this.route) {
+    return route?.pool.distribution === 'sticky';
+  },
+
+  dropHomes() {
+    this.homes.clear();
+    clearInterval(this.sweepTimer);
+    this.sweepTimer = null;
+  },
+
+  // Forget the conversations that went quiet, and those whose key is no longer
+  // in the pool. True when something was forgotten.
+  sweepHomes(now = Date.now()) {
+    const idle = this.stickyIdleMs();
+    const ids = new Set(this.route?.pool.keys.map((k) => k.id));
+    let gone = false;
+    for (const [session, h] of this.homes) {
+      if (now - h.at > idle || !ids.has(h.keyId)) {
+        this.homes.delete(session);
+        gone = true;
+      }
+    }
+    return gone;
+  },
+
+  // How many conversations each key has (key id -> n), leaving out `except`.
+  homeCounts(except = null) {
+    const n = new Map();
+    for (const [session, h] of this.homes) if (session !== except) n.set(h.keyId, (n.get(h.keyId) || 0) + 1);
+    return n;
+  },
+
+  // A conversation that is forgotten when it goes quiet is noticed even when no
+  // request comes in to notice it, so the counts the Hub shows go down too.
+  armSweep() {
+    if (this.sweepTimer) return;
+    const gap = Math.min(60_000, Math.max(50, Math.floor(this.stickyIdleMs() / 2)));
+    this.sweepTimer = setInterval(() => {
+      if (this.sweepHomes(Date.now())) this.report();
+      if (!this.homes.size) {
+        clearInterval(this.sweepTimer);
+        this.sweepTimer = null;
+      }
+    }, gap);
+    this.sweepTimer.unref?.();
+  },
+
+  // Of `candidates` (keys in the pool's order), the one with the fewest
+  // conversations; the first of them in the list when they are level.
+  fewest(candidates, except) {
+    const counts = this.homeCounts(except);
+    let best = null;
+    for (const k of candidates) if (!best || (counts.get(k.id) || 0) < (counts.get(best.id) || 0)) best = k;
+    return best;
+  },
+
+  // The key this conversation's request goes to next, in a sticky pool. `tried`
+  // is what this request has already been sent to (or could not be sent to).
+  //   - the conversation's own key, when it is fine and this request has not been
+  //     there yet: every request of the conversation - the main agent's and its
+  //     subagents' - goes there, which keeps the gateway's cache for it;
+  //   - its key is out (quota, refused) or it has none: the key with the fewest
+  //     conversations among the keys that are fine, and the conversation is moved
+  //     there for good. Nobody else moves; and a request of the same conversation
+  //     that was in flight finds the conversation already moved and follows it
+  //     instead of choosing again;
+  //   - its key is fine but this request cannot be sent there (the key's gateway
+  //     has no counterpart of the request's model): this one request goes
+  //     elsewhere and the conversation stays where it is.
+  // Only when no key is fine, a key whose wait is over is tried (this request is
+  // its probe), as in a relay. null: no key is left for this request.
+  stickyKey(route, session, tried) {
+    const keys = route.pool.keys;
+    const now = Date.now();
+    const gone = this.sweepHomes(now);
+    const home = this.homes.get(session);
+    const homeKey = home ? keys.find((k) => k.id === home.keyId) : null;
+    const homeFine = Boolean(homeKey && !this.blocked(homeKey));
+    if (homeFine) {
+      home.at = now;
+      if (!tried.has(homeKey.id)) {
+        if (gone) this.report();
+        return homeKey;
+      }
+    }
+    const pick = (list) => this.fewest(list, session);
+    const key = pick(keys.filter((k) => !tried.has(k.id) && !this.blocked(k))) || pick(keys.filter((k) => !tried.has(k.id) && this.due(route, k)));
+    if (key && !homeFine) {
+      this.homes.set(session, { keyId: key.id, at: now });
+      for (let over = this.homes.size - this.stickyMax(); over > 0; over--) {
+        let oldest = null;
+        for (const [id, h] of this.homes) if (id !== session && (!oldest || h.at < this.homes.get(oldest).at)) oldest = id;
+        this.homes.delete(oldest);
+      }
+      this.armSweep();
+      this.report();
+    } else if (gone) this.report();
+    return key;
+  },
+
   clear() {
+    this.dropHomes();
     this.route = null;
     this.models = [];
     this.lastReport = '';
@@ -2075,6 +2218,8 @@ const proxy = {
       ...(route.pool.retryMs ? { retryMs: route.pool.retryMs } : {}),
       ...(route.pool.rotation ? { rotation: 1 } : {}),
       ...(route.pool.modelMap ? { modelMap: route.pool.modelMap } : {}),
+      // (Which conversation is on which key is not saved: see proxy.homes.)
+      ...(route.pool.distribution ? { distribution: route.pool.distribution } : {}),
       keys: route.pool.keys.map((k) => ({
         id: k.id,
         apiKey: k.apiKey,
@@ -2092,6 +2237,10 @@ const proxy = {
     const route = this.route;
     if (!route) return;
     const active = route.pool.keys.find((k) => k.id === route.pool.activeId) || null;
+    // In a sticky pool each key also says how many conversations it has right now
+    // (ids and numbers, never a conversation's id); a relay says nothing of the kind.
+    const sticky = this.isSticky(route);
+    const counts = sticky ? this.homeCounts() : null;
     const msg = {
       t: 'deepseek.pool',
       // A pool that rotates across gateways says which gateway the key in use is
@@ -2100,6 +2249,7 @@ const proxy = {
       ...(route.pool.rotation ? { rotation: 1 } : {}),
       activeId: active ? active.id : null,
       revision: route.pool.revision,
+      ...(route.pool.distribution ? { distribution: route.pool.distribution } : {}),
       // Health is only ever said when there is something to say: a key with
       // no field is "this connector has no news", not "healthy" (the hub
       // never clears an exhaustion from silence). Evidence of recovery is a
@@ -2107,15 +2257,16 @@ const proxy = {
       // refused (HTTP 401) says so in its own fields: when, how many in a row, and
       // when a real request will look at it again (our probing schedule, never a
       // time the gateway stated).
-      keys: route.pool.keys.map((k) =>
-        k.exhaustedAt
+      keys: route.pool.keys.map((k) => {
+        const health = k.exhaustedAt
           ? { id: k.id, exhaustedAt: k.exhaustedAt, ...(k.retryAt ? { retryAt: k.retryAt } : {}) }
           : k.authFailedAt
             ? { id: k.id, authFailedAt: k.authFailedAt, authFailures: k.authFailures || 1, authRetryAt: this.retryAt(route, k) }
             : k.recoveredAt
               ? { id: k.id, recoveredAt: k.recoveredAt, ...(k.recoveredFrom ? { recoveredFrom: k.recoveredFrom } : {}) }
-              : { id: k.id },
-      ),
+              : { id: k.id };
+        return sticky ? { ...health, sessions: counts.get(k.id) || 0 } : health;
+      }),
     };
     const json = JSON.stringify(msg);
     if (!force && json === this.lastReport) return;
@@ -2515,7 +2666,10 @@ const proxy = {
       this.report();
       return;
     }
-    if (route.pool.activeId !== found.id) {
+    // (A sticky pool has many keys in use at once: a success on one of them says
+    // nothing about which one the nameless requests should use, and moving the
+    // pointer with every answer would rewrite the saved state each time.)
+    if (route.pool.activeId !== found.id && !this.isSticky(route)) {
       route.pool.activeId = found.id;
       this.save();
       this.report();
@@ -2859,12 +3013,16 @@ const proxy = {
       const reqNo = dsLog.nextRequest();
       let attempts = 0;
       let previous = null;
+      // A sticky pool gives a conversation its own key (see stickyKey); a request
+      // that names no conversation, and every request of a relay, takes the key in
+      // use and moves on when it runs out.
+      const sticky = session !== null && this.isSticky(route);
       for (;;) {
         if (this.route !== route) return this.json(res, 409, 'pool_changed', 'DeepSeek 號池已更新，請重試');
         // Healthy keys first; only when none is left, an exhausted key whose
         // wait is over (this request is its probe). The order is one list for
         // every gateway: the next key may be on another one.
-        const key = order.find((k) => !tried.has(k.id) && !this.blocked(k)) || order.find((k) => !tried.has(k.id) && this.due(route, k));
+        const key = sticky ? this.stickyKey(route, session, tried) : order.find((k) => !tried.has(k.id) && !this.blocked(k)) || order.find((k) => !tried.has(k.id) && this.due(route, k));
         if (!key) break;
         tried.add(key.id);
         const target = this.prepare(route, key, body);
@@ -4624,8 +4782,13 @@ const daemon = {
 //                    keeps that key aside as "refused" (authFailedAt, authFailures,
 //                    authRetryAt: its own fields, never "exhausted") and probes it again with
 //                    real requests at doubling gaps; the Hub may send and read those fields
+//   pool_sticky      the pool may name a `distribution`: 'sticky' gives each conversation (the
+//                    `prompt_cache_key` of its requests) one key for good - the key with the
+//                    fewest conversations takes a new one - and moves only the conversations
+//                    of a key that runs out or is refused; 'relay' is the order of old. The
+//                    pool report says each key's `sessions` (a count) in a sticky pool
 function connectorCapabilities() {
-  return ['pool', 'pool_cross', 'secondary_model', ...(brokerReady ? ['broker'] : []), 'handoff', 'pool_timing', 'pool_measure', 'event_timing', 'pool_auth'];
+  return ['pool', 'pool_cross', 'secondary_model', ...(brokerReady ? ['broker'] : []), 'handoff', 'pool_timing', 'pool_measure', 'event_timing', 'pool_auth', 'pool_sticky'];
 }
 
 // ------------------------------------------------------------- the hub

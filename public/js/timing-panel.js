@@ -72,11 +72,33 @@ export class TimingPane {
     this.draw();
   }
 
+  // Which key the conversation is on, in the Hub's words: the gateway and the key's
+  // last four characters of its latest request, never the key. Only for a
+  // conversation that goes through the key pool (the answer says nothing of a
+  // key otherwise, and nothing is said for it).
+  keyLine() {
+    const t = this.raw;
+    if (!t) return null;
+    const k = t.currentKey;
+    if (!k) return t.requests === 0 ? h('p', { class: 'timing-key muted', dataset: { part: 'current-key' } }, '用的 key：這個對話還沒有請求紀錄，看不出來。') : null;
+    const name = k.removed ? `${k.gatewayLabel || k.gateway || '某一家'} 的一把 key（已不在清單裡）` : `${k.gatewayLabel || k.gateway} …${k.hint}`;
+    const how = k.distribution === 'sticky' ? '平均分配：這個對話固定用這一把，它用完或被拒絕才換' : '接力：所有對話共用使用中的那一把，它用完才換下一把';
+    return h(
+      'p',
+      { class: 'timing-key', dataset: { part: 'current-key', distribution: k.distribution || '' } },
+      h('span', { class: 'timing-label' }, '用的 key'),
+      ' ',
+      h('strong', { class: 'timing-key-name' }, name),
+      h('span', { class: 'timing-key-how muted' }, `（${how}）`),
+    );
+  }
+
   // The last answer in full, and - if the read after it failed - a line that says so.
   draw() {
     const got = this.raw ? { timing: this.raw } : this.error ? { error: this.error } : null;
     fill(
       this.slot,
+      this.keyLine(),
       timingBox(got, { detail: true }),
       this.raw && this.error ? h('p', { class: 'timing-stale', role: 'status' }, `重新讀取失敗：${this.error.message || String(this.error)}。上面是上一次讀到的數字。`) : null,
     );

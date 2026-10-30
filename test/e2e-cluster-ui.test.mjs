@@ -292,19 +292,26 @@ test('a worker finishing its turn reaches the open page by itself (socket, no re
 
 test('the time breakdown is the Hub\'s own measure for each worker: what Kimi timed is drawn, what nobody timed says 量不到 and why', { skip }, async () => {
   await open(`#/cluster/${S.c.id}`);
-  await b.waitFor(`document.querySelectorAll('.cluster-worker .cluster-timing').length === 2`);
+  await b.waitFor(`document.querySelectorAll('.cluster-worker').length === 2`);
   const [w1, w2] = S.c.workers;
   const t1 = await hub.api('GET', `/sessions/${w1.sessionId}/timing`);
   const t2 = await hub.api('GET', `/sessions/${w2.sessionId}/timing`);
   assert.deepEqual({ turns: t1.turns, wallMs: t1.wallMs, modelMs: t1.modelMs, toolMs: t1.toolMs, compactMs: t1.compactMs, rateLimitWaitMs: t1.rateLimitWaitMs }, { turns: 1, wallMs: 10000, modelMs: 1500, toolMs: 2000, compactMs: 1000, rateLimitWaitMs: 4000 });
 
-  const timing = (sid) => b.eval(`(() => {
-    const c = document.querySelector('.cluster-worker[data-session="${sid}"]');
+  // The time breakdown is in the worker's drawer: open it, read it, close it.
+  const timing = async (sid) => {
+    await page.openDrawer(sid);
+    await b.waitFor(`!document.querySelector('.cluster-drawer [data-sec="time"] .cluster-timing-loading')`, { timeout: 8000 });
+    const r = await b.eval(`(() => {
+    const c = document.querySelector('.cluster-drawer');
     const part = (k) => { const li = c.querySelector('.cluster-legend [data-part="' + k + '"]'); return li ? li.querySelector('.cluster-legend-value').innerText.trim() : null; };
     const reasons = [...c.querySelectorAll('.cluster-reason')].map((p) => p.innerText.trim());
     const bar = Object.fromEntries([...c.querySelectorAll('.cluster-bar [data-seg]')].map((s) => [s.dataset.seg, s.style.width]));
     return { total: c.querySelector('.cluster-timing-total')?.innerText.trim(), failed: c.querySelector('.cluster-timing-failed')?.innerText.trim() ?? null, model: part('modelMs'), tool: part('toolMs'), wait: part('rateLimitWaitMs'), compact: part('compactMs'), bar, reasons, facts: c.querySelector('.cluster-timing-facts')?.innerText.trim() ?? null };
   })()`);
+    await page.closeDrawer();
+    return r;
+  };
   const a = await timing(w1.sessionId);
   assert.equal(a.failed, null);
   assert.equal(a.total, '總時間 10.0 秒');
@@ -585,6 +592,7 @@ test('a cluster made elsewhere puts the banner on an open main conversation, and
 
   await b.eval(`document.querySelector('.cluster-banner a').click()`);
   await b.waitFor(`document.querySelector('.cluster-worker')`);
+  await page.openDrawer(c.workers[0].sessionId);
   assert.equal(await b.eval(`document.querySelector('.cluster-worker-progress').innerText.trim()`), '還沒有進度');
   const kid = await kidOf(c.workers[0].sessionId);
   hub.machine.frame(kid, 'turn.started', { turnId: 'live1', promptId: 'p_live', origin: { kind: 'user' }, prompt: 'x' });
@@ -632,7 +640,9 @@ test('a worker whose conversation was deleted reads 已刪除 on an open page (n
   await hub.api('DELETE', `/sessions/${w1.sessionId}`);
   assert.equal((await getCluster(c.id)).workers[0].status, 'deleted', 'the Hub says so');
   await b.waitFor(`document.querySelector('.cluster-worker[data-session="${w1.sessionId}"] .cluster-worker-state')?.innerText.trim() === '已刪除'`, { label: 'the card follows the deletion', timeout: 8000 });
-  const card = await b.eval(`(() => { const c = document.querySelector('.cluster-worker[data-session="${w1.sessionId}"]'); return { open: Boolean(c.querySelector('[data-action="open-worker"]')), timing: c.querySelector('.cluster-timing-failed')?.innerText ?? null }; })()`);
+  await page.openDrawer(w1.sessionId);
+  const card = await b.eval(`(() => { const c = document.querySelector('.cluster-drawer'); return { open: Boolean(c.querySelector('[data-action="open-worker"]') && !c.querySelector('[data-action="open-worker"]').hidden), timing: c.querySelector('.cluster-timing-failed')?.innerText ?? null }; })()`);
+  await page.closeDrawer();
   assert.equal(card.open, false);
   assert.match(card.timing, /已被刪除/);
   assert.match(await b.eval(`document.querySelector('.cluster-head').innerText`), /1 個已刪除/);
@@ -777,12 +787,14 @@ test('a DeepSeek conversation dispatches DeepSeek workers; the request count and
   }, 8000, 'the requests counted');
   assert.equal(t.http429, 1);
   await open(`#/cluster/${c.id}`);
-  await b.waitFor(`document.querySelector('.cluster-worker .cluster-timing-facts')?.innerText.includes('請求 3')`, { label: 'the page shows the proxy\'s own count' });
-  const facts = await b.eval(`document.querySelector('.cluster-worker .cluster-timing-facts').innerText.trim()`);
+  await b.waitFor(`document.querySelector('.cluster-worker')`);
+  await page.openDrawer(w.sessionId);
+  await b.waitFor(`document.querySelector('.cluster-drawer .cluster-timing-facts')?.innerText.includes('請求 3')`, { label: 'the page shows the proxy\'s own count' });
+  const facts = await b.eval(`document.querySelector('.cluster-drawer .cluster-timing-facts').innerText.trim()`);
   assert.match(facts, /請求 3/);
   assert.match(facts, /429 次數 1/);
-  assert.equal(await b.eval(`document.querySelector('.cluster-worker .cluster-timing-total').innerText.trim()`), '總時間 5.0 秒');
-  assert.doesNotMatch(await b.eval(`document.querySelector('.cluster-worker .cluster-timing').innerText`), /不是 DeepSeek 號池/, 'no "not a DeepSeek conversation" note for a DeepSeek one');
+  assert.equal(await b.eval(`document.querySelector('.cluster-drawer .cluster-timing-total').innerText.trim()`), '總時間 5.0 秒');
+  assert.doesNotMatch(await b.eval(`document.querySelector('.cluster-drawer .cluster-timing').innerText`), /不是 DeepSeek 號池/, 'no "not a DeepSeek conversation" note for a DeepSeek one');
   await shot('15-cluster-deepseek-1280-light.png');
   hub.machine.reply(kid, prompts(kid)[0].body.prompt_id, '簡報');
 });
@@ -858,7 +870,7 @@ test('eight workers (the most) when asked for, each with its worktree, and the p
   assert.equal(new Set(c.workers.map((w) => w.worktree)).size, 8, 'a worktree each');
   for (const w of c.workers) assert.ok(fs.existsSync(path.join(w.worktree, 'a.txt')));
   assert.match(await b.eval(`document.querySelector('.cluster-head').innerText`), /0\/8 完成/);
-  await b.waitFor(`document.querySelectorAll('.cluster-worker .cluster-timing').length === 8`);
+  await b.waitFor(`document.querySelectorAll('.cluster-worker').length === 8`);
   S.c8 = c;
   await shot('17-cluster-eight-1280-light.png');
   for (const w of c.workers) {
@@ -981,6 +993,7 @@ test('text with markup in it (titles, tasks, the note, a decision, what a worker
   const kid = await kidOf(c.workers[0].sessionId);
   hub.machine.reply(kid, prompts(kid)[0].body.prompt_id, evil);
   await b.waitFor(`document.querySelector('.cluster-worker-state').innerText.trim() === '已完成'`);
+  await page.openDrawer(c.workers[0].sessionId);
   await b.waitFor(`document.querySelector('.cluster-worker-progress').innerText.includes('<img')`);
   await check('worker progress');
   await open(`#/s/${parent.id}`);
@@ -1010,7 +1023,8 @@ test('a double press on 派出 makes one cluster; going to a worker\'s conversat
 
   // 開啟對話 from the card, and back.
   const cid = list[0].id;
-  await b.click('[data-action="open-worker"]');
+  await page.openDrawer(list[0].workers[0].sessionId);
+  await b.click('.cluster-drawer [data-action="open-worker"]');
   await b.waitFor(`location.hash === '#/s/${list[0].workers[0].sessionId}'`);
   await b.waitFor(`document.querySelector('.cluster-worker-note')`);
   await b.eval(`history.back()`);
@@ -1033,7 +1047,9 @@ test('a worker waiting for the person\'s approval reads 等你核准 on the card
   await b.waitFor(`document.querySelector('.cluster-worker-state').innerText.trim() === '等你核准'`, { label: 'the card asks for the person' });
   assert.equal(await b.eval(`document.querySelector('[data-field="status"]').innerText.trim()`), '進行中', 'the cluster is not stuck or done');
   assert.equal(await b.eval(`document.querySelector('.cluster-worker-state').classList.contains('om-badge--warning')`), true, 'drawn as something to act on');
-  assert.equal(await b.eval(`Boolean(document.querySelector('[data-action="open-worker"]'))`), true, 'with the way to the conversation where it is answered');
+  await page.openDrawer(w.sessionId);
+  assert.equal(await b.eval(`Boolean(document.querySelector('.cluster-drawer [data-action="open-worker"]') && !document.querySelector('.cluster-drawer [data-action="open-worker"]').hidden)`), true, 'with the way to the conversation where it is answered, in its drawer');
+  await page.closeDrawer();
   const row = await b.eval(`[...document.querySelectorAll('.sidebar .side-row')].find((r) => r.querySelector('.row-title')?.innerText.trim() === '等核准的')?.innerText ?? null`);
   assert.match(row, /需要你/, 'the sidebar says it too');
   assert.equal((await getCluster(c.id)).workers[0].status, 'awaiting_permission');
@@ -1135,8 +1151,9 @@ test('a worker whose own conversation moved to another runtime and back is still
   assert.equal((await getCluster(c.id)).workers[0].sessionId, w.sessionId);
   await open(`#/cluster/${c.id}`);
   await b.waitFor(`document.querySelectorAll('.cluster-worker').length === 1`);
-  await b.waitFor(`document.querySelector('.cluster-worker .cluster-timing, .cluster-worker .cluster-timing-failed')`);
-  assert.equal(await b.eval(`Boolean(document.querySelector('.cluster-worker .cluster-timing-failed'))`), false, 'its time is read through the chain, not "量不到" for a missing conversation');
+  await page.openDrawer(w.sessionId);
+  await b.waitFor(`document.querySelector('.cluster-drawer .cluster-timing, .cluster-drawer .cluster-timing-failed')`);
+  assert.equal(await b.eval(`Boolean(document.querySelector('.cluster-drawer .cluster-timing-failed'))`), false, 'its time is read through the chain, not "量不到" for a missing conversation');
   hub.machine.frame(kid, 'assistant.delta', { turnId: 'after-switch', delta: '新節點裡說的話 SWITCHED_PROGRESS' });
   await b.waitFor(`document.querySelector('.cluster-worker-progress').innerText.includes('SWITCHED_PROGRESS')`, { label: 'the progress line follows the worker in its new node' });
   hub.machine.reply(kid, prompts(kid).at(-1).body.prompt_id, '換環境後的第一句');
@@ -1368,7 +1385,7 @@ const overflow = () => b.eval(`({ page: document.documentElement.scrollWidth - i
 
 test('on a phone (390) the dispatch dialog, the cluster page with its time bars and the merge result fit the screen with nothing cut off or scrolling sideways', { skip }, async () => {
   await openLook(`#/cluster/${S.c.id}`, { width: 390, height: 844 });
-  await b.waitFor(`document.querySelectorAll('.cluster-worker .cluster-timing').length === 2 && document.querySelector('.cluster-merge')`);
+  await b.waitFor(`document.querySelectorAll('.cluster-worker').length === 2 && document.querySelector('.cluster-merge')`);
   let o = await overflow();
   assert.ok(o.page <= 0 && o.body <= 0, `no sideways scroll: ${JSON.stringify(o)}`);
   assert.deepEqual(o.wide, [], 'nothing sticks out past the right edge');
@@ -1409,28 +1426,44 @@ test('on a phone (390) the dispatch dialog, the cluster page with its time bars 
   await until(async () => (await getCluster(live.id)).status === 'done', 8000, 'the cluster done');
 });
 
-test('in the dark look the cluster page text can be read: the time bars, the reasons, the merge result and the memory all keep their contrast', { skip }, async () => {
-  const sels = ['.cluster-worker-title', '.cluster-worker-task', '.cluster-kv code', '.cluster-worker-progress', '.cluster-timing-total', '.cluster-legend-label', '.cluster-legend-value', '.cluster-legend li.unmeasured .cluster-legend-value', '.cluster-reason', '.cluster-timing-facts', '.cluster-merge-name', '.cluster-merge-branchname', '.cluster-memory-text', '.cluster-memory-path', '.cluster-head .om-badge', '.cluster-worker-state', '.cluster-chip', '.cluster-merge .om-badge'];
-  for (const theme of ['dark', 'light']) {
-    await openLook(`#/cluster/${S.c.id}`, { theme });
-    await b.waitFor(`document.querySelectorAll('.cluster-worker .cluster-timing').length === 2 && document.querySelector('.cluster-merge') && document.querySelector('.cluster-memory-text')?.textContent`);
-    const bg = await b.eval(`getComputedStyle(document.body).backgroundColor`);
-    const lum = (c) => { const m = c.match(/\d+/g).map(Number); return (0.2126 * m[0] + 0.7152 * m[1] + 0.0722 * m[2]) / 255; };
-    if (theme === 'dark') assert.ok(lum(bg) < 0.25, `the page is dark: ${bg}`);
-    else assert.ok(lum(bg) > 0.6, `the page is light: ${bg}`);
+test('in the dark look the cluster page text can be read: the tiles, the drawer with its time bars and reasons, the merge result and the memory all keep their contrast', { skip }, async () => {
+  const pageSels = ['.cluster-worker-title', '.cluster-merge-name', '.cluster-merge-branchname', '.cluster-memory-text', '.cluster-memory-path', '.cluster-head .om-badge', '.cluster-worker-state', '.cluster-merge .om-badge', '.cw-line', '.cw-speed'];
+  const drawerSels = ['.cd-task', '.cluster-kv code', '.cluster-drawer .cluster-worker-progress', '.cluster-timing-total', '.cluster-legend-label', '.cluster-legend-value', '.cluster-reason', '.cluster-timing-facts', '.cluster-drawer .cluster-chip', '.cd-sec h3'];
+  // The second worker's turn was written without times: its unmeasured parts.
+  const unmeasuredSels = ['.cluster-legend li.unmeasured .cluster-legend-value', '.cluster-reason'];
+  const check = async (theme, sels) => {
     for (const sel of sels) {
       const r = await b.eval(`(${CONTRAST_JS})(${JSON.stringify(sel)})`);
       assert.ok(r, `${theme}: ${sel} is on the page`);
       assert.ok(r.ratio >= 4.5, `${theme}: ${sel} contrast ${r.ratio.toFixed(2)} (text ${r.fg} on ${r.bg})`);
     }
-    // The coloured parts of the bar are told apart from the track they sit on.
-    const segs = await b.eval(`[...document.querySelectorAll('.cluster-worker')[0].querySelectorAll('.cluster-bar [data-seg]')].map((s) => getComputedStyle(s).backgroundColor + '|' + getComputedStyle(s).backgroundImage.slice(0, 30))`);
-    assert.equal(new Set(segs).size, 4, `${theme}: four different looks for the four parts: ${JSON.stringify(segs)}`);
+  };
+  for (const theme of ['dark', 'light']) {
+    await openLook(`#/cluster/${S.c.id}`, { theme });
+    await b.waitFor(`document.querySelectorAll('.cluster-worker').length === 2 && document.querySelector('.cluster-merge') && document.querySelector('.cluster-memory-text')?.textContent`);
+    const bg = await b.eval(`getComputedStyle(document.body).backgroundColor`);
+    const lum = (c) => { const m = c.match(/\d+/g).map(Number); return (0.2126 * m[0] + 0.7152 * m[1] + 0.0722 * m[2]) / 255; };
+    if (theme === 'dark') assert.ok(lum(bg) < 0.25, `the page is dark: ${bg}`);
+    else assert.ok(lum(bg) > 0.6, `the page is light: ${bg}`);
+    await check(theme, pageSels);
     if (theme === 'dark') {
       await shot('22-cluster-page-1280-dark.png');
       await b.eval(`document.querySelector('.cluster-merge').scrollIntoView()`);
       await shot('23-merge-result-1280-dark.png');
     }
+    // The drawer of the first worker: its whole task, where it works, its time with the reasons.
+    await page.openDrawer(S.c.workers[0].sessionId);
+    await b.waitFor(`!document.querySelector('.cluster-drawer [data-sec="time"] .cluster-timing-loading')`, { timeout: 8000 });
+    await check(theme, drawerSels);
+    // The coloured parts of the bar are told apart from the track they sit on.
+    const segs = await b.eval(`[...document.querySelectorAll('.cluster-drawer .cluster-bar [data-seg]')].map((s) => getComputedStyle(s).backgroundColor + '|' + getComputedStyle(s).backgroundImage.slice(0, 30))`);
+    assert.equal(new Set(segs).size, 4, `${theme}: four different looks for the four parts: ${JSON.stringify(segs)}`);
+    if (theme === 'dark') await shot('22b-cluster-drawer-1280-dark.png');
+    await page.closeDrawer();
+    await page.openDrawer(S.c.workers[1].sessionId);
+    await b.waitFor(`!document.querySelector('.cluster-drawer [data-sec="time"] .cluster-timing-loading')`, { timeout: 8000 });
+    await check(theme, unmeasuredSels);
+    await page.closeDrawer();
   }
   await LOOK('light');
 });

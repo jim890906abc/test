@@ -10,6 +10,13 @@ export function clusterPage({ b, base, cluster }) {
     async open(hash) {
       await b.goto(`${base}${hash}`, 400);
       await b.waitFor(`document.querySelector('.sidebar') && document.querySelector('.view')?.children.length`, { timeout: 15000 });
+      // The folded parts of a cluster page (the task queue, the memory) are closed on a fresh page; a person opens
+      // what they want to read, and these tests read them.
+      if (/^#\/cluster\//.test(hash)) await page.openFolds();
+    },
+    async openFolds() {
+      await b.waitFor(`document.querySelector('.cluster-worker') || document.querySelector('.cluster-none')`, { timeout: 15000 }).catch(() => {});
+      await b.eval(`document.querySelectorAll('details.cluster-fold').forEach((d) => d.setAttribute('open', ''))`);
     },
     async press(key, code = key) {
       const vk = { Enter: 13, Escape: 27, Tab: 9 }[key] || 0;
@@ -26,12 +33,36 @@ export function clusterPage({ b, base, cluster }) {
       await page.typeInto(sel('input[name="task-title"]'), title);
       await page.typeInto(sel('textarea[name="task-prompt"]'), prompt);
     },
-    // The worker cards as drawn.
-    cards: () =>
-      b.eval(`[...document.querySelectorAll('.cluster-worker')].map((c) => {
-        const t = (s) => c.querySelector(s)?.innerText.trim() ?? null;
-        return { session: c.dataset.session, title: t('.cluster-worker-title'), task: t('.cluster-worker-task'), state: t('.cluster-worker-state'), branch: t('[data-field="branch"]'), worktree: t('[data-field="worktree"]'), swarm: t('[data-native-swarm]'), progress: t('.cluster-worker-progress'), timing: t('.cluster-timing'), open: c.querySelector('[data-action="open-worker"]')?.getAttribute('href') ?? null };
-      })`),
+    // A worker's drawer, the way a person opens it: press the tile. (Everything long about a worker is in it.)
+    async openDrawer(sid) {
+      await b.click(`.cluster-worker[data-session="${sid}"]`);
+      await b.waitFor(`document.querySelector('.cluster-drawer.on')`);
+      await b.sleep(200);
+    },
+    // ...and shuts it: the scrim.
+    async closeDrawer() {
+      await b.eval(`document.querySelector('.cd-scrim')?.click()`);
+      await b.waitFor(`!document.querySelector('.cluster-drawer.on')`);
+    },
+    // The workers as drawn: what a tile says, and, by opening each one's drawer in turn, what the drawer says.
+    async cards() {
+      const sids = await b.eval(`[...document.querySelectorAll('.cluster-worker')].map((c) => c.dataset.session)`);
+      const out = [];
+      for (const sid of sids) {
+        const tile = await b.eval(`(() => { const c = document.querySelector('.cluster-worker[data-session="${sid}"]'); const t = (s) => c.querySelector(s)?.innerText.trim() ?? null; return { title: t('.cluster-worker-title'), state: t('.cluster-worker-state'), place: t('.cluster-worker-queue'), speed: t('[data-field="speed"]') }; })()`);
+        await page.openDrawer(sid);
+        // (The time breakdown is asked for when the drawer opens: wait for the answer, or for the page's word that there is none.)
+        await b.waitFor(`!document.querySelector('.cluster-drawer [data-sec="time"] .cluster-timing-loading')`, { timeout: 8000 }).catch(() => {});
+        const inside = await b.eval(`(() => {
+          const d = document.querySelector('.cluster-drawer');
+          const t = (s) => d.querySelector(s)?.innerText.trim() ?? null;
+          return { session: '${sid}', task: t('[data-field="task"]'), branch: t('[data-field="branch"]'), worktree: t('[data-field="worktree"]'), swarm: t('[data-native-swarm]'), progress: t('[data-field="progress"]'), queue: t('[data-field="worker-queue"]'), timing: t('.cluster-timing'), open: d.querySelector('[data-action="open-worker"]')?.getAttribute('href') ?? null };
+        })()`);
+        await page.closeDrawer();
+        out.push({ ...tile, ...inside });
+      }
+      return out;
+    },
     // The last button of the open dialog (its "go on" button).
     async confirm() {
       await b.waitFor(`document.querySelector('.dialog .dialog-actions .om-btn:last-child')`);
@@ -61,6 +92,7 @@ export function clusterPage({ b, base, cluster }) {
       await b.waitFor(`/^#\\/cluster\\//.test(location.hash)`, { timeout: 30000 });
       const cid = await b.eval('location.hash.slice(10)');
       await b.waitFor(`document.querySelectorAll('.cluster-worker').length === ${workers ?? Math.min(tasks.length, 4)}`);
+      await page.openFolds();
       return cluster(cid);
     },
   };

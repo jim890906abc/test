@@ -7,10 +7,10 @@
 // Naming (spec §0): a cluster is never called a Swarm here. "Swarm" on these
 // screens is only Kimi's own mode, which a worker can be started in; every place
 // that says it is marked data-native-swarm and says whose it is.
-import { h, fill, icon, relTime, copyText, baseName } from './dom.js';
+import { h, fill, icon, relTime } from './dom.js';
 import { get, post } from './api.js';
 import { busy as sessionBusy } from './providers.js';
-import { timingBox } from './timing-box.js';
+import { WorkerTile, WorkerDrawer, ClusterListPage, TONE_BADGE, CLUSTER_BADGE, barEl, elapsedText } from './cluster-tiles.js';
 import {
   CLUSTER_MAX_TASKS,
   CLUSTER_MAX_WORKERS,
@@ -20,6 +20,7 @@ import {
   cleanupPlanView,
   cleanupResultView,
   clusterStatusLabel,
+  clusterElapsed,
   contextWarnings,
   defaultWorkers,
   draftProblems,
@@ -35,8 +36,11 @@ import {
   queueAdvice,
   queueView,
   requestBody,
-  workerQueueLine,
-  workerState,
+  speedView,
+  summarizeCluster,
+  taskBar,
+  totalsOf,
+  workingSubagents,
   workersFor,
 } from './cluster-model.js';
 
@@ -46,11 +50,52 @@ const known = new Map(); // cluster id -> the newest cluster this page has seen
 const loadedFor = new Set(); // clusters of a worker whose cluster was fetched this page load
 const askedFor = new Map(); // main conversation id -> the list of its cluster ids the cluster list was last fetched for
 
+// One light line per cluster (summarizeCluster: the same function the Hub's
+// GET /api/clusters uses), kept for the page that lists them all and for the
+// number beside its link in the sidebar. Told about a cluster, it is redrawn
+// only if the line changed.
+const summaries = new Map();
+const rowTitles = new Map(); // cluster id -> the main conversation's name the Hub gave in the list
+const listeners = new Set();
+const sigs = new Map();
+export const onClusterRows = (fn) => (listeners.add(fn), () => listeners.delete(fn));
+const noteRows = () => {
+  for (const fn of listeners) fn();
+};
+export const clusterRows = () => [...summaries.values()];
+export const clusterTotals = () => totalsOf(clusterRows());
+const keepRow = (row) => {
+  const sig = JSON.stringify(row);
+  summaries.set(row.id, row);
+  if (sigs.get(row.id) === sig) return false;
+  sigs.set(row.id, sig);
+  return true;
+};
+
 export const rememberCluster = (c) => {
-  if (c?.id) known.set(c.id, c);
+  if (c?.id) {
+    known.set(c.id, c);
+    if (keepRow(summarizeCluster(c))) noteRows();
+  }
   return c;
 };
+
+// The list of every cluster, from the Hub (once when the page starts, and again when asked to).
+export async function loadClusterRows() {
+  const list = await get('/clusters');
+  let changed = false;
+  for (const r of Array.isArray(list) ? list : []) {
+    if (!r?.id) continue;
+    const { parentTitle, ...row } = r;
+    if (parentTitle) rowTitles.set(r.id, parentTitle);
+    changed = keepRow(row) || changed;
+  }
+  if (changed) noteRows();
+}
 export const clusterById = (id) => known.get(id) || null;
+
+// The page that lists every cluster (#/clusters). ctx.parentTitle(id): the main conversation's name.
+export const createClusterList = (ctx) => new ClusterListPage({ rows: clusterRows, title: (r) => ctx.parentTitle?.(r.parentId) || rowTitles.get(r.id) || '（主對話）', load: loadClusterRows });
 // The clusters a main conversation started, newest first. A cluster names the
 // node of the conversation's chain it was made from (parentId); once the
 // conversation has moved on to another node (a model on another runtime and
@@ -388,44 +433,56 @@ export async function openClusterList(ctx, session) {
 
 // ------------------------------------------------------------ the page
 
-const TONE_BADGE = { busy: 'cluster-badge-busy', warn: 'om-badge--warning', danger: 'om-badge--danger', ok: 'om-badge--success', idle: '' };
-const CLUSTER_BADGE = { starting: 'cluster-badge-busy', running: 'cluster-badge-busy', merging: 'cluster-badge-busy', done: 'om-badge--success', stopped: '', error: 'om-badge--danger' };
-const DELETED_TIMING = { error: new Error('這個工作者的對話已被刪除，沒有耗時資料') };
 const TIMING_REFRESH_MS = 10_000;
+const DASH = '—';
 
-// The page for one cluster. ctx: { confirmDialog, toast, fail, go, parentTitle(id), onTitle(cluster) }.
+// The page for one cluster: how far it is and how fast it goes, then its
+// workers as small tiles; a tile opens the worker's drawer (the whole task,
+// where it works, its time, its subagents). Nothing long sits on the page
+// itself. ctx: { confirmDialog, toast, fail, go, parentTitle(id), onTitle(cluster), focusAgent(sid, eventId), modelName, effortLabel }.
 export class ClusterPage {
   constructor(ctx, id) {
     this.ctx = ctx;
     this.id = id;
     this.cluster = clusterById(id);
-    this.timings = new Map(); // worker session id -> { timing } | { error }
-    this.cards = new Map(); // worker session id -> { el, sig, state, progress, timingSlot, shown }
+    this.timings = new Map(); // worker session id -> { timing } | { error }, for the worker whose drawer is open
+    this.tiles = new Map(); // worker session id -> WorkerTile
     this.sigs = {}; // what each part of the page was last drawn from
     this.busy = null; // 'stop' | 'merge' | 'cleanup' | 'unhide' while that request is out
     this.actionError = ''; // what the Hub said to the last stop / merge it refused
-    this.started = false; // the first cluster has come in: the time and the memory are then read
+    this.started = false; // the first cluster has come in: the memory is then read
     this.memSeen = null; // { bytes, updatedAt } of the memory file as last read
     this.memAsked = ''; // the change of the file the page last tried to read
+    this.fold = { queue: false, memory: false }; // which of the folded parts the person opened
     this.dead = false;
     this.sig = '';
-    this.head = h('div', { class: 'cluster-head' });
+    this.headTop = h('div', { class: 'ch-top' });
+    this.bar = barEl('ch-bar');
+    this.elapsed = h('span', { class: 'ch-elapsed', dataset: { field: 'elapsed' } });
+    this.stats = { speed: this.statBox('speed', '目前速度'), workers: this.statBox('workers', '執行中工作者'), subs: this.statBox('subagents', '執行中子代理') };
+    this.facts = h('div', { class: 'ch-facts' });
+    this.head = h('div', { class: 'cluster-head' }, this.headTop, h('div', { class: 'ch-barrow' }, this.bar, this.elapsed), h('div', { class: 'ch-stats' }, this.stats.speed.el, this.stats.workers.el, this.stats.subs.el), this.facts);
     this.warns = h('div', { class: 'cluster-warns' });
     this.workers = h('div', { class: 'cluster-workers' });
     this.count = h('span', { class: 'muted cluster-workers-count' });
     this.queueBox = h('div', { class: 'cluster-queue-slot' });
     this.mergeBox = h('div', { class: 'cluster-merge-slot' });
     this.cleanupBox = h('div', { class: 'cluster-cleanup-slot' });
-    this.memoryBox = h('section', { class: 'cluster-section cluster-memory' });
+    this.memoryBox = h('details', { class: 'cluster-fold cluster-memory', ontoggle: (e) => (this.fold.memory = e.target.open) });
     this.body = h('div', { class: 'cluster-body' });
     this.el = h('div', { class: 'cluster-page' }, this.body);
+    this.drawer = new WorkerDrawer({ ctx, cleanupState: (w) => this.cleanupSlot(w), onNeedTiming: (sid) => this.loadTiming(sid), timingOf: (sid) => this.timings.get(sid) });
     this.buildMemory();
-    this.timer = setInterval(() => document.visibilityState === 'visible' && this.cluster && isActive(this.cluster) && this.loadTimings(), TIMING_REFRESH_MS);
+    // Time is asked for only for the worker whose drawer is open.
+    this.timer = setInterval(() => document.visibilityState === 'visible' && this.cluster && isActive(this.cluster) && this.drawer.isOpen && this.loadTiming(this.drawer.sid), TIMING_REFRESH_MS);
+    this.clock = setInterval(() => this.drawElapsed(), 1000);
   }
 
   destroy() {
     this.dead = true;
     clearInterval(this.timer);
+    clearInterval(this.clock);
+    this.drawer.destroy();
   }
 
   // The cluster, from the Hub. A cluster this page already knows (just made, or
@@ -460,9 +517,9 @@ export class ClusterPage {
     this.started = true;
     this.cluster = rememberCluster(c);
     this.draw();
-    // Time is asked for again when a worker's state moved, and on a timer while it runs.
+    // The open drawer's time is asked for again when its worker's state moved.
     const sig = JSON.stringify((c.workers || []).map((w) => [w.sessionId, w.status, w.finishedAt]));
-    if (first || sig !== this.sig) this.loadTimings();
+    if (this.drawer.isOpen && sig !== this.sig) this.loadTiming(this.drawer.sid);
     if (first) this.loadMemory();
     else this.followMemory(c.memory);
     this.sig = sig;
@@ -481,7 +538,7 @@ export class ClusterPage {
   // ---- drawing
 
   // Each part is drawn again only when what it shows changed. Progress comes a
-  // few times a second while workers run; a card, a button or a text being
+  // few times a second while workers run; a tile, a button or a text being
   // selected must not be torn down for a line that moved somewhere else.
   draw() {
     const c = this.cluster;
@@ -493,19 +550,21 @@ export class ClusterPage {
         this.head,
         this.warns,
         h('section', { class: 'cluster-section' }, h('div', { class: 'cluster-section-title' }, h('span', null, '工作者'), this.count), this.workers),
-        this.queueBox,
         this.mergeBox,
         this.cleanupBox,
+        this.queueBox,
         this.memoryBox,
       );
       this.sigs = {};
     }
     this.drawHead();
+    this.drawStats();
     this.drawWarnings();
     this.drawWorkers();
     this.drawQueue();
     this.drawMerge();
     this.drawCleanup();
+    this.drawer.update(c);
   }
 
   changed(part, value) {
@@ -515,6 +574,53 @@ export class ClusterPage {
     return true;
   }
 
+  // One of the big numbers under the progress bar; its parts are updated in place (they change every second).
+  statBox(key, label) {
+    const num = h('span', { class: 'ch-stat-num', dataset: { field: 'num' } });
+    const unit = h('span', { class: 'ch-stat-unit' });
+    const sub = h('div', { class: 'ch-stat-sub', dataset: { field: 'sub' } });
+    const el = h('div', { class: 'ch-stat', dataset: { stat: key } }, h('div', { class: 'ch-stat-label' }, label), h('div', { class: 'ch-stat-value' }, num, unit), sub);
+    return { el, num, unit, sub };
+  }
+
+  setStat(box, { num, unit = '', sub = '', title = '', live = false, none = false }) {
+    if (box.num.textContent !== num) box.num.textContent = num;
+    if (box.unit.textContent !== unit) box.unit.textContent = unit;
+    if (box.sub.textContent !== sub) box.sub.textContent = sub;
+    box.el.title = title;
+    box.el.classList.toggle('live', live);
+    box.el.classList.toggle('none', none);
+  }
+
+  drawStats() {
+    const c = this.cluster;
+    const sum = summarizeCluster(c);
+    const sp = speedView(sum.speed);
+    this.setStat(this.stats.speed, {
+      num: sp.measured ? sp.text.replace(/ tok\/s$/, '') : DASH,
+      unit: sp.measured ? 'tok/s' : '',
+      sub: sp.measured ? [sum.speed.requestsPerMinute !== null ? `請求 ${speedView({ tokensPerSecond: 0, requestsPerMinute: sum.speed.requestsPerMinute }).requests.replace('請求 ', '')}` : null, sum.speed.workersMeasured < sum.speed.workers ? `${sum.speed.workersMeasured}/${sum.speed.workers} 個工作者量得到` : null].filter(Boolean).join('・') : '量不到',
+      title: sp.measured ? '最近幾分鐘連接器記下的請求，輸出的 token 數除以秒數；只算量得到的工作者' : `量不到：${sp.why}`,
+      live: sp.measured && isActive(c),
+      none: !sp.measured,
+    });
+    this.setStat(this.stats.workers, { num: String(sum.workersRunning), unit: `／${sum.workers}`, sub: '個在工作', live: sum.workersRunning > 0 });
+    const sub = sum.subagents;
+    this.setStat(this.stats.subs, sub ? { num: String(sub.running + sub.awaiting), sub: `共開過 ${sub.total + sub.older} 個${sub.awaiting ? `・${sub.awaiting} 個等你核准` : ''}`, live: sub.running + sub.awaiting > 0 } : { num: DASH, sub: '量不到', none: true });
+    const bar = taskBar(c);
+    const { done, total } = progressOf(c);
+    if (this.changed('bar', [bar, done, total])) this.bar.set(bar, `任務 ${done}／${total} 完成`);
+    this.drawElapsed();
+  }
+
+  drawElapsed() {
+    const c = this.cluster;
+    if (!c || this.dead) return;
+    const text = elapsedText(c, Date.now());
+    const label = text ? `${isActive(c) ? '已跑' : '共跑'} ${text}` : DASH;
+    if (this.elapsed.textContent !== label) this.elapsed.textContent = label;
+  }
+
   drawHead() {
     const c = this.cluster;
     const { done, total, failed, deleted } = progressOf(c);
@@ -522,37 +628,38 @@ export class ClusterPage {
     const cleanup = cleanupAvailability(c, Boolean(this.busy));
     const stoppable = isStoppable(c) && !this.busy;
     const parentTitle = c.parentId ? this.ctx.parentTitle?.(c.parentId) : '';
-    // The heading over the worker cards counts workers; `total` counts tasks once a queue is used.
+    // The heading over the tiles counts workers; `total` counts tasks once a queue is used.
     this.count.textContent = `${(c.workers || []).length} 個`;
     // The "x minutes ago" moves on by itself, so it is part of what this is drawn from.
-    if (!this.changed('head', [c.status, done, total, failed, deleted, c.mode, c.isolate, c.swarm, c.parentId, parentTitle, merge, cleanup, stoppable, this.busy, this.actionError, Math.floor(Date.now() / 60_000)])) return;
+    if (!this.changed('head', [c.status, done, total, failed, deleted, c.mode, c.isolate, c.swarm, c.parentId, parentTitle, merge, cleanup, stoppable, this.busy, this.actionError, Math.floor(Date.now() / 60_000), (c.workers || []).some((w) => w.branch)])) return;
     const parent = c.parentId;
     fill(
-      this.head,
+      this.headTop,
       h(
         'div',
-        { class: 'cluster-head-main' },
-        h(
-          'div',
-          { class: 'cluster-head-line' },
-          h('span', { class: `om-badge ${CLUSTER_BADGE[c.status] || ''}`, dataset: { field: 'status' } }, clusterStatusLabel(c.status)),
-          h('span', { class: 'cluster-progress', dataset: { field: 'progress' } }, `任務 ${done}/${total} 完成`),
-          failed ? h('span', { class: 'om-badge om-badge--danger' }, failedText(c, failed)) : null,
-          deleted ? h('span', { class: 'om-badge' }, `${deleted} 個已刪除`) : null,
-          h('span', { class: 'muted' }, `建立於 ${relTime(c.createdAt)}`),
-        ),
-        h('div', { class: 'cluster-head-facts' }, h('span', null, modeLabel(c.mode)), h('span', null, c.isolate ? '每個工作者獨立 worktree' : '共用同一個資料夾'), nativeSwarm(c.swarm)),
-        c.isolate && (c.workers || []).some((w) => w.branch) ? null : h('div', { class: 'om-field__help', dataset: { field: 'no-merge' } }, '沒有獨立 worktree，沒有分支可以合併；工作者改的都在同一個資料夾裡。'),
-        parent ? h('a', { class: 'linklike', href: `#/s/${parent}`, dataset: { action: 'open-parent' } }, `回主對話${parentTitle ? `「${parentTitle}」` : ''}`) : null,
-        this.actionError ? h('div', { class: 'om-field__error cluster-error', role: 'alert' }, this.actionError) : null,
+        { class: 'ch-title' },
+        h('span', { class: `om-badge ${CLUSTER_BADGE[c.status] || ''}`, dataset: { field: 'status' } }, clusterStatusLabel(c.status)),
+        h('span', { class: 'cluster-progress', dataset: { field: 'progress' } }, `任務 ${done}/${total} 完成`),
+        failed ? h('span', { class: 'om-badge om-badge--danger' }, failedText(c, failed)) : null,
+        deleted ? h('span', { class: 'om-badge' }, `${deleted} 個已刪除`) : null,
       ),
       h(
         'div',
         { class: 'cluster-actions' },
-        h('button', { class: 'om-btn om-btn--destructive', type: 'button', dataset: { action: 'stop' }, disabled: !stoppable, title: stoppable ? '中斷每個工作者目前這一輪（對話、分支與 worktree 都保留）' : '叢集已經不在跑了', onclick: () => this.stop() }, icon('stop'), '全部停止'),
-        h('button', { class: 'om-btn om-btn--primary', type: 'button', dataset: { action: 'merge' }, disabled: !merge.ok, title: merge.why, onclick: () => this.merge() }, icon('branch'), '合併工作者分支'),
-        h('button', { class: 'om-btn', type: 'button', dataset: { action: 'cleanup' }, disabled: !cleanup.ok, title: cleanup.why, onclick: () => this.cleanup() }, icon('trash'), '清理'),
+        h('button', { class: 'om-btn om-btn--sm om-btn--destructive', type: 'button', dataset: { action: 'stop' }, 'aria-label': '全部停止', disabled: !stoppable, title: stoppable ? '中斷每個工作者目前這一輪（對話、分支與 worktree 都保留）' : '叢集已經不在跑了', onclick: () => this.stop() }, icon('stop'), h('span', { class: 'btn-label' }, '全部停止')),
+        h('button', { class: 'om-btn om-btn--sm om-btn--primary', type: 'button', dataset: { action: 'merge' }, 'aria-label': '合併工作者分支', disabled: !merge.ok, title: merge.why, onclick: () => this.merge() }, icon('branch'), h('span', { class: 'btn-label' }, '合併工作者分支')),
+        h('button', { class: 'om-btn om-btn--sm', type: 'button', dataset: { action: 'cleanup' }, 'aria-label': '清理', disabled: !cleanup.ok, title: cleanup.why, onclick: () => this.cleanup() }, icon('trash'), h('span', { class: 'btn-label' }, '清理')),
       ),
+    );
+    fill(
+      this.facts,
+      h('span', null, `建立於 ${relTime(c.createdAt)}`),
+      h('span', null, modeLabel(c.mode)),
+      h('span', null, c.isolate ? '每個工作者獨立 worktree' : '共用同一個資料夾'),
+      nativeSwarm(c.swarm),
+      parent ? h('a', { class: 'linklike', href: `#/s/${parent}`, dataset: { action: 'open-parent' } }, `回主對話${parentTitle ? `「${parentTitle}」` : ''}`) : null,
+      c.isolate && (c.workers || []).some((w) => w.branch) ? null : h('div', { class: 'om-field__help ch-note', dataset: { field: 'no-merge' } }, '沒有獨立 worktree，沒有分支可以合併；工作者改的都在同一個資料夾裡。'),
+      this.actionError ? h('div', { class: 'om-field__error cluster-error ch-note', role: 'alert' }, this.actionError) : null,
     );
   }
 
@@ -562,102 +669,36 @@ export class ClusterPage {
     fill(this.warns, warnings.map((w) => h('div', { class: 'callout small cluster-warn' }, icon('warn'), h('div', { class: 'callout-text' }, w))));
   }
 
-  // One card per worker, kept as long as what it shows apart from its state,
-  // progress and time is the same; those three are updated in place.
+  // One small tile per worker, kept as long as the worker is; every part of
+  // it is updated in place. Pressing it opens the drawer.
   drawWorkers() {
     const list = this.cluster.workers || [];
     const els = [];
     const seen = new Set();
     for (const w of list) {
-      const sig = JSON.stringify([w.title, w.task, w.branch, w.worktree, w.swarm, w.status === 'deleted']);
-      let card = this.cards.get(w.sessionId);
-      if (!card || card.sig !== sig) {
-        card = this.buildCard(w, sig);
-        this.cards.set(w.sessionId, card);
-      }
-      this.updateCard(card, w);
-      els.push(card.el);
+      let tile = this.tiles.get(w.sessionId);
+      if (!tile) this.tiles.set(w.sessionId, (tile = new WorkerTile({ sessionId: w.sessionId, onOpen: (sid, opener) => this.openWorker(sid, opener) })));
+      tile.update(w, this.cluster);
+      els.push(tile.el);
       seen.add(w.sessionId);
     }
-    for (const id of [...this.cards.keys()]) if (!seen.has(id)) this.cards.delete(id);
+    for (const id of [...this.tiles.keys()]) if (!seen.has(id)) this.tiles.delete(id);
     const now = [...this.workers.children];
     if (now.length !== els.length || now.some((e, i) => e !== els[i])) this.workers.replaceChildren(...els);
   }
 
-  buildCard(w, sig) {
-    const state = h('span', { class: 'om-badge cluster-worker-state' });
-    const progress = h('p', { class: 'cluster-worker-progress' });
-    const queueLine = h('p', { class: 'cluster-worker-queue', dataset: { field: 'worker-queue' } });
-    const timingSlot = h('div', { class: 'cluster-timing-slot' });
-    const cleanupSlot = h('div', { class: 'cluster-worker-cleanup' });
-    const deleted = w.status === 'deleted';
-    const el = h(
-      'article',
-      { class: 'cluster-worker', dataset: { session: w.sessionId } },
-      h('header', { class: 'cluster-worker-head' }, h('div', { class: 'cluster-worker-title', title: w.title }, w.title), state),
-      h('p', { class: 'cluster-worker-task', title: w.task }, w.task),
-      w.branch || w.worktree
-        ? h(
-            'dl',
-            { class: 'cluster-kv' },
-            w.branch ? [h('dt', null, '分支'), h('dd', null, h('code', { dataset: { field: 'branch' } }, w.branch))] : null,
-            w.worktree
-              ? [
-                  h('dt', null, 'worktree'),
-                  h('dd', null, h('code', { dataset: { field: 'worktree' } }, w.worktree), h('button', { class: 'om-btn om-btn--toolbar om-btn--sm', type: 'button', dataset: { action: 'copy-path' }, title: '複製路徑', 'aria-label': `複製 ${w.title} 的 worktree 路徑`, onclick: () => copyText(w.worktree).then(() => this.ctx.toast('已複製')) }, icon('copy'))),
-                ]
-              : null,
-          )
-        : null,
-      h('div', { class: 'cluster-worker-meta' }, nativeSwarm(w.swarm), deleted ? null : h('a', { class: 'om-btn om-btn--sm', href: `#/s/${w.sessionId}`, dataset: { action: 'open-worker' } }, '開啟對話')),
-      queueLine,
-      progress,
-      cleanupSlot,
-      timingSlot,
-    );
-    return { el, sig, state, progress, queueLine, timingSlot, cleanupSlot, shown: null, stateKey: '', progressText: null, queueText: null, cleanupKey: null };
+  openWorker(sid, opener) {
+    this.drawer.cluster = this.cluster;
+    this.drawer.open(sid, opener);
   }
 
-  updateCard(card, w) {
-    const st = workerState(w);
-    const stateKey = `${st.label}|${st.tone}`;
-    if (card.stateKey !== stateKey) {
-      card.stateKey = stateKey;
-      card.state.className = `om-badge cluster-worker-state ${TONE_BADGE[st.tone] || ''}`;
-      card.state.textContent = st.label;
-    }
-    // Which task it is on and how many it has done (only a cluster that has a queue says it).
-    const queueText = workerQueueLine(w, this.cluster) || '';
-    if (card.queueText !== queueText) {
-      card.queueText = queueText;
-      card.queueLine.hidden = !queueText;
-      card.queueLine.textContent = queueText;
-    }
-    const text = w.progress || '';
-    if (card.progressText !== text) {
-      card.progressText = text;
-      card.progress.className = `cluster-worker-progress${text ? '' : ' muted'}`;
-      card.progress.title = text;
-      card.progress.textContent = text || '還沒有進度';
-    }
-    // What the clean-up did to this worker, and the way back to the sidebar.
-    const view = cleanupResultView(this.cluster.cleanup?.results?.find((r) => r.sessionId === w.sessionId));
-    const cleanupKey = JSON.stringify([view, w.status === 'deleted']);
-    if (card.cleanupKey !== cleanupKey) {
-      card.cleanupKey = cleanupKey;
-      card.cleanupSlot.hidden = !view;
-      fill(card.cleanupSlot, view ? this.cleanupState(view, w) : null);
-    }
-    const got = w.status === 'deleted' ? DELETED_TIMING : this.timings.get(w.sessionId) || null;
-    if (card.shown !== got) {
-      card.shown = got;
-      // The time breakdown of one worker's conversation (spec §5), drawn by the
-      // function the 耗時 tab of a conversation uses too (timing-box.js).
-      fill(card.timingSlot, timingBox(got));
-    }
+  // What the clean-up did to one worker, and the way back to the sidebar: in its drawer.
+  cleanupSlot(w) {
+    const view = cleanupResultView(this.cluster?.cleanup?.results?.find((r) => r.sessionId === w.sessionId));
+    return view ? h('div', { class: 'cluster-worker-cleanup' }, this.cleanupState(view, w)) : null;
   }
 
-  // 任務佇列: every task, its state, who does it and when it started and ended (the Hub's clock).
+  // 任務佇列: every task, its state, who does it and when it started and ended (the Hub's clock). Folded.
   drawQueue() {
     const c = this.cluster;
     const view = queueView(c);
@@ -672,12 +713,16 @@ export class ClusterPage {
       if (r.span) bits.push(`用了 ${r.span}`);
       return bits.join(' · ');
     };
+    // (Whether the person had it open is read from the box being replaced: the toggle event that says it comes a moment after.)
+    const was = this.queueBox.querySelector('details');
+    if (was) this.fold.queue = was.open;
     fill(
       this.queueBox,
       h(
-        'section',
-        { class: 'cluster-section cluster-queue' },
-        h('div', { class: 'cluster-section-title' }, h('span', null, '任務佇列'), h('span', { class: 'muted', dataset: { field: 'queue-sum' } }, `${sum.done}/${sum.total} 完成${sum.running ? ` · ${sum.running} 條進行中` : ''}${sum.pending ? ` · ${sum.pending} 條等待中` : ''}${sum.failed ? ` · ${sum.failed} 條失敗` : ''}`)),
+        'details',
+        { class: 'cluster-fold cluster-queue', open: this.fold.queue, ontoggle: (e) => (this.fold.queue = e.target.open) },
+        h('summary', null, h('span', { class: 'cf-title' }, '任務佇列'), h('span', { class: 'muted', dataset: { field: 'queue-sum' } }, `${sum.done}/${sum.total} 完成${sum.running ? ` · ${sum.running} 條進行中` : ''}${sum.pending ? ` · ${sum.pending} 條等待中` : ''}${sum.failed ? ` · ${sum.failed} 條失敗` : ''}`)),
+        h('div', { class: 'cf-body' },
         h('div', { class: 'om-field__help' }, '工作者做完一條，會在同一個對話裡自動領下一條；時間是中控台自己的時鐘：交給工作者的那一刻，到看見它停下的那一刻。'),
         view.neverSent ? h('div', { class: 'callout small cluster-warn', dataset: { field: 'never-sent' }, role: 'status' }, icon('warn'), h('div', { class: 'callout-text' }, `已經停止派工：還有 ${view.neverSent} 條任務沒有派出去，不會再自動派。`)) : null,
         h(
@@ -693,6 +738,7 @@ export class ClusterPage {
               r.status === 'failed' && r.error ? h('div', { class: 'cluster-queue-note om-field__error', dataset: { field: 'task-note' } }, r.error) : null,
             ),
           ),
+        ),
         ),
       ),
     );
@@ -791,20 +837,17 @@ export class ClusterPage {
 
   // ---- time
 
-  async loadTimings() {
-    const c = this.cluster;
-    if (!c) return;
-    const ids = (c.workers || []).filter((w) => w.status !== 'deleted').map((w) => w.sessionId);
-    await Promise.all(
-      ids.map(async (sid) => {
-        try {
-          this.timings.set(sid, { timing: await get(`/sessions/${sid}/timing`) });
-        } catch (err) {
-          this.timings.set(sid, { error: err });
-        }
-      }),
-    );
-    if (!this.dead && this.cluster) this.drawWorkers();
+  // The time breakdown of one worker's conversation (spec §5): asked for when its drawer opens, again now and then while it is open.
+  async loadTiming(sid) {
+    if (!sid || this.dead) return;
+    const w = (this.cluster?.workers || []).find((x) => x.sessionId === sid);
+    if (!w || w.status === 'deleted') return;
+    try {
+      this.timings.set(sid, { timing: await get(`/sessions/${sid}/timing`) });
+    } catch (err) {
+      this.timings.set(sid, { error: err });
+    }
+    if (!this.dead && this.cluster) this.drawer.update(this.cluster);
   }
 
   // ---- stop and merge
@@ -922,15 +965,20 @@ export class ClusterPage {
     this.addBtn = h('button', { class: 'om-btn om-btn--primary', type: 'submit', dataset: { action: 'add-memory' }, disabled: true }, '追加到記憶');
     this.reloadBtn = h('button', { class: 'om-btn om-btn--sm', type: 'button', dataset: { action: 'reload-memory' }, onclick: () => this.loadMemory() }, icon('refresh'), '重新讀取');
     const form = h('form', { class: 'cluster-memory-add', onsubmit: (e) => (e.preventDefault(), this.addMemory()) }, h('label', { class: 'om-field' }, h('span', { class: 'om-field__label' }, '追加一條主對話決定'), this.decision, h('span', { class: 'om-field__help' }, `會以「主對話決定（時間）」為標題追加在記憶檔後面；每個工作者下一則 prompt 前會讀到新增的部分。一次最多 ${MEMORY_MAX_CHARS.toLocaleString('en-US')} 字。`)), this.memError, h('div', { class: 'dialog-actions' }, this.addBtn));
+    this.memoryBox.open = this.fold.memory;
     fill(
       this.memoryBox,
-      h('div', { class: 'cluster-section-title' }, h('span', null, '叢集記憶'), this.reloadBtn),
-      h('p', { class: 'om-field__help' }, '所有工作者共用的一份記憶檔（memory.md），放在工作者那台電腦、所有 worktree 之外，不會進 git。'),
-      h('div', { class: 'cluster-memory-head' }, this.memPath, this.memMeta),
-      this.memNone,
-      this.memTruncated,
-      this.memText,
-      form,
+      h('summary', null, h('span', { class: 'cf-title' }, '叢集記憶'), this.memMeta),
+      h(
+        'div',
+        { class: 'cf-body' },
+        h('div', { class: 'cluster-section-title' }, h('span', { class: 'om-field__help' }, '所有工作者共用的一份記憶檔（memory.md），放在工作者那台電腦、所有 worktree 之外，不會進 git。'), this.reloadBtn),
+        h('div', { class: 'cluster-memory-head' }, this.memPath),
+        this.memNone,
+        this.memTruncated,
+        this.memText,
+        form,
+      ),
     );
   }
 

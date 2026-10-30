@@ -14,6 +14,7 @@ import * as policy from '../subagent-policy.js';
 import { remoteHost } from './claude-tools.js';
 import * as clusterMemory from '../cluster-memory.js';
 import * as timing from '../timing.js';
+import * as roster from '../subagent-roster.js';
 
 export const live = true;
 
@@ -754,6 +755,23 @@ export class Mirror {
       // Attached mid-run: no tool card for the Agent call yet, so make one.
       if (!parent) parent = this.tool(parentAgent, p.parentToolCallId || `agent:${id}`, { name: 'Agent', title: p.description || p.subagentName, status: 'running' }, this.parentOf(parentAgent));
       this.agents.set(id, { ...known, parent: parent.id, background: Boolean(p.runInBackground) });
+      // One AgentSwarm is one card, overwritten by whichever member spoke last:
+      // each member is kept on its own (subagent-roster.js). What was asked for is
+      // the snapshot the card was made with, the same for all members of one call.
+      if (!known?.btw) {
+        roster.noteSpawned(this.session, {
+          id,
+          parent: parent.id,
+          name: p.subagentName || 'subagent',
+          description: p.description,
+          swarmIndex: p.swarmIndex,
+          background: Boolean(p.runInBackground),
+          model: p.model,
+          effort: p.thinkingEffort,
+          requested: parent.subagent?.requested !== undefined ? parent.subagent.requested : policy.requestedSnapshot(this.session),
+          at: now(),
+        });
+      }
       // The spawned frame carries the model and effort the subagent actually
       // runs on; showing them here means the card is right from the start,
       // not only after the first status update.
@@ -779,6 +797,11 @@ export class Mirror {
     if (!a) this.agents.set(id, { parent: parent.id, background: Boolean(parent.subagent.background) });
     const status = { 'subagent.started': 'running', 'subagent.completed': 'done', 'subagent.failed': 'error', 'subagent.cancelled': 'cancelled', 'subagent.suspended': 'suspended' }[type];
     if (!status) return;
+    if (!this.agents.get(id)?.btw) {
+      // The card is only this member's own while its `subagent.id` says so.
+      const own = parent.subagent.id === id ? parent.subagent : {};
+      roster.noteStatus(this.session, id, status, { at: now(), error: p.error, from: { parent: parent.id, name: own.name, description: own.description, background: own.background, model: own.model, effort: own.effort, requested: own.requested } });
+    }
     this.closeBlock(id);
     this.ctx.patch(parent, { subagent: { ...parent.subagent, status, summary: p.resultSummary ?? parent.subagent.summary, error: p.error } });
   }
@@ -979,6 +1002,11 @@ export class Mirror {
           if (p.isError) fields.subagent = { ...ev.subagent, status: 'error', error: output.slice(0, 2000) || '子代理失敗' };
           else if (!(ev.subagent.background && ev.subagent.status === 'running')) fields.subagent = { ...ev.subagent, status: 'done', ...(output.trim() && !ev.subagent.summary ? { summary: output.trim().slice(0, 20_000) } : {}) };
         }
+        // A plain Agent call is one subagent, so what its call ends as is what that
+        // subagent ended as. (An AgentSwarm call is many: each member has its own say.)
+        if (fields.subagent?.status && ev.subagent?.id && !/Swarm/.test(ev.name || '') && !['done', 'error', 'cancelled'].includes(roster.find(this.session, ev.subagent.id)?.status)) {
+          roster.noteStatus(this.session, ev.subagent.id, fields.subagent.status, { at: now(), error: fields.subagent.error });
+        }
         this.ctx.patch(ev, fields);
         return;
       }
@@ -1046,6 +1074,7 @@ export class Mirror {
           });
         } else if (p.model || p.thinkingEffort) {
           // A subagent's own model and thinking, shown with it.
+          roster.noteModel(this.session, agentId, { model: p.model, effort: p.thinkingEffort });
           const a = this.agents.get(agentId);
           const card = a && this.events().find((e) => e.id === a.parent);
           if (card?.subagent) {
@@ -1602,6 +1631,7 @@ export class Mirror {
       // Its card: a background subagent from now on, kept running past the turn.
       const card = [...this.tools.entries()].find(([k]) => k.endsWith(`:${t.parent_tool_call_id}`))?.[1];
       if (card?.subagent) {
+        roster.noteBackground(this.session, card.subagent.id);
         this.ctx.patch(card, { subagent: { ...card.subagent, background: true } });
         const a = this.agents.get(card.subagent.id);
         if (a) a.background = true;

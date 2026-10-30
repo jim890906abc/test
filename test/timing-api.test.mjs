@@ -299,6 +299,7 @@ test('a conversation on the Kimi subscription has no proxy requests to count', a
   const t = await timing(s.id);
   assert.equal(t.requests, null);
   assert.ok(t.unmeasured.some((u) => /^requests：.*不是 DeepSeek 號池/.test(u)));
+  assert.equal(t.currentKey, null, 'no key is claimed for a conversation that does not go through the pool');
 });
 
 // ------------------------------------------------------------------ keys
@@ -445,4 +446,60 @@ test('a connector that says it can but does not know the operation is still told
   const busy = await rejected(hub.api('POST', `/deepseek/keys/${k.id}/measure`, { confirmedRequests: 31 }));
   assert.equal(busy.status, 409);
   assert.match(busy.message, /正在量測/);
+});
+
+// ------------------------------------------------- the key a conversation is on
+// (Last in the file: these put requests on the seeded key, which the test of "a key
+// with no records" needs to find untouched.)
+
+test('the key a DeepSeek conversation is on is the key of its latest request: gateway and last four characters, never the key', async () => {
+  await grant('pool_timing', 'pool_sticky');
+  const keys = (await hub.api('GET', '/deepseek')).rotation.keys;
+  assert.ok(keys.length >= 2, 'two keys on the list');
+  const [a, b] = keys;
+  const s = await newDeepseek();
+  const other = await newDeepseek();
+  const now = Date.now();
+  // No request yet: nothing is claimed.
+  assert.equal((await timing(s.id)).currentKey, null);
+  report([
+    record({ session: s.kimiSessionId, key: a.id, startAt: now - 5000 }),
+    record({ session: s.kimiSessionId, key: b.id, startAt: now - 1000 }),
+    record({ session: s.kimiSessionId, key: a.id, startAt: now - 3000 }), // arrived out of order
+    record({ session: other.kimiSessionId, key: a.id, startAt: now - 10 }), // another conversation's, and later
+  ]);
+  const t = await settle(s.id, (x) => x.currentKey, 'the key');
+  assert.deepEqual(t.currentKey, { id: b.id, gateway: b.gateway, gatewayLabel: b.gatewayLabel, hint: b.hint, removed: false, lastUsedAt: now - 1000, machineId: MID, distribution: 'sticky' });
+  assert.equal(t.currentKey.hint.length, 4);
+  noKey(t);
+  // It moves with the conversation: a later request on the other key.
+  report([record({ session: s.kimiSessionId, key: a.id, startAt: now - 500 })]);
+  const moved = await settle(s.id, (x) => x.currentKey?.id === a.id, 'the move');
+  assert.equal(moved.currentKey.lastUsedAt, now - 500);
+  assert.equal((await timing(other.id)).currentKey.id, a.id, 'each conversation has its own');
+});
+
+test('the way the keys are given out is said for the computer that sent the request: the Hub\'s choice if it can, the relay if it cannot', async () => {
+  const [a] = (await hub.api('GET', '/deepseek')).rotation.keys;
+  const s = await newDeepseek();
+  report([record({ session: s.kimiSessionId, key: a.id, startAt: Date.now() - 100 })]);
+  await grant('pool_timing'); // a connector that cannot give each conversation its own key
+  assert.equal((await settle(s.id, (x) => x.currentKey)).currentKey.distribution, 'relay');
+  await grant('pool_timing', 'pool_sticky');
+  assert.equal((await settle(s.id, (x) => x.currentKey?.distribution === 'sticky')).currentKey.distribution, 'sticky');
+  await hub.api('PUT', '/deepseek', { distribution: 'relay' });
+  try {
+    assert.equal((await settle(s.id, (x) => x.currentKey?.distribution === 'relay')).currentKey.distribution, 'relay', 'a person chose the relay');
+  } finally {
+    await hub.api('PUT', '/deepseek', { distribution: 'sticky' });
+  }
+  assert.equal((await timing(s.id)).currentKey.distribution, 'sticky');
+});
+
+test('a key that is no longer on the list is said to be gone, with its gateway, and no last four characters are made up', async () => {
+  await grant('pool_timing', 'pool_sticky');
+  const s = await newDeepseek();
+  report([record({ session: s.kimiSessionId, key: 'dk_removed1', gateway: 'commandcode', startAt: Date.now() - 100 })]);
+  const t = await settle(s.id, (x) => x.currentKey, 'the key');
+  assert.deepEqual([t.currentKey.id, t.currentKey.gateway, t.currentKey.gatewayLabel, t.currentKey.hint, t.currentKey.removed], ['dk_removed1', 'commandcode', 'Command Code', null, true]);
 });

@@ -24,6 +24,10 @@ import * as runner from './runner.js';
 import * as machines from './machines.js';
 import { redact } from './redact.js';
 import * as mem from './cluster-memory.js';
+import { subagentsOf } from './cluster-subagents.js';
+import * as roster from './subagent-roster.js';
+import * as timing from './timing.js';
+import { summarizeCluster } from '../public/js/cluster-model.js';
 
 export const MAX_WORKERS = 8;
 // More tasks than workers is allowed: a worker that finishes a task is given
@@ -170,6 +174,10 @@ export function publicCluster(rec) {
     warnings: [...rec.warnings],
     workers: rec.workers.map((w) => {
       const s = leafOfWorker(w);
+      // Its subagents, one entry each (an AgentSwarm's members too), judged by the conversation's own rules.
+      const sub = subagentsOf(s, { childStatus: (id) => store.getSession(id)?.status });
+      // How fast it is going now: the connector's request records, added up over the last minutes (null and why where they cannot say).
+      const speed = timing.recentSpeed(s ? store.chainOf(s) : [], { from: rec.createdAt });
       return {
         sessionId: w.sessionId,
         title: w.title,
@@ -188,6 +196,12 @@ export function publicCluster(rec) {
         // the tasks, which are the one place that says who did what.
         taskIndex: taskOf(rec, w)?.index ?? null,
         done: tasksOf(rec).filter((t) => t.status === 'done' && t.workerSessionId === w.sessionId).length,
+        // The newest 160 (oldest first); `subagentCounts` is over every one the Hub knows,
+        // `subagentsOlder` how many more it let go of (always said, never silently left out).
+        subagents: sub.list,
+        subagentCounts: sub.counts,
+        subagentsOlder: sub.older,
+        speed,
       };
     }),
     // Every task, in the order given. Times are the Hub's own clock: `startedAt`
@@ -220,7 +234,22 @@ function announce(rec, { force = false } = {}) {
   broadcast({ t: 'cluster', cluster: pub });
 }
 
-// A worker's events or status moved: say so, but not once per token.
+// A subagent that claims to run and has nothing to back it up reads unknown
+// after a minute of silence (agent-state.js) - by the clock alone, with no event
+// to say so. So now and then the clusters that have such a claim are read again;
+// nothing is sent when nothing changed.
+const RECHECK_MS = 15_000;
+const recheckTimer = setInterval(() => {
+  for (const rec of clusters.values()) {
+    if (rec.phase) continue;
+    if (rec.workers.some((w) => roster.rosterOf(leafOfWorker(w)).list.some((e) => !['done', 'error', 'cancelled'].includes(e.status)))) announce(rec);
+  }
+}, RECHECK_MS);
+recheckTimer.unref?.();
+
+// A worker's events or status moved: say so, but not once per token, and not more
+// than once a second (a swarm of 128 changes something every few milliseconds).
+const ANNOUNCE_EVERY_MS = 1000;
 const announceTimers = new Map();
 export function noteActivity(sessionId) {
   if (!workerIndex.size) return;
@@ -234,7 +263,7 @@ export function noteActivity(sessionId) {
     announceTimers.delete(cid);
     const rec = clusters.get(cid);
     if (rec) announce(rec);
-  }, 800);
+  }, ANNOUNCE_EVERY_MS);
   t.unref?.();
   announceTimers.set(cid, t);
 }
@@ -620,6 +649,16 @@ export function listFor(session) {
     .filter((rec) => ids.has(rec.parentId))
     .sort((a, b) => b.createdAt - a.createdAt)
     .map(publicCluster);
+}
+
+// Every cluster, one light line each (no worker's subagent list: that is what
+// a cluster's own page is for), for the page that lists them all. The numbers
+// come out of the very same function the page applies to the cluster it is
+// told about (summarizeCluster), so a pushed cluster and this list agree.
+export function listAll() {
+  return [...clusters.values()]
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .map((rec) => ({ ...summarizeCluster(publicCluster(rec)), parentTitle: store.getSession(rec.parentId)?.title ?? null }));
 }
 
 // ------------------------------------------------------------------ memory

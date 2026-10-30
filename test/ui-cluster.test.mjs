@@ -13,6 +13,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { skipReason, uiSession, CONTRAST_JS } from './browser-harness.mjs';
+import { FAKE_SCRIPT, rowOf } from './fixtures/cluster-fake.mjs';
 import { fixtureSessions } from './ui-fixtures.mjs';
 
 const skip = skipReason();
@@ -20,61 +21,9 @@ const SHOTS = process.env.CLUSTER_UI_SHOTS || '';
 let ui;
 let b;
 
-// The page's side of a Hub with clusters. GETs are answered from window.__fake
-// (the data is re-installed in every page that loads, so a test can reload),
-// the sockets are kept so a test can push a message down them, and summaries
-// can be given the cluster fields the real Hub will put on them (window.__patch).
-const SCRIPT = `(() => {
-  window.__fake = window.__fake || { online: true, clusters: {}, parents: {}, timing: {}, memory: {} };
-  window.__patch = window.__patch || {};
-  window.__gets = [];
-  window.__posts = [];
-  window.__sockets = [];
-  const patchSession = (s) => (s && window.__patch[s.id] ? { ...s, ...window.__patch[s.id] } : s);
-  const RealWS = window.WebSocket;
-  window.WebSocket = class extends RealWS {
-    constructor(...a) { super(...a); window.__sockets.push(this); }
-    set onmessage(fn) {
-      this.__fn = fn;
-      super.onmessage = (e) => {
-        let m; try { m = JSON.parse(e.data); } catch { return fn(e); }
-        const patchMsg = (x) => (x.t === 'batch' ? { ...x, items: x.items.map(patchMsg) } : (x.t === 'session' || x.t === 'snapshot') && x.session ? { ...x, session: patchSession(x.session) } : x);
-        fn({ data: JSON.stringify(patchMsg(m)) });
-      };
-    }
-    get onmessage() { return this.__fn; }
-  };
-  window.__emit = (msg) => { const s = window.__sockets[window.__sockets.length - 1]; s.__fn({ data: JSON.stringify(msg) }); };
-  const real = window.fetch;
-  const reply = (status, body) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
-  const hit = (table, key) => { const v = table[key]; return v === undefined ? reply(404, { error: '沒有這筆資料' }) : v && v.__error ? reply(v.__error.status, { error: v.__error.message }) : reply(200, v); };
-  window.fetch = async (url, init = {}) => {
-    const u = String(url);
-    const method = (init.method || 'GET').toUpperCase();
-    if (method !== 'GET') {
-      window.__posts.push(method + ' ' + u);
-      const d = window.__postDelay;
-      if (d && u.startsWith(d.prefix)) await new Promise((r) => setTimeout(r, d.ms));
-      return real(url, init);
-    }
-    window.__gets.push(u);
-    const F = window.__fake;
-    let m;
-    if (u === '/api/machines' && F.online !== null) return reply(200, [{ id: 'm1', name: 'box', online: F.online, kimi: { available: F.online } }]);
-    if ((m = u.match(/^\\/api\\/clusters\\/([\\w-]+)\\/cleanup\\/plan$/))) return hit(F.plans || {}, m[1]);
-    if ((m = u.match(/^\\/api\\/clusters\\/([\\w-]+)\\/memory$/))) return hit(F.memory, m[1]);
-    if ((m = u.match(/^\\/api\\/clusters\\/([\\w-]+)$/))) return hit(F.clusters, m[1]);
-    if ((m = u.match(/^\\/api\\/sessions\\/([\\w-]+)\\/clusters$/))) return hit(F.parents, m[1]);
-    if ((m = u.match(/^\\/api\\/sessions\\/([\\w-]+)\\/timing$/))) return hit(F.timing, m[1]);
-    const res = await real(url, init);
-    if (/^\\/api\\/sessions(\\/[\\w-]+)?$/.test(u) && Object.keys(window.__patch).length) {
-      const j = await res.clone().json().catch(() => null);
-      if (Array.isArray(j)) return reply(res.status, j.map(patchSession));
-      if (j && j.id) return reply(res.status, patchSession(j));
-    }
-    return res;
-  };
-})()`;
+// The page's side of a Hub with clusters is test/fixtures/cluster-fake.mjs (FAKE_SCRIPT): GETs answered from window.__fake,
+// the sockets kept so a test can push a message down them, summaries given the cluster fields the real Hub will put on them.
+const SCRIPT = FAKE_SCRIPT;
 
 before(async () => {
   if (skip) return;
@@ -87,7 +36,7 @@ after(() => ui?.stop());
 // What the page is told next, now and in every page loaded after.
 let fakeScript = null;
 async function setFake(fake = {}, patch = {}) {
-  const data = { online: true, clusters: {}, parents: {}, timing: {}, memory: {}, ...fake };
+  const data = { online: true, clusters: {}, parents: {}, timing: {}, memory: {}, list: [], ...fake };
   if (fakeScript) await b.removeBeforeLoad(fakeScript);
   const src = `window.__fake = ${JSON.stringify(data)}; window.__patch = ${JSON.stringify(patch)};`;
   fakeScript = await b.beforeLoad(src);
@@ -178,6 +127,18 @@ async function openPage(fake = fullFake(), cid = CID) {
   await setFake(fake);
   await ui.openApp(`#/cluster/${cid}`);
   await b.waitFor(`document.querySelector('.cluster-page .cluster-worker') || document.querySelector('.cluster-page .cluster-none')`);
+  // The folded parts (the task queue, the memory) are closed on a fresh page; a person opens what they want to read, and these tests read them.
+  await b.eval(`document.querySelectorAll('details.cluster-fold').forEach((d) => d.setAttribute('open', ''))`);
+}
+// A worker's drawer: the whole task, where it works, its time. Opened by pressing its tile, shut by the scrim.
+async function openDrawerOf(sid) {
+  await b.click(`.cluster-worker[data-session="${sid}"]`);
+  await b.waitFor(`document.querySelector('.cluster-drawer.on')`);
+  await b.sleep(200);
+}
+async function closeDrawer() {
+  await b.eval(`document.querySelector('.cd-scrim')?.click()`);
+  await b.waitFor(`!document.querySelector('.cluster-drawer.on')`);
 }
 const confirmLast = () => b.click('.dialog .dialog-actions .om-btn:last-child');
 
@@ -267,8 +228,8 @@ test('the dialog starts as the spec says and sends exactly spec §2: tasks, mode
   await b.waitFor(`document.body.innerText.includes('不是 git 專案')`);
   assert.equal(await b.eval(`Boolean(document.querySelector('.cluster-dialog'))`), false, 'the dialog is gone');
   // The page drew the cluster it was just given at once; the memory and the time are read all the same.
-  await b.waitFor(`document.querySelector('.cluster-memory-text')?.innerText.includes('主對話決定')`);
-  await b.waitFor(`document.querySelectorAll('.cluster-worker .cluster-timing').length === 2`);
+  await b.waitFor(`document.querySelector('.cluster-memory-text')?.textContent.includes('主對話決定')`);
+  await b.waitFor(`document.querySelectorAll('.cluster-worker').length === 2`);
 });
 
 test('Enter in a task name goes on to its content; it does not send the dispatch', { skip }, async () => {
@@ -469,42 +430,50 @@ test('a full fork needs the main conversation idle: the dialog says so while it 
 
 // -------------------------------------------------------------- cluster page
 
-test('the cluster page shows the cluster, every worker, and how far it is', { skip }, async () => {
+test('the cluster page shows the cluster, every worker, and how far it is: the tile says little, the drawer the rest', { skip }, async () => {
   await openPage();
   const t = await pageText();
   assert.match(t, /進行中/, 'the cluster status');
   assert.match(t, /1\/3 完成/, 'one worker has finished');
   assert.match(t, /簡報起跑/);
-  const workers = await b.eval(`[...document.querySelectorAll('.cluster-worker')].map((w) => ({
+  const tiles = await b.eval(`[...document.querySelectorAll('.cluster-worker')].map((w) => ({
     session: w.dataset.session,
     title: w.querySelector('.cluster-worker-title').innerText.trim(),
     state: w.querySelector('.cluster-worker-state').innerText.trim(),
-    task: w.querySelector('.cluster-worker-task').innerText.trim(),
-    branch: w.querySelector('[data-field="branch"]')?.innerText.trim(),
-    worktree: w.querySelector('[data-field="worktree"]')?.innerText.trim(),
-    swarm: w.querySelector('[data-native-swarm]')?.innerText.trim(),
-    progress: w.querySelector('.cluster-worker-progress')?.innerText.trim(),
-    open: w.querySelector('a[data-action="open-worker"]')?.getAttribute('href'),
+    long: Boolean(w.querySelector('.cluster-worker-task, [data-field="branch"], [data-field="worktree"], .cluster-timing')),
   }))`);
-  assert.equal(workers.length, 3);
-  assert.deepEqual(workers.map((w) => w.session), ['s_w1', 's_w2', 's_w3']);
-  assert.deepEqual(workers.map((w) => w.state), ['執行中', '已完成', '出錯']);
-  assert.equal(workers[0].title, '工作者 1：改第 1 區');
-  assert.equal(workers[0].task, '把第 1 區的登入錯誤訊息改好，並補測試');
-  assert.equal(workers[0].branch, `cluster/${CID}/w1`);
-  assert.equal(workers[0].worktree, `/home/user/proj-cluster-${CID}/w1`);
-  assert.match(workers[0].swarm, /原生 Swarm.*開/);
-  assert.match(workers[1].swarm, /原生 Swarm.*關/);
-  assert.equal(workers[0].progress, '正在改第 1 個檔案');
-  assert.equal(workers[0].open, '#/s/s_w1');
+  assert.equal(tiles.length, 3);
+  assert.deepEqual(tiles.map((w) => w.session), ['s_w1', 's_w2', 's_w3']);
+  assert.deepEqual(tiles.map((w) => w.state), ['執行中', '已完成', '出錯']);
+  assert.equal(tiles[0].title, '工作者 1：改第 1 區');
+  assert.deepEqual(tiles.map((w) => w.long), [false, false, false], 'nothing long on a tile');
+  // The drawer: the whole of it.
+  const inDrawer = async (sid) => {
+    await openDrawerOf(sid);
+    const r = await b.eval(`(() => { const d = document.querySelector('.cluster-drawer'); const q = (s) => d.querySelector(s)?.innerText.trim(); return {
+      task: q('[data-field="task"]'), branch: q('[data-field="branch"]'), worktree: q('[data-field="worktree"]'), swarm: q('[data-native-swarm]'), progress: q('[data-field="progress"]'),
+      open: d.querySelector('a[data-action="open-worker"]')?.getAttribute('href') }; })()`);
+    await closeDrawer();
+    return r;
+  };
+  const w1 = await inDrawer('s_w1');
+  assert.equal(w1.task, '把第 1 區的登入錯誤訊息改好，並補測試');
+  assert.equal(w1.branch, `cluster/${CID}/w1`);
+  assert.equal(w1.worktree, `/home/user/proj-cluster-${CID}/w1`);
+  assert.match(w1.swarm, /原生 Swarm.*開/);
+  assert.equal(w1.progress, '正在改第 1 個檔案');
+  assert.equal(w1.open, '#/s/s_w1');
+  assert.match((await inDrawer('s_w2')).swarm, /原生 Swarm.*關/);
   // The way back.
   assert.equal(await b.eval(`document.querySelector('[data-action="open-parent"]').getAttribute('href')`), '#/s/s_kimi');
 });
 
 test('the time breakdown draws what was reported at its reported share, and says 量不到 with the Hub\'s reason for what was not', { skip }, async () => {
   await openPage();
-  await b.waitFor(`document.querySelectorAll('.cluster-worker .cluster-timing').length === 3`);
-  const card = (sid) => `.cluster-worker[data-session="${sid}"]`;
+  // The time breakdown is in the worker's drawer, asked for when it opens.
+  const card = () => '.cluster-drawer';
+  await openDrawerOf('s_w1');
+  await b.waitFor(`document.querySelector('.cluster-drawer .cluster-timing')`);
   // Worker 1: everything reported, against a 100 s total.
   const w1 = await b.eval(`(() => {
     const c = document.querySelector(${JSON.stringify(card('s_w1'))});
@@ -525,8 +494,11 @@ test('the time breakdown draws what was reported at its reported share, and says
   assert.match(w1.total, /總時間.*1 分 40 秒/);
   assert.match(w1.facts, /回合 3/);
   assert.match(w1.facts, /429 次數 1/);
+  await closeDrawer();
 
   // Worker 2: the model time and the compaction time could not be measured.
+  await openDrawerOf('s_w2');
+  await b.waitFor(`document.querySelector('.cluster-drawer .cluster-timing')`);
   const w2 = await b.eval(`(() => {
     const c = document.querySelector(${JSON.stringify(card('s_w2'))});
     return { segs: [...c.querySelectorAll('[data-seg]')].map((e) => [e.dataset.seg, parseFloat(e.style.width)]),
@@ -541,16 +513,21 @@ test('the time breakdown draws what was reported at its reported share, and says
   assert.match(w2.tool, /工具.*4\.0 秒/);
   assert.deepEqual(w2.reasons, [['modelMs', '模型：閘道請求無法對應到這個對話'], ['compactMs', '壓縮：Kimi 沒有回報壓縮時間']], 'each reason is the Hub\'s own words, under the name of the part it is about');
 
+  await closeDrawer();
   // Worker 3: the timing call itself failed.
+  await openDrawerOf('s_w3');
+  await b.waitFor(`document.querySelector('.cluster-drawer .cluster-timing-failed')`);
   const w3 = await b.eval(`(() => { const c = document.querySelector(${JSON.stringify(card('s_w3'))}); return { failed: c.querySelector('.cluster-timing-failed')?.innerText.trim(), segs: c.querySelectorAll('[data-seg]').length }; })()`);
   assert.match(w3.failed, /量不到/);
   assert.match(w3.failed, /HTTP 404/);
   assert.equal(w3.segs, 0);
+  await closeDrawer();
 });
 
 test('without a total from the Hub, the total says 量不到 and why, and the parts are drawn against each other, not against a made-up whole', { skip }, async () => {
   const one = CLUSTER({ workers: [W(1)] });
   await openPage(fullFake({ clusters: { [CID]: one }, timing: { s_w1: TIMING({ wallMs: null, modelMs: 6000, toolMs: 2000, rateLimitWaitMs: 2000, compactMs: 0, unmeasured: ['wallMs：這個對話沒有開始時間'] }) } }));
+  await openDrawerOf('s_w1');
   await b.waitFor(`document.querySelector('.cluster-timing-total')`);
   assert.equal(await b.eval(`document.querySelector('.cluster-timing-total').innerText.trim()`), '總時間 量不到');
   assert.equal(await b.eval(`document.querySelector('.cluster-reason[data-part="wallMs"]').innerText.trim()`), '總時間：這個對話沒有開始時間');
@@ -560,6 +537,7 @@ test('without a total from the Hub, the total says 量不到 and why, and the pa
 test('the time is read again while the cluster runs, and no longer once the page is left', { skip }, async () => {
   const one = CLUSTER({ workers: [W(1)] });
   await openPage(fullFake({ clusters: { [CID]: one }, timing: { s_w1: TIMING() } }));
+  await openDrawerOf('s_w1');
   await b.waitFor(`document.querySelector('li[data-part="modelMs"]')?.innerText.includes('50.0 秒')`);
   // The model time moves on (the Hub's answer changes); the page picks it up by itself.
   await b.eval(`window.__fake.timing.s_w1 = ${JSON.stringify(TIMING({ modelMs: 70_000, wallMs: 120_000 }))}`);
@@ -573,12 +551,13 @@ test('the time is read again while the cluster runs, and no longer once the page
   assert.equal(await asked(), before, 'the page that was left stopped reading');
 });
 
-test('the page never makes a number up: every figure on a card is one the Hub sent', { skip }, async () => {
+test('the page never makes a number up: every figure in a drawer is one the Hub sent', { skip }, async () => {
   // Distinctive figures, so that a sum or a difference would show.
   const t = TIMING({ wallMs: 123_000, modelMs: 41_000, toolMs: 17_000, rateLimitWaitMs: 5000, compactMs: 3000, turns: 7, requests: 19, http429: 2 });
   await openPage(fullFake({ timing: { s_w1: t, s_w2: t, s_w3: t } }));
-  await b.waitFor(`document.querySelectorAll('.cluster-worker .cluster-timing-total').length === 3`);
-  const shown = await b.eval(`[...document.querySelector('.cluster-worker .cluster-timing').innerText.matchAll(/\\d+(?:\\.\\d+)?/g)].map((m) => m[0])`);
+  await openDrawerOf('s_w1');
+  await b.waitFor(`document.querySelector('.cluster-drawer .cluster-timing-total')`);
+  const shown = await b.eval(`[...document.querySelector('.cluster-drawer .cluster-timing').innerText.matchAll(/\\d+(?:\\.\\d+)?/g)].map((m) => m[0])`);
   // 123 s = 2 分 3 秒; 41 s; 17 s; 5 s; 3 s; 7 turns; 19 requests; 2 x 429; 2 subagents; 0 requeued - and nothing else (no 123 - 66 = 57 s "other").
   assert.deepEqual([...new Set(shown)].sort(), ['0', '17.0', '19', '2', '3', '3.0', '41.0', '429', '5.0', '7'].sort());
 });
@@ -706,8 +685,10 @@ test('合併 is not offered when the workers had no worktrees of their own, and 
 test('a worker whose conversation was deleted says so, has nothing to open, and its time is not asked for', { skip }, async () => {
   const c = CLUSTER({ workers: [W(1), W(2, { status: 'deleted', finishedAt: T0 - 5000, progress: '' }), W(3, { status: 'idle', finishedAt: T0 - 1000 })] });
   await openPage(fullFake({ clusters: { [CID]: c } }));
-  await b.waitFor(`document.querySelectorAll('.cluster-worker .cluster-timing').length === 3`);
-  const card = await b.eval(`(() => { const c = document.querySelector('.cluster-worker[data-session="s_w2"]'); return { state: c.querySelector('.cluster-worker-state').innerText.trim(), open: Boolean(c.querySelector('[data-action="open-worker"]')), timing: c.querySelector('.cluster-timing-failed')?.innerText.trim() }; })()`);
+  await openDrawerOf('s_w2');
+  await b.waitFor(`document.querySelector('.cluster-drawer .cluster-timing-failed')`);
+  const card = await b.eval(`(() => { const c = document.querySelector('.cluster-drawer'); const tile = document.querySelector('.cluster-worker[data-session="s_w2"]'); const link = c.querySelector('[data-action="open-worker"]'); return { state: tile.querySelector('.cluster-worker-state').innerText.trim(), open: Boolean(link && !link.hidden), timing: c.querySelector('.cluster-timing-failed')?.innerText.trim() }; })()`);
+  await closeDrawer();
   assert.equal(card.state, '已刪除');
   assert.equal(card.open, false, 'there is no conversation to open');
   assert.match(card.timing, /量不到.*刪除/);
@@ -780,26 +761,28 @@ test('a merge the Hub refuses stays on the page where the buttons are, not only 
   await ui.stopAnswering();
 });
 
-test('a progress message redraws only what changed: the card, its text and the buttons are the same elements, so a selection or a focus is not lost', { skip }, async () => {
+test('a progress message redraws only what changed: the tile, its parts and the buttons are the same elements, so a selection or a focus is not lost; the open drawer follows', { skip }, async () => {
   await openPage();
-  await b.waitFor(`document.querySelectorAll('.cluster-worker .cluster-timing').length === 3`);
-  await b.eval(`(() => { window.__keep = { card: document.querySelector('.cluster-worker[data-session="s_w1"]'), path: document.querySelector('.cluster-worker[data-session="s_w1"] [data-field="worktree"]'), stop: document.querySelector('[data-action="stop"]'), timing: document.querySelector('.cluster-worker[data-session="s_w1"] .cluster-timing') }; })()`);
+  await openDrawerOf('s_w1');
+  await b.waitFor(`document.querySelector('.cluster-drawer .cluster-timing')`);
+  await b.eval(`(() => { window.__keep = { tile: document.querySelector('.cluster-worker[data-session="s_w1"]'), title: document.querySelector('.cluster-worker[data-session="s_w1"] .cluster-worker-title'), path: document.querySelector('.cluster-drawer [data-field="worktree"]'), stop: document.querySelector('[data-action="stop"]'), timing: document.querySelector('.cluster-drawer .cluster-timing') }; })()`);
   // Only the first worker's progress line moves (Hub updates come this way, several a second while it works).
   const next = CLUSTER({ workers: [W(1, { progress: '▸ 補測試：第 2 / 5 項' }), W(2, { status: 'idle', finishedAt: T0 - 5000, swarm: false }), W(3, { status: 'error', finishedAt: T0 - 1000 })] });
   await b.eval(`window.__emit(${JSON.stringify({ t: 'cluster', cluster: next })})`);
-  await b.waitFor(`document.querySelector('.cluster-worker[data-session="s_w1"] .cluster-worker-progress').innerText.includes('補測試')`);
+  await b.waitFor(`document.querySelector('.cluster-drawer .cluster-worker-progress').innerText.includes('補測試')`);
   const same = await b.eval(`({
-    card: window.__keep.card === document.querySelector('.cluster-worker[data-session="s_w1"]'),
-    path: window.__keep.path === document.querySelector('.cluster-worker[data-session="s_w1"] [data-field="worktree"]'),
+    tile: window.__keep.tile === document.querySelector('.cluster-worker[data-session="s_w1"]'),
+    title: window.__keep.title === document.querySelector('.cluster-worker[data-session="s_w1"] .cluster-worker-title'),
+    path: window.__keep.path === document.querySelector('.cluster-drawer [data-field="worktree"]'),
     stop: window.__keep.stop === document.querySelector('[data-action="stop"]'),
-    timing: window.__keep.timing === document.querySelector('.cluster-worker[data-session="s_w1"] .cluster-timing'),
+    timing: window.__keep.timing === document.querySelector('.cluster-drawer .cluster-timing'),
   })`);
-  assert.deepEqual(same, { card: true, path: true, stop: true, timing: true });
-  // A state change does change the badge, in the same card.
+  assert.deepEqual(same, { tile: true, title: true, path: true, stop: true, timing: true });
+  // A state change does change the badge, in the same tile.
   const done = CLUSTER({ workers: [W(1, { status: 'idle', finishedAt: T0, progress: 'ok' }), W(2, { status: 'idle', finishedAt: T0 - 5000, swarm: false }), W(3, { status: 'error', finishedAt: T0 - 1000 })] });
   await b.eval(`window.__emit(${JSON.stringify({ t: 'cluster', cluster: done })})`);
   await b.waitFor(`document.querySelector('.cluster-worker[data-session="s_w1"] .cluster-worker-state').innerText.trim() === '已完成'`);
-  assert.equal(await b.eval(`window.__keep.card === document.querySelector('.cluster-worker[data-session="s_w1"]')`), true);
+  assert.equal(await b.eval(`window.__keep.tile === document.querySelector('.cluster-worker[data-session="s_w1"]')`), true);
   assert.match(await b.eval(`document.querySelector('.cluster-head').innerText`), /2\/3 完成/, 'the head follows the counts');
 });
 
@@ -821,13 +804,13 @@ test('a cluster that does not exist says so; one the Hub cannot answer shows the
 
 test('a cluster message over the socket updates the page, and one about another cluster does not', { skip }, async () => {
   await openPage();
-  await b.waitFor(`document.querySelectorAll('.cluster-worker .cluster-timing').length === 3`);
-  assert.deepEqual(await b.eval(`[...document.querySelectorAll('.cluster-worker-state')].map((e) => e.innerText.trim())`), ['執行中', '已完成', '出錯']);
+  await openDrawerOf('s_w1');
+  assert.deepEqual(await b.eval(`[...document.querySelectorAll('.cluster-worker .cluster-worker-state')].map((e) => e.innerText.trim())`), ['執行中', '已完成', '出錯']);
   const next = CLUSTER({ workers: [W(1, { status: 'idle', finishedAt: T0, progress: '全部改完了' }), W(2, { status: 'idle', finishedAt: T0 - 5000, swarm: false }), W(3, { status: 'error', finishedAt: T0 - 1000 })], status: 'done' });
   await b.eval(`window.__emit(${JSON.stringify({ t: 'cluster', cluster: next })})`);
   await b.waitFor(`document.querySelector('.cluster-worker-state').innerText.trim() === '已完成'`);
   assert.match(await pageText(), /2\/3 完成/, 'one more finished (the failed one is not counted as 完成)');
-  assert.equal(await b.eval(`document.querySelector('.cluster-worker-progress').innerText.trim()`), '全部改完了');
+  assert.equal(await b.eval(`document.querySelector('.cluster-drawer .cluster-worker-progress').innerText.trim()`), '全部改完了', 'and the open drawer says what the worker said');
   assert.match(await b.eval(`document.querySelector('.cluster-head').innerText`), /已完成/);
   // Another cluster's news is not this page's.
   const other = CLUSTER({ id: 'c_aaaaaaaaaaaa', status: 'stopped', workers: [W(9)] });
@@ -874,7 +857,8 @@ test('a conversation whose summary lists clusters gets its banner from the Hub w
   await ui.openApp('#/s/s_ds');
   await b.waitFor(`document.querySelector('.composer-input')`);
   await b.sleep(300);
-  assert.deepEqual((await b.eval(`window.__gets`)).filter((u) => /cluster/.test(u)), [], 'nothing was asked for a conversation with no clusters');
+  // (The list of every cluster is asked for once when the page starts, for the sidebar's number; that is not about this conversation.)
+  assert.deepEqual((await b.eval(`window.__gets`)).filter((u) => /cluster/.test(u) && u !== '/api/clusters'), [], 'nothing was asked for a conversation with no clusters');
 });
 
 test('a worker is tagged 叢集 in the sidebar and, opened, says which cluster it belongs to', { skip }, async () => {
@@ -912,10 +896,18 @@ test('nothing on any cluster screen calls a cluster a swarm; "Swarm" is only eve
   assert.ok(r.native.length >= 1 && r.native.every((t) => /Kimi 原生/.test(t)), `the dialog says whose Swarm it is: ${r.native}`);
   // The page and the banner.
   await openPage();
-  await b.waitFor(`document.querySelectorAll('.cluster-worker .cluster-timing').length === 3`);
+  await openDrawerOf('s_w1');
   r = await b.eval(NAMING);
   assert.deepEqual([r.group, r.swarm], [[], []], `page: ${JSON.stringify(r)}`);
-  assert.ok(r.native.length >= 3 && r.native.every((t) => /原生 Swarm/.test(t)), `each worker's chip says 原生: ${r.native}`);
+  assert.ok(r.native.length >= 2 && r.native.every((t) => /原生 Swarm/.test(t)), `the cluster's chip and the worker's chip in its drawer say 原生: ${r.native}`);
+  await closeDrawer();
+  // The list of every cluster and the link to it in the sidebar.
+  await setFake({ list: [rowOf(CLUSTER())], clusters: { [CID]: CLUSTER() } });
+  await ui.openApp('#/clusters');
+  await b.waitFor(`document.querySelector('.cluster-card')`);
+  r = await b.eval(NAMING.replace(".cluster-dialog *, .cluster-page *", ".cluster-dialog *, .cluster-page *, .sidebar [data-nav=clusters] *"));
+  assert.deepEqual([r.group, r.swarm], [[], []], `the list: ${JSON.stringify(r)}`);
+  await openPage();
   await ui.openApp('#/s/s_kimi');
   await b.waitFor(`document.querySelector('.composer-input')`);
   await b.eval(`window.__emit(${JSON.stringify({ t: 'cluster', cluster: CLUSTER() })})`);
@@ -941,24 +933,12 @@ const PAGE_TEXT = [
   ['cluster status badge', '.cluster-head [data-field="status"]'],
   ['failed count badge', '.cluster-head .om-badge--danger'],
   ['progress', '.cluster-progress'],
-  ['facts', '.cluster-head-facts > span:not([data-native-swarm])'],
-  ['native swarm chip (off)', '.cluster-chip:not(.on)'],
-  ['native swarm chip (on)', '.cluster-chip.on'],
+  ['facts', '.ch-facts > span:not([data-native-swarm])'],
+  ['native swarm chip (on)', '.cluster-head .cluster-chip.on'],
   ['link to the main conversation', '.cluster-head .linklike'],
   ['stop button', '[data-action="stop"]'],
   ['worker state badge', '.cluster-worker-state'],
   ['worker title', '.cluster-worker-title'],
-  ['worker task', '.cluster-worker-task'],
-  ['branch and worktree names', '.cluster-kv dt'],
-  ['branch value', '.cluster-kv code'],
-  ['progress line', '.cluster-worker-progress'],
-  ['time total', '.cluster-timing-total'],
-  ['time legend label', '.cluster-legend-label'],
-  ['time legend value', '.cluster-legend-value'],
-  ['量不到', '.cluster-legend li.unmeasured .cluster-legend-value'],
-  ['reason', '.cluster-reason'],
-  ['counts', '.cluster-timing-facts'],
-  ['timing failed', '.cluster-timing-failed'],
   ['memory text', '.cluster-memory-text'],
   ['memory meta', '.cluster-memory-meta'],
   ['memory truncated note', '.cluster-memory-truncated'],
@@ -969,6 +949,26 @@ const PAGE_TEXT = [
   ['merge conflict badge', '.cluster-merge li.fail .om-badge'],
   ['conflict path', '.cluster-conflicts code'],
 ];
+// What a worker's drawer shows (a tile has no long text; the drawer has all of it).
+const DRAWER_TEXT = {
+  s_w1: [
+    ['worker task', '.cd-task'],
+    ['branch and worktree names', '.cluster-kv dt'],
+    ['branch value', '.cluster-kv code'],
+    ['progress line', '.cluster-drawer .cluster-worker-progress'],
+    ['time total', '.cluster-timing-total'],
+    ['time legend label', '.cluster-legend-label'],
+    ['time legend value', '.cluster-legend-value'],
+    ['counts', '.cluster-timing-facts'],
+    ['native swarm chip (on)', '.cluster-drawer .cluster-chip.on'],
+  ],
+  s_w2: [
+    ['量不到', '.cluster-legend li.unmeasured .cluster-legend-value'],
+    ['reason', '.cluster-reason'],
+    ['native swarm chip (off)', '.cluster-drawer .cluster-chip:not(.on)'],
+  ],
+  s_w3: [['timing failed', '.cluster-timing-failed']],
+};
 const DIALOG_TEXT = [
   ['task number', '.cluster-task-no'],
   ['count', '.cluster-count'],
@@ -985,7 +985,8 @@ async function contrastOf(list, L) {
   const bad = [];
   for (const [what, sel] of list) {
     // A control that is switched off is exempt (WCAG 1.4.3); the ones that matter are measured while they are on.
-    const rs = await b.eval(`[...document.querySelectorAll(${JSON.stringify(sel)})].filter((e) => !e.matches(':disabled')).slice(0, 6).map((e) => (${CONTRAST_JS})(e))`);
+    // (What is on the screen: a drawer that is shut is not.)
+    const rs = await b.eval(`[...document.querySelectorAll(${JSON.stringify(sel)})].filter((e) => !e.matches(':disabled') && e.getClientRects().length).slice(0, 6).map((e) => (${CONTRAST_JS})(e))`);
     assert.ok(rs.length, `${what} (${sel}) is on the screen`);
     const floor = KNOWN_PRIMARY[`${what}|${L.name}`] ?? AA;
     for (const r of rs) if (r.ratio < floor) bad.push(`${what} ${r.ratio.toFixed(2)}:1, needs ${floor}:1 (text ${r.fg}, behind ${r.bg})`);
@@ -1005,10 +1006,18 @@ for (const L of LOOKS) {
       await b.waitFor(`document.querySelector('.sidebar') && document.querySelector('.view')?.children.length`);
     };
     await open(`#/cluster/${CID}`);
-    await b.waitFor(`document.querySelectorAll('.cluster-worker .cluster-timing').length === 3 && document.querySelector('.cluster-memory-text') && document.querySelector('.cluster-merge')`);
+    await b.waitFor(`document.querySelectorAll('.cluster-worker').length === 3 && document.querySelector('.cluster-memory-text') && document.querySelector('.cluster-merge')`);
+    await b.eval(`document.querySelectorAll('details.cluster-fold').forEach((d) => d.setAttribute('open', ''))`);
     // A memory that cannot be read, to measure its notice too.
     assert.deepEqual(await contrastOf(PAGE_TEXT, L), [], `${L.name}: the page`);
     if (SHOTS) await b.shot(path.join(SHOTS, `look-${L.name.replace(' ', '-')}.png`));
+    // The drawers.
+    for (const [sid, list] of Object.entries(DRAWER_TEXT)) {
+      await openDrawerOf(sid);
+      await b.waitFor(`document.querySelector('.cluster-drawer [data-sec="time"] .cluster-timing, .cluster-drawer [data-sec="time"] .cluster-timing-failed')`);
+      assert.deepEqual(await contrastOf(list, L), [], `${L.name}: the drawer of ${sid}`);
+      await closeDrawer();
+    }
     // The merge button, while it is on (once a cluster is merged it is off for good).
     await setFake(fullFake(), { s_ds: { clusterId: CID, clusterRole: 'worker' } });
     await open(`#/cluster/${CID}`);
@@ -1114,19 +1123,27 @@ for (const cell of CELLS) {
 
     // The cluster page.
     await openCell(cell, `#/cluster/${CID}`);
-    await b.waitFor(`document.querySelectorAll('.cluster-worker .cluster-timing').length === 3 && document.querySelector('.cluster-memory-text')`);
+    await b.waitFor(`document.querySelectorAll('.cluster-worker').length === 3 && document.querySelector('.cluster-memory-text')`);
+    await b.eval(`document.querySelectorAll('details.cluster-fold').forEach((d) => d.setAttribute('open', ''))`);
     fit = await b.eval(STICKS_OUT('.cluster-page'));
     assert.deepEqual(fit, { out: [], page: 0, box: 0 }, `${cell.name} page: ${JSON.stringify(fit)}`);
     const cards = await b.eval(`(() => [...document.querySelectorAll('.cluster-worker')].map((c) => { const r = c.getBoundingClientRect(); const t = c.querySelector('.cluster-worker-title'); return { w: Math.round(r.width), left: Math.round(r.left), vw: innerWidth, titleClipped: t.scrollWidth > t.clientWidth + 1 && getComputedStyle(t).whiteSpace === 'nowrap' && getComputedStyle(t).textOverflow !== 'ellipsis' }; }))()`);
     assert.equal(cards.length, 3);
     for (const c of cards) {
       assert.ok(c.left >= 0 && c.left + c.w <= c.vw, `${cell.name}: a card is inside the window: ${JSON.stringify(c)}`);
-      assert.ok(c.w >= (cell.w < 700 ? 300 : 300), `${cell.name}: a card is not squeezed into a sliver: ${c.w}px`);
+      assert.ok(c.w >= 150, `${cell.name}: a tile is not squeezed into a sliver: ${c.w}px`);
     }
     // The buttons are whole words on one line each, not cut into letters.
     const buttons = await b.eval(`[...document.querySelectorAll('.cluster-page .om-btn')].map((e) => { const r = e.getBoundingClientRect(); return { text: e.innerText.trim(), h: Math.round(r.height), w: Math.round(r.width), lines: Math.round(r.height / parseFloat(getComputedStyle(e).lineHeight || 20)) }; }).filter((x) => x.text)`);
-    assert.ok(buttons.length >= 4);
+    assert.ok(buttons.length >= 2);
     for (const x of buttons) assert.ok(x.h <= 40, `${cell.name}: button 「${x.text}」 stays on one line (${x.h}px high)`);
+    // A worker's drawer fits as well: nothing sticks out of it or of the window.
+    await openDrawerOf('s_w1');
+    await b.waitFor(`document.querySelector('.cluster-drawer .cluster-timing')`);
+    fit = await b.eval(STICKS_OUT('.cluster-drawer'));
+    assert.deepEqual(fit, { out: [], page: 0, box: 0 }, `${cell.name} drawer: ${JSON.stringify(fit)}`);
+    if (SHOTS) await b.shot(path.join(SHOTS, `drawer-${cell.name.replace(' ', '-')}.png`));
+    await closeDrawer();
     if (SHOTS) {
       await b.eval(`document.querySelector('.cluster-page').scrollTop = 0`);
       await b.shot(path.join(SHOTS, `page-${cell.name.replace(' ', '-')}.png`));
@@ -1268,14 +1285,20 @@ test('清理 asks first, listing what it will remove and what it keeps with the 
   assert.match(sec, /2 個分支已刪除/);
   assert.match(sec, /2 個對話已從側欄收起/);
   assert.ok(sec.includes('有 2 項未提交的修改或未追蹤的檔案') && sec.includes(`/home/user/proj-cluster-${CID}/w2`), 'the kept worker: reason and path');
-  const cards = await b.eval(`[...document.querySelectorAll('.cluster-worker')].map((c) => ({ session: c.dataset.session, worktree: c.querySelector('[data-field="cleanup-worktree"]')?.innerText.trim() ?? null, branch: c.querySelector('[data-field="cleanup-branch"]')?.innerText.trim() ?? null, hidden: c.querySelector('[data-field="cleanup-hidden"]')?.innerText.trim() ?? null, unhide: Boolean(c.querySelector('[data-action="unhide"]')), reasons: [...c.querySelectorAll('.cluster-cleanup-reasons li')].map((l) => l.innerText.trim()) }))`);
+  // What the clean-up did to each worker is in its drawer.
+  const cards = [];
+  for (const sid of ['s_w1', 's_w2', 's_w3']) {
+    await openDrawerOf(sid);
+    cards.push(await b.eval(`(() => { const c = document.querySelector('.cluster-drawer'); return { session: '${sid}', worktree: c.querySelector('[data-field="cleanup-worktree"]')?.innerText.trim() ?? null, branch: c.querySelector('[data-field="cleanup-branch"]')?.innerText.trim() ?? null, hidden: c.querySelector('[data-field="cleanup-hidden"]')?.innerText.trim() ?? null, unhide: Boolean(c.querySelector('[data-action="unhide"]')), reasons: [...c.querySelectorAll('.cluster-cleanup-reasons li')].map((l) => l.innerText.trim()) }; })()`));
+    if (sid === 's_w1') assert.equal(await b.eval(`document.querySelector('.cluster-drawer [data-action="open-worker"]') !== null`), true, 'the conversation can still be opened from its drawer');
+    await closeDrawer();
+  }
   assert.deepEqual(cards.map((c) => [c.session, c.worktree, c.branch, c.hidden, c.unhide]), [
     ['s_w1', 'worktree 已移除', '分支已刪除', '已從側欄收起', true],
     ['s_w2', 'worktree 保留', '分支保留', '在側欄', false],
     ['s_w3', 'worktree 已移除', '分支已刪除', '已從側欄收起', true],
   ]);
   assert.deepEqual(cards[1].reasons, KEPT_WHY);
-  assert.equal(await b.eval(`document.querySelector('[data-action="open-worker"]') !== null`), true, 'the conversation can still be opened from its card');
   if (SHOTS) {
     await b.eval(`document.querySelector('.cluster-cleanup').scrollIntoView()`);
     await b.shot(path.join(SHOTS, 'cleanup-result-1280-light.png'));
@@ -1327,11 +1350,15 @@ test('放回側欄: one worker or all, sent to THIS cluster, and the card and th
   await ui.clearCalls();
   const afterOne = CLEANED({ workers: [1, 2, 3].map((n) => W(n, { status: 'idle', finishedAt: T0 - 9000 + n * 1000, swarm: false, hidden: n === 3 })), cleanup: { at: T0 - 2000, auto: true, results: RESULTS.map((r) => ({ ...r, hidden: r.sessionId === 's_w3' })) } });
   await ui.answer('POST', `/api/clusters/${CID}/unhide`, 200, { cluster: afterOne });
-  await b.click('.cluster-worker[data-session="s_w1"] [data-action="unhide"]');
-  await b.waitFor(`document.querySelector('.cluster-worker[data-session="s_w1"] [data-field="cleanup-hidden"]').innerText.trim() === '在側欄'`);
+  await openDrawerOf('s_w1');
+  await b.click('.cluster-drawer [data-action="unhide"]');
+  await b.waitFor(`document.querySelector('.cluster-drawer [data-field="cleanup-hidden"]').innerText.trim() === '在側欄'`);
   assert.deepEqual((await callsTo(/\/unhide$/)).map((c) => [c.url, c.body]), [[`/api/clusters/${CID}/unhide`, { sessionId: 's_w1' }]]);
-  assert.equal(await b.eval(`Boolean(document.querySelector('.cluster-worker[data-session="s_w1"] [data-action="unhide"]'))`), false, 'nothing left to put back on that card');
-  assert.equal(await b.eval(`document.querySelector('.cluster-worker[data-session="s_w3"] [data-field="cleanup-hidden"]').innerText.trim()`), '已從側欄收起');
+  assert.equal(await b.eval(`Boolean(document.querySelector('.cluster-drawer [data-action="unhide"]'))`), false, 'nothing left to put back on that worker');
+  await closeDrawer();
+  await openDrawerOf('s_w3');
+  assert.equal(await b.eval(`document.querySelector('.cluster-drawer [data-field="cleanup-hidden"]').innerText.trim()`), '已從側欄收起');
+  await closeDrawer();
   assert.match(await b.eval(`document.querySelector('.cluster-cleanup').innerText`), /1 個對話已從側欄收起/);
   await ui.stopAnswering();
 
@@ -1371,16 +1398,29 @@ test('the clean-up result and the confirmation fit a phone, and nothing in them 
     ['result title', '.cluster-cleanup .cluster-section-title'],
     ['result summary', '.cluster-cleanup-summary'],
     ['kept reason', '.cluster-cleanup-kept .om-field__help, .cluster-cleanup-kept li'],
-    ['card chip', '.cluster-worker-cleanup .om-badge'],
-    ['card reason', '.cluster-cleanup-reasons li'],
+  ];
+  // (Each worker's own chips and reasons are in its drawer: checked below.)
+  const DRAWER_SEL = [
+    ['card chip', '.cluster-drawer .cluster-worker-cleanup .om-badge'],
+    ['card reason', '.cluster-drawer .cluster-cleanup-reasons li'],
   ];
   for (const cell of CELLS) {
     await setFake(fullFake({ clusters: { [CID]: cleaned }, plans: { [CID]: PLAN } }));
     await openCell(cell, `#/cluster/${CID}`);
-    await b.waitFor(`document.querySelector('.cluster-cleanup') && document.querySelectorAll('.cluster-worker-cleanup').length === 3`);
+    await b.waitFor(`document.querySelector('.cluster-cleanup') && document.querySelectorAll('.cluster-worker').length === 3`);
     let fit = await b.eval(STICKS_OUT('.cluster-page'));
     assert.deepEqual(fit, { out: [], page: 0, box: 0 }, `${cell.name} page: ${JSON.stringify(fit)}`);
     const bad = [];
+    // The worker that was kept (its reasons are the long ones) in its drawer.
+    await openDrawerOf('s_w2');
+    fit = await b.eval(STICKS_OUT('.cluster-drawer'));
+    assert.deepEqual(fit, { out: [], page: 0, box: 0 }, `${cell.name} drawer: ${JSON.stringify(fit)}`);
+    for (const [what, sel] of DRAWER_SEL) {
+      const rs = await b.eval(`[...document.querySelectorAll(${JSON.stringify(sel)})].slice(0, 6).map((e) => (${CONTRAST_JS})(e))`);
+      assert.ok(rs.length, `${what} is on the screen`);
+      for (const r of rs) if (r.ratio < AA) bad.push(`${cell.name} ${what} ${r.ratio.toFixed(2)}:1`);
+    }
+    await closeDrawer();
     for (const [what, sel] of SEL) {
       const rs = await b.eval(`[...document.querySelectorAll(${JSON.stringify(sel)})].slice(0, 6).map((e) => (${CONTRAST_JS})(e))`);
       assert.ok(rs.length, `${what} is on the screen`);

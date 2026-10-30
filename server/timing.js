@@ -310,12 +310,21 @@ const secondsAgo = (t) => new Date(t).toLocaleString('zh-TW', { hour12: false })
  * the parts are not meant to add up to wallMs.
  *   requests/http429 upstream requests the DeepSeek proxy sent for this
  *                    conversation (and its subagents), and how many were 429
+ *   currentKey       the key of the conversation's latest request, from those
+ *                    records: { id, gateway, gatewayLabel, hint (the key's last
+ *                    four characters; null when the Hub no longer has the key),
+ *                    removed, lastUsedAt (when that request was sent), machineId
+ *                    (the computer whose connector sent it), distribution }; null
+ *                    when no request of the conversation has been recorded.
+ *                    `distribution` is how that computer gives keys out: 'sticky'
+ *                    (this conversation keeps this key until it runs out or is
+ *                    refused) or 'relay' (the key in use, whoever asks)
  */
 export function sessionTiming(nodes, { now = Date.now() } = {}) {
   const unmeasured = [];
   const list = (nodes || []).filter(Boolean);
   const own = list.map((n) => ledgers.get(n.id)).filter(Boolean);
-  const out = { since: null, turns: 0, wallMs: null, modelMs: null, toolMs: null, compactMs: null, rateLimitWaitMs: null, requests: null, http429: null, requestsSince: null, subagents: { spawned: null, requeuedForRateLimit: null }, unmeasured };
+  const out = { since: null, turns: 0, wallMs: null, modelMs: null, toolMs: null, compactMs: null, rateLimitWaitMs: null, requests: null, http429: null, requestsSince: null, currentKey: null, subagents: { spawned: null, requeuedForRateLimit: null }, unmeasured };
   const why = (field, reason) => unmeasured.push(`${field}：${reason}`);
 
   if (!own.length || !own.some((l) => l.frames > 0)) {
@@ -455,6 +464,7 @@ function requestsOf(nodes, out, why) {
   let http429 = 0;
   let unattributed = 0;
   let coverage = null;
+  let latest = null; // the newest record of this conversation, and the computer it came from
   const lacking = [];
   for (const [machineId, ids] of byMachine) {
     const m = machines.getMachine(machineId);
@@ -474,10 +484,26 @@ function requestsOf(nodes, out, why) {
       if (r.session && ids.has(r.session)) {
         requests++;
         if (r.status === 429) http429++;
+        if (!latest || r.startAt > latest.r.startAt) latest = { r, machineId };
       } else if (!r.session && r.startAt >= from) unattributed++;
     }
   }
   out.requestsSince = coverage;
+  if (latest) {
+    const { r, machineId } = latest;
+    const known = deepseekAccount.keyIdentity(r.key);
+    // A connector that cannot give each conversation its own key relays, whatever the Hub chose.
+    out.currentKey = {
+      id: r.key,
+      gateway: known?.gateway ?? r.gateway,
+      gatewayLabel: known?.gatewayLabel ?? (r.gateway && deepseekAccount.GATEWAYS[r.gateway]?.label) ?? null,
+      hint: known?.hint ?? null,
+      removed: !known,
+      lastUsedAt: r.startAt,
+      machineId,
+      distribution: machines.hasCapability(machineId, 'pool_sticky') ? deepseekAccount.distribution() : 'relay',
+    };
+  }
   if (lacking.length) return sub(`「${lacking.join('、')}」的連接器太舊，沒有寫請求紀錄。在那台電腦重新執行連接指令更新`);
   if (coverage === null) return sub('連接器還沒有回報過任何請求紀錄（沒有請求，或連接器剛連上；它回報時會自己補上）');
   if (requests === 0 && unattributed > 0) return sub(`有 ${unattributed} 個請求沒帶對話識別（Kimi 版本沒有送 prompt_cache_key），沒辦法判斷哪些是這個對話的`);
@@ -609,4 +635,75 @@ export async function measureKey({ keyId, levels, confirmedRequests, machineId, 
   } finally {
     busy.forEach((b) => measuring.delete(b));
   }
+}
+
+// ------------------------------------------------------------- right now
+
+// How fast a conversation is going right now, for the cluster pages. Only what
+// the connector's request records say, added up over a time window - no
+// estimate, and nothing is said about how long anything will take:
+//   outTokens          output tokens of the requests that ENDED in the window
+//   tokensPerSecond    outTokens over the window's seconds
+//   requests           requests that STARTED in the window (each attempt counts)
+//   requestsPerMinute  requests over the window's minutes
+// The window is the last `windowMs`, but not from before `from` (when the work
+// began) nor before the records are complete (the connector's coverage): a
+// window cannot be longer than the time it is known for, so the number of a
+// conversation that started 30 seconds ago is over 30 seconds, and `windowMs`
+// says which. Every field is null, with `unmeasured` saying why, where the
+// records cannot say (not a DeepSeek-pool conversation, no records yet, a
+// window too short to mean anything).
+export const SPEED_WINDOW_MS = 5 * 60_000;
+export const SPEED_MIN_SPAN_MS = 5_000;
+export function recentSpeed(nodes, { now = Date.now(), windowMs = SPEED_WINDOW_MS, from = null } = {}) {
+  const none = (unmeasured) => ({ windowMs: null, outTokens: null, tokensPerSecond: null, requests: null, requestsPerMinute: null, unmeasured });
+  const leaf = nodes?.at(-1);
+  if (!leaf?.kimiSessionId || !leaf.machineId) return none('這個對話還沒有對應到任何一台電腦上的 Kimi 對話');
+  if (!(deepseekAccount.isDeepseek(leaf) || leaf.provider === 'deepseek')) return none('這個對話用的不是 DeepSeek 號池（沒有經過連接器的 proxy），沒有請求紀錄可以算速度');
+  const byMachine = new Map();
+  for (const n of nodes) if (n.kimiSessionId && n.machineId) (byMachine.get(n.machineId) || byMachine.set(n.machineId, new Set()).get(n.machineId)).add(n.kimiSessionId);
+  let coverage = null;
+  const lacking = [];
+  const used = [];
+  for (const [machineId, ids] of byMachine) {
+    if (!machines.hasCapability(machineId, 'pool_timing')) {
+      lacking.push(machines.getMachine(machineId)?.name || machineId);
+      continue;
+    }
+    const s = stores.get(machineId);
+    const cov = s ? coverageOf(s) : null;
+    if (cov === null) continue;
+    coverage = coverage === null ? cov : Math.min(coverage, cov);
+    used.push([s, ids]);
+  }
+  if (lacking.length) return none(`「${lacking.join('、')}」的連接器太舊，沒有寫請求紀錄。在那台電腦重新執行連接指令更新`);
+  if (coverage === null) return none('連接器還沒有回報過任何請求紀錄（沒有請求，或連接器剛連上；它回報時會自己補上）');
+  const since = Math.max(now - windowMs, finite(from) ? from : 0, coverage);
+  const span = now - since;
+  if (span < SPEED_MIN_SPAN_MS) return none(`可以算的時間窗只有 ${Math.max(0, Math.round(span / 1000))} 秒（工作剛開始，或連接器剛開始記請求），還量不出速度`);
+  let outTokens = 0;
+  let requests = 0;
+  let unattributed = 0;
+  for (const [s, ids] of used) {
+    for (const r of s.records.values()) {
+      if (!r.session) {
+        if (r.startAt >= since && r.startAt <= now) unattributed++;
+        continue;
+      }
+      if (!ids.has(r.session)) continue;
+      if (r.startAt >= since && r.startAt <= now) requests++;
+      const end = finite(r.endMs) ? r.startAt + r.endMs : null;
+      if (end !== null && end >= since && end <= now && r.outTokens !== null) outTokens += r.outTokens;
+    }
+  }
+  // As for the request count of a conversation: a request that names no conversation may be this one's, so a zero is not claimed.
+  if (requests === 0 && unattributed > 0) return none(`窗內有 ${unattributed} 個請求沒帶對話識別（Kimi 版本沒有送 prompt_cache_key），沒辦法判斷哪些是這個對話的`);
+  return {
+    windowMs: span,
+    outTokens,
+    tokensPerSecond: Math.round((outTokens / (span / 1000)) * 10) / 10,
+    requests,
+    requestsPerMinute: Math.round((requests / (span / 60_000)) * 10) / 10,
+    unmeasured: null,
+  };
 }

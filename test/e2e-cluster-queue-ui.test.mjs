@@ -63,7 +63,20 @@ const waitPrompts = (sid, n) => until(async () => prompts(await kidOf(sid)).leng
 
 const rows = () =>
   b.eval(`[...document.querySelectorAll('.cluster-queue-row')].map((r) => { const t = (s) => r.querySelector(s)?.innerText.trim() ?? null; return { task: r.dataset.task, status: r.dataset.status, no: t('.cluster-queue-no'), title: t('.cluster-queue-title'), state: t('[data-field="task-status"]'), worker: t('[data-field="task-worker"]'), times: t('[data-field="task-times"]'), note: t('[data-field="task-note"]') }; })`);
-const queueCards = () => b.eval(`[...document.querySelectorAll('.cluster-worker')].map((c) => ({ title: c.querySelector('.cluster-worker-title')?.innerText.trim(), line: c.querySelector('.cluster-worker-queue')?.innerText.trim() ?? null }))`);
+// A worker's tile says which task it is on in a few words; the whole line (which, of how many, what it is called, how many done) is in its drawer.
+const queueCards = async () => {
+  const sids = await b.eval(`[...document.querySelectorAll('.cluster-worker')].map((c) => c.dataset.session)`);
+  const out = [];
+  for (const sid of sids) {
+    const place = await b.eval(`document.querySelector('.cluster-worker[data-session="${sid}"] .cluster-worker-queue')?.innerText.trim() ?? null`);
+    const title = await b.eval(`document.querySelector('.cluster-worker[data-session="${sid}"] .cluster-worker-title')?.innerText.trim()`);
+    await page.openDrawer(sid);
+    const line = await b.eval(`document.querySelector('.cluster-drawer [data-field="worker-queue"]')?.innerText.trim() ?? null`);
+    await page.closeDrawer();
+    out.push({ title, place, line });
+  }
+  return out;
+};
 const overflow = () => b.eval(`({ page: document.documentElement.scrollWidth - innerWidth, body: document.body.scrollWidth - innerWidth, wide: [...document.querySelectorAll('.cluster-page *, .cluster-dialog *')].filter((e) => e.getBoundingClientRect().right > innerWidth + 1 && getComputedStyle(e).position !== 'fixed' && !e.closest('.cluster-memory-text, pre, .cluster-tasks, .cluster-queue-list')).slice(0, 5).map((e) => e.className || e.tagName) })`);
 
 const READONLY = ['審查登入模組並列出問題', '審查付款模組並列出問題', '審查通知模組並列出問題', '審查報表模組並列出問題', '審查搜尋模組並列出問題', '審查設定模組並列出問題'];
@@ -154,6 +167,7 @@ test('a dispatch of 6 tasks to 2 workers: the page lists the queue, each worker 
   await b.waitFor(`/^#\\/cluster\\//.test(location.hash)`, { timeout: 30000 });
   const cid = await b.eval('location.hash.slice(10)');
   await b.waitFor(`document.querySelectorAll('.cluster-queue-row').length === 6`);
+  await page.openFolds(); // the queue is folded on a fresh page; a person opens it
   S.c = await getCluster(cid);
   assert.equal(S.c.workers.length, 2, 'two workers were made, for six tasks');
   assert.equal(S.c.tasks.length, 6);
@@ -181,7 +195,7 @@ test('a dispatch of 6 tasks to 2 workers: the page lists the queue, each worker 
   assert.deepEqual(r.map((x) => x.state), ['已完成', '進行中', '進行中', '等待中', '等待中', '等待中']);
   assert.equal(r[2].worker, 'w1', 'the next one is w1\'s');
   assert.match(r[0].times, /^開始 .* · 結束 .* · 用了 [\d.]+ 秒$/, 'a finished task has start, end and the length between them');
-  await b.waitFor(`document.querySelector('.cluster-worker[data-session="${w1.sessionId}"] .cluster-worker-queue')?.innerText.includes('正在做第 3/6 條')`);
+  await b.waitFor(`document.querySelector('.cluster-worker[data-session="${w1.sessionId}"] .cluster-worker-queue')?.innerText.includes('第 3/6 條')`);
   assert.equal((await queueCards())[0].line, `正在做第 3/6 條「${READONLY[2]}」 · 已完成 1 條`);
   // The card's own title is the task it is on now.
   assert.equal((await queueCards())[0].title, READONLY[2]);
@@ -311,7 +325,7 @@ test('on a phone (390) the queue, the worker lines and the dialog with the paste
 });
 
 test('in the dark look the queue and the new lines of the dialog and the worker cards can be read', { skip }, async () => {
-  const sels = ['.cluster-queue-no', '.cluster-queue-title', '[data-field="task-status"]', '[data-field="task-worker"]', '[data-field="task-times"]', '.cluster-queue .cluster-section-title .muted', '.cluster-worker-queue', '.cluster-progress'];
+  const sels = ['.cluster-queue-no', '.cluster-queue-title', '[data-field="task-status"]', '[data-field="task-worker"]', '[data-field="task-times"]', '.cluster-queue summary .muted', '.cluster-worker-queue', '.cluster-progress'];
   for (const theme of ['dark', 'light']) {
     await openLook(`#/cluster/${S.done.id}`, { theme });
     await b.waitFor(`document.querySelectorAll('.cluster-queue-row').length === 6 && document.querySelector('.cluster-worker-queue')`);

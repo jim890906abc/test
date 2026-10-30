@@ -212,6 +212,47 @@ test('every figure in the pane is one the Hub sent: the total, the four parts, t
   assert.deepEqual([...new Set(shown)].sort(), ['1', '17.0', '19', '2', '3', '3.0', '4', '41.0', '429', '5.0', '7'].sort());
 });
 
+// -------------------------------------------------- the key the conversation is on
+
+const ON_KEY = (patch = {}) => ({ id: 'dk_a1', gateway: 'opencode-go', gatewayLabel: 'OpenCode Go', hint: 'a1b2', removed: false, lastUsedAt: T + 650_000, machineId: 'm_fake', distribution: 'sticky', ...patch });
+
+test('the pane says which key the conversation is on, the way the Hub described it: gateway and last four characters, and how keys are given out', { skip }, async () => {
+  await setPage({ timing: { s_ds: FULL({ currentKey: ON_KEY() }) } });
+  await openTiming('s_ds');
+  await b.waitFor(`document.querySelector('.panel .timing-key')`);
+  const line = await itemText('.panel .timing-key');
+  assert.match(line, /^用的 key OpenCode Go …a1b2/, line);
+  assert.match(line, /平均分配：這個對話固定用這一把，它用完或被拒絕才換/, line);
+  assert.equal(await b.eval(`document.querySelector('.panel .timing-key').dataset.distribution`), 'sticky');
+  assert.ok(!secretLike.test(line), line);
+  // The line sits above the bar, and the figures below it are unchanged.
+  assert.equal(await b.eval(`document.querySelector('.panel .timing-key').nextElementSibling.classList.contains('cluster-timing')`), true);
+  assert.equal(await itemText('.panel .cluster-timing-total'), '總時間 2 分 3 秒');
+});
+
+test('on a relay the same line says every conversation shares the key in use, and a key the Hub no longer has is said to be gone with no tail made up', { skip }, async () => {
+  await setPage({ timing: { s_ds: FULL({ currentKey: ON_KEY({ distribution: 'relay' }) }) } });
+  await openTiming('s_ds');
+  await b.waitFor(`document.querySelector('.panel .timing-key')`);
+  assert.match(await itemText('.panel .timing-key'), /OpenCode Go …a1b2.*接力：所有對話共用使用中的那一把，它用完才換下一把/);
+  await setPage({ timing: { s_ds: FULL({ currentKey: ON_KEY({ removed: true, hint: null, gatewayLabel: 'Command Code', gateway: 'commandcode' }) }) } });
+  await openTiming('s_ds');
+  await b.waitFor(`document.querySelector('.panel .timing-key')`);
+  const gone = await itemText('.panel .timing-key');
+  assert.match(gone, /Command Code 的一把 key（已不在清單裡）/, gone);
+  assert.ok(!gone.includes('…'), 'no tail was made up for a key that is not there');
+});
+
+test('a DeepSeek conversation with no request yet says so; one that does not go through the key pool says nothing about keys', { skip }, async () => {
+  await setPage({ timing: { s_ds: FULL({ requests: 0, http429: 0, currentKey: null }), s_kimi: LACKING() } });
+  await openTiming('s_ds');
+  await b.waitFor(`document.querySelector('.panel .timing-key')`);
+  assert.match(await itemText('.panel .timing-key'), /用的 key：這個對話還沒有請求紀錄，看不出來/);
+  await openTiming('s_kimi');
+  await b.waitFor(`document.querySelector('.panel .cluster-timing-total')`);
+  assert.equal(await b.eval(`document.querySelector('.panel .timing-key')`), null, 'a Kimi subscription conversation has no key to name');
+});
+
 test('what the Hub could not measure says 量不到 and the Hub\'s reason, never a number, a date or a 0 in its place', { skip }, async () => {
   await setPage({ timing: { s_kimi: LACKING() } });
   await openTiming();
@@ -232,11 +273,12 @@ test('what the Hub could not measure says 量不到 and the Hub\'s reason, never
   assert.equal(await b.eval(`document.querySelectorAll('.panel .cluster-bar [data-seg]').length`), 1, 'only the measured part is drawn');
 });
 
-test('the pane and the worker cards draw the time with the same function: one place builds the bar, the legend and the reasons', { skip }, async () => {
+test('the pane and the worker drawers draw the time with the same function: one place builds the bar, the legend and the reasons', { skip }, async () => {
   const read = (f) => fs.readFileSync(path.join(ROOT, 'public/js', f), 'utf8');
   const builders = fs.readdirSync(path.join(ROOT, 'public/js')).filter((f) => f.endsWith('.js') && /['"`]cluster-bar['"`]|['"`]cluster-legend['"`]/.test(read(f)));
   assert.deepEqual(builders, ['timing-box.js'], 'the bar and the legend are built in exactly one file');
-  for (const f of ['cluster.js', 'timing-panel.js']) assert.match(read(f), /import \{[^}]*\btimingBox\b[^}]*\} from '\.\/timing-box\.js'/, `${f} draws it with the shared timingBox`);
+  // (The cluster page draws it in a worker's drawer, which is cluster-tiles.js.)
+  for (const f of ['cluster-tiles.js', 'timing-panel.js']) assert.match(read(f), /import \{[^}]*\btimingBox\b[^}]*\} from '\.\/timing-box\.js'/, `${f} draws it with the shared timingBox`);
   // ... and the pane really shows that bar.
   await setPage({ timing: { s_kimi: FULL() } });
   await openTiming();
@@ -444,9 +486,10 @@ for (const L of LOOKS) {
     await openCell({ w: 1280, h: 900, ...L });
     assert.equal(await b.eval(`document.documentElement.dataset.look`), L.look);
     const bad = await contrastOf(PANE_TEXT.filter(([w]) => w !== 'coverage value'), L); // no date to read where the Hub sent none
-    await setPage({ timing: { s_kimi: FULL({ unmeasured: ['requests：另有 3 個請求沒帶對話識別，沒有算進來（這個數字是下限）'] }) } });
+    await setPage({ timing: { s_kimi: FULL({ unmeasured: ['requests：另有 3 個請求沒帶對話識別，沒有算進來（這個數字是下限）'], currentKey: ON_KEY() }) } });
     await openCell({ w: 1280, h: 900, ...L });
     bad.push(...(await contrastOf(PANE_TEXT.filter(([w]) => !/量不到/.test(w)), L)));
+    bad.push(...(await contrastOf([['key line', '.timing-pane .timing-key'], ['key name', '.timing-pane .timing-key-name'], ['key how', '.timing-pane .timing-key-how']], L)));
     if (SHOTS) await b.shot(path.join(SHOTS, `look-${L.name.replace(' ', '-')}.png`));
     await setPage({ timing: { s_kimi: { __error: { status: 500, message: '中控台暫時讀不到這個對話' } } } });
     await openCell({ w: 1280, h: 900, ...L });
@@ -483,7 +526,7 @@ const FITS = `(() => {
 })()`;
 for (const cell of CELLS) {
   test(`${cell.name}: the 耗時 tab fits - tabs, bar, legend, counts, dates, reasons and the button, nothing cut off or run past its box`, { skip }, async () => {
-    for (const [what, data] of [['measured', FULL({ unmeasured: ['requests：另有 3 個同時間的請求沒帶對話識別，沒有算進來（這個數字是下限）'] })], ['lacking', LACKING()]]) {
+    for (const [what, data] of [['measured', FULL({ unmeasured: ['requests：另有 3 個同時間的請求沒帶對話識別，沒有算進來（這個數字是下限）'], currentKey: ON_KEY() })], ['lacking', LACKING()]]) {
       await setPage({ timing: { s_kimi: data } });
       await openCell(cell);
       const fit = await b.eval(FITS);

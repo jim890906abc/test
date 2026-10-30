@@ -206,7 +206,7 @@ app.get('/api/claude/models', wrap(async () => ({ defaultModel: claudeAccount.DE
 // sent here, never back) and the defaults for new DeepSeek conversations.
 app.get('/api/deepseek', wrap(() => deepseekAccount.publicAccount()));
 
-const DEEPSEEK_PUT_FIELDS = new Set(['gateway', 'keyGateway', 'apiKey', 'clearKey', 'activateKeyId', 'removeKeyId', 'retryKeyId', 'markFullKeyId', 'clearMarkKeyId', 'moveKeyId', 'direction', 'defaults']);
+const DEEPSEEK_PUT_FIELDS = new Set(['gateway', 'keyGateway', 'apiKey', 'clearKey', 'activateKeyId', 'removeKeyId', 'retryKeyId', 'markFullKeyId', 'clearMarkKeyId', 'moveKeyId', 'direction', 'distribution', 'defaults']);
 const DEEPSEEK_TEST_FIELDS = new Set(['gateway', 'keyId']);
 
 function deepseekBody(req, allowed) {
@@ -222,11 +222,13 @@ function deepseekBody(req, allowed) {
 // on one key by its id (whatever gateway it is on), `markFullKeyId` and
 // `clearMarkKeyId` are a person saying a key is full / is fine, `moveKeyId`
 // moves a key in the order (`direction`: up, down or top), and `clearKey`
-// removes a whole gateway's keys. Exactly one operation per request keeps the
-// revision and the computers in step.
+// removes a whole gateway's keys, and `distribution` ('sticky' or 'relay') chooses
+// how the keys are given out: each conversation keeps one key, or every
+// conversation uses the key in use until it runs out. Exactly one operation per
+// request keeps the revision and the computers in step.
 app.put('/api/deepseek', wrap(async (req) => {
   const body = deepseekBody(req, DEEPSEEK_PUT_FIELDS);
-  const { gateway: chosen, keyGateway, apiKey, clearKey, activateKeyId, removeKeyId, retryKeyId, markFullKeyId, clearMarkKeyId, moveKeyId, direction, defaults } = body;
+  const { gateway: chosen, keyGateway, apiKey, clearKey, activateKeyId, removeKeyId, retryKeyId, markFullKeyId, clearMarkKeyId, moveKeyId, direction, distribution, defaults } = body;
   if (chosen !== undefined && !deepseekAccount.isGateway(chosen)) throw Object.assign(new Error('不支援的閘道'), { status: 400 });
   if (keyGateway !== undefined && !deepseekAccount.isGateway(keyGateway)) throw Object.assign(new Error('不支援的閘道'), { status: 400 });
   const gw = keyGateway ?? chosen ?? deepseekAccount.gateway();
@@ -240,8 +242,9 @@ app.put('/api/deepseek', wrap(async (req) => {
     typeof apiKey === 'string' && apiKey.trim() ? 'apiKey' : '',
     ...byId.filter(([, id]) => id !== undefined).map(([name]) => name),
     clearKey ? 'clearKey' : '',
+    distribution !== undefined ? 'distribution' : '',
   ].filter(Boolean);
-  if (ops.length > 1) throw Object.assign(new Error('一次只能新增、啟用、移除、重新啟用、標記、移動或清除一組 key'), { status: 400 });
+  if (ops.length > 1) throw Object.assign(new Error('一次只能新增、啟用、移除、重新啟用、標記、移動、清除一組 key，或切換分配方式'), { status: 400 });
   // A key is named by its id, which is one across gateways.
   const ownerOf = (id) => deepseekAccount.gatewayOfKey(id) || gw;
 
@@ -260,6 +263,7 @@ app.put('/api/deepseek', wrap(async (req) => {
   else if (ops[0] === 'clearMarkKeyId') deepseekAccount.clearMark(clearMarkKeyId);
   else if (ops[0] === 'moveKeyId') deepseekAccount.moveKey(moveKeyId, direction ?? 'up');
   else if (ops[0] === 'clearKey') deepseekAccount.clearKey(gw);
+  else if (ops[0] === 'distribution') deepseekAccount.setDistribution(distribution);
   deepseekAccount.setSettings({ gateway: chosen, defaults });
 
   // Every online Kimi gets the key/pool for native DeepSeek subagents; with
@@ -1058,6 +1062,7 @@ app.post('/api/sessions/:id/backup', wrap(async (req) => {
 // Not Kimi's /swarm: a worker may have that mode on, which is Kimi's own.
 app.post('/api/sessions/:id/cluster', wrap((req) => clusters.create(leafOf(req), req.body)));
 app.get('/api/sessions/:id/clusters', wrap((req) => clusters.listFor(leafOf(req))));
+app.get('/api/clusters', wrap(() => clusters.listAll()));
 app.get('/api/clusters/:cid', wrap((req) => clusters.get(req.params.cid)));
 app.post('/api/clusters/:cid/stop', wrap((req) => clusters.stop(req.params.cid)));
 app.post('/api/clusters/:cid/merge', wrap((req) => clusters.merge(req.params.cid)));
