@@ -266,6 +266,11 @@ const nextHello = () => new Promise((resolve) => helloWaiters.push(resolve));
 const withBridgeEnv = async (extraEnv = {}) => {
   if (JSON.stringify(extraEnv) !== bridgeEnvKey) await restartBridge(extraEnv);
 };
+// The connector sends a request that got a rate limit (429) on to the next key and cools a key down
+// after a few of them (test/bridge-rate-limit.test.mjs). The tests below that send many 429s at the
+// same key id are about what a 429 does NOT mean (quota); they run without the cooldown so one test's
+// 429s do not decide where the next test's first request goes.
+const NO_COOLDOWN = { AGENT_HUB_DEEPSEEK_RATE_TRIP_429: '100000', AGENT_HUB_DEEPSEEK_RATE_TRIP_MIN_REQUESTS: '100000' };
 // Stop the connector and start another on the same state, with extra
 // environment (the proxy's timeouts and retry waits are read at start).
 let bridgeEnvKey = '{}';
@@ -484,9 +489,9 @@ test('non-quota failures never move the pool', async () => {
   const cases = [
     [402, 'payment_required', 'Payment required'],
     [403, 'upgrade_required', 'This plan has no API access'],
-    [429, 'rate_limit_exceeded', 'Rate limit reached for requests'],
     [500, 'server_error', 'internal error'],
   ];
+  // (A 429 is not in this list any more: since 2026-10-30 a rate limit is sent on to the next key, see "a transient 429" below.)
   for (const [status, code, message] of cases) {
     fresh();
     upstreamRequests = [];
@@ -574,7 +579,8 @@ test('404/409/422/5xx never rotate, even with a quota code (400 and 403 do: see 
   }
 });
 
-test('a transient 429 never rotates, whatever its message says about usage or quota', async () => {
+test('a transient 429 never marks the key out of quota, whatever its message says about usage or quota - the request is sent on to the next key (2026-10-30)', async () => {
+  await withBridgeEnv(NO_COOLDOWN);
   const cases = [
     jsonError(429, { code: 'rate_limited', message: 'Too many requests: per-minute usage limit, retry in 3s' }),
     jsonError(429, { code: 'rate_limit_exceeded', message: 'Rate limit reached for requests. You exceeded your current quota of requests per minute' }),
@@ -584,20 +590,44 @@ test('a transient 429 never rotates, whatever its message says about usage or qu
   ];
   for (const [i, handler] of cases.entries()) {
     const out = await poolOutcome(handler);
-    assert.equal(out.status, 429, `case ${i}`);
-    assert.deepEqual(out.upstream, [KEY_A], `case ${i} rotated`);
+    assert.equal(out.status, 200, `case ${i}: the next key answered`);
+    assert.match(out.text, /second key answered/, `case ${i}`);
+    assert.deepEqual(out.upstream, [KEY_A, KEY_B], `case ${i}: sent on to the next key once`);
     assert.deepEqual(out.exhausted, [], `case ${i} marked exhausted`);
+    assert.deepEqual(out.saved, [], `case ${i} saved as exhausted`);
   }
 });
 
+test('a 429 that every key answers goes to the client as it came, with each key asked once and none marked', async () => {
+  await withBridgeEnv(NO_COOLDOWN);
+  const handler = (req, res) => (res.writeHead(429, { 'retry-after': '2', 'content-type': 'application/json' }), res.end('{"error":{"code":"rate_limit_exceeded","message":"slow down"}}'));
+  fresh();
+  upstreamRequests = [];
+  responses = new Map();
+  reports = [];
+  for (const k of [KEY_A, KEY_B, KEY_C]) responses.set(k, handler);
+  const r = await provision({ pool: pool([key('dk_a', KEY_A), key('dk_b', KEY_B), key('dk_c', KEY_C)]) });
+  assert.equal(r.ok, true, r.error);
+  const res = await chat({ model: 'deepseek-v4.1-flash', reasoning_effort: 'max', stream: true, messages: [{ role: 'user', content: 'x' }] });
+  assert.equal(res.status, 429);
+  assert.equal(res.headers.get('retry-after'), '2');
+  assert.match(await res.text(), /rate_limit_exceeded/);
+  assert.deepEqual(upstreamRequests.map((x) => x.key), [KEY_A, KEY_B, KEY_C]);
+  await new Promise((r) => setTimeout(r, 80));
+  const last = reports.filter((x) => x.revision === 1).at(-1);
+  assert.deepEqual((last?.keys || []).filter((k) => k.exhaustedAt), [], 'none marked');
+});
+
 test('quota words outside the error object (an echoed request) are not a quota signal', async () => {
+  await withBridgeEnv(NO_COOLDOWN);
   const out = await poolOutcome(jsonError(429, { code: 'invalid_request', message: 'bad request' }, { echo: { prompt: 'please explain insufficient_quota and quota exceeded' }, detail: 'no credits' }));
-  assert.equal(out.status, 429);
-  assert.deepEqual(out.upstream, [KEY_A]);
-  assert.deepEqual(out.exhausted, []);
+  assert.equal(out.status, 200, 'a rate limit: sent on to the next key');
+  assert.deepEqual(out.upstream, [KEY_A, KEY_B]);
+  assert.deepEqual(out.exhausted, [], 'but not marked out of quota');
 });
 
 test('an explicit quota/credit/balance error on 402 or 429 still rotates to the next key', async () => {
+  await withBridgeEnv(NO_COOLDOWN);
   const cases = [
     ['402 code', jsonError(402, { code: 'insufficient_quota', message: 'x' })],
     ['429 type', jsonError(429, { type: 'insufficient_quota', message: 'x' })],
@@ -1007,6 +1037,7 @@ test('a 400 that says "insufficient credits" (the 2026-10-24 incident) rotates t
 });
 
 test('400/403 count as quota only for an account-level statement: explicit quota code, or credits/limit wording that is not an echo', async () => {
+  await withBridgeEnv(NO_COOLDOWN);
   const rotate = [
     ['400 quota code', jsonError(400, { code: 'insufficient_quota', message: 'x' })],
     ['403 quota code', jsonError(403, { code: 'usage_limit_reached', message: 'x' })],
@@ -1028,7 +1059,6 @@ test('400/403 count as quota only for an account-level statement: explicit quota
     ['400 echoed words', 400, jsonError(400, { code: 'invalid_request_error', message: 'Your request mentioned insufficient credits and a monthly limit reached in the prompt' })],
     ['403 plan refusal', 403, jsonError(403, { code: 'upgrade_required', message: 'Your plan has no API access; upgrade to add credits' })],
     ['403 plain forbidden', 403, jsonError(403, { message: 'Forbidden' })],
-    ['429 per minute', 429, jsonError(429, { message: 'Rate limit: you have exceeded your usage limit per minute, retry in 3 seconds' })],
     ['400 credits wording in a code that names rate limiting', 400, jsonError(400, { code: 'rate_limit_exceeded', message: 'insufficient credits for this burst' })],
   ];
   for (const [name, status, handler] of stay) {
@@ -1037,6 +1067,11 @@ test('400/403 count as quota only for an account-level statement: explicit quota
     assert.deepEqual(out.upstream, [KEY_A], `${name}: no other key was tried`);
     assert.deepEqual(out.exhausted, [], name);
   }
+  // A rate limit in words: not quota, so the key stays; the request is sent on once (2026-10-30).
+  const lent = await poolOutcome(jsonError(429, { message: 'Rate limit: you have exceeded your usage limit per minute, retry in 3 seconds' }));
+  assert.equal(lent.status, 200, '429 per minute');
+  assert.deepEqual(lent.upstream, [KEY_A, KEY_B], '429 per minute: lent to the next key');
+  assert.deepEqual(lent.exhausted, [], '429 per minute: not marked');
 });
 
 test('OpenCode Go -> Command Code: the same request goes to the next gateway with its address, model id, session header and key', async () => {

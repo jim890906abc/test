@@ -90,7 +90,20 @@ export class TimingPane {
       ' ',
       h('strong', { class: 'timing-key-name' }, name),
       h('span', { class: 'timing-key-how muted' }, `（${how}）`),
+      this.lentNote(k),
     );
+  }
+
+  // The conversation's latest request was LENT to this key (2026-10-30): its own key is cooling down
+  // because of rate limits, or just answered one, so the connector sent the request to a healthy key and
+  // the conversation stays where it is. Said only when the Hub says it (`currentKey.borrowedFrom`: the
+  // key it was lent from, its last four characters, and whether that key is cooling down now).
+  lentNote(k) {
+    const from = k.borrowedFrom;
+    if (!from || typeof from !== 'object') return null;
+    const why = from.cooling ? '限流冷卻中' : '剛收到限流 429';
+    const name = from.hint ? `…${from.hint}` : '原本的 key';
+    return h('span', { class: 'timing-key-lent', dataset: { part: 'key-lent' } }, ` 暫時借用 …${k.hint || '????'}（${name} ${why}）`);
   }
 
   // The last answer in full, and - if the read after it failed - a line that says so.

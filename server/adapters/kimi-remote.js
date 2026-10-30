@@ -1120,7 +1120,8 @@ export class Mirror {
     if (p.reason === 'failed' && p.error) {
       const code = p.error.code || '';
       const auth = /^auth\./.test(code) || /model\.not_configured/.test(code);
-      this.ctx.emit({ type: 'error', text: auth ? `${p.error.message}。在那台電腦上執行 kimi login，或在 Kimi 裡用 /model 選擇模型。` : p.error.message });
+      // (`code` is Kimi's own word for the kind of error, e.g. provider.rate_limit: server/key-recover.js reads it.)
+      this.ctx.emit({ type: 'error', text: auth ? `${p.error.message}。在那台電腦上執行 kimi login，或在 Kimi 裡用 /model 選擇模型。` : p.error.message, ...(code ? { code: String(code).slice(0, 80) } : {}) });
     }
     // Background subagents keep running after the turn that started them.
     const lives = (ev) => (ev.subagent?.background && ev.subagent.status === 'running') || this.agents.get(ev.agentId)?.background;

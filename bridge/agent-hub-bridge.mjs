@@ -38,6 +38,20 @@
 //                                     key it was on (default 21600000 = 6 hours); sticky pools only
 //   AGENT_HUB_DEEPSEEK_STICKY_MAX     most conversations remembered at once (default 20000; the one that
 //                                     asked longest ago is forgotten first); sticky pools only
+//   AGENT_HUB_DEEPSEEK_RATE_WINDOW_MS how far back each key's requests and rate limits (HTTP 429 that is not about
+//                                     quota) are counted (default 30000 = 30 seconds)
+//   AGENT_HUB_DEEPSEEK_RATE_TRIP_429  a key goes into rate-limit cooldown when it answered this many 429 in that
+//                                     window (default 3) ...
+//   AGENT_HUB_DEEPSEEK_RATE_TRIP_MIN_REQUESTS / AGENT_HUB_DEEPSEEK_RATE_TRIP_RATIO
+//                                     ... or when, with at least this many requests (default 5), this share of them
+//                                     (default 0.2) and at least two 429 (DS_RATE_RATIO_MIN_HITS)
+//   AGENT_HUB_DEEPSEEK_RATE_COOLDOWN_MS  the first cooldown (default 60000); a key that trips again right after one
+//                                     ends gets twice as long ...
+//   AGENT_HUB_DEEPSEEK_RATE_COOLDOWN_MAX_MS  ... up to this (default 600000 = 10 minutes)
+//   AGENT_HUB_DEEPSEEK_RATE_REBALANCE_MS  a key that has been cooling this long without a break (default 300000 =
+//                                     5 minutes) gives half of its conversations (DS_RATE_REBALANCE_SHARE) to other
+//                                     keys for good, and again after each such stretch
+//   AGENT_HUB_DEEPSEEK_RATE_REPORT_MS how often the borrowing/cooldown counts are sent to the Hub (default 5000)
 //   AGENT_HUB_DAEMON_RECHECK_MS       how often a stale Claude daemon is looked at (default 15000)
 //   AGENT_HUB_TRASH_SWEEP_MS          how often the cluster backups older than 7 days are deleted from <state dir>/trash
 //                                     (default 86400000 = once a day, and once at start)
@@ -878,6 +892,11 @@ const DS_STRICT_STATUSES = new Set([400, 403]);
 const DS_AUTH_STATUS = 401;
 // Refusals counted in a row are capped so the doubling gap cannot overflow.
 const DS_AUTH_MAX_FAILURES = 60;
+// A rate-limit cooldown by share (see proxy.maybeTrip) also needs this many 429: one stray 429 among
+// five requests is 20% and no signal.
+const DS_RATE_RATIO_MIN_HITS = 2;
+// The share of a key's conversations given to other keys for good after a break-free stretch of cooling.
+const DS_RATE_REBALANCE_SHARE = 0.5;
 const DS_LABELS = { 'opencode-go': 'OpenCode Go', opencode: 'OpenCode', commandcode: 'Command Code' };
 // The time zone a stated reset time must carry (Z, UTC, GMT, +08:00): without it
 // the time is not read, never guessed.
@@ -1893,7 +1912,7 @@ const dsLog = {
     return ++this.reqSeq;
   },
 
-  // `info`: { req, attempt, key, gateway, session, clientRetry, switchedFrom, recvAt }
+  // `info`: { req, attempt, key, gateway, session, clientRetry, switchedFrom, recvAt, borrowedFrom, borrowReason }
   begin(info) {
     const open = (this.flight.get(info.key) || 0) + 1;
     this.flight.set(info.key, open);
@@ -1908,6 +1927,10 @@ const dsLog = {
       session: info.session ?? null,
       clientRetry: info.clientRetry ?? null,
       switchedFrom: info.switchedFrom ?? null,
+      // The key this request would have gone to but was lent away from, and why ('rate429': it got a
+      // 429 there; 'cooldown': that key was cooling down).
+      borrowedFrom: info.borrowedFrom ?? null,
+      borrowReason: info.borrowReason ?? null,
       recvAt: info.recvAt,
       startAt: Date.now(),
       headersMs: null,
@@ -1994,6 +2017,15 @@ const proxy = {
   // where they are as long as their key is still in the pool.
   homes: new Map(),
   sweepTimer: null,
+  // Rate limits, measured per key (see noteRequest): key id -> { reqs: [times], hits: [times] } over
+  // the last window; the keys cooling down or just out of a cooldown (key id -> { until, level,
+  // stretchStart, lastShed }); and what was borrowed, cooled and resent (key id -> counts, since this
+  // process started). In memory only, like homes: a restarted connector counts afresh.
+  rates: new Map(),
+  cools: new Map(),
+  rateStats: new Map(),
+  rateTimer: null,
+  statsTimer: null,
 
   localBase(gateway) {
     return `http://127.0.0.1:${this.port}/${gateway}`;
@@ -2074,6 +2106,7 @@ const proxy = {
     // the conversations that were on it (they are placed again when they ask).
     if (route.pool.distribution !== 'sticky') this.dropHomes();
     else this.sweepHomes(Date.now());
+    this.refreshRates(route);
     this.save();
     this.report(true);
   },
@@ -2150,6 +2183,179 @@ const proxy = {
     return best;
   },
 
+  // ---- rate limits (HTTP 429 that is not about quota), measured
+  // Which key a request may use, in this order: 1. it has quota and is usable (not out of quota,
+  // not refused, not marked full; a key past its stated reset time counts), 2. it is not cooling
+  // down, 3. it has the fewest conversations of those, 4. the order of the list.
+  //   - A request that gets a 429 before anything went to Kimi is sent again, the very same
+  //     request, to the next such key (once for each); only when every one said 429 does Kimi get
+  //     the 429. The conversation stays on its key: this is borrowing, and its cache key is
+  //     untouched.
+  //   - A key with `rateTrip429()` such 429s in the last window - or `rateTripRatio()` of at least
+  //     `rateTripMinRequests()` requests - cools down for `rateCooldownMs()`: its conversations
+  //     borrow other keys, new conversations are not given to it. A key that trips again right
+  //     after a cooldown ends gets twice as long (`rateCooldownMaxMs()` at most). Only after
+  //     `rateRebalanceMs()` of that without a break are half of its conversations given to other
+  //     keys for good (each at its next request).
+  //   - Every key cooling or unusable: the conversation's own key is used as always.
+  // Counts only; no time is guessed.
+  rateWindowMs() {
+    return this.ms('AGENT_HUB_DEEPSEEK_RATE_WINDOW_MS', 30_000);
+  },
+  rateTrip429() {
+    const n = Number(process.env.AGENT_HUB_DEEPSEEK_RATE_TRIP_429);
+    return Number.isInteger(n) && n >= 1 && n <= 100_000 ? n : 3;
+  },
+  rateTripMinRequests() {
+    const n = Number(process.env.AGENT_HUB_DEEPSEEK_RATE_TRIP_MIN_REQUESTS);
+    return Number.isInteger(n) && n >= 1 && n <= 100_000 ? n : 5;
+  },
+  rateTripRatio() {
+    const n = Number(process.env.AGENT_HUB_DEEPSEEK_RATE_TRIP_RATIO);
+    return Number.isFinite(n) && n >= 0.01 && n <= 1 ? n : 0.2;
+  },
+  rateCooldownMs() {
+    return this.ms('AGENT_HUB_DEEPSEEK_RATE_COOLDOWN_MS', 60_000);
+  },
+  rateCooldownMaxMs() {
+    return Math.max(this.rateCooldownMs(), this.ms('AGENT_HUB_DEEPSEEK_RATE_COOLDOWN_MAX_MS', 600_000));
+  },
+  rateRebalanceMs() {
+    return this.ms('AGENT_HUB_DEEPSEEK_RATE_REBALANCE_MS', 300_000);
+  },
+
+  statOf(id) {
+    let s = this.rateStats.get(id);
+    if (!s) this.rateStats.set(id, (s = { borrows: 0, cooldowns: 0, resendOk: 0, resendFail: 0 }));
+    return s;
+  },
+
+  // The counts ride along with the next report; not every borrowing is news.
+  statsChanged() {
+    if (this.statsTimer) return;
+    this.statsTimer = setTimeout(() => {
+      this.statsTimer = null;
+      this.report(true);
+    }, this.ms('AGENT_HUB_DEEPSEEK_RATE_REPORT_MS', 5000));
+    this.statsTimer.unref?.();
+  },
+
+  // One answer from a key's gateway: `hit` when it was a 429 that is not about quota.
+  noteRequest(route, key, hit, now = Date.now()) {
+    if (this.route !== route) return;
+    let r = this.rates.get(key.id);
+    if (!r) this.rates.set(key.id, (r = { reqs: [], hits: [] }));
+    r.reqs.push(now);
+    if (hit) r.hits.push(now);
+    this.trimRate(r, now);
+    if (hit) this.maybeTrip(route, key, now);
+  },
+
+  trimRate(r, now) {
+    const cut = now - this.rateWindowMs();
+    for (const list of [r.reqs, r.hits]) {
+      let i = 0;
+      while (i < list.length && list[i] <= cut) i++;
+      if (i) list.splice(0, i);
+    }
+  },
+
+  rateCounts(id, now = Date.now()) {
+    const r = this.rates.get(id);
+    if (!r) return { requests: 0, n429: 0 };
+    this.trimRate(r, now);
+    return { requests: r.reqs.length, n429: r.hits.length };
+  },
+
+  // Cooling down: the cooldown has not ended, and the key is in use otherwise (a key that is out
+  // of use has its own words).
+  cooling(key, now = Date.now()) {
+    const c = this.cools.get(key.id);
+    return Boolean(c && c.until > now && this.usable(key, now));
+  },
+
+  // A cooldown that ended less than a window ago still belongs to the same stretch of trouble:
+  // a trip right after it is twice as long, and its cooling counts as one without a break.
+  inStretch(c, now = Date.now()) {
+    return c.until > now || now - c.until <= this.rateWindowMs();
+  },
+
+  // Put the key into cooldown when its window says so. True when it did.
+  maybeTrip(route, key, now = Date.now()) {
+    if (!this.usable(key, now) || this.cooling(key, now)) return false;
+    const { requests, n429 } = this.rateCounts(key.id, now);
+    const tripped = n429 >= this.rateTrip429() || (requests >= this.rateTripMinRequests() && n429 >= DS_RATE_RATIO_MIN_HITS && n429 >= requests * this.rateTripRatio());
+    if (!tripped) return false;
+    const prev = this.cools.get(key.id);
+    const again = Boolean(prev && now - prev.until <= this.rateWindowMs());
+    const level = again ? prev.level + 1 : 0;
+    const length = Math.min(this.rateCooldownMaxMs(), this.rateCooldownMs() * 2 ** Math.min(level, 20));
+    this.cools.set(key.id, { until: now + length, level, stretchStart: again ? prev.stretchStart : now, lastShed: again ? prev.lastShed : now });
+    this.statOf(key.id).cooldowns++;
+    this.armRateTimer();
+    this.report();
+    return true;
+  },
+
+  // Look at the cooldowns: one that ended while the window still shows the trouble trips again at
+  // once; one that has been over for more than a window is forgotten (the next trip starts at the
+  // base length); one that has lasted a whole stretch without a break gives half of its
+  // conversations to other keys.
+  refreshRates(route, now = Date.now()) {
+    if (this.route !== route) return;
+    const ids = new Set(route.pool.keys.map((k) => k.id));
+    for (const [id, c] of [...this.cools]) {
+      const key = route.pool.keys.find((k) => k.id === id);
+      if (!key) {
+        this.cools.delete(id);
+        continue;
+      }
+      if (c.until <= now && this.maybeTrip(route, key, now)) continue;
+      if (!this.inStretch(c, now)) {
+        this.cools.delete(id);
+        for (const home of this.homes.values()) if (home.keyId === id) delete home.move;
+        continue;
+      }
+      const stretch = this.rateRebalanceMs();
+      if (this.usable(key, now) && now - c.stretchStart >= stretch && now - c.lastShed >= stretch) {
+        c.lastShed = now;
+        this.shed(route, key);
+      }
+    }
+    for (const id of [...this.rates.keys()]) if (!ids.has(id)) this.rates.delete(id);
+    for (const id of [...this.rateStats.keys()]) if (!ids.has(id)) this.rateStats.delete(id);
+    this.armRateTimer();
+    this.report();
+  },
+
+  // Mark the share of this key's conversations that asked most recently (the busiest ones: the
+  // idle ones add nothing to its load) to move for good at their next request. Sticky pools only.
+  shed(route, key) {
+    if (!this.isSticky(route)) return 0;
+    const mine = [...this.homes.values()].filter((h) => h.keyId === key.id);
+    const need = Math.ceil(mine.length * DS_RATE_REBALANCE_SHARE) - mine.filter((h) => h.move).length;
+    if (need <= 0) return 0;
+    const picked = mine.filter((h) => !h.move).sort((a, b) => b.at - a.at).slice(0, need);
+    for (const home of picked) home.move = true;
+    return picked.length;
+  },
+
+  // While a key cools down - or has just stopped - the end of its cooldown is noticed (and said)
+  // even when no request comes in.
+  armRateTimer() {
+    if (!this.cools.size) {
+      clearInterval(this.rateTimer);
+      this.rateTimer = null;
+      return;
+    }
+    if (this.rateTimer) return;
+    const gap = Math.min(5000, Math.max(50, Math.floor(this.rateWindowMs() / 12)));
+    this.rateTimer = setInterval(() => {
+      if (this.route) this.refreshRates(this.route);
+    }, gap);
+    this.rateTimer.unref?.();
+  },
+
   // The key this conversation's request goes to next, in a sticky pool. `tried`
   // is what this request has already been sent to (or could not be sent to).
   //   - the conversation's own key, when it is fine and this request has not been
@@ -2163,24 +2369,50 @@ const proxy = {
   //   - its key is fine but this request cannot be sent there (the key's gateway
   //     has no counterpart of the request's model): this one request goes
   //     elsewhere and the conversation stays where it is.
-  // Only when no key is fine, a key whose wait is over is tried (this request is
-  // its probe), as in a relay. null: no key is left for this request.
-  stickyKey(route, session, tried) {
+  // "Fine" includes a key out of quota whose gateway STATED a reset time that has
+  // passed (see usable): it is a key with its conversations counted like any other,
+  // and its first request proves it. Only when no key is fine, a key whose probing
+  // gap is over (no stated time) is tried (this request is its probe), as in a relay.
+  // null: no key is left for this request.
+  stickyKey(route, session, tried, lend = false) {
     const keys = route.pool.keys;
     const now = Date.now();
     const gone = this.sweepHomes(now);
     const home = this.homes.get(session);
     const homeKey = home ? keys.find((k) => k.id === home.keyId) : null;
-    const homeFine = Boolean(homeKey && !this.blocked(homeKey));
-    if (homeFine) {
-      home.at = now;
-      if (!tried.has(homeKey.id)) {
-        if (gone) this.report();
-        return homeKey;
-      }
-    }
+    const homeFine = Boolean(homeKey && this.usable(homeKey, now));
     const pick = (list) => this.fewest(list, session);
-    const key = pick(keys.filter((k) => !tried.has(k.id) && !this.blocked(k))) || pick(keys.filter((k) => !tried.has(k.id) && this.due(route, k)));
+    // A key with quota that is not cooling down and that this request has not been to yet.
+    const healthy = (k) => !tried.has(k.id) && this.usable(k, now) && !this.cooling(k, now);
+    if (homeFine) home.at = now;
+    // This request got a 429 on the key it was sent to: another healthy key takes it, the
+    // conversation stays where it is (borrowing). null: nobody to lend it to.
+    if (lend) {
+      if (gone) this.report();
+      return pick(keys.filter(healthy));
+    }
+    if (homeFine && !tried.has(homeKey.id)) {
+      // A conversation picked to leave its key for good (that key has been cooling for a whole
+      // stretch) goes, at this request, to the healthy key with the fewest conversations.
+      if (home.move) {
+        delete home.move;
+        const c = this.cools.get(homeKey.id);
+        const away = c && this.inStretch(c, now) ? pick(keys.filter((k) => k.id !== homeKey.id && healthy(k))) : null;
+        if (away) {
+          this.homes.set(session, { keyId: away.id, at: now });
+          this.armSweep();
+          this.report();
+          return away;
+        }
+      }
+      // Its key is cooling down: this request borrows a healthy key; nobody healthy -> its own, as always.
+      const other = this.cooling(homeKey, now) ? pick(keys.filter(healthy)) : null;
+      if (gone) this.report();
+      return other || homeKey;
+    }
+    // (A new conversation, or one whose key is out: the healthy key with the fewest conversations;
+    // all of them cooling, a usable one; none, a key whose probing gap is over.)
+    const key = pick(keys.filter(healthy)) || pick(keys.filter((k) => !tried.has(k.id) && this.usable(k, now))) || pick(keys.filter((k) => !tried.has(k.id) && this.due(route, k, now)));
     if (key && !homeFine) {
       this.homes.set(session, { keyId: key.id, at: now });
       for (let over = this.homes.size - this.stickyMax(); over > 0; over--) {
@@ -2196,6 +2428,13 @@ const proxy = {
 
   clear() {
     this.dropHomes();
+    this.rates.clear();
+    this.cools.clear();
+    this.rateStats.clear();
+    clearInterval(this.rateTimer);
+    this.rateTimer = null;
+    clearTimeout(this.statsTimer);
+    this.statsTimer = null;
     this.route = null;
     this.models = [];
     this.lastReport = '';
@@ -2274,10 +2513,19 @@ const proxy = {
             : k.recoveredAt
               ? { id: k.id, recoveredAt: k.recoveredAt, ...(k.recoveredFrom ? { recoveredFrom: k.recoveredFrom } : {}) }
               : { id: k.id };
-        return sticky ? { ...health, sessions: counts.get(k.id) || 0 } : health;
+        // A key cooling down because of rate limits says until when and on what count (measured over
+        // the window); a key that has been lent away from, cooled or resent says how often.
+        const now = Date.now();
+        const c = this.cools.get(k.id);
+        const cool = c && this.cooling(k, now) ? { rateCooldown: { until: c.until, level: c.level, n429: this.rateCounts(k.id, now).n429, windowMs: this.rateWindowMs() } } : null;
+        const st = this.rateStats.get(k.id);
+        const stat = st && (st.borrows || st.cooldowns || st.resendOk || st.resendFail) ? { rateStats: { ...st } } : null;
+        const full = { ...health, ...cool, ...stat };
+        return sticky ? { ...full, sessions: counts.get(k.id) || 0 } : full;
       }),
     };
-    const json = JSON.stringify(msg);
+    // (The counts of borrowings move all the time: they are sent along, but alone they are no news.)
+    const json = JSON.stringify(msg, (name, value) => (name === 'rateStats' ? undefined : value));
     if (!force && json === this.lastReport) return;
     this.lastReport = json;
     hub.send(msg);
@@ -2554,7 +2802,7 @@ const proxy = {
     if (i < 0) i = 0;
     for (let j = 1; j <= n; j++) {
       const key = pool.keys[(i + j) % n];
-      if (!this.blocked(key)) return key;
+      if (this.usable(key)) return key;
     }
     return null;
   },
@@ -2563,6 +2811,21 @@ const proxy = {
   // its gateway with HTTP 401 (authFailedAt). The two are never both set.
   blocked(key) {
     return Boolean(key.exhaustedAt || key.authFailedAt);
+  },
+
+  // A key out of quota whose gateway STATED when it comes back (retryAt), and that
+  // time has passed. Only a stated time counts: a key with none keeps the probing
+  // rule (see due), a key a person marked full waits for a person, and a refused key
+  // (401) says nothing about when it might work. Nothing is made up here.
+  resetPassed(key, now = Date.now()) {
+    return Boolean(key.exhaustedAt && !key.manual && !key.authFailedAt && key.retryAt && key.retryAt <= now);
+  },
+
+  // A key a request may use like a healthy one: not set aside, or its stated reset
+  // time has passed. Its first real request is the proof (ok() clears the mark, a
+  // quota answer marks it again with the time the gateway gives then).
+  usable(key, now = Date.now()) {
+    return !this.blocked(key) || this.resetPassed(key, now);
   },
 
   // How long a refused key waits before a real request may look at it again:
@@ -2755,6 +3018,8 @@ const proxy = {
     t.headers(upstream.status);
 
     if (upstream.status >= 200 && upstream.status < 300) {
+      this.noteRequest(route, key, false);
+      let ok = false;
       // The end of the answer is where its usage is; only that much is kept.
       let tail = '';
       let aborted = false;
@@ -2791,6 +3056,7 @@ const proxy = {
         res.end();
         t.tokens(tail);
         t.end(aborted ? 'aborted' : 'ok');
+        ok = !aborted;
         this.ok(route, key, was);
       } catch {
         t.end(timedOut ? 'timeout' : clientGone || res.destroyed ? 'aborted' : 'stream_cut');
@@ -2804,7 +3070,7 @@ const proxy = {
       } finally {
         finish();
       }
-      return { done: true };
+      return { done: true, ok };
     }
 
     let errBody;
@@ -2824,15 +3090,27 @@ const proxy = {
     // status; the answer's words are not looked at, and never reach Kimi.)
     if (upstream.status === DS_AUTH_STATUS) {
       t.end('http_error');
+      this.noteRequest(route, key, false);
       return { authFailed: true };
     }
     if (this.quota(upstream.status, errText)) {
       t.end('quota');
+      // (A 429 that is about quota is an empty key, not a rate limit.)
+      this.noteRequest(route, key, false);
       return { quota: true, resetAt: this.resetAt(upstream.headers, errText) };
     }
     if (res.destroyed) return t.end('aborted'), { done: true };
     const headers = this.downHeaders(upstream.headers);
     headers['content-length'] = String(errBody.length);
+    // A rate limit (the key has quota, the gateway says slow down) and nothing has gone to Kimi:
+    // the caller sends the request on to another healthy key, and only if there is none does
+    // Kimi get this answer.
+    if (upstream.status === 429) {
+      t.end('http_error');
+      this.noteRequest(route, key, true);
+      return { rate: { status: 429, headers, body: errBody } };
+    }
+    this.noteRequest(route, key, false);
     res.writeHead(upstream.status, headers);
     res.end(errBody);
     t.end('http_error');
@@ -3022,6 +3300,7 @@ const proxy = {
       const reqNo = dsLog.nextRequest();
       let attempts = 0;
       let previous = null;
+      let pending = null; // the 429 (rate limit) this request got last: { key, status, headers, body }; null: none yet
       // A sticky pool gives a conversation its own key (see stickyKey); a request
       // that names no conversation, and every request of a relay, takes the key in
       // use and moves on when it runs out.
@@ -3031,7 +3310,11 @@ const proxy = {
         // Healthy keys first; only when none is left, an exhausted key whose
         // wait is over (this request is its probe). The order is one list for
         // every gateway: the next key may be on another one.
-        const key = sticky ? this.stickyKey(route, session, tried) : order.find((k) => !tried.has(k.id) && !this.blocked(k)) || order.find((k) => !tried.has(k.id) && this.due(route, k));
+        // (A key with quota that is not cooling down, in the order of the list from the key in use.)
+        const healthy = (k) => !tried.has(k.id) && this.usable(k) && !this.cooling(k);
+        const key = sticky
+          ? this.stickyKey(route, session, tried, pending !== null)
+          : order.find(healthy) || (pending ? null : order.find((k) => !tried.has(k.id) && this.usable(k)) || order.find((k) => !tried.has(k.id) && this.due(route, k)));
         if (!key) break;
         tried.add(key.id);
         const target = this.prepare(route, key, body);
@@ -3039,9 +3322,27 @@ const proxy = {
           skipped.add(key.id);
           continue;
         }
-        const t = dsLog.begin({ req: reqNo, attempt: ++attempts, key: key.id, gateway: key.gateway || route.gateway, session, clientRetry: Number.isInteger(retried) && retried >= 0 ? retried : null, switchedFrom: previous, recvAt });
+        // Lent: the key this request would have gone to (its conversation's own key, or the one
+        // that just said 429) and why.
+        const homeId = sticky ? this.homes.get(session)?.keyId : null;
+        const lentBy = homeId && homeId !== key.id ? homeId : !sticky && pending ? pending.key.id : null;
+        if (lentBy) {
+          this.statOf(lentBy).borrows++;
+          this.statsChanged();
+        }
+        const t = dsLog.begin({ req: reqNo, attempt: ++attempts, key: key.id, gateway: key.gateway || route.gateway, session, clientRetry: Number.isInteger(retried) && retried >= 0 ? retried : null, switchedFrom: previous, recvAt, borrowedFrom: lentBy, borrowReason: lentBy ? (pending ? 'rate429' : 'cooldown') : null });
         const result = await this.attempt(req, res, route, key, target, rest, t);
+        // A request sent on because of a 429: did it work?
+        if (pending) {
+          this.statOf(pending.key.id)[result.ok ? 'resendOk' : 'resendFail']++;
+          this.statsChanged();
+        }
         if (result.done) return;
+        if (result.rate) {
+          previous = key.id;
+          pending = { key, ...result.rate };
+          continue;
+        }
         if (result.quota) {
           previous = key.id;
           this.fail(route, key, result.resetAt);
@@ -3055,6 +3356,12 @@ const proxy = {
         return;
       }
       if (!res.headersSent && !res.destroyed) {
+        // Every healthy key said 429: Kimi gets the last of them (it backs off by itself).
+        if (pending) {
+          res.writeHead(pending.status, pending.headers);
+          res.end(pending.body);
+          return;
+        }
         let model = '';
         if (skipped.size) {
           try {
@@ -4800,8 +5107,15 @@ const daemon = {
 //                    fewest conversations takes a new one - and moves only the conversations
 //                    of a key that runs out or is refused; 'relay' is the order of old. The
 //                    pool report says each key's `sessions` (a count) in a sticky pool
+//   pool_reset_due   a key out of quota whose gateway STATED a reset time that has passed is
+//                    used like a healthy one (in a sticky pool it counts as the key with the
+//                    fewest conversations); the first real request proves it or marks it again
+//   pool_rate        the proxy counts each key's requests and rate limits (429 that is not about quota):
+//                    a request that gets one is sent on to another healthy key at once (the conversation
+//                    keeps its key), a key that keeps answering 429 cools down (its conversations borrow
+//                    other keys), and the pool report says `rateCooldown` and `rateStats` for it
 function connectorCapabilities() {
-  return ['pool', 'pool_cross', 'secondary_model', ...(brokerReady ? ['broker'] : []), 'handoff', 'pool_timing', 'pool_measure', 'event_timing', 'pool_auth', 'pool_sticky', 'kimi_delete'];
+  return ['pool', 'pool_cross', 'secondary_model', ...(brokerReady ? ['broker'] : []), 'handoff', 'pool_timing', 'pool_measure', 'event_timing', 'pool_auth', 'pool_sticky', 'kimi_delete', 'pool_reset_due', 'pool_rate'];
 }
 
 

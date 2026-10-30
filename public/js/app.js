@@ -3687,6 +3687,9 @@ async function deepseekDialog() {
   const distBox = h('div', { class: 'gw-list ds-dist', role: 'radiogroup', 'aria-label': 'key 分配方式' });
   const distNote = h('p', { class: 'om-field__help ds-note ds-dist-note' });
   const allOutBox = h('div', { class: 'ds-all-out-box' });
+  // The Hub types 「繼續」 by itself into a conversation whose turn ended on a quota or rate-limit error, once a
+  // key is available that was not. On unless a person turns it off; chosen at once, like a key operation.
+  const resumeInput = h('input', { class: 'om-switch', type: 'checkbox', name: 'autoResume', checked: acc.autoResume !== false });
   const machineBox = h('div', { class: 'ds-machines' });
   const modelSel = h('select', { class: 'om-input', name: 'model' });
   const effortSel = h('select', { class: 'om-input', name: 'effort' });
@@ -3774,6 +3777,9 @@ async function deepseekDialog() {
   const keyState = (k) => {
     if (k.state === 'manual' || k.manual) return { text: '手動標記已滿', badge: 'warning' };
     if (k.state === 'auth_failed' || k.authFailed) return { text: '認證失敗（HTTP 401）', badge: 'danger' };
+    // The gateway's stated reset time has passed: the key is back in the rotation and waits for
+    // the next real request to confirm it. It is not "full" any more.
+    if (k.state === 'reset_due' || k.resetDue) return { text: '已到重置時間，待下一個請求確認', badge: 'accent' };
     if (k.state === 'exhausted' || k.exhaustedAt) {
       if (k.expiryKnown && k.resetAt) return { text: `已滿，${new Date(k.resetAt).toLocaleString()} 重置`, badge: 'warning' };
       if (k.resetAt) return { text: '已滿，閘道說的重置時間已過（下一個真實請求會再試）', badge: 'warning' };
@@ -3781,6 +3787,16 @@ async function deepseekDialog() {
     }
     return k.active ? { text: '使用中', badge: 'success' } : { text: '待命', badge: '' };
   };
+  // A key cooling down because of rate limits (HTTP 429 that is not about quota), in the words of
+  // the computers that watch: until when, on what count over what window. The key is still in use
+  // for everything else; its conversations borrow other keys while it cools.
+  const hms = (t) => {
+    const d = new Date(t);
+    return [d.getHours(), d.getMinutes(), d.getSeconds()].map((n) => String(n).padStart(2, '0')).join(':');
+  };
+  const spanOf = (ms) => (ms >= 120_000 && ms % 60_000 === 0 ? `${ms / 60_000} 分鐘` : `${Math.round(ms / 1000)} 秒`);
+  const rateText = (c) => `限流冷卻中（到 ${hms(c.until)}，最近 ${spanOf(c.windowMs)} ${c.n429} 次 429）`;
+  const rateStatsText = (st) => `限流應對：借用 ${st.borrows} 次、冷卻 ${st.cooldowns} 次、因限流重送成功 ${st.resendOk}／失敗 ${st.resendFail}（各電腦自連接器啟動起算，加總）`;
   // When a key the gateway refused is looked at again, said as ours: a refused key
   // has no reset time (the gateway said nothing about one), only the Hub's probing.
   const authNote = (k) => {
@@ -3881,10 +3897,13 @@ async function deepseekDialog() {
       keys.length
         ? keys.map((k, i) => {
             const st = keyState(k);
+            // Marked (it can be cleared or re-enabled by hand) vs. really out of use: a key only
+            // waiting for its confirming request is marked but is in the rotation.
             const out = k.state !== 'ready';
+            const dim = out && k.state !== 'reset_due';
             return h(
               'div',
-              { class: `ds-key${k.active ? ' on' : ''}${out ? ' exhausted' : ''}`, 'data-key-id': k.id },
+              { class: `ds-key${k.active ? ' on' : ''}${dim ? ' exhausted' : ''}`, 'data-key-id': k.id },
               h(
                 'div',
                 { class: 'ds-key-main' },
@@ -3892,11 +3911,13 @@ async function deepseekDialog() {
                 h('span', { class: 'ds-key-gw' }, k.gatewayLabel || k.gateway),
                 h('span', { class: 'ds-key-hint' }, `…${k.hint || '????'}`),
                 h('span', { class: `om-badge${st.badge ? ` om-badge--${st.badge}` : ''} ds-key-state` }, st.text),
+                k.rateCooldown ? h('span', { class: 'om-badge om-badge--warning ds-key-rate', 'data-rate': 'cooldown', title: '這把 key 最近一直收到限流（429，不是額度用完）：它的對話暫時借用別把 key，新對話不分給它；冷卻到期自動回來用' }, rateText(k.rateCooldown)) : null,
                 // Only in the even split, and only once a computer has said how many (not 0 before anyone counted).
                 !relay && Number.isInteger(k.sessions) ? h('span', { class: 'ds-key-sessions', 'data-sessions': String(k.sessions), title: '現在固定用這把 key 的對話數（各台電腦加起來）' }, `目前 ${k.sessions} 個對話`) : null,
                 h('span', { class: 'ds-key-added', title: k.addedAt ? new Date(k.addedAt).toLocaleString() : '' }, k.addedAt ? `加入於 ${relTime(k.addedAt)}` : ''),
               ),
               k.state === 'auth_failed' || k.authFailed ? h('div', { class: 'ds-key-auth' }, authNote(k)) : null,
+              k.rateStats && (k.rateStats.borrows || k.rateStats.cooldowns || k.rateStats.resendOk || k.rateStats.resendFail) ? h('div', { class: 'ds-key-rate-stats', 'data-rate': 'stats' }, rateStatsText(k.rateStats)) : null,
               h(
                 'div',
                 { class: 'ds-key-actions' },
@@ -3923,7 +3944,7 @@ async function deepseekDialog() {
       rows.length
         ? rows.map((a) => {
             const key = rot().find((k) => k.id === a.activeId);
-            const out = key && key.state !== 'ready' ? (key.state === 'manual' ? '（手動標記已滿）' : key.state === 'auth_failed' ? '（認證失敗 HTTP 401）' : '（額度用盡）') : '';
+            const out = key && key.state !== 'ready' ? (key.state === 'manual' ? '（手動標記已滿）' : key.state === 'auth_failed' ? '（認證失敗 HTTP 401）' : key.state === 'reset_due' ? '（已到重置時間，待確認）' : '（額度用盡）') : '';
             return h(
               'div',
               { class: 'ds-machine' },
@@ -3937,6 +3958,10 @@ async function deepseekDialog() {
                 a.rotation ? null : h('span', { class: 'ds-machine-old' }, `（舊版連接器，只在 ${label(a.gateway)} 內換；重新執行連接指令更新後才會跨家）`),
                 // A connector from before each conversation could have its own key relays, whatever is chosen.
                 a.stickyCapable || acc.distribution === 'relay' ? null : h('span', { class: 'ds-machine-old', 'data-note': 'relay-only' }, '（這台電腦的連接器太舊，只能接力；重新執行連接指令更新後才會平均分配）'),
+                // A connector from before a key came back at its stated reset time waits for every other key to be out first.
+                // A connector from before rate limits were watched passes a 429 to Kimi as it comes.
+                a.rateCapable ? null : h('span', { class: 'ds-machine-old', 'data-note': 'rate-old' }, '（這台電腦的連接器太舊，不會偵測限流；重新執行連接指令更新後，收到 429 的請求才會自動改用別把 key）'),
+                a.resetDueCapable || !rot().some((k) => k.state === 'reset_due') ? null : h('span', { class: 'ds-machine-old', 'data-note': 'reset-due-old' }, '（這台電腦的連接器太舊，過了重置時間的 key 要等其他 key 都用完才會被試；重新執行連接指令更新後才會回到輪替）'),
               ),
               h('span', { class: 'ds-machine-rev', title: '這台電腦最近回報的清單版本（清單有變動就會增加）' }, `v${a.revision}`),
             );
@@ -3976,6 +4001,7 @@ async function deepseekDialog() {
   };
   const draw = () => {
     acc = S.deepseek || acc;
+    resumeInput.checked = acc.autoResume !== false;
     drawDistribution();
     drawGateways();
     drawKeyNote();
@@ -4112,6 +4138,12 @@ async function deepseekDialog() {
     e.preventDefault();
     addKey();
   });
+  resumeInput.addEventListener('change', async () => {
+    const want = resumeInput.checked;
+    const done = await keyOp({ autoResume: want }, want ? '開啟自動繼續' : '關閉自動繼續');
+    // Refused or failed: the switch goes back to what the Hub says.
+    if (!done) resumeInput.checked = acc.autoResume !== false;
+  });
   draw();
   addGw.addEventListener('change', drawKeyActions);
   fill(
@@ -4135,6 +4167,7 @@ async function deepseekDialog() {
     h('div', { class: 'dialog-subtitle' }, 'key 分配方式'),
     distBox,
     distNote,
+    h('label', { class: 'settings-switch ds-auto-resume' }, resumeInput, h('span', null, h('span', { class: 'om-field__label' }, 'key 恢復後自動繼續被中斷的對話'), h('span', { class: 'om-field__help' }, '對話的回合因 DeepSeek 額度用完或限流而中斷時，等到有 key 可用（供應商給的重置時間到、清除標記、新增 key、冷卻結束）就自動送一次「繼續」並留一則說明。每個中斷的回合只送一次，只處理最近 2 小時內中斷的，Claude 對話不適用。'))),
     h('div', { class: 'dialog-subtitle' }, '各機實際 key'),
     machineBox,
     h('div', { class: 'dialog-subtitle' }, '模型名稱來源'),

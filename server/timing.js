@@ -231,6 +231,9 @@ function cleanRecord(r) {
     session: str(r.session, /^session_[\w-]{4,80}$/),
     clientRetry: intOrNull(r.clientRetry),
     switchedFrom: str(r.switchedFrom, /^[\w-]{1,64}$/),
+    // Lent (2026-10-30): the key this request would have gone to and why ('rate429' | 'cooldown').
+    borrowedFrom: str(r.borrowedFrom, /^[\w-]{1,64}$/),
+    borrowReason: r.borrowReason === 'rate429' || r.borrowReason === 'cooldown' ? r.borrowReason : null,
     recvAt: epoch(r.recvAt),
     startAt,
     headersMs: numOrNull(r.headersMs),
@@ -563,6 +566,13 @@ function requestsOf(nodes, out, why) {
       lastUsedAt: r.startAt,
       machineId,
       distribution: machines.hasCapability(machineId, 'pool_sticky') ? deepseekAccount.distribution() : 'relay',
+      // The latest request was lent to this key: the key it was lent from, and whether that one is cooling down now.
+      ...(r.borrowedFrom
+        ? (() => {
+            const from = deepseekAccount.keyIdentity(r.borrowedFrom);
+            return { borrowedFrom: { id: r.borrowedFrom, hint: from?.hint ?? null, gatewayLabel: from?.gatewayLabel ?? null, cooling: deepseekAccount.keyCooling(r.borrowedFrom) } };
+          })()
+        : {}),
     };
   }
   if (lacking.length) return sub(`「${lacking.join('、')}」的連接器太舊，沒有寫請求紀錄。在那台電腦重新執行連接指令更新`);

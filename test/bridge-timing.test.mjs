@@ -255,18 +255,25 @@ test('a request is written down with its own times, status, key id, conversation
   assert.ok(!JSON.stringify(hubMessages).includes('sk-timing'), 'no key value in anything sent to the Hub');
 });
 
-test('a 429 that is not a quota error goes to the client unchanged and is written down as a 429, with no key change', async () => {
+test('a 429 that is not a quota error is sent on to the next key (2026-10-30), and goes to the client unchanged when every key says it; each attempt is written down as a 429, and none marks a key', async () => {
   behaviours.set(KEY_A, failing(429, 'rate_limit_exceeded', 'slow down'));
+  behaviours.set(KEY_B, failing(429, 'rate_limit_exceeded', 'slow down'));
+  behaviours.set(KEY_C, failing(429, 'rate_limit_exceeded', 'slow down'));
   const res = await chat();
   assert.equal(res.status, 429);
   await res.text();
-  const [r] = await until(() => records().length === 1 && records(), 5000, 'the record');
+  const [r, second] = await until(() => records().length === 3 && records(), 5000, 'the records');
   assert.equal(r.status, 429);
   assert.equal(r.outcome, 'http_error');
   assert.equal(r.key, 'dk_a');
   assert.equal(r.firstByteMs !== null, true, 'the error body\'s first byte was seen');
   assert.equal(r.outTokens, null, 'no usage in an error');
-  assert.equal(upstreamRequests.length, 1, 'no other key was tried');
+  assert.equal(r.borrowedFrom, null, 'the first attempt is on its own key');
+  assert.deepEqual([second.key, second.status, second.outcome, second.borrowedFrom, second.borrowReason], ['dk_b', 429, 'http_error', 'dk_a', 'rate429'], 'the second attempt was lent by a');
+  assert.equal(upstreamRequests.length, 3, 'every key was asked once, no more');
+  await sleep(100);
+  const report = hubMessages.filter((m) => m.t === 'deepseek.pool').at(-1);
+  assert.ok(!report || report.keys.every((k) => !k.exhaustedAt), 'a rate limit marks no key out of quota');
 });
 
 test('a key that is out of quota hands the same request to the next key, and both attempts are written down', async () => {

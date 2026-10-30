@@ -22,6 +22,7 @@ import * as machines from './machines.js';
 import * as subagentBroker from './subagent-broker.js';
 import { registerSecretSource } from './redact.js';
 import { createAutoPause, activityOf, timings, isActive } from './autopause.js';
+import { createKeyRecover } from './key-recover.js';
 import { createScheduler, scheduleTimings } from './schedule.js';
 import { mergeQuota, countsOf } from './quota.js';
 import * as claudeAccount from './claude-account.js';
@@ -210,7 +211,7 @@ app.get('/api/claude/models', wrap(async () => ({ defaultModel: claudeAccount.DE
 // sent here, never back) and the defaults for new DeepSeek conversations.
 app.get('/api/deepseek', wrap(() => deepseekAccount.publicAccount()));
 
-const DEEPSEEK_PUT_FIELDS = new Set(['gateway', 'keyGateway', 'apiKey', 'clearKey', 'activateKeyId', 'removeKeyId', 'retryKeyId', 'markFullKeyId', 'clearMarkKeyId', 'moveKeyId', 'direction', 'distribution', 'defaults']);
+const DEEPSEEK_PUT_FIELDS = new Set(['gateway', 'keyGateway', 'apiKey', 'clearKey', 'activateKeyId', 'removeKeyId', 'retryKeyId', 'markFullKeyId', 'clearMarkKeyId', 'moveKeyId', 'direction', 'distribution', 'defaults', 'autoResume']);
 const DEEPSEEK_TEST_FIELDS = new Set(['gateway', 'keyId']);
 
 function deepseekBody(req, allowed) {
@@ -232,7 +233,7 @@ function deepseekBody(req, allowed) {
 // request keeps the revision and the computers in step.
 app.put('/api/deepseek', wrap(async (req) => {
   const body = deepseekBody(req, DEEPSEEK_PUT_FIELDS);
-  const { gateway: chosen, keyGateway, apiKey, clearKey, activateKeyId, removeKeyId, retryKeyId, markFullKeyId, clearMarkKeyId, moveKeyId, direction, distribution, defaults } = body;
+  const { gateway: chosen, keyGateway, apiKey, clearKey, activateKeyId, removeKeyId, retryKeyId, markFullKeyId, clearMarkKeyId, moveKeyId, direction, distribution, defaults, autoResume } = body;
   if (chosen !== undefined && !deepseekAccount.isGateway(chosen)) throw Object.assign(new Error('不支援的閘道'), { status: 400 });
   if (keyGateway !== undefined && !deepseekAccount.isGateway(keyGateway)) throw Object.assign(new Error('不支援的閘道'), { status: 400 });
   const gw = keyGateway ?? chosen ?? deepseekAccount.gateway();
@@ -268,7 +269,9 @@ app.put('/api/deepseek', wrap(async (req) => {
   else if (ops[0] === 'moveKeyId') deepseekAccount.moveKey(moveKeyId, direction ?? 'up');
   else if (ops[0] === 'clearKey') deepseekAccount.clearKey(gw);
   else if (ops[0] === 'distribution') deepseekAccount.setDistribution(distribution);
-  deepseekAccount.setSettings({ gateway: chosen, defaults });
+  deepseekAccount.setSettings({ gateway: chosen, defaults, autoResume });
+  // (A key came back, or the automatic 「繼續」 was turned on: conversations waiting for it are looked at now.)
+  keyRecover.evaluate();
 
   // Every online Kimi gets the key/pool for native DeepSeek subagents; with
   // no key left for the gateway in use, the provider is taken off them.
@@ -1437,7 +1440,11 @@ clusterTrash.startSweeper();
 machines.onBridgeMessage((machineId, msg) => {
   if (msg?.t !== 'deepseek.pool') return;
   try {
-    if (deepseekAccount.applyPoolReport(machineId, msg)) broadcast({ t: 'deepseek', account: deepseekAccount.publicAccount() });
+    if (deepseekAccount.applyPoolReport(machineId, msg)) {
+      broadcast({ t: 'deepseek', account: deepseekAccount.publicAccount() });
+      // A key may be available now that was not (a proven key, a cooldown over): conversations waiting for one are looked at.
+      keyRecover.evaluate();
+    }
   } catch (err) {
     console.warn(`[deepseek] pool report from ${machineId}: ${err.message}`);
   }
@@ -1469,6 +1476,21 @@ machines.onSessionChange((mid, entry) => {
   if (isActive(s?.autoPause)) autoPause.observe(s);
 });
 autoPause.start();
+// A DeepSeek conversation whose turn ended on a quota or rate-limit error gets 「繼續」 by itself once a key is
+// available that was not (server/key-recover.js). Its state is kept with the conversation.
+const keyRecover = createKeyRecover({
+  isDeepseek: (s) => deepseekAccount.isDeepseek(s),
+  sessions: () => store.listLeaves(),
+  getSession: (id) => store.getSession(id),
+  enabled: () => deepseekAccount.autoResumeEnabled(),
+  availability: () => deepseekAccount.availability(),
+  send: (s, text) => runner.deliver(s, text),
+  info: (s, text) => runner.liveContext(s).emit({ type: 'info', text }),
+  changed: (s) => persist(s, { immediate: false }),
+  log: (err) => console.warn(`[key-recover] ${err?.message || err}`),
+});
+runner.onStatus((s) => keyRecover.observe(s));
+keyRecover.start();
 // Claude conversations run here, so they are always "online".
 const isClaude = (s) => s.agentId === 'claude';
 const scheduler = createScheduler({

@@ -3861,6 +3861,16 @@ pre.tail {
 .ds-key.exhausted {
   border-color: var(--warning);
 }
+/* A key cooling down because of rate limits, and what was done about them. */
+.ds-key-rate {
+  flex: none;
+}
+.ds-key-rate-stats {
+  color: var(--ink-secondary);
+  font-size: 12px;
+  line-height: 17px;
+  overflow-wrap: anywhere;
+}
 /* A key its gateway refused: when it failed and when a real request tries again (the Hub's own probing time). */
 .ds-key-auth {
   color: var(--ink-secondary);

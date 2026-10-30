@@ -33,11 +33,19 @@ const FILE = path.join(DATA_DIR, 'machines.json');
 //                    `distribution`: 'sticky', or 'relay' for the order of old) and says how many
 //                    conversations each key has; the Hub sends the setting only to a connector
 //                    that says so (an older one relays)
+//   pool_reset_due   the DeepSeek proxy uses a key that is out of quota like a healthy one once the
+//                    reset time its gateway STATED has passed (in the order of the list, or as the
+//                    key with the fewest conversations); its next real request proves it or marks it
+//                    again. An older connector looks at such a key only when no other is healthy
+//   pool_rate        the DeepSeek proxy counts each key's requests and rate limits (HTTP 429, not
+//                    quota) over a short window, keeps new conversations off a key that is being
+//                    limited, moves some of its conversations away, and reports it per key
+//                    (`rateLimited`: how many 429 in how many requests, over how long)
 // A connector that sends no `capabilities` has none (an empty array): the
 // version string is never used to guess. The first connector that sends the
 // field is CAPABILITY_CONNECTOR_VERSION; older ones must be reconnected with
 // the current command (a message about "upgrade" can name this version).
-export const CAPABILITIES = ['pool', 'pool_cross', 'secondary_model', 'broker', 'handoff', 'pool_timing', 'pool_measure', 'event_timing', 'pool_auth', 'pool_sticky', 'kimi_delete'];
+export const CAPABILITIES = ['pool', 'pool_cross', 'secondary_model', 'broker', 'handoff', 'pool_timing', 'pool_measure', 'event_timing', 'pool_auth', 'pool_sticky', 'kimi_delete', 'pool_reset_due', 'pool_rate'];
 export const CAPABILITY_CONNECTOR_VERSION = '0.11.0';
 const cleanCapabilities = (raw) => (Array.isArray(raw) ? [...new Set(raw.filter((x) => typeof x === 'string' && /^[a-z][a-z0-9_]{0,31}$/.test(x)))].slice(0, 16) : []);
 const machines = new Map(); // id -> machine

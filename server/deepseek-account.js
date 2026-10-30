@@ -144,6 +144,14 @@ export const retryAtOf = (k) => {
 // connector's next real request is then the probe). Never one a person marked.
 const isUsable = (k, now = Date.now()) => !isBlocked(k) || (!k.manual && retryAtOf(k) <= now);
 const firstUsable = (keys, now = Date.now()) => keys.find((k) => !isBlocked(k)) || keys.find((k) => isUsable(k, now)) || keys[0] || null;
+// Out of quota, but the gateway STATED when it comes back (retryAt) and that time has
+// passed (2026-10-30): the key is not "full" any more, it only waits for the next real
+// request to confirm it. A connector that says `pool_reset_due` puts such a key back
+// into its rotation by itself. A key with no stated time is not due (it is probed the
+// old way), and neither is one a person marked or one the gateway refused (401).
+export const isResetDue = (k, now = Date.now()) => Boolean(k?.exhaustedAt && !k.manual && k.retryAt && k.retryAt <= now);
+// In use as far as the Hub knows: not set aside, or only waiting to be confirmed.
+const isAvailable = (k, now = Date.now()) => !isBlocked(k) || isResetDue(k, now);
 
 const cleanFailures = (v) => {
   const n = Number(v);
@@ -300,6 +308,7 @@ export function reload() {
   saved = load().data;
   provisioned.clear();
   stickyReports.clear();
+  rateReports.clear();
   headerWarnings.clear();
   jobs.clear();
   tails.clear();
@@ -403,6 +412,58 @@ export function setDistribution(mode) {
 // in memory only, forgotten when the computer reconnects (it says them again
 // with its next provision) and left out while it is offline.
 const stickyReports = new Map();
+
+// ---- what connectors say about rate limits (2026-10-30)
+// A connector that says `pool_rate` counts each key's requests and rate limits (429 that is not
+// about quota), lends a request that got one to another key and cools a key down after a few.
+// Its pool report says, per key it is cooling: { rateCooldown: { until, n429, windowMs, level } } and,
+// for a key it has lent away from, cooled or resent: { rateStats: { borrows, cooldowns, resendOk,
+// resendFail } } (whole numbers since that connector started). Each report replaces the computer's
+// last one; it is kept in memory only (forgotten when the computer reconnects, left out while it is
+// offline) and believed only from a connector that said it watches.
+//   machine id -> { cool: { key id: { until, n429, windowMs, level } }, stats: { key id: { borrows, ... } } }
+const rateReports = new Map();
+const wholeNumber = (v, max) => (Number.isInteger(v) && v >= 0 && v <= max ? v : null);
+const STAT_NAMES = ['borrows', 'cooldowns', 'resendOk', 'resendFail'];
+function cleanRateReport(items, known, now = Date.now()) {
+  const cool = {};
+  const stats = {};
+  for (const item of items.slice(0, 100)) {
+    if (!item || typeof item.id !== 'string' || !known.has(item.id)) continue;
+    const c = item.rateCooldown;
+    if (c && typeof c === 'object') {
+      const until = Number(c.until);
+      const n429 = wholeNumber(c.n429, 1_000_000);
+      const windowMs = wholeNumber(c.windowMs, 3_600_000);
+      const level = c.level === undefined ? 0 : wholeNumber(c.level, 20);
+      // (A cooldown is minutes long: one that ends in more than a day is not one.)
+      if (typeof c.until === 'number' && Number.isFinite(until) && until <= now + 86_400_000 && n429 !== null && windowMs !== null && windowMs >= 1000 && level !== null) cool[item.id] = { until, n429, windowMs, level };
+    }
+    const st = item.rateStats;
+    if (st && typeof st === 'object') stats[item.id] = Object.fromEntries(STAT_NAMES.map((name) => [name, wholeNumber(st[name], 1_000_000_000) ?? 0]));
+  }
+  return { cool, stats };
+}
+const onlineRateReports = () => [...rateReports].filter(([id]) => machines.getMachine(id)?.online).map(([, r]) => r);
+// The cooldown of a key, over the computers that are online: the later end, the more 429s, how many say so.
+function rateCooldownOf(keyId, now = Date.now()) {
+  let out = null;
+  for (const r of onlineRateReports()) {
+    const c = r.cool[keyId];
+    if (!c || c.until <= now) continue;
+    out = out ? { until: Math.max(out.until, c.until), n429: out.n429 + c.n429, windowMs: Math.max(out.windowMs, c.windowMs), level: Math.max(out.level, c.level), machines: out.machines + 1 } : { ...c, machines: 1 };
+  }
+  return out;
+}
+function rateStatsOf(keyId) {
+  let out = null;
+  for (const r of onlineRateReports()) {
+    const st = r.stats[keyId];
+    if (!st) continue;
+    out = out ? Object.fromEntries(STAT_NAMES.map((name) => [name, out[name] + st[name]])) : { ...st };
+  }
+  return out;
+}
 // { catalog gateway's model id -> the id of the same model at gateway g }, for
 // the gateways other than the catalog's that hold a key. The same model is the
 // one whose last name part is the same (`deepseek/deepseek-v4.1-flash` and
@@ -702,6 +763,15 @@ export function applyPoolReport(machineId, msg) {
       changed = true;
     }
   } else if (stickyReports.delete(id)) changed = true;
+  // Rate-limit news: live, replaces the computer's last, from a connector that says it watches.
+  let live = false;
+  if (machines.hasCapability(id, 'pool_rate') && Array.isArray(msg.keys)) {
+    const next = cleanRateReport(msg.keys, known);
+    if (JSON.stringify(rateReports.get(id)) !== JSON.stringify(next)) {
+      rateReports.set(id, next);
+      live = true;
+    }
+  } else if (rateReports.delete(id)) live = true;
   const prev = saved.activity?.[id];
   // The newest report by revision wins for a machine's activity. A different
   // gateway is a new fact even when its revision counter is lower (another
@@ -776,7 +846,7 @@ export function applyPoolReport(machineId, msg) {
     }
   }
   if (changed) save();
-  return changed;
+  return changed || live;
 }
 
 // ------------------------------------------------------------- settings
@@ -803,9 +873,16 @@ export function settings(gw = gateway()) {
   };
 }
 
-export function setSettings({ gateway: gw, defaults } = {}) {
+// Whether the Hub sends 「繼續」 by itself to a DeepSeek conversation whose turn ended on a quota or
+// rate-limit error, once a key is available again (server/key-recover.js). On unless a person turns it off.
+export const autoResumeEnabled = () => saved.autoResume !== false;
+
+export function setSettings({ gateway: gw, defaults, autoResume } = {}) {
   if (gw !== undefined && !isGateway(gw)) throw Object.assign(new Error('不支援的閘道'), { status: 400 });
+  if (autoResume !== undefined && typeof autoResume !== 'boolean') throw Object.assign(new Error('autoResume 要是 true 或 false'), { status: 400 });
   const next = { ...saved };
+  if (autoResume === false) next.autoResume = false;
+  else if (autoResume === true) delete next.autoResume;
   if (gw !== undefined) next.gateway = gw;
   if (defaults && typeof defaults === 'object') {
     const d = { ...(saved.defaults || {}) };
@@ -832,6 +909,29 @@ function sessionsOn(keyId) {
     n = (n || 0) + r.counts[keyId];
   }
   return n;
+}
+
+// True while some computer that is online says this key is cooling down because of rate limits.
+export const keyCooling = (keyId, now = Date.now()) => rateCooldownOf(keyId, now) !== null;
+
+// Which keys a stuck turn can count on right now: with quota (a key only waiting to be confirmed after
+// its stated reset time counts), and not cooling down because of rate limits (as the computers that
+// watch say). `nextAt`: the next time that is going to change, from a time somebody STATED - a key's
+// reset time or the end of a cooldown - or null. Nothing here is estimated: a key out of quota with
+// no stated time stays out until a real request or a person says otherwise.
+export function availability(now = Date.now()) {
+  const ids = new Set();
+  let nextAt = Infinity;
+  for (const { k } of rotationEntries()) {
+    if (!isAvailable(k, now)) {
+      if (k.exhaustedAt && !k.manual && k.retryAt && k.retryAt > now) nextAt = Math.min(nextAt, k.retryAt);
+      continue;
+    }
+    const cooling = rateCooldownOf(k.id, now);
+    if (cooling) nextAt = Math.min(nextAt, cooling.until);
+    else ids.add(k.id);
+  }
+  return { ids, nextAt: Number.isFinite(nextAt) ? nextAt : null };
 }
 
 export function publicAccount() {
@@ -862,6 +962,12 @@ export function publicAccount() {
     retryAt: isBlocked(k) && !k.manual ? retryAtOf(k) : null,
     resetAt: k.exhaustedAt && !k.manual && k.retryAt ? k.retryAt : null,
     expiryKnown: Boolean(k.exhaustedAt && !k.manual && k.retryAt && k.retryAt > now),
+    // The gateway's stated time has passed: "waiting for the next request to confirm it", not "full".
+    resetDue: isResetDue(k, now),
+    // Rate limits, as the computers that watch say (null: nothing reported): cooling down until a time
+    // on a count of 429s, and how often the key was lent away from, cooled and resent.
+    rateCooldown: rateCooldownOf(k.id, now),
+    rateStats: rateStatsOf(k.id),
     manual: Boolean(k.exhaustedAt && k.manual),
     authFailed: isRefused(k),
     authFailedAt: isRefused(k) ? k.authFailedAt : null,
@@ -886,14 +992,14 @@ export function publicAccount() {
       // healthy key). allExhausted/nextRetryAt: the whole gateway is out, and
       // the earliest automatic try.
       keys: keys.map((k) => keyView(k, pool)),
-      allExhausted: keys.length > 0 && keys.every(isBlocked),
-      nextRetryAt: keys.some(isBlocked) && keys.every(isBlocked) && nextTries.length ? Math.min(...nextTries) : null,
+      allExhausted: keys.length > 0 && keys.every((k) => isBlocked(k) && !isResetDue(k, now)),
+      nextRetryAt: keys.length > 0 && keys.every((k) => isBlocked(k) && !isResetDue(k, now)) && nextTries.length ? Math.min(...nextTries) : null,
     };
   });
   // The one list the keys are used in, across gateways: each key with its
   // gateway, place and state. `active` is the first key not known to be out.
   const entries = rotationEntries();
-  const head = entries.find((e) => !isBlocked(e.k))?.k.id || null;
+  const head = entries.find((e) => isAvailable(e.k, now))?.k.id || null;
   const stated = entries.filter((e) => e.k.exhaustedAt && !e.k.manual && e.k.retryAt && e.k.retryAt > now).map((e) => e.k.retryAt);
   const rotation = {
     revision: rotationRevision(),
@@ -904,13 +1010,13 @@ export function publicAccount() {
       gatewayLabel: GATEWAYS[e.gw].label,
       position: i + 1,
       active: e.k.id === head,
-      state: e.k.exhaustedAt ? (e.k.manual ? 'manual' : 'exhausted') : isRefused(e.k) ? 'auth_failed' : 'ready',
+      state: e.k.exhaustedAt ? (e.k.manual ? 'manual' : isResetDue(e.k, now) ? 'reset_due' : 'exhausted') : isRefused(e.k) ? 'auth_failed' : 'ready',
       // How many conversations are on this key right now, added up over the
       // computers that are online and give each conversation its own key; null
       // when none of them has said (not zero: nobody has counted).
       sessions: sessionsOn(e.k.id),
     })),
-    allExhausted: entries.length > 0 && entries.every((e) => isBlocked(e.k)),
+    allExhausted: entries.length > 0 && entries.every((e) => isBlocked(e.k) && !isResetDue(e.k, now)),
     nextResetAt: stated.length ? Math.min(...stated) : null,
   };
   const cur = gateways.find((g) => g.id === gw);
@@ -928,6 +1034,12 @@ export function publicAccount() {
       // give each conversation its own key (`stickyCapable`), and the way it last
       // said it gives them out (`distribution`). Neither: an older connector.
       ...(machines.hasCapability(machineId, 'pool_sticky') ? { stickyCapable: true } : {}),
+      // This computer's connector puts a key whose stated reset time has passed back into
+      // its rotation by itself; an older one waits until every other key is out.
+      ...(machines.hasCapability(machineId, 'pool_reset_due') ? { resetDueCapable: true } : {}),
+      // This computer's connector watches for rate limits (lends a request that got a 429, cools a key);
+      // an older one does neither.
+      ...(machines.hasCapability(machineId, 'pool_rate') ? { rateCapable: true } : {}),
       ...(stickyReports.get(machineId)?.distribution ? { distribution: stickyReports.get(machineId).distribution } : {}),
     }))
     .sort((a, b) => a.machineId.localeCompare(b.machineId));
@@ -937,7 +1049,7 @@ export function publicAccount() {
   const secondaryModels = [...secondary]
     .map(([machineId, s]) => ({ machineId, machineName: machines.getMachine(machineId)?.name || machineId, ...s }))
     .sort((a, b) => a.machineId.localeCompare(b.machineId));
-  return { gateway: gw, hasKey: cur.hasKey || rotation.keys.length > 0, keyHint: cur.keyHint, gateways, rotation, distribution: distribution(), defaults: settings(gw).defaults, warnings, activity, secondaryModels, damaged: keyFile.public() };
+  return { gateway: gw, hasKey: cur.hasKey || rotation.keys.length > 0, keyHint: cur.keyHint, gateways, rotation, distribution: distribution(), autoResume: autoResumeEnabled(), defaults: settings(gw).defaults, warnings, activity, secondaryModels, damaged: keyFile.public() };
 }
 
 // -------------------------------------------------------------- models
@@ -1169,7 +1281,9 @@ function planFor(machineId) {
     const map = modelMapFor(gw, ids, new Set(all.map((e) => e.gw)));
     const revision = rotationRevision();
     sig = sigOf(gw, revision, ids, map);
-    const first = all.find((e) => !isBlocked(e.k)) || all.find((e) => isUsable(e.k, now));
+    // (A key whose stated reset time has passed counts as not out: the connector takes the first
+    // such key of the list in the order of the list, a relay starts on it.)
+    const first = all.find((e) => isAvailable(e.k, now)) || all.find((e) => isUsable(e.k, now));
     // A refused key (HTTP 401) goes with its own fields to a connector that says
     // it reads them (`pool_auth`); one that does not gets the key as it always
     // did, and is still started on a key the Hub does not know to be refused.
@@ -1478,6 +1592,7 @@ export const forgetProvider = (machineId) => {
 // had said it was not up). Both start fresh: no stale backoff or throttle.
 machines.onBridgeHello((id) => {
   stickyReports.delete(id);
+  rateReports.delete(id);
   forgetProvider(id);
   stopRetry(id);
   autoFailures.delete(id);
