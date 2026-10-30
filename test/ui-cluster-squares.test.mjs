@@ -353,8 +353,8 @@ test('the squares: one per subagent, a glyph as well as a colour, a legend, a co
   assert.equal(g.cells.length, 8);
   assert.deepEqual(g.cells.map((c) => c[0]), ['running', 'running', 'running', 'running', 'running', 'done', 'done', 'done']);
   assert.deepEqual(g.cells.map((c) => c[1]), ['', '', '', '', '', '✓', '✓', '✓'], 'done says ✓ in the square (the running dot is drawn)');
-  assert.equal(g.cells[0][2], '子代理 1，「分包 #1 (coder)」，執行中，最新動作 執行 wc -l /root/proj/f0.md');
-  assert.equal(g.cells[7][2], '子代理 8，「分包 #8 (coder)」，完成，最新動作 執行 wc -l /root/proj/f7.md');
+  assert.equal(g.cells[0][2], '子代理 1，「分包 #1 (coder)」，執行中，最新動作 執行 wc -l /home/user/proj/f0.md');
+  assert.equal(g.cells[7][2], '子代理 8，「分包 #8 (coder)」，完成，最新動作 執行 wc -l /home/user/proj/f7.md');
   assert.ok(g.cells.every((c) => c[2] === c[5]), 'the tooltip is the same words');
   assert.deepEqual(g.cells.map((c) => c[4]), [0, -1, -1, -1, -1, -1, -1, -1], 'one stop for the keyboard');
   assert.deepEqual(g.legend, ['執行中', '! 等你核准', '✓ 完成', '✕ 失敗或取消', '? 狀態未知']);
@@ -403,7 +403,7 @@ test('a square opens that subagent\'s detail; Esc closes the detail first, then 
   assert.deepEqual([d.role, d.title, d.state, d.expanded], ['region:子代理詳細', '分包 #3 (coder)', '執行中', 'true']);
   assert.match(d.model, /deepseek-v4\.1-flash.* · 思考 max/i, 'the model Kimi reported, with its thinking');
   assert.equal(d.steps, '5 步');
-  assert.equal(d.last, '執行 wc -l /root/proj/f2.md');
+  assert.equal(d.last, '執行 wc -l /home/user/proj/f2.md');
   assert.match(d.started, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
   assert.match(d.span, /^已跑 \d+ 分 \d+ 秒$|^已跑 \d+\.\d 秒$/);
   assert.equal(d.finished, null, 'it has not finished: no end to show');

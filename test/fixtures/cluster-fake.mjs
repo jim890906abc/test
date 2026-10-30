@@ -80,7 +80,7 @@ const SUB_BASE = (i, patch = {}) => ({
   effort: 'max',
   modelReason: null,
   steps: 3 + i,
-  lastAction: `執行 wc -l /root/proj/f${i}.md`,
+  lastAction: `執行 wc -l /home/user/proj/f${i}.md`,
   startedAt: T0 - 90_000 + i * 1000,
   finishedAt: null,
   background: false,

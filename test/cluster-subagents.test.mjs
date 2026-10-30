@@ -84,15 +84,15 @@ test('an AgentSwarm of four: four entries (not one), each with its own status, s
   const ids = [0, 1, 2, 3].map((i) => member(w.f, i));
   // member 0: three steps, then done. 1: fails. 2: still at its second step. 3: has not done anything yet.
   step(w.f, ids[0], 1, 'ls');
-  step(w.f, ids[0], 2, 'wc -l /root/a.md');
+  step(w.f, ids[0], 2, 'wc -l /home/user/a.md');
   step(w.f, ids[0], 3, 'git status');
   w.f('subagent.completed', { subagentId: ids[0], resultSummary: '做完了' });
   step(w.f, ids[1], 1, 'npm test');
   w.f('subagent.failed', { subagentId: ids[1], error: '測試失敗' });
   step(w.f, ids[2], 1, 'cat x');
-  step(w.f, ids[2], 2, 'wc -l /root/pentest-lab/AGENTS.md', { finish: false });
+  step(w.f, ids[2], 2, 'wc -l /home/user/proj/AGENTS.md', { finish: false });
 
-  const list = await settled(w.cid, (s) => s?.length === 4 && s[0].status === 'done' && s[1].status === 'failed' && s[2].lastAction === '執行 wc -l /root/pentest-lab/AGENTS.md', 'four members, drawn from their own frames');
+  const list = await settled(w.cid, (s) => s?.length === 4 && s[0].status === 'done' && s[1].status === 'failed' && s[2].lastAction === '執行 wc -l /home/user/proj/AGENTS.md', 'four members, drawn from their own frames');
   assert.deepEqual(list.map((s) => [s.id, s.status]), [['agent-0', 'done'], ['agent-1', 'failed'], ['agent-2', 'running'], ['agent-3', 'running']]);
   assert.deepEqual(list.map((s) => s.steps), [3, 1, 2, 0], 'each member counts its OWN tool calls');
   assert.equal(list[0].lastAction, '執行 git status');

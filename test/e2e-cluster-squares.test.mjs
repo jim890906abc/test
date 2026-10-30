@@ -105,7 +105,7 @@ test('an AgentSwarm of six in one worker: the tile, the band and the drawer show
 
   // Members work, two finish, one fails.
   S.w1.step('m0', 1, 'ls');
-  S.w1.step('m0', 2, 'wc -l /root/pentest-lab/AGENTS.md', false);
+  S.w1.step('m0', 2, 'wc -l /home/user/proj/AGENTS.md', false);
   S.w1.step('m1', 1, 'git status');
   S.w1.done('m2');
   S.w1.done('m3');
@@ -129,7 +129,7 @@ test('an AgentSwarm of six in one worker: the tile, the band and the drawer show
   await b.waitFor(`!document.querySelector('.sa-detail').hidden`);
   assert.equal(await text('.sa-detail [data-field="title"]'), '群 #1 (coder)');
   assert.equal(await text('.sa-detail [data-field="steps"]'), '2 步');
-  assert.equal(await text('.sa-detail [data-field="last-action"]'), '執行 wc -l /root/pentest-lab/AGENTS.md');
+  assert.equal(await text('.sa-detail [data-field="last-action"]'), '執行 wc -l /home/user/proj/AGENTS.md');
   assert.match(await text('.sa-detail [data-field="model"]'), /deepseek-v4\.1-flash.* · 思考 max/i);
   await shot('e2e-squares-drawer-1280.png');
   // ... and follows it: that member takes another step and finishes; the open detail moves with it.
