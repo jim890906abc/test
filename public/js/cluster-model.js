@@ -8,7 +8,12 @@
 // the others, never fills a gap, and never gives the part of the total that no
 // field accounts for a name of its own (the owner, 2026-10-21: no estimating).
 
-export const CLUSTER_MAX_TASKS = 8;
+// More tasks than workers is fine: a worker that finishes one is given the next
+// (the queue). So the two limits are separate: how many tasks, how many workers.
+export const CLUSTER_MAX_TASKS = 64;
+export const CLUSTER_MAX_WORKERS = 8;
+// By default as many workers as tasks, but not more than this (every worker is a conversation that spends quota).
+export const CLUSTER_DEFAULT_WORKER_CAP = 4;
 export const CLUSTER_DEFAULTS = Object.freeze({ mode: 'brief', isolate: true, swarm: true });
 export const CLUSTER_MODES = ['brief', 'fork'];
 // From this share of the main conversation's context on, a full fork is a poor start (spec §2).
@@ -28,6 +33,19 @@ export function titleFromPrompt(prompt) {
   return chars.length > TITLE_MAX ? `${chars.slice(0, TITLE_MAX).join('')}…` : line;
 }
 
+// How many workers a dispatch of `taskCount` tasks opens when the person has not said.
+export const defaultWorkers = (taskCount) => Math.max(1, Math.min(Number(taskCount) || 1, CLUSTER_DEFAULT_WORKER_CAP));
+
+// The worker count that is really sent: what the person chose (a whole number
+// from 1 to 8), or the default; never more than there are tasks, because a
+// worker with no task would only sit there.
+export function workersFor(draft) {
+  const n = Array.isArray(draft?.tasks) ? draft.tasks.length : 0;
+  const chosen = draft?.workers;
+  const asked = Number.isInteger(chosen) && chosen >= 1 && chosen <= CLUSTER_MAX_WORKERS ? chosen : defaultWorkers(n);
+  return Math.max(1, Math.min(asked, n || 1));
+}
+
 // What a person has to fix before the dispatch can be sent (an empty list: send).
 export function draftProblems(draft) {
   const problems = [];
@@ -35,6 +53,7 @@ export function draftProblems(draft) {
   if (!CLUSTER_MODES.includes(draft?.mode)) problems.push('起跑方式要選「簡報起跑」或「完整分叉」');
   if (!tasks.length) problems.push('至少要有 1 個任務');
   if (tasks.length > CLUSTER_MAX_TASKS) problems.push(`一次最多 ${CLUSTER_MAX_TASKS} 個任務`);
+  if (draft?.workers !== undefined && draft?.workers !== null && (!Number.isInteger(draft.workers) || draft.workers < 1 || draft.workers > CLUSTER_MAX_WORKERS)) problems.push(`工作者數要是 1 到 ${CLUSTER_MAX_WORKERS} 的整數`);
   tasks.forEach((t, i) => {
     if (!String(t?.prompt ?? '').trim()) problems.push(`任務 ${i + 1} 還沒寫要做什麼`);
   });
@@ -51,10 +70,45 @@ export function requestBody(draft) {
     mode: draft.mode,
     isolate: Boolean(draft.isolate),
     swarm: Boolean(draft.swarm),
+    workers: workersFor(draft),
   };
   const note = String(draft.note ?? '').trim();
   if (note) body.note = note;
   return body;
+}
+
+// Many tasks pasted at once: one task per line. Blank lines are skipped, and a
+// list marker the line was copied with ("- ", "* ", "1. ", "2) ", "• ") is not
+// part of the task. A line is the task's whole text; its name is made from it.
+const LIST_MARK = /^\s*(?:[-*•‧·]|\d{1,3}[.)、])\s+/;
+export function parseTaskLines(text) {
+  return String(text ?? '')
+    .split(/\r?\n/)
+    .map((l) => l.replace(LIST_MARK, '').trim())
+    .filter(Boolean)
+    .map((prompt) => ({ title: titleFromPrompt(prompt), prompt }));
+}
+
+// What the dialog suggests, from the task list alone. Only a suggestion: it
+// never changes what the person chose, and it is made from the words of the
+// tasks (so it can be wrong - it says "看起來").
+//   · 3 tasks or fewer: a cluster costs more than it saves; do it in this conversation.
+//   · many tasks that all only read: Kimi's own swarm mode in ONE conversation sends them all at once.
+//   · tasks that change files while the workers share one folder: give each its own worktree.
+const WRITES = /修改|修正|修復|修掉|改成|改寫|改為|重構|重寫|新增|加上|加入|實作|實現|寫入|寫一個|刪除|移除|產生|生成|建立|更新|升級|遷移|commit|fix\b|implement|refactor|rewrite|write\b|create\b|delete\b|remove\b|edit\b|patch\b|migrate|update\b|add\b/i;
+const READS = /審查|檢查|審視|審閱|閱讀|讀取|分析|列出|盤點|調查|查看|查出|找出|掃描|比對|研究|說明|總結|摘要|review|audit|inspect|read\b|analy[sz]e|list\b|scan|summari[sz]e|explain|find\b|check\b/i;
+export const FEW_TASKS = 3;
+export const MANY_READONLY = 5;
+export const looksLikeWriting = (task) => WRITES.test(`${task?.title ?? ''} ${task?.prompt ?? ''}`);
+export const looksReadOnly = (task) => READS.test(`${task?.title ?? ''} ${task?.prompt ?? ''}`) && !looksLikeWriting(task);
+export function queueAdvice({ tasks, isolate } = {}) {
+  const list = (Array.isArray(tasks) ? tasks : []).filter((t) => String(t?.prompt ?? '').trim());
+  const out = [];
+  if (!list.length) return out;
+  if (list.length <= FEW_TASKS) out.push({ id: 'few', text: `任務很少（${list.length} 條），直接在這個對話做通常最快：叢集要另外開對話、讀簡報，多花的時間和額度不一定賺得回來。` });
+  if (list.length >= MANY_READONLY && list.every(looksReadOnly)) out.push({ id: 'readonly-swarm', text: `這 ${list.length} 條看起來都是只讀的同類任務：也可以在單一對話用 Kimi 原生的 Swarm 模式一次派出，不用另外開工作者。` });
+  if (isolate === false && list.some(looksLikeWriting)) out.push({ id: 'isolate', text: '有任務看起來要改檔，而工作者共用同一個資料夾：建議每個工作者獨立 worktree，才不會互相覆蓋。' });
+  return out;
 }
 
 // Said in the dialog before anything is sent. `context` is the conversation's
@@ -79,13 +133,84 @@ export const isActive = (cluster) => ['starting', 'running', 'merging'].includes
 // A cluster stop can still do something for: workers are working or about to.
 export const isStoppable = (cluster) => ['starting', 'running'].includes(cluster?.status);
 
-// "x/y 完成": workers that have a finish time and neither failed nor had their
-// conversation deleted, over all workers. A worker that stopped with an error has
-// finished but is not 完成; a deleted one is gone. Each is counted on its own.
+// "任務 x/y 完成". With the queue it counts TASKS (what is done, over all
+// tasks; a task that failed is counted on its own, not as done). A cluster that
+// came without tasks (an older Hub) is counted the way it always was: workers
+// that have a finish time and neither failed nor had their conversation deleted.
 export function progressOf(cluster) {
   const workers = Array.isArray(cluster?.workers) ? cluster.workers : [];
+  const deleted = workers.filter((w) => w?.status === 'deleted').length;
+  const tasks = Array.isArray(cluster?.tasks) ? cluster.tasks : [];
+  if (tasks.length) {
+    const is = (status) => tasks.filter((t) => t?.status === status).length;
+    return { done: is('done'), total: tasks.length, failed: is('failed'), deleted };
+  }
   const is = (status) => workers.filter((w) => w?.status === status).length;
-  return { done: workers.filter((w) => w?.finishedAt && w.status !== 'error' && w.status !== 'deleted').length, total: workers.length, failed: is('error'), deleted: is('deleted') };
+  return { done: workers.filter((w) => w?.finishedAt && w.status !== 'error' && w.status !== 'deleted').length, total: workers.length, failed: is('error'), deleted };
+}
+
+// ------------------------------------------------------------- the queue
+
+// "2 條失敗" for a cluster that counts tasks, "2 個出錯" for one that counts workers.
+export const failedText = (cluster, n) => (Array.isArray(cluster?.tasks) && cluster.tasks.length ? `${n} 條失敗` : `${n} 個出錯`);
+
+const TASK_STATUS = {
+  pending: { label: '等待中', tone: 'idle' },
+  running: { label: '進行中', tone: 'busy' },
+  done: { label: '已完成', tone: 'ok' },
+  failed: { label: '失敗', tone: 'danger' },
+};
+export const taskStatus = (status) => TASK_STATUS[status] || { label: String(status ?? ''), tone: 'idle' };
+
+// The queue as the cluster page lists it: per task its state, who is doing or
+// did it, and the Hub's own times (the moment it was handed over, the moment
+// the Hub saw that worker go quiet; the length is the one minus the other, both
+// measured). `workerNo` is the worker's place in the cluster ("w1").
+export function queueView(cluster) {
+  const tasks = Array.isArray(cluster?.tasks) ? cluster.tasks : [];
+  const workers = Array.isArray(cluster?.workers) ? cluster.workers : [];
+  const rows = tasks.map((t) => {
+    const at = workers.findIndex((w) => w?.sessionId === t.workerSessionId);
+    const st = taskStatus(t.status);
+    const started = fmtStamp(t.startedAt);
+    const ended = fmtStamp(t.finishedAt);
+    const span = isMoment(t.startedAt) && isMoment(t.finishedAt) && t.finishedAt >= t.startedAt ? fmtMs(t.finishedAt - t.startedAt) : null;
+    return {
+      index: t.index,
+      no: (Number.isInteger(t.index) ? t.index : 0) + 1,
+      title: t.title,
+      status: t.status,
+      label: st.label,
+      tone: st.tone,
+      workerNo: at >= 0 ? at + 1 : null,
+      workerTitle: at >= 0 ? workers[at].title : null,
+      started,
+      ended,
+      span,
+      attempts: Number.isInteger(t.attempts) ? t.attempts : 0,
+      // Handed back to the queue once already, whatever it is now.
+      handedBack: (t.attempts || 0) > 1 || (t.status === 'pending' && (t.attempts || 0) > 0),
+      error: t.error || null,
+    };
+  });
+  const count = (status) => rows.filter((r) => r.status === status).length;
+  const sum = { total: rows.length, done: count('done'), running: count('running'), pending: count('pending'), failed: count('failed') };
+  // A stop ends the dispatching for good: tasks still waiting then were never sent.
+  const neverSent = cluster?.status === 'stopped' ? sum.pending : 0;
+  return { rows, sum, neverSent };
+}
+
+// One worker's line about the queue: the task it is on, how many it has done.
+export function workerQueueLine(w, cluster) {
+  const tasks = Array.isArray(cluster?.tasks) ? cluster.tasks : [];
+  if (!tasks.length) return null;
+  const current = Number.isInteger(w?.taskIndex) ? tasks.find((t) => t.index === w.taskIndex) : null;
+  const done = Number.isInteger(w?.done) ? w.done : 0;
+  const parts = [];
+  if (current) parts.push(`正在做第 ${current.index + 1}/${tasks.length} 條「${current.title}」`);
+  else parts.push(w?.status === 'deleted' ? '對話已刪除' : tasks.some((t) => t.status === 'pending') && cluster?.status !== 'stopped' ? '等待下一條' : '手上沒有任務');
+  parts.push(`已完成 ${done} 條`);
+  return parts.join(' · ');
 }
 
 // A worker is a conversation, so it has that conversation's status; a finish
@@ -119,6 +244,13 @@ export function mergeAvailability(cluster, busy = false) {
   if (cluster.status === 'merging') return { ok: false, why: '正在合併' };
   if (cluster.status === 'starting') return { ok: false, why: '工作者還在啟動' };
   if (busy) return { ok: false, why: '上一個操作還沒完成' };
+  const tasks = Array.isArray(cluster?.tasks) ? cluster.tasks : [];
+  if (tasks.length) {
+    const open = tasks.filter((t) => t?.status === 'pending' || t?.status === 'running').length;
+    const failed = tasks.filter((t) => t?.status === 'failed').length;
+    if (open || failed) return { ok: true, why: `${[open ? `還有 ${open} 條任務沒做完` : '', failed ? `${failed} 條任務失敗或被中斷` : ''].filter(Boolean).join('、')}；現在合併只會合進各工作者已 commit 的內容${open ? '，之後做完的要另外再合' : ''}` };
+    return { ok: true, why: '把各工作者的分支合進一個新分支' };
+  }
   const unfinished = workers.filter((w) => !w?.finishedAt && w?.status !== 'deleted').length;
   return { ok: true, why: unfinished ? `還有 ${unfinished} 個工作者沒做完；現在合併只會合進它們已 commit 的內容` : '把各工作者的分支合進一個新分支' };
 }
@@ -149,6 +281,8 @@ export function cleanupAvailability(cluster, busy = false) {
   if (cluster.status === 'starting') return { ok: false, why: '工作者還在啟動' };
   if (cluster.status === 'merging') return { ok: false, why: '正在合併' };
   if (workers.some(isWorking)) return { ok: false, why: '工作者還在跑，先全部停止' };
+  // Tasks still waiting (or handed out and not ended) count as work, unless a stop ended the dispatching.
+  if (cluster.status !== 'stopped' && (Array.isArray(cluster.tasks) ? cluster.tasks : []).some((t) => t?.status === 'pending' || t?.status === 'running')) return { ok: false, why: '佇列還有任務沒做完：等它們做完，或先全部停止' };
   if (isCleanedUp(cluster)) return { ok: false, why: '已經清理乾淨了：沒有留下可以再清的 worktree、分支或側欄對話' };
   if (!cluster.isolate) return { ok: true, why: '工作者共用同一個資料夾，沒有 worktree 或分支要清；只把工作者對話從側欄收起' };
   return {

@@ -9,10 +9,20 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   CLUSTER_MAX_TASKS,
+  CLUSTER_MAX_WORKERS,
   CLUSTER_DEFAULTS,
+  defaultWorkers,
+  workersFor,
+  parseTaskLines,
+  queueAdvice,
+  queueView,
+  workerQueueLine,
+  looksLikeWriting,
+  looksReadOnly,
   requestBody,
   draftProblems,
   progressOf,
+  failedText,
   isActive,
   workerState,
   clusterStatusLabel,
@@ -32,18 +42,20 @@ const draft = (patch = {}) => ({ tasks: [{ title: '修登入', prompt: '把登�
 
 // ---------------------------------------------------------------- dispatch
 
-test('the defaults are the spec\'s: brief start, a worktree each, Kimi\'s own swarm mode on; 8 tasks at most', () => {
+test('the defaults are the spec\'s: brief start, a worktree each, Kimi\'s own swarm mode on; 64 tasks and 8 workers at most', () => {
   assert.deepEqual({ ...CLUSTER_DEFAULTS }, { mode: 'brief', isolate: true, swarm: true });
-  assert.equal(CLUSTER_MAX_TASKS, 8);
+  assert.equal(CLUSTER_MAX_TASKS, 64);
+  assert.equal(CLUSTER_MAX_WORKERS, 8);
 });
 
-test('the request body is spec §2 exactly: tasks, mode, isolate, swarm, and note only when there is one', () => {
-  assert.deepEqual(requestBody(draft()), { tasks: [{ title: '修登入', prompt: '把登入頁的錯誤訊息改好' }], mode: 'brief', isolate: true, swarm: true });
+test('the request body is spec §2 exactly: tasks, mode, isolate, swarm, workers, and note only when there is one', () => {
+  assert.deepEqual(requestBody(draft()), { tasks: [{ title: '修登入', prompt: '把登入頁的錯誤訊息改好' }], mode: 'brief', isolate: true, swarm: true, workers: 1 });
   assert.deepEqual(requestBody(draft({ mode: 'fork', isolate: false, swarm: false, note: '  先讀 README  ' })), {
     tasks: [{ title: '修登入', prompt: '把登入頁的錯誤訊息改好' }],
     mode: 'fork',
     isolate: false,
     swarm: false,
+    workers: 1,
     note: '先讀 README',
   });
   assert.ok(!('note' in requestBody(draft({ note: '   ' }))), 'a blank note is not sent');
@@ -56,12 +68,12 @@ test('a task without a name is named after the first line of what it says; names
   assert.ok(long.tasks[0].title.length <= 31 && long.tasks[0].title.endsWith('…'), `a long first line is cut: ${long.tasks[0].title}`);
 });
 
-test('what stops a dispatch: no task, more than 8, a task with nothing to do, and an unknown way to start', () => {
+test('what stops a dispatch: no task, more than 64, a task with nothing to do, and an unknown way to start', () => {
   assert.deepEqual(draftProblems(draft()), []);
   assert.match(draftProblems(draft({ tasks: [] })).join(), /至少要有 1 個任務/);
-  const nine = Array.from({ length: 9 }, (_, i) => ({ title: `t${i}`, prompt: `p${i}` }));
-  assert.match(draftProblems(draft({ tasks: nine })).join(), /最多 8 個/);
-  assert.deepEqual(draftProblems(draft({ tasks: nine.slice(0, 8) })), [], '8 is fine');
+  const many = Array.from({ length: 65 }, (_, i) => ({ title: `t${i}`, prompt: `p${i}` }));
+  assert.match(draftProblems(draft({ tasks: many })).join(), /最多 64 個/);
+  assert.deepEqual(draftProblems(draft({ tasks: many.slice(0, 64) })), [], '64 is fine - more than the workers: they wait in the queue');
   const blank = draftProblems(draft({ tasks: [{ title: 'a', prompt: 'ok' }, { title: 'b', prompt: '  ' }] }));
   assert.match(blank.join(), /任務 2/, 'names the task that is empty');
   assert.match(draftProblems(draft({ mode: 'swarm' })).join(), /起跑方式/);
@@ -279,4 +291,145 @@ test('the result of a worker\'s clean-up is said in the words of the screen: wor
   assert.equal(shared.worktree, null, 'a worker with no worktree of its own has nothing to say about one');
   assert.equal(shared.branch, null);
   assert.equal(cleanupResultView(null), null);
+});
+
+// -------------------------------------------------------------- the queue
+
+const nTasks = (n, make = (i) => ({ title: `任務${i + 1}`, prompt: `做第 ${i + 1} 件事` })) => Array.from({ length: n }, (_, i) => make(i));
+
+test('workers: one per task up to 4 unless chosen; a chosen number is a whole number from 1 to 8; never more than there are tasks', () => {
+  assert.deepEqual([1, 2, 3, 4, 5, 6, 64].map(defaultWorkers), [1, 2, 3, 4, 4, 4, 4]);
+  assert.equal(workersFor(draft({ tasks: nTasks(6) })), 4, 'not chosen: the default');
+  assert.equal(workersFor(draft({ tasks: nTasks(6), workers: null })), 4, 'null is "not chosen" too');
+  assert.equal(workersFor(draft({ tasks: nTasks(6), workers: 2 })), 2);
+  assert.equal(workersFor(draft({ tasks: nTasks(20), workers: 8 })), 8);
+  assert.equal(workersFor(draft({ tasks: nTasks(3), workers: 8 })), 3, 'a worker with no task would only sit there');
+  assert.equal(workersFor(draft({ tasks: nTasks(6), workers: 0 })), 4, 'a number the form refuses is not sent: the default stands in');
+  assert.equal(requestBody(draft({ tasks: nTasks(6), workers: 3 })).workers, 3);
+  assert.equal(requestBody(draft({ tasks: nTasks(6) })).workers, 4);
+  assert.equal(requestBody(draft({ tasks: nTasks(2), workers: 8 })).workers, 2);
+  for (const bad of [0, 9, 1.5, -1]) assert.match(draftProblems(draft({ tasks: nTasks(6), workers: bad })).join(), /工作者數要是 1 到 8/, `${bad} is refused`);
+  assert.deepEqual(draftProblems(draft({ tasks: nTasks(6), workers: 8 })), []);
+  assert.deepEqual(draftProblems(draft({ tasks: nTasks(6), workers: null })), [], 'not chosen is fine');
+});
+
+test('many tasks pasted at once: one per line, blank lines skipped, a copied list marker taken off, each named after its line', () => {
+  const got = parseTaskLines('審查 A 模組\n\n  - 審查 B 模組  \n2. 審查 C 模組\n3) 審查 D\n• 審查 E\n\r\n* 審查 F\n');
+  assert.deepEqual(got.map((t) => t.prompt), ['審查 A 模組', '審查 B 模組', '審查 C 模組', '審查 D', '審查 E', '審查 F']);
+  assert.deepEqual(got.map((t) => t.title), got.map((t) => t.prompt), 'a short line is its own name');
+  assert.deepEqual(parseTaskLines(''), []);
+  assert.deepEqual(parseTaskLines('   \n\n \t\n'), []);
+  assert.deepEqual(parseTaskLines('1.5 倍速度測試'), [{ title: '1.5 倍速度測試', prompt: '1.5 倍速度測試' }], 'a number that is not a list marker stays');
+  assert.deepEqual(parseTaskLines('2024-01 的報表'), [{ title: '2024-01 的報表', prompt: '2024-01 的報表' }]);
+  const long = parseTaskLines(`請審查這個很長很長很長很長很長很長很長很長很長很長的任務${'。'.repeat(30)}`)[0];
+  assert.ok(long.title.length <= 31 && long.title.endsWith('…') && long.prompt.length > 31, 'a long line is cut for its name, whole as the task');
+  assert.equal(parseTaskLines(Array.from({ length: 70 }, (_, i) => `t${i}`).join('\n')).length, 70, 'the cap is the dialog\'s to apply, not this function\'s');
+});
+
+test('the dialog\'s suggestion: few tasks → do it here; many alike read-only ones → one conversation with the native swarm; writing with a shared folder → a worktree each; nothing chosen or changed for the person', () => {
+  const ids = (o) => queueAdvice(o).map((a) => a.id);
+  const read = (n) => nTasks(n, (i) => ({ title: `審查 ${i}`, prompt: `審查 src/mod${i}.js 並列出問題` }));
+  const write = (n) => nTasks(n, (i) => ({ title: `改 ${i}`, prompt: `修改 src/mod${i}.js 並新增測試` }));
+  // up to 3 tasks: do it in this conversation
+  for (const n of [1, 2, 3]) {
+    const advice = queueAdvice({ tasks: read(n), isolate: true });
+    assert.deepEqual(advice.map((a) => a.id), ['few']);
+    assert.match(advice[0].text, /任務很少/);
+    assert.match(advice[0].text, /直接在這個對話做通常最快/);
+  }
+  assert.deepEqual(ids({ tasks: read(4), isolate: true }), [], 'four tasks: no suggestion either way');
+  // many tasks of the same read-only kind
+  const many = queueAdvice({ tasks: read(8), isolate: true });
+  assert.deepEqual(many.map((a) => a.id), ['readonly-swarm']);
+  assert.match(many[0].text, /Swarm 模式一次派出/);
+  assert.match(many[0].text, /Kimi 原生/, 'whose swarm it is');
+  assert.deepEqual(ids({ tasks: [...read(7), ...write(1)], isolate: true }), [], 'one that writes spoils "all read-only"');
+  assert.deepEqual(ids({ tasks: nTasks(8, () => ({ title: '雜事', prompt: '做一些事情' })), isolate: true }), [], 'tasks that say nothing either way are not called read-only');
+  // writing without a worktree each
+  const shared = queueAdvice({ tasks: write(6), isolate: false });
+  assert.deepEqual(shared.map((a) => a.id), ['isolate']);
+  assert.match(shared[0].text, /建議每個工作者獨立 worktree/);
+  assert.deepEqual(ids({ tasks: write(6), isolate: true }), [], 'already isolated: nothing to suggest');
+  assert.deepEqual(ids({ tasks: read(6), isolate: false }), ['readonly-swarm'], 'read-only tasks do not need a worktree each');
+  assert.deepEqual(ids({ tasks: write(2), isolate: false }), ['few', 'isolate'], 'both can be said');
+  // empty tasks are not tasks; nothing to say about nothing
+  assert.deepEqual(queueAdvice({ tasks: [{ title: '', prompt: '  ' }] }), []);
+  assert.deepEqual(queueAdvice({}), []);
+  // it only says things: the same input gives the same words, and the input is untouched
+  const input = { tasks: write(2), isolate: false };
+  const before = JSON.stringify(input);
+  assert.deepEqual(queueAdvice(input), queueAdvice(input));
+  assert.equal(JSON.stringify(input), before);
+  for (const a of [...many, ...shared]) assert.doesNotMatch(a.text.replace(/Kimi 原生的 Swarm 模式/, ''), /Swarm|子代理群/, 'the cluster is never called a Swarm');
+  // the words it reads
+  assert.equal(looksLikeWriting({ title: '', prompt: 'fix the login bug' }), true);
+  assert.equal(looksReadOnly({ title: '', prompt: 'review the login flow' }), true);
+  assert.equal(looksReadOnly({ title: '', prompt: 'review the login flow and fix it' }), false);
+});
+
+test('progress counts TASKS when the cluster has them (a failed one on its own), and workers as before when it has none', () => {
+  const tasks = (...s) => s.map((status, index) => ({ index, title: `t${index}`, status }));
+  const c = { workers: [{ status: 'idle', finishedAt: 5 }, { status: 'running', finishedAt: null }], tasks: tasks('done', 'done', 'done', 'running', 'pending', 'failed') };
+  assert.deepEqual(progressOf(c), { done: 3, total: 6, failed: 1, deleted: 0 });
+  assert.deepEqual(progressOf({ ...c, workers: [{ status: 'deleted' }, { status: 'idle', finishedAt: 5 }] }), { done: 3, total: 6, failed: 1, deleted: 1 });
+  assert.deepEqual(progressOf({ workers: [{ status: 'idle', finishedAt: 5 }], tasks: [] }), { done: 1, total: 1, failed: 0, deleted: 0 }, 'no tasks listed: the workers, as before');
+});
+
+test('the queue as the page lists it: state, worker, and the Hub\'s two moments with the length between them; a stop says what was never sent', () => {
+  const T0 = 1_790_000_000_000;
+  const cluster = {
+    status: 'running',
+    workers: [{ sessionId: 'a', title: '甲' }, { sessionId: 'b', title: '乙' }],
+    tasks: [
+      { index: 0, title: '第一', status: 'done', workerSessionId: 'a', startedAt: T0, finishedAt: T0 + 192_000, attempts: 1, error: null },
+      { index: 1, title: '第二', status: 'running', workerSessionId: 'b', startedAt: T0 + 5000, finishedAt: null, attempts: 1, error: null },
+      { index: 2, title: '第三', status: 'pending', workerSessionId: null, startedAt: null, finishedAt: null, attempts: 1, error: 'w1 的回合出錯了，已退回佇列等別的工作者接手' },
+      { index: 3, title: '第四', status: 'failed', workerSessionId: 'a', startedAt: T0 + 1000, finishedAt: T0 + 2000, attempts: 2, error: 'w1 的回合出錯了；這條已經重派過一次，不再重派' },
+      { index: 4, title: '第五', status: 'pending', workerSessionId: null, startedAt: null, finishedAt: null, attempts: 0, error: null },
+    ],
+  };
+  const v = queueView(cluster);
+  assert.deepEqual(v.sum, { total: 5, done: 1, running: 1, pending: 2, failed: 1 });
+  assert.deepEqual(v.rows.map((r) => [r.no, r.label, r.tone, r.workerNo]), [[1, '已完成', 'ok', 1], [2, '進行中', 'busy', 2], [3, '等待中', 'idle', null], [4, '失敗', 'danger', 1], [5, '等待中', 'idle', null]]);
+  assert.equal(v.rows[0].span, '3 分 12 秒', 'the length is end minus start, both the Hub\'s own');
+  assert.match(v.rows[0].started, /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/);
+  assert.equal(v.rows[1].ended, null, 'a task still running has no end and no length');
+  assert.equal(v.rows[1].span, null);
+  assert.equal(v.rows[2].started, null);
+  assert.deepEqual(v.rows.map((r) => r.handedBack), [false, false, true, true, false], 'handed back once, whatever it is now');
+  assert.equal(v.neverSent, 0, 'running: waiting tasks are about to be sent');
+  const stopped = queueView({ ...cluster, status: 'stopped' });
+  assert.equal(stopped.neverSent, 2, 'after a stop what still waits was never sent');
+  // an end before the start is not made into a length
+  assert.equal(queueView({ workers: [], tasks: [{ index: 0, title: 'x', status: 'done', startedAt: T0 + 10, finishedAt: T0, attempts: 1 }] }).rows[0].span, null);
+  assert.deepEqual(queueView({}).rows, []);
+});
+
+test('a worker card says which task it is on and how many it has done', () => {
+  const tasks = Array.from({ length: 6 }, (_, i) => ({ index: i, title: `任務${i + 1}`, status: 'pending' }));
+  const c = { status: 'running', tasks };
+  assert.equal(workerQueueLine({ status: 'running', taskIndex: 2, done: 2 }, c), '正在做第 3/6 條「任務3」 · 已完成 2 條');
+  assert.equal(workerQueueLine({ status: 'idle', taskIndex: null, done: 3 }, c), '等待下一條 · 已完成 3 條');
+  assert.equal(workerQueueLine({ status: 'idle', taskIndex: null, done: 3 }, { status: 'done', tasks: tasks.map((t) => ({ ...t, status: 'done' })) }), '手上沒有任務 · 已完成 3 條');
+  assert.equal(workerQueueLine({ status: 'idle', taskIndex: null, done: 1 }, { status: 'stopped', tasks }), '手上沒有任務 · 已完成 1 條', 'after a stop it is not waiting for a next one');
+  assert.equal(workerQueueLine({ status: 'deleted', taskIndex: null, done: 1 }, c), '對話已刪除 · 已完成 1 條');
+  assert.equal(workerQueueLine({ status: 'idle' }, { tasks: [] }), null, 'a cluster without tasks (an older Hub) says nothing');
+});
+
+test('merge and clean-up count the queue: tasks still to do are said before a merge, and clean-up waits for the queue unless a stop ended it', () => {
+  const base = { isolate: true, status: 'running', merge: null, workers: [{ status: 'idle', branch: 'b1', finishedAt: 5 }], tasks: [{ index: 0, status: 'done' }, { index: 1, status: 'pending' }, { index: 2, status: 'running' }] };
+  assert.match(mergeAvailability(base).why, /還有 2 條任務沒做完/);
+  assert.equal(mergeAvailability({ ...base, tasks: [{ index: 0, status: 'done' }] }).why, '把各工作者的分支合進一個新分支');
+  assert.match(mergeAvailability({ ...base, tasks: [{ index: 0, status: 'done' }, { index: 1, status: 'failed' }] }).why, /^1 條任務失敗或被中斷；現在合併只會合進各工作者已 commit 的內容$/, 'a task that failed or was cut off is said too - its worker may have left half a change');
+  assert.match(mergeAvailability({ ...base, tasks: [{ index: 0, status: 'pending' }, { index: 1, status: 'failed' }] }).why, /還有 1 條任務沒做完、1 條任務失敗或被中斷/);
+  assert.equal(cleanupAvailability(base).ok, false);
+  assert.match(cleanupAvailability(base).why, /佇列還有任務/);
+  assert.equal(cleanupAvailability({ ...base, tasks: [{ index: 0, status: 'done' }, { index: 1, status: 'failed' }] }).ok, true, 'nothing left to do');
+  assert.equal(cleanupAvailability({ ...base, status: 'stopped', tasks: [{ index: 0, status: 'done' }, { index: 1, status: 'pending' }] }).ok, true, 'a stop ended the dispatching: what waits will never be sent');
+});
+
+test('a failure is counted in the unit of what is counted: 條失敗 for tasks, 個出錯 for workers of a cluster with no task list', () => {
+  assert.equal(failedText({ tasks: [{ index: 0, status: 'failed' }] }, 2), '2 條失敗');
+  assert.equal(failedText({ tasks: [] , workers: [] }, 2), '2 個出錯');
+  assert.equal(failedText({}, 1), '1 個出錯');
 });

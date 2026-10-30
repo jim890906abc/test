@@ -195,8 +195,8 @@ test('a brief cluster in a git repo: a worker per task, each in a worktree and a
 
   // Status, the list, the stream.
   const got = await getCluster(c.id);
-  assert.deepEqual(Object.keys(got).sort(), ['cleanup', 'createdAt', 'id', 'isolate', 'memory', 'merge', 'mode', 'parentId', 'status', 'swarm', 'warnings', 'workers']);
-  assert.deepEqual(Object.keys(got.workers[0]).sort(), ['branch', 'finishedAt', 'hidden', 'progress', 'sessionId', 'status', 'swarm', 'task', 'title', 'worktree']);
+  assert.deepEqual(Object.keys(got).sort(), ['cleanup', 'createdAt', 'id', 'isolate', 'memory', 'merge', 'mode', 'parentId', 'status', 'swarm', 'tasks', 'warnings', 'workers']);
+  assert.deepEqual(Object.keys(got.workers[0]).sort(), ['branch', 'done', 'finishedAt', 'hidden', 'progress', 'sessionId', 'status', 'swarm', 'task', 'taskIndex', 'title', 'worktree']);
   assert.equal(got.cleanup, null, 'nothing has been cleaned up yet');
   assert.equal(got.workers[0].hidden, false);
   assert.deepEqual(Object.keys(got.memory).sort(), ['bytes', 'path', 'updatedAt']);
@@ -333,7 +333,7 @@ test('a Claude conversation cannot dispatch a cluster', async () => {
   await rejects(cluster(claude.id, { tasks: tasks('甲') }), 400, /^叢集第一版只支援 Kimi／DeepSeek 對話$/);
 });
 
-test('a bad request is refused before anything is made: 0 or 9 tasks, a task without a title or content, a bad mode, a non-boolean switch', async () => {
+test('a bad request is refused before anything is made: 0 or 65 tasks, workers outside 1 to 8, a task without a title or content, a bad mode, a non-boolean switch', async () => {
   const repo = makeRepo('bad');
   const parent = await newKimi(repo);
   const natives = hub.machine.sessions.size;
@@ -341,7 +341,9 @@ test('a bad request is refused before anything is made: 0 or 9 tasks, a task wit
   const bad = [
     [{ tasks: [] }, /至少/],
     [{}, /至少/],
-    [{ tasks: tasks('1', '2', '3', '4', '5', '6', '7', '8', '9') }, /最多 8/],
+    [{ tasks: Array.from({ length: 65 }, (_, i) => tasks(String(i))[0]) }, /最多 64/],
+    [{ tasks: tasks('1'), workers: 0 }, /workers/],
+    [{ tasks: tasks('1', '2'), workers: 9 }, /workers/],
     [{ tasks: [{ title: '', prompt: 'x' }] }, /沒有標題/],
     [{ tasks: [{ title: 'x', prompt: '  ' }] }, /沒有內容/],
     [{ tasks: tasks('x'), mode: 'swarm' }, /mode/],
@@ -349,8 +351,8 @@ test('a bad request is refused before anything is made: 0 or 9 tasks, a task wit
     [{ tasks: tasks('x'), swarm: 1 }, /swarm/],
   ];
   for (const [body, pattern] of bad) await rejects(cluster(parent.id, body), 400, pattern);
-  // Eight is the limit, and is allowed.
-  const eight = await cluster(parent.id, { tasks: tasks('1', '2', '3', '4', '5', '6', '7', '8'), isolate: false });
+  // Eight workers is the limit, and is allowed (more tasks than that wait in the queue: test/cluster-queue.test.mjs).
+  const eight = await cluster(parent.id, { tasks: tasks('1', '2', '3', '4', '5', '6', '7', '8'), workers: 8, isolate: false });
   assert.equal(eight.cluster.workers.length, 8);
   assert.equal(hub.machine.sessions.size, natives + 8, 'only the eight');
   assert.equal((await hub.api('GET', '/sessions')).length, listed + 8);

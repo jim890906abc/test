@@ -13,6 +13,7 @@ import { busy as sessionBusy } from './providers.js';
 import { timingBox } from './timing-box.js';
 import {
   CLUSTER_MAX_TASKS,
+  CLUSTER_MAX_WORKERS,
   CLUSTER_DEFAULTS,
   CLUSTER_MODES,
   cleanupAvailability,
@@ -20,16 +21,23 @@ import {
   cleanupResultView,
   clusterStatusLabel,
   contextWarnings,
+  defaultWorkers,
   draftProblems,
+  failedText,
   fmtBytes,
   isActive,
   isStoppable,
   memoryNote,
   mergeAvailability,
   MEMORY_MAX_CHARS,
+  parseTaskLines,
   progressOf,
+  queueAdvice,
+  queueView,
   requestBody,
+  workerQueueLine,
   workerState,
+  workersFor,
 } from './cluster-model.js';
 
 // ---------------------------------------------------------- what we know
@@ -128,7 +136,7 @@ export function drawClusterNote(slot, summary) {
           'div',
           { class: 'callout small child-note cluster-banner', role: 'status' },
           icon('cluster'),
-          h('span', { class: 'cluster-banner-text' }, `${c.status === 'merging' ? '叢集合併中' : '叢集進行中'} ${done}/${total} 完成`, failed ? `，${failed} 個出錯` : ''),
+          h('span', { class: 'cluster-banner-text' }, `${c.status === 'merging' ? '叢集合併中' : '叢集進行中'} ${done}/${total} 完成`, failed ? `，${failedText(c, failed)}` : ''),
           h('a', { class: 'linklike', href: clusterHash(c.id) }, '查看 →'),
         ),
       );
@@ -142,7 +150,8 @@ export function drawClusterNote(slot, summary) {
 
 // ctx: { dialog, toast, fail, go } from the page. `session`: the main conversation.
 export function openClusterDialog(ctx, session, { prompt = '' } = {}) {
-  const draft = { tasks: [{ title: '', prompt }], ...CLUSTER_DEFAULTS, note: '' };
+  // `workers: null` is "not chosen": the Hub's default (one per task, at most 4) follows the number of tasks.
+  const draft = { tasks: [{ title: '', prompt }], ...CLUSTER_DEFAULTS, workers: null, note: '' };
   let dirty = Boolean(prompt);
   let sending = false;
   let closed = false;
@@ -151,6 +160,28 @@ export function openClusterDialog(ctx, session, { prompt = '' } = {}) {
   const tasksBox = h('div', { class: 'cluster-tasks' });
   const count = h('span', { class: 'cluster-count' });
   const addBtn = h('button', { class: 'om-btn om-btn--sm', type: 'button', dataset: { action: 'add-task' }, onclick: () => addTask() }, icon('plus'), '新增任務');
+  const workersInput = h('input', {
+    class: 'om-input cluster-workers-input',
+    type: 'number',
+    name: 'workers',
+    min: 1,
+    max: CLUSTER_MAX_WORKERS,
+    step: 1,
+    inputmode: 'numeric',
+    'aria-label': '工作者數',
+    oninput: () => {
+      const raw = workersInput.value.trim();
+      // Emptied: back to the default, which follows the number of tasks.
+      draft.workers = raw === '' ? null : Number(raw);
+      dirty = true;
+      drawState();
+    },
+  });
+  const workersHelp = h('span', { class: 'om-field__help', dataset: { field: 'workers-help' } });
+  const adviceBox = h('div', { class: 'cluster-advice', dataset: { field: 'advice' } });
+  const lines = h('textarea', { class: 'om-input', name: 'task-lines', rows: 4, placeholder: '一行一條任務，可以一次貼上很多行（前面的「- 」「1. 」會自動去掉）', 'aria-label': '一次貼上多條任務，每行一條' });
+  const linesNote = h('span', { class: 'om-field__help', dataset: { field: 'lines-note' }, role: 'status' });
+  const addLinesBtn = h('button', { class: 'om-btn', type: 'button', dataset: { action: 'add-lines' }, onclick: () => addLines() }, icon('plus'), '加入清單');
   const modeBox = h('div', { class: 'om-seg', role: 'group', 'aria-label': '起跑方式', dataset: { field: 'mode' } });
   const modeHelp = h('span', { class: 'om-field__help' });
   const warnBox = h('div', { class: 'cluster-warns' });
@@ -191,6 +222,21 @@ export function openClusterDialog(ctx, session, { prompt = '' } = {}) {
     );
     drawState();
   }
+  // The pasted lines become tasks at the end of the list (the one empty task a new dialog starts with is replaced).
+  function addLines() {
+    const parsed = parseTaskLines(lines.value);
+    if (!parsed.length) return fill(linesNote, '沒有可以加入的內容：每行一條任務，空行會略過。');
+    const kept = draft.tasks.filter((t) => t.title.trim() || t.prompt.trim());
+    const room = CLUSTER_MAX_TASKS - kept.length;
+    // The name is left empty: it is made from the task's first line when sent (the box says so), so the line is not written twice.
+    const taken = parsed.slice(0, Math.max(0, room)).map((t) => ({ title: '', prompt: t.prompt }));
+    draft.tasks = [...kept, ...taken];
+    if (!draft.tasks.length) draft.tasks = [{ title: '', prompt: '' }];
+    lines.value = taken.length < parsed.length ? parsed.slice(taken.length).map((t) => t.prompt).join('\n') : '';
+    fill(linesNote, taken.length < parsed.length ? `加了 ${taken.length} 條；最多 ${CLUSTER_MAX_TASKS} 條，其餘 ${parsed.length - taken.length} 條還留在上面的框裡。` : `加了 ${taken.length} 條。`);
+    dirty = true;
+    drawTasks();
+  }
   function addTask() {
     if (draft.tasks.length >= CLUSTER_MAX_TASKS) return;
     draft.tasks.push({ title: '', prompt: '' });
@@ -216,8 +262,24 @@ export function openClusterDialog(ctx, session, { prompt = '' } = {}) {
     fill(warnBox, warns.map((w) => h('div', { class: 'callout small cluster-warn' }, icon('warn'), h('div', { class: 'callout-text' }, w))));
     const problems = draftProblems(draft);
     fill(problemBox, dirty && problems.length ? problems.join('；') : null);
+    // The number of workers: what the person chose, or the default that follows the tasks. A box left empty shows the default.
+    const w = workersFor(draft);
+    if (document.activeElement !== workersInput) workersInput.value = draft.workers === null ? String(w) : String(draft.workers);
+    workersInput.placeholder = String(defaultWorkers(n));
+    const chosen = draft.workers !== null && Number.isInteger(draft.workers) ? draft.workers : null;
+    fill(
+      workersHelp,
+      chosen !== null && chosen > n && chosen <= CLUSTER_MAX_WORKERS
+        ? `任務只有 ${n} 條，所以只會開 ${w} 個工作者。`
+        : n > w
+          ? `${n} 條任務、${w} 個工作者：每個工作者一次做一條，做完在同一個對話裡自動領下一條。每個工作者是一個要花額度的對話。`
+          : `${w} 個工作者各做一條。任務比工作者多時，做完的會自動領下一條。`,
+    );
+    const advice = queueAdvice({ tasks: draft.tasks, workers: w, isolate: draft.isolate, mode: draft.mode });
+    fill(adviceBox, advice.map((a) => h('div', { class: 'callout small cluster-advice-item', dataset: { advice: a.id } }, icon('sparkle'), h('div', { class: 'callout-text' }, a.text))));
     submit.disabled = sending || problems.length > 0;
-    submit.textContent = sending ? '派工中…' : `派出 ${n} 個工作者`;
+    // One task per worker is what it always was; with a queue the label says both numbers.
+    submit.textContent = sending ? '派工中…' : n === w ? `派出 ${w} 個工作者` : `派出 ${n} 條任務（${w} 個工作者）`;
     cancel.disabled = sending;
     fields.disabled = sending;
     sendingNote.hidden = !sending;
@@ -229,6 +291,9 @@ export function openClusterDialog(ctx, session, { prompt = '' } = {}) {
     { class: 'cluster-fields' },
     h('p', { class: 'dialog-text settings-lead' }, '把任務分給幾個工作者，各自開一個新的對話同時做；做完可以一鍵合併。每個工作者都是一個要花額度的對話。'),
     h('div', { class: 'om-field' }, h('span', { class: 'om-field__label' }, '任務'), tasksBox, h('div', { class: 'cluster-tasks-foot' }, count, addBtn)),
+    h('div', { class: 'om-field cluster-lines' }, h('label', { class: 'om-field__label' }, '一次貼上多條任務（選填）', lines), h('div', { class: 'cluster-lines-foot' }, linesNote, addLinesBtn)),
+    h('div', { class: 'om-field' }, h('label', { class: 'om-field__label' }, '工作者數（1 到 8）', workersInput), workersHelp),
+    adviceBox,
     h('div', { class: 'om-field' }, h('span', { class: 'om-field__label' }, '起跑方式'), modeBox, modeHelp),
     h(
       'label',
@@ -311,7 +376,7 @@ export async function openClusterList(ctx, session) {
             'a',
             { class: 'cluster-list-item', href: clusterHash(c.id), onclick: () => d.close() },
             h('span', { class: `om-badge${isActive(c) ? ' cluster-badge-busy' : ''}` }, clusterStatusLabel(c.status)),
-            h('span', { class: 'cluster-list-text' }, `${modeLabel(c.mode)} · ${done}/${total} 完成`),
+            h('span', { class: 'cluster-list-text' }, `${modeLabel(c.mode)} · 任務 ${done}/${total} 完成`),
             h('span', { class: 'muted' }, relTime(c.createdAt)),
           );
         }),
@@ -348,6 +413,7 @@ export class ClusterPage {
     this.warns = h('div', { class: 'cluster-warns' });
     this.workers = h('div', { class: 'cluster-workers' });
     this.count = h('span', { class: 'muted' });
+    this.queueBox = h('div', { class: 'cluster-queue-slot' });
     this.mergeBox = h('div', { class: 'cluster-merge-slot' });
     this.cleanupBox = h('div', { class: 'cluster-cleanup-slot' });
     this.memoryBox = h('section', { class: 'cluster-section cluster-memory' });
@@ -427,6 +493,7 @@ export class ClusterPage {
         this.head,
         this.warns,
         h('section', { class: 'cluster-section' }, h('div', { class: 'cluster-section-title' }, h('span', null, '工作者'), this.count), this.workers),
+        this.queueBox,
         this.mergeBox,
         this.cleanupBox,
         this.memoryBox,
@@ -436,6 +503,7 @@ export class ClusterPage {
     this.drawHead();
     this.drawWarnings();
     this.drawWorkers();
+    this.drawQueue();
     this.drawMerge();
     this.drawCleanup();
   }
@@ -467,8 +535,8 @@ export class ClusterPage {
           'div',
           { class: 'cluster-head-line' },
           h('span', { class: `om-badge ${CLUSTER_BADGE[c.status] || ''}`, dataset: { field: 'status' } }, clusterStatusLabel(c.status)),
-          h('span', { class: 'cluster-progress' }, `${done}/${total} 完成`),
-          failed ? h('span', { class: 'om-badge om-badge--danger' }, `${failed} 個出錯`) : null,
+          h('span', { class: 'cluster-progress', dataset: { field: 'progress' } }, `任務 ${done}/${total} 完成`),
+          failed ? h('span', { class: 'om-badge om-badge--danger' }, failedText(c, failed)) : null,
           deleted ? h('span', { class: 'om-badge' }, `${deleted} 個已刪除`) : null,
           h('span', { class: 'muted' }, `建立於 ${relTime(c.createdAt)}`),
         ),
@@ -518,6 +586,7 @@ export class ClusterPage {
   buildCard(w, sig) {
     const state = h('span', { class: 'om-badge cluster-worker-state' });
     const progress = h('p', { class: 'cluster-worker-progress' });
+    const queueLine = h('p', { class: 'cluster-worker-queue', dataset: { field: 'worker-queue' } });
     const timingSlot = h('div', { class: 'cluster-timing-slot' });
     const cleanupSlot = h('div', { class: 'cluster-worker-cleanup' });
     const deleted = w.status === 'deleted';
@@ -540,11 +609,12 @@ export class ClusterPage {
           )
         : null,
       h('div', { class: 'cluster-worker-meta' }, nativeSwarm(w.swarm), deleted ? null : h('a', { class: 'om-btn om-btn--sm', href: `#/s/${w.sessionId}`, dataset: { action: 'open-worker' } }, '開啟對話')),
+      queueLine,
       progress,
       cleanupSlot,
       timingSlot,
     );
-    return { el, sig, state, progress, timingSlot, cleanupSlot, shown: null, stateKey: '', progressText: null, cleanupKey: null };
+    return { el, sig, state, progress, queueLine, timingSlot, cleanupSlot, shown: null, stateKey: '', progressText: null, queueText: null, cleanupKey: null };
   }
 
   updateCard(card, w) {
@@ -554,6 +624,13 @@ export class ClusterPage {
       card.stateKey = stateKey;
       card.state.className = `om-badge cluster-worker-state ${TONE_BADGE[st.tone] || ''}`;
       card.state.textContent = st.label;
+    }
+    // Which task it is on and how many it has done (only a cluster that has a queue says it).
+    const queueText = workerQueueLine(w, this.cluster) || '';
+    if (card.queueText !== queueText) {
+      card.queueText = queueText;
+      card.queueLine.hidden = !queueText;
+      card.queueLine.textContent = queueText;
     }
     const text = w.progress || '';
     if (card.progressText !== text) {
@@ -577,6 +654,47 @@ export class ClusterPage {
       // function the 耗時 tab of a conversation uses too (timing-box.js).
       fill(card.timingSlot, timingBox(got));
     }
+  }
+
+  // 任務佇列: every task, its state, who does it and when it started and ended (the Hub's clock).
+  drawQueue() {
+    const c = this.cluster;
+    const view = queueView(c);
+    if (!this.changed('queue', [view.rows, view.neverSent])) return;
+    if (!view.rows.length) return fill(this.queueBox);
+    const { sum } = view;
+    const worker = (r) => (r.workerNo === null ? null : h('span', { class: 'cluster-chip', title: r.workerTitle || '', dataset: { field: 'task-worker' } }, `w${r.workerNo}`));
+    const times = (r) => {
+      if (!r.started) return null;
+      const bits = [`開始 ${r.started}`];
+      if (r.ended) bits.push(`結束 ${r.ended}`);
+      if (r.span) bits.push(`用了 ${r.span}`);
+      return bits.join(' · ');
+    };
+    fill(
+      this.queueBox,
+      h(
+        'section',
+        { class: 'cluster-section cluster-queue' },
+        h('div', { class: 'cluster-section-title' }, h('span', null, '任務佇列'), h('span', { class: 'muted', dataset: { field: 'queue-sum' } }, `${sum.done}/${sum.total} 完成${sum.running ? ` · ${sum.running} 條進行中` : ''}${sum.pending ? ` · ${sum.pending} 條等待中` : ''}${sum.failed ? ` · ${sum.failed} 條失敗` : ''}`)),
+        h('div', { class: 'om-field__help' }, '工作者做完一條，會在同一個對話裡自動領下一條；時間是中控台自己的時鐘：交給工作者的那一刻，到看見它停下的那一刻。'),
+        view.neverSent ? h('div', { class: 'callout small cluster-warn', dataset: { field: 'never-sent' }, role: 'status' }, icon('warn'), h('div', { class: 'callout-text' }, `已經停止派工：還有 ${view.neverSent} 條任務沒有派出去，不會再自動派。`)) : null,
+        h(
+          'ol',
+          { class: 'cluster-queue-list' },
+          view.rows.map((r) =>
+            h(
+              'li',
+              { class: 'cluster-queue-row', dataset: { task: String(r.index), status: r.status } },
+              h('div', { class: 'cluster-queue-main' }, h('span', { class: 'cluster-queue-no' }, `#${r.no}`), h('span', { class: 'cluster-queue-title', title: r.title }, r.title), worker(r), h('span', { class: `om-badge ${TONE_BADGE[r.tone] || ''}`, dataset: { field: 'task-status' } }, r.label)),
+              times(r) ? h('div', { class: 'cluster-queue-times muted', dataset: { field: 'task-times' } }, times(r)) : null,
+              r.handedBack && r.status !== 'failed' ? h('div', { class: 'cluster-queue-note om-field__help', dataset: { field: 'task-note' } }, r.status === 'pending' ? r.error || '退回佇列等別的工作者接手' : '這條已經退回佇列重派過一次。') : null,
+              r.status === 'failed' && r.error ? h('div', { class: 'cluster-queue-note om-field__error', dataset: { field: 'task-note' } }, r.error) : null,
+            ),
+          ),
+        ),
+      ),
+    );
   }
 
   drawMerge() {
@@ -699,8 +817,9 @@ export class ClusterPage {
   async merge() {
     if (this.busy) return;
     const c = this.cluster;
-    const unfinished = (c.workers || []).filter((w) => !w.finishedAt && w.status !== 'deleted').length;
-    const body = `會從主對話目前的 HEAD 開新分支 cluster/${c.id}/merged，依工作者的順序合併各自的分支；只會合進各分支上已 commit 的內容。不動主對話正在用的分支與工作樹。有衝突的工作者會跳過並列出檔案，其餘照常合併。\n\n如果全部工作者都合併成功，會接著自動清理：移除乾淨的 worktree、刪除已經併進去的工作者分支、把工作者對話從側欄收起（對話不會刪）；有未提交修改、或沒合進去的工作者會原封不動留著。${unfinished ? `\n\n還有 ${unfinished} 個工作者沒做完，它們之後才 commit 的內容不會在這次合併裡。` : ''}`;
+    const tasks = Array.isArray(c.tasks) ? c.tasks : [];
+    const unfinished = tasks.length ? tasks.filter((t) => t.status === 'pending' || t.status === 'running').length : (c.workers || []).filter((w) => !w.finishedAt && w.status !== 'deleted').length;
+    const body = `會從主對話目前的 HEAD 開新分支 cluster/${c.id}/merged，依工作者的順序合併各自的分支；只會合進各分支上已 commit 的內容。不動主對話正在用的分支與工作樹。有衝突的工作者會跳過並列出檔案，其餘照常合併。\n\n如果全部工作者都合併成功，會接著自動清理：移除乾淨的 worktree、刪除已經併進去的工作者分支、把工作者對話從側欄收起（對話不會刪）；有未提交修改、或沒合進去的工作者會原封不動留著。${unfinished ? `\n\n還有 ${unfinished} ${tasks.length ? '條任務' : '個工作者'}沒做完，之後才 commit 的內容不會在這次合併裡。` : ''}`;
     const ok = await this.ctx.confirmDialog({ title: '要合併各工作者的分支嗎？', body, action: '合併' });
     if (ok) await this.run('merge');
   }

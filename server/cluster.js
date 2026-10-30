@@ -26,6 +26,13 @@ import { redact } from './redact.js';
 import * as mem from './cluster-memory.js';
 
 export const MAX_WORKERS = 8;
+// More tasks than workers is allowed: a worker that finishes a task is given
+// the next one that is waiting, in its own conversation (see "the queue" below).
+export const MAX_TASKS = 64;
+export const DEFAULT_WORKERS = 4;
+// A task is handed out at most twice: once, and once more after the first
+// worker failed with it. A second failure is the task's own, not retried again.
+export const MAX_ATTEMPTS = 2;
 export const EXCERPT_MAX_CHARS = 8000;
 const MAX_TITLE = 120;
 const MAX_PROMPT = 20_000;
@@ -38,6 +45,7 @@ const CLUSTER_DIR = path.join(store.DATA_DIR, 'clusters');
 const clusters = new Map(); // cluster id -> record (see create())
 const workerIndex = new Map(); // conversation id -> cluster id
 const cleaning = new Set(); // cluster ids being cleaned up right now (in memory only: a restart ends it)
+const feeding = new Map(); // worker session id -> { ended, error } while the next task is on its way to it (in memory only)
 let broadcast = () => {};
 export function setBroadcast(fn) {
   broadcast = fn;
@@ -80,6 +88,7 @@ export function load() {
     try {
       const rec = JSON.parse(fs.readFileSync(path.join(CLUSTER_DIR, name), 'utf8'));
       if (rec?.id !== name.slice(0, -5) || !Array.isArray(rec.workers) || typeof rec.parentId !== 'string') throw new Error('內容不像一個叢集');
+      adoptQueue(rec);
       index(rec);
     } catch (err) {
       console.warn(`[cluster] ${name} 沒有載入：${err.message}`);
@@ -137,8 +146,15 @@ function statusOf(rec) {
   if (rec.phase) return rec.phase;
   const live = rec.workers.map(leafOfWorker);
   if (live.some((s) => s && WORKING.includes(s.status))) return 'running';
+  // Tasks still waiting for a worker (or handed to one that has not started yet): not done.
+  if (queueOpen(rec)) return 'running';
   if (rec.stoppedAt) return 'stopped';
-  if (rec.workers.length && rec.workers.every((w) => w.finishedAt)) return live.every((s) => !s || s.status === 'error') ? 'error' : 'done';
+  // A stop ends the dispatching for good: what was never handed out stays waiting, and the cluster reads stopped.
+  if (rec.halted && pendingOf(rec).length) return 'stopped';
+  if (rec.workers.length && rec.workers.every((w) => w.finishedAt)) {
+    const tasks = tasksOf(rec);
+    return (tasks.length ? tasks.every((t) => t.status === 'failed') : live.every((s) => !s || s.status === 'error')) ? 'error' : 'done';
+  }
   return 'running';
 }
 
@@ -167,8 +183,19 @@ export function publicCluster(rec) {
         finishedAt: w.finishedAt || null,
         // Taken off the sidebar by a clean-up (the conversation itself is kept).
         hidden: Boolean(s?.clusterHidden),
+        // The queue, from this worker's side: the task it is on now (its index
+        // in `tasks`, from 0) and how many it has finished. Both are read from
+        // the tasks, which are the one place that says who did what.
+        taskIndex: taskOf(rec, w)?.index ?? null,
+        done: tasksOf(rec).filter((t) => t.status === 'done' && t.workerSessionId === w.sessionId).length,
       };
     }),
+    // Every task, in the order given. Times are the Hub's own clock: `startedAt`
+    // when the task was handed to its worker, `finishedAt` when the Hub saw that
+    // worker's turn end. `attempts` is how many times it was handed out (a task
+    // whose worker failed is handed out once more); `error` says why one failed
+    // or was handed back.
+    tasks: tasksOf(rec).map((t) => ({ index: t.index, title: t.title, status: t.status, workerSessionId: t.workerSessionId || null, startedAt: t.startedAt || null, finishedAt: t.finishedAt || null, attempts: t.attempts || 0, error: t.error || null })),
     memory: { path: rec.memory.path, bytes: rec.memory.bytes ?? 0, updatedAt: rec.memory.updatedAt ?? null },
     merge: rec.merge || null,
     cleanup: publicCleanup(rec),
@@ -197,8 +224,11 @@ function announce(rec, { force = false } = {}) {
 const announceTimers = new Map();
 export function noteActivity(sessionId) {
   if (!workerIndex.size) return;
+  // A worker's conversation that is no longer there was deleted: its task goes back to the queue.
+  const own = workerIndex.get(sessionId);
+  if (own && !store.getSession(sessionId)) setImmediate(() => workerGone(own, sessionId));
   // A worker that went on in a new node of its chain speaks under the new node's id; the node knows its cluster.
-  const cid = workerIndex.get(sessionId) || store.getSession(sessionId)?.clusterId;
+  const cid = own || store.getSession(sessionId)?.clusterId;
   if (!cid || !clusters.has(cid) || announceTimers.has(cid)) return;
   const t = setTimeout(() => {
     announceTimers.delete(cid);
@@ -219,23 +249,45 @@ async function refreshMemory(rec) {
   } catch {}
 }
 
+// The worker a conversation node belongs to, with its cluster record.
+function workerOf(session) {
+  const cid = workerIndex.get(session.id) || (session.continuedFrom ? chainIds(session).map((id) => workerIndex.get(id)).find(Boolean) : undefined);
+  const rec = cid && clusters.get(cid);
+  if (!rec) return null;
+  const ids = chainIds(session);
+  const w = rec.workers.find((x) => ids.includes(x.sessionId) || x.sessionId === session.id);
+  return w ? { rec, w } : null;
+}
+
 // A worker finished a turn, started one, or was stopped.
 runner.onStatus((session) => {
   if (!workerIndex.size) return;
-  const cid = workerIndex.get(session.id) || (session.continuedFrom ? chainIds(session).map((id) => workerIndex.get(id)).find(Boolean) : undefined);
-  const rec = cid && clusters.get(cid);
-  if (!rec) return;
-  const w = rec.workers.find((x) => chainIds(session).includes(x.sessionId) || x.sessionId === session.id);
-  if (!w) return;
+  const hit = workerOf(session);
+  if (!hit) return;
+  const { rec, w } = hit;
+  let pairs = [];
   if (WORKING.includes(session.status)) {
     w.ran = true;
     w.finishedAt = null;
     rec.stoppedAt = null;
+    // The task it is on has been seen to start (a restart can tell a task that
+    // ended while the Hub was away from one whose first turn never began).
+    let t = taskOf(rec, w);
+    // A person goes on with a worker that a stop cut off (a message to its
+    // conversation): the work of that task goes on, and counts as done when it ends.
+    if (!t) t = reviveCut(rec, w);
+    if (t) t.began = true;
   } else if (w.ran && (session.status === 'idle' || session.status === 'error')) {
-    // A turn that ended because stop() cut it short is not a finished worker:
-    // it did not get to the end of its task, and the page must not count it as done.
-    w.finishedAt = w.cutOff && session.status === 'idle' ? null : now();
-    w.cutOff = false;
+    const handoff = feeding.get(w.sessionId);
+    if (handoff) {
+      // The next task is being handed to this worker right now: the turn that
+      // ended is either the task's own (it was quick) or the failed handoff.
+      // The handoff decides which, when Kimi has answered it.
+      handoff.ended = true;
+      handoff.error = session.status === 'error';
+      return;
+    }
+    pairs = turnEnded(rec, w, session.status);
   } else return;
   // A cluster still being made is not shown or saved yet: it may yet be taken back.
   if (rec.phase === 'starting') return;
@@ -248,6 +300,7 @@ runner.onStatus((session) => {
       announce(rec);
     });
   }
+  handOut(rec, pairs);
 });
 
 function chainIds(session) {
@@ -256,6 +309,294 @@ function chainIds(session) {
   } catch {
     return [session.id];
   }
+}
+
+// -------------------------------------------------------------- the queue
+//
+// A cluster may have more tasks than workers. The workers are opened with the
+// first tasks; whenever a worker's turn ends, the Hub gives that same
+// conversation (its context, its worktree, the commits of its earlier tasks on
+// the same branch) the next task that is waiting, until none is left. So the
+// slowest task no longer holds up everything behind it: whoever is free takes
+// the next one.
+//
+// Every task is in `rec.tasks`, in the order given:
+//   pending   not handed out yet (or handed back after a failure)
+//   running   handed to a worker (`workerSessionId`) at `startedAt`
+//   done      that worker's turn ended; `finishedAt` is when the Hub saw it
+//   failed    the worker's turn failed (twice), it was cut off by a stop, or no
+//             worker was left to take it; `error` says which
+// The times are this Hub's clock at the moment it handed the task out and at
+// the moment it saw the worker go quiet: measured, not estimated.
+//
+// A worker whose turn failed, whose conversation was deleted, or that refused
+// the next task is out of the queue (`w.out`): the task it held goes back to
+// the queue ONCE (`attempts`), for another worker; a second failure ends it.
+// A stop ends the dispatching for good (`rec.halted`): what was never handed
+// out stays pending, nothing new is sent.
+
+const RECONCILE_GRACE_MS = 30_000;
+
+function tasksOf(rec) {
+  return Array.isArray(rec.tasks) ? rec.tasks : [];
+}
+function pendingOf(rec) {
+  return tasksOf(rec).filter((t) => t.status === 'pending');
+}
+// The task a worker is on now.
+function taskOf(rec, w) {
+  return tasksOf(rec).find((t) => t.status === 'running' && t.workerSessionId === w.sessionId) || null;
+}
+// Tasks are still waiting for a worker, or being worked on, and no stop has ended the dispatching.
+function queueOpen(rec) {
+  return !rec.halted && tasksOf(rec).some((t) => t.status === 'pending' || t.status === 'running');
+}
+
+// A cluster record from before the queue (or one just read from disk): its
+// tasks are its workers' tasks, so every cluster has the same shape.
+function adoptQueue(rec) {
+  if (!Array.isArray(rec.tasks)) {
+    rec.tasks = rec.workers.map((w, i) => ({
+      index: i,
+      title: w.title,
+      prompt: '',
+      status: w.finishedAt ? 'done' : rec.stoppedAt ? 'failed' : 'running',
+      workerSessionId: w.sessionId,
+      startedAt: rec.createdAt || null,
+      finishedAt: w.finishedAt || null,
+      attempts: 1,
+      error: !w.finishedAt && rec.stoppedAt ? CUT_OFF : null,
+      began: Boolean(w.ran),
+    }));
+  }
+  rec.halted ??= false;
+}
+
+const CUT_OFF = '被「全部停止」中斷了';
+
+const newTask = (t, index) => ({ index, title: t.title, prompt: t.prompt, status: 'pending', workerSessionId: null, startedAt: null, finishedAt: null, attempts: 0, error: null, began: false });
+
+// The task is handed to the worker (before it is sent: the page sees it as
+// running from the moment the Hub decided).
+function claim(rec, w, task) {
+  task.status = 'running';
+  task.workerSessionId = w.sessionId;
+  task.startedAt = now();
+  task.finishedAt = null;
+  task.error = null;
+  task.began = false;
+  task.attempts += 1;
+  w.title = task.title;
+  w.task = task.prompt;
+  w.finishedAt = null;
+}
+
+function endTask(task, status, error = null) {
+  task.status = status;
+  task.finishedAt = now();
+  task.error = error;
+  // A finished task's text is not needed again; a failed one keeps it.
+  if (status === 'done') task.prompt = '';
+}
+
+// A task whose worker failed: back to the queue for another worker the first
+// time, failed for good the second.
+function giveBack(rec, task, why) {
+  if (task.attempts < MAX_ATTEMPTS && !rec.halted) {
+    task.status = 'pending';
+    task.workerSessionId = null;
+    task.startedAt = null;
+    task.finishedAt = null;
+    task.began = false;
+    task.error = `${why}，已退回佇列等別的工作者接手`;
+  } else {
+    endTask(task, 'failed', `${why}${task.attempts >= MAX_ATTEMPTS ? '；這條已經重派過一次，不再重派' : ''}`);
+  }
+}
+
+// A worker that takes no more tasks from the queue.
+function retire(w, why) {
+  w.out = why;
+  w.finishedAt = w.finishedAt || now();
+}
+
+// Waiting tasks with no worker left to take them end as failed, so the
+// cluster can end; with a worker alive (even a busy one) they wait for it.
+function failStranded(rec) {
+  if (rec.halted || !pendingOf(rec).length) return;
+  if (rec.workers.some((w) => !w.out && store.getSession(w.sessionId))) return;
+  for (const t of pendingOf(rec)) endTask(t, 'failed', '沒有可用的工作者了（都出錯或被刪除），這條沒有派出');
+}
+
+// A worker the queue can give a task to: quiet, with nothing on it, not out.
+function canTake(rec, w) {
+  if (w.out || feeding.has(w.sessionId) || taskOf(rec, w)) return false;
+  return leafOfWorker(w)?.status === 'idle';
+}
+
+// Decides, now and in this one step (so two events cannot give the same task
+// to two workers), which waiting task goes to which free worker, in the order
+// of the tasks and of the workers. Nothing is sent here: handOut() sends.
+function assign(rec) {
+  const pairs = [];
+  if (rec.halted || rec.phase) return pairs;
+  for (const w of rec.workers) {
+    const task = pendingOf(rec)[0];
+    if (!task) break;
+    if (!canTake(rec, w)) continue;
+    claim(rec, w, task);
+    feeding.set(w.sessionId, { ended: false, error: false });
+    pairs.push({ w, task });
+  }
+  return pairs;
+}
+
+// The task a stop cut off on this worker, if the worker has one and nothing else
+// is on it: running again (the same work, the same start).
+function reviveCut(rec, w) {
+  const cut = tasksOf(rec)
+    .filter((t) => t.status === 'failed' && t.error === CUT_OFF && t.workerSessionId === w.sessionId)
+    .sort((a, b) => (b.finishedAt || 0) - (a.finishedAt || 0))[0];
+  if (!cut) return null;
+  cut.status = 'running';
+  cut.finishedAt = null;
+  cut.error = null;
+  return cut;
+}
+
+// A worker's turn ended (`status` is what it ended as): settle the task it was
+// on and decide what is handed out now. → the pairs to send.
+function turnEnded(rec, w, status) {
+  const cut = Boolean(w.cutOff) && status === 'idle';
+  const task = taskOf(rec, w);
+  if (task) {
+    // A turn that ended because stop() cut it short did not finish its task.
+    if (cut) endTask(task, 'failed', CUT_OFF);
+    else if (status === 'error') {
+      retire(w, 'error');
+      giveBack(rec, task, `w${w.n} 的回合出錯了`);
+    } else endTask(task, 'done');
+  } else if (status === 'error') retire(w, 'error');
+  w.cutOff = false;
+  w.ran = true;
+  w.finishedAt = cut ? null : now();
+  const pairs = assign(rec);
+  failStranded(rec);
+  return pairs;
+}
+
+export function buildTaskMessage({ n, index, total, task, isolate, branch }) {
+  return [
+    `這是第 ${index + 1}/${total} 條任務；完成後照固定格式回報，然後等待下一條。`,
+    '',
+    `## 任務：${task.title}`,
+    '',
+    task.prompt,
+    '',
+    `（你是 w${n}：工作範圍、叢集記憶檔與規則照一開始的簡報。${isolate ? `這條的改動一樣 commit 到分支 ${branch}。` : ''}回報固定四段：做了什麼／改了哪些檔／怎麼驗證／未完成什麼。）`,
+  ].join('\n');
+}
+
+// Hands the waiting tasks to the free workers, if there are any of either.
+function pump(rec) {
+  const pairs = assign(rec);
+  if (!pairs.length) return;
+  persist(rec);
+  announce(rec);
+  handOut(rec, pairs);
+}
+
+function handOut(rec, pairs) {
+  for (const { w, task } of pairs) feedOne(rec, w, task).catch((err) => console.warn(`[cluster] ${rec.id}: handing task ${task.index + 1} to ${w.sessionId} failed: ${err.message}`));
+}
+
+// Sends one task to its worker. The task is already `running` (assign()); this
+// settles it by what Kimi says to the message.
+async function feedOne(rec, w, task) {
+  const session = leafOfWorker(w);
+  try {
+    if (!session) throw new Error('工作者的對話已被刪除');
+    // The conversation is named after what it is doing now (the sidebar shows it).
+    await runner.command(session, 'title', task.title).catch(() => {});
+    const text = buildTaskMessage({ n: w.n, index: task.index, total: rec.tasks.length, task, isolate: rec.isolate, branch: w.branch });
+    const r = await runner.deliver(session, text, { note: `叢集任務 ${task.index + 1}/${rec.tasks.length}` });
+    if (r?.ok === false) throw new Error(r.error || 'Kimi 沒有收到訊息');
+  } catch (err) {
+    feeding.delete(w.sessionId);
+    if (!clusters.has(rec.id)) return;
+    retire(w, 'refused');
+    giveBack(rec, task, `交給 w${w.n} 時失敗：${err.message}`);
+    const pairs = assign(rec);
+    failStranded(rec);
+    persist(rec);
+    announce(rec, { force: true });
+    handOut(rec, pairs);
+    return;
+  }
+  const handoff = feeding.get(w.sessionId);
+  feeding.delete(w.sessionId);
+  if (!clusters.has(rec.id)) return;
+  if (handoff?.ended) {
+    // It was quick: the turn is over already.
+    const pairs = turnEnded(rec, w, handoff.error ? 'error' : 'idle');
+    persist(rec);
+    announce(rec);
+    handOut(rec, pairs);
+  } else if (rec.halted) {
+    // A stop came while the message was on its way: it is cut like the others.
+    w.cutOff = true;
+    await Promise.resolve(runner.interrupt(w.sessionId)).catch(() => {
+      w.cutOff = false;
+    });
+  }
+}
+
+// The Hub's list of what Kimi is doing on a computer (it arrives when a
+// computer connects, and as conversations change): after a Hub restart a turn
+// may have ended while nobody was listening, and this is how the queue finds
+// out and goes on. Only a worker that is quiet in the Hub AND in Kimi is
+// settled; a task the Hub has not yet seen start is given a grace period.
+machines.onSessionChange((machineId, entry) => {
+  if (!clusters.size || !entry || entry.busy) return;
+  for (const rec of clusters.values()) {
+    if (rec.machineId !== machineId || rec.phase) continue;
+    for (const w of rec.workers) if (leafOfWorker(w)?.kimiSessionId === entry.id) reconcile(rec, w);
+  }
+});
+
+function reconcile(rec, w) {
+  if (feeding.has(w.sessionId) || cleaning.has(rec.id)) return;
+  const leaf = leafOfWorker(w);
+  if (!leaf || WORKING.includes(leaf.status)) return;
+  const task = taskOf(rec, w);
+  let pairs;
+  if (task) {
+    if (!task.began && now() - (task.startedAt || 0) < RECONCILE_GRACE_MS) return;
+    pairs = turnEnded(rec, w, leaf.status === 'error' ? 'error' : 'idle');
+  } else {
+    pairs = assign(rec);
+    if (!pairs.length) return;
+  }
+  persist(rec);
+  announce(rec);
+  handOut(rec, pairs);
+}
+
+// A worker's conversation was deleted: its task goes back to the queue (once).
+function workerGone(cid, sessionId) {
+  const rec = clusters.get(cid);
+  const w = rec?.workers.find((x) => x.sessionId === sessionId);
+  if (!w || store.getSession(sessionId) || w.out === 'deleted') return;
+  feeding.delete(sessionId);
+  const task = taskOf(rec, w);
+  retire(w, 'deleted');
+  if (task) giveBack(rec, task, `w${w.n} 的對話被刪除了`);
+  const pairs = rec.phase ? [] : assign(rec);
+  failStranded(rec);
+  if (rec.phase === 'starting') return;
+  persist(rec);
+  announce(rec, { force: true });
+  handOut(rec, pairs);
 }
 
 // ---------------------------------------------------------------- queries
@@ -334,8 +675,11 @@ export function excerptOf(session, max = EXCERPT_MAX_CHARS) {
   return clip(redact(lines.join('\n\n')), max);
 }
 
-export function buildBrief({ cid, n, total, task, tasks, worktree, folder, branch, cwd, isolate, mode, memoryPath, note, excerpt }) {
-  const out = [`你是叢集 ${cid} 的工作者 w${n}（共 ${total} 個）。這份簡報是派工，不是閒聊；讀完請直接開始做。`, '', `## 你的任務：${task.title}`, '', task.prompt, '', '## 工作範圍'];
+export function buildBrief({ cid, n, total, task, taskIndex = n - 1, tasks, worktree, folder, branch, cwd, isolate, mode, memoryPath, note, excerpt }) {
+  const queued = tasks.length > total; // more tasks than workers: the others wait their turn
+  const out = [`你是叢集 ${cid} 的工作者 w${n}（共 ${total} 個）。這份簡報是派工，不是閒聊；讀完請直接開始做。`, '', `## 你的任務：${task.title}`, ''];
+  if (queued) out.push(`這是第 ${taskIndex + 1}/${tasks.length} 條任務；完成後照固定格式回報，然後等待下一條。`, '');
+  out.push(task.prompt, '', '## 工作範圍');
   if (isolate && mode === 'fork') {
     out.push(`你專屬的 git worktree：${worktree}（分支 ${branch}）。你的對話是從主對話分叉出來的，所以目前的工作資料夾是主專案資料夾 ${cwd}，不是你的 worktree。所有讀、寫、指令一律用 ${worktree} 開頭的絕對路徑（或先 cd 進去再做）；不要編輯 ${cwd} 裡的檔案，也不要碰其他工作者的資料夾。`);
   } else if (isolate) {
@@ -353,9 +697,12 @@ export function buildBrief({ cid, n, total, task, tasks, worktree, folder, branc
     '- 這個檔在 git 之外，不要 commit 它。',
   );
   if (note?.trim()) out.push('', '## 主對話交代', '', note.trim());
-  if (tasks.length > 1) out.push('', '## 同時進行的任務', '', ...tasks.map((t, i) => `- w${i + 1}${i + 1 === n ? '（你）' : ''}：${t.title}`));
+  if (queued) {
+    const shown = tasks.slice(0, 40);
+    out.push('', '## 任務佇列', '', `這個叢集有 ${tasks.length} 條任務、${total} 個工作者。你做完一條並回報之後，Agent Hub 會在這個對話裡把下一條任務交給你（不會重送這份簡報）；沒有下一條時就不會再收到。全部任務：`, ...shown.map((t, i) => `- 第 ${i + 1} 條${i === taskIndex ? '（你現在做這條）' : ''}：${t.title}`), ...(tasks.length > shown.length ? [`- …還有 ${tasks.length - shown.length} 條`] : []));
+  } else if (tasks.length > 1) out.push('', '## 同時進行的任務', '', ...tasks.map((t, i) => `- w${i + 1}${i + 1 === n ? '（你）' : ''}：${t.title}`));
   out.push('', '## 完成時');
-  if (isolate) out.push('', `把你的改動 commit 到分支 ${branch}（小而清楚的 commit）；沒有 commit 的改動不會被合併。`);
+  if (isolate) out.push('', `把你的改動 commit 到分支 ${branch}（小而清楚的 commit${queued ? '；每條任務各自 commit，累積在同一個分支上' : ''}）；沒有 commit 的改動不會被合併。`);
   out.push('', '最後用下面固定的四段回報：', '', '### 做了什麼', '### 改了哪些檔', '### 怎麼驗證', '### 未完成什麼');
   if (excerpt) out.push('', '## 主對話最近的對話摘錄（舊到新，已遮蔽金鑰，只當背景）', '', excerpt);
   return out.join('\n');
@@ -415,7 +762,8 @@ function parseRequest(body) {
   if (b.note !== undefined && typeof b.note !== 'string') throw fail(400, 'note 必須是文字');
   if ((b.note || '').length > MAX_NOTE) throw fail(400, `給全部工作者的話最多 ${MAX_NOTE} 個字`);
   if (!Array.isArray(b.tasks) || !b.tasks.length) throw fail(400, '至少要有一個任務');
-  if (b.tasks.length > MAX_WORKERS) throw fail(400, `叢集第一版最多 ${MAX_WORKERS} 個工作者`);
+  if (b.tasks.length > MAX_TASKS) throw fail(400, `一個叢集最多 ${MAX_TASKS} 條任務`);
+  if (b.workers !== undefined && (!Number.isInteger(b.workers) || b.workers < 1 || b.workers > MAX_WORKERS)) throw fail(400, `workers（工作者數）要是 1 到 ${MAX_WORKERS} 的整數`);
   const tasks = b.tasks.map((t, i) => {
     const title = typeof t?.title === 'string' ? t.title.replace(/\s+/g, ' ').trim() : '';
     const prompt = typeof t?.prompt === 'string' ? t.prompt.trim() : '';
@@ -425,7 +773,10 @@ function parseRequest(body) {
     if (prompt.length > MAX_PROMPT) throw fail(400, `第 ${i + 1} 個任務的內容最多 ${MAX_PROMPT} 個字`);
     return { title, prompt };
   });
-  return { tasks, mode, isolate: b.isolate !== false, swarm: b.swarm !== false, note: (b.note || '').trim() };
+  // Workers: as many as asked (at most 8), by default one per task up to 4. More
+  // workers than tasks would leave some with nothing to do: only as many are opened as there are tasks.
+  const asked = b.workers ?? Math.min(tasks.length, DEFAULT_WORKERS);
+  return { tasks, workers: Math.min(asked, tasks.length), workersAsked: b.workers ?? null, mode, isolate: b.isolate !== false, swarm: b.swarm !== false, note: (b.note || '').trim() };
 }
 
 // What the parent runs on, to be given to every worker: the same provider and
@@ -493,6 +844,8 @@ export async function create(parentNode, body) {
     warnings.push(`主對話的上下文已用 ${Math.round((ctxUsed.used / ctxUsed.size) * 100)}%，每個分叉都帶著它起跑，很快會碰到上限；建議改用「簡報起跑」`);
   }
 
+  if (req.workersAsked !== null && req.workersAsked > req.workers) warnings.push(`工作者數 ${req.workersAsked} 比任務數 ${req.tasks.length} 多，只開 ${req.workers} 個工作者（多的會閒著，白花額度）`);
+
   const memoryPath = git ? `${git.common}/agent-hub-cluster/${cid}/memory.md` : `${parent.cwd.replace(/\/+$/, '')}/.agent-hub-cluster/${cid}/memory.md`;
   const rec = {
     id: cid,
@@ -509,6 +862,9 @@ export async function create(parentNode, body) {
     repo: isolate ? { top: git.top, common: git.common, head: git.head, container } : null,
     memory: { path: memoryPath, bytes: 0, updatedAt: null },
     workers: [],
+    // The queue: every task in the order given (see "the queue" below).
+    tasks: req.tasks.map(newTask),
+    halted: false,
     merge: null,
     cleanup: null,
     stoppedAt: null,
@@ -516,7 +872,7 @@ export async function create(parentNode, body) {
   const made = { memory: false, worktrees: [], sessions: [] };
   clusters.set(cid, rec);
   try {
-    await mem.createMemory(parent.machineId, parent.cwd, memoryPath, memoryHeader(rec, req.tasks), { ignoreFolder: !git });
+    await mem.createMemory(parent.machineId, parent.cwd, memoryPath, memoryHeader(rec, req.tasks, req.workers), { ignoreFolder: !git });
     made.memory = true;
     await refreshMemory(rec);
     const startOffset = rec.memory.bytes || 0;
@@ -525,7 +881,7 @@ export async function create(parentNode, body) {
     // order of branches is the order of workers.
     // A conversation working in a folder below the project's root gets the same
     // folder in its worktree.
-    const plan = req.tasks.map((task, i) => ({ task, n: i + 1, branch: isolate ? `cluster/${cid}/w${i + 1}` : null, worktree: isolate ? `${container}/w${i + 1}` : null, folder: isolate ? (git.prefix ? `${container}/w${i + 1}/${git.prefix}` : `${container}/w${i + 1}`) : parent.cwd }));
+    const plan = req.tasks.slice(0, req.workers).map((task, i) => ({ task, n: i + 1, branch: isolate ? `cluster/${cid}/w${i + 1}` : null, worktree: isolate ? `${container}/w${i + 1}` : null, folder: isolate ? (git.prefix ? `${container}/w${i + 1}/${git.prefix}` : `${container}/w${i + 1}`) : parent.cwd }));
     if (isolate) {
       for (const w of plan) {
         const r = await mem.sh(parent.machineId, git.top, gitIn(git.top, `worktree add -b ${mem.quote(w.branch)} ${mem.quote(w.worktree)} ${mem.quote(git.head)}`));
@@ -591,14 +947,18 @@ export async function create(parentNode, body) {
     // Every conversation exists; only now do any of them start.
     const briefs = rec.workers.map((w) => ({
       w,
-      text: buildBrief({ cid, n: w.n, total: plan.length, task: { title: w.title, prompt: w.task }, tasks: req.tasks, worktree: w.worktree, folder: w.folder, branch: w.branch, cwd: parent.cwd, isolate, mode: req.mode, memoryPath, note: req.note, excerpt }),
+      text: buildBrief({ cid, n: w.n, total: plan.length, task: { title: w.title, prompt: w.task }, taskIndex: w.n - 1, tasks: req.tasks, worktree: w.worktree, folder: w.folder, branch: w.branch, cwd: parent.cwd, isolate, mode: req.mode, memoryPath, note: req.note, excerpt }),
     }));
     for (const { w, text } of briefs) {
+      // The first tasks go out with the brief; each is `running` from the moment it is sent.
+      claim(rec, w, rec.tasks[w.n - 1]);
       const r = await runner.deliver(store.getSession(w.sessionId), text, { note: '叢集派工簡報' });
       if (r?.ok === false) throw fail(502, `w${w.n} 沒有收到簡報：${r.error || 'Kimi 沒有回應'}`);
     }
 
     rec.phase = null;
+    // A worker that was quick may have finished its first task while the others were still being briefed.
+    const pairs = assign(rec);
     parent.clusterIds = [...(parent.clusterIds || []), cid];
     store.saveSession(parent, { touch: false });
     persist(rec);
@@ -608,6 +968,7 @@ export async function create(parentNode, body) {
       if (s) broadcast({ t: 'session', session: runner.summarize(s) });
     }
     announce(rec, { force: true });
+    handOut(rec, pairs);
     return { cluster: publicCluster(rec), warnings: [...warnings] };
   } catch (err) {
     await recycle(rec, made).catch((e) => console.warn(`[cluster] ${cid} not fully cleaned up: ${e.message}`));
@@ -615,7 +976,7 @@ export async function create(parentNode, body) {
   }
 }
 
-function memoryHeader(rec, tasks) {
+function memoryHeader(rec, tasks, workers = tasks.length) {
   return [
     `# 叢集記憶 ${rec.id}`,
     '',
@@ -624,7 +985,8 @@ function memoryHeader(rec, tasks) {
     '',
     '## 任務',
     '',
-    ...tasks.map((t, i) => `- w${i + 1}：${t.title}`),
+    // One task per worker: the worker is the task's name. More tasks than workers: they are numbered, and whoever is free takes the next.
+    ...tasks.map((t, i) => (tasks.length > workers ? `- 第 ${i + 1} 條：${t.title}` : `- w${i + 1}：${t.title}`)),
     '',
   ].join('\n');
 }
@@ -672,6 +1034,14 @@ async function recycle(rec, made) {
 
 export async function stop(cid) {
   const rec = getRecord(cid);
+  // From here on nothing new is handed out (a stop ends the dispatching for
+  // good: tasks that were never sent stay waiting). This is set BEFORE any
+  // worker is interrupted: the turn that ends because of the interrupt must not
+  // be followed by the next task. A cluster with nothing working and nothing
+  // waiting is left as it is.
+  const open = tasksOf(rec).some((t) => t.status === 'pending' || t.status === 'running');
+  const working = rec.workers.some((w) => WORKING.includes(leafOfWorker(w)?.status));
+  if (open || working) rec.halted = true;
   let any = false;
   for (const w of rec.workers) {
     const s = leafOfWorker(w);
@@ -683,7 +1053,7 @@ export async function stop(cid) {
       console.warn(`[cluster] ${cid}: ${s.id} not interrupted: ${err.message}`);
     });
   }
-  if (any) rec.stoppedAt = now();
+  if (any || open) rec.stoppedAt = now();
   persist(rec);
   announce(rec, { force: true });
   return publicCluster(rec);
@@ -712,6 +1082,7 @@ export async function stop(cid) {
 // that fails leaves that worker as it was and the next worker is done.
 const CLEAN_TIMEOUT_MS = 120_000;
 const WHY_RUNNING = '工作者還在跑';
+const WHY_QUEUE = '工作者還在跑：佇列還有任務沒做完';
 
 const chainNodes = (leaf) => {
   try {
@@ -879,7 +1250,7 @@ async function applyDecision(rec, w, d) {
 // One worker: decide (and, unless `dry`, do) what its clean-up is.
 async function cleanWorker(rec, w, { dry }) {
   const leaf = leafOfWorker(w);
-  const keepWhy = leaf && WORKING.includes(leaf.status) ? WHY_RUNNING : rec.merge?.results?.some((r) => r.sessionId === w.sessionId && !r.ok) ? '合併時沒合進去（衝突或失敗），分支與 worktree 留給你處理' : '';
+  const keepWhy = leaf && WORKING.includes(leaf.status) ? WHY_RUNNING : queueOpen(rec) ? WHY_QUEUE : rec.merge?.results?.some((r) => r.sessionId === w.sessionId && !r.ok) ? '合併時沒合進去（衝突或失敗），分支與 worktree 留給你處理' : '';
   const base = { sessionId: w.sessionId, worktree: null, branch: null, hidden: false, reasons: [] };
   let result;
   let did = { worktree: false, branch: false };
@@ -939,6 +1310,7 @@ function checkCleanable(rec) {
   if (rec.phase) throw fail(409, rec.phase === 'merging' ? '正在合併中，等它完成再清理' : '叢集還在建立中');
   if (cleaning.has(rec.id)) throw fail(409, '正在清理中');
   if (rec.workers.some((w) => WORKING.includes(leafOfWorker(w)?.status))) throw fail(409, '工作者還在跑，先全部停止');
+  if (queueOpen(rec)) throw fail(409, '工作者還在跑：佇列還有任務沒做完，等它們做完或先全部停止');
   if (rec.repo && !machines.getMachine(rec.machineId)?.online) throw fail(409, `機器「${machines.getMachine(rec.machineId)?.name || rec.machineId}」目前離線：請在那台機器上執行連接器`);
 }
 
@@ -970,6 +1342,7 @@ export async function cleanupPlan(cid) {
 // After a merge in which every worker went in. A worker still at work is left
 // whole (and says so); a clean-up that goes wrong never undoes the merge.
 async function autoCleanup(rec) {
+  if (queueOpen(rec)) return; // a worker between two tasks still needs its worktree
   if (!rec.merge || !rec.workers.length || rec.merge.results.length !== rec.workers.length || !rec.merge.results.every((r) => r.ok)) return;
   if (cleaning.has(rec.id)) return;
   cleaning.add(rec.id);
@@ -1078,11 +1451,14 @@ export async function merge(cid) {
     persist(rec);
     announceMerge(rec, head.output.trim());
     announce(rec, { force: true });
+    // Tasks that waited while the branches were merged go on.
+    pump(rec);
   } catch (err) {
     // Half a merge is not kept: what this attempt made goes, so it can be tried again.
     await run(`${created.tree ? `${gitIn(dir, `worktree remove --force ${mem.quote(tree)}`, { quiet: true })}; ` : ''}${gitIn(dir, 'worktree prune', { quiet: true })}; ${gitIn(dir, `branch -D ${mem.quote(branch)}`, { quiet: true })}; true`).catch(() => {});
     rec.phase = null;
     announce(rec, { force: true });
+    pump(rec);
     throw err.status ? err : fail(502, err.message || String(err));
   }
   // Outside the try above: whatever happens in the clean-up must never take the

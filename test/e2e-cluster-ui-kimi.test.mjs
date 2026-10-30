@@ -337,7 +337,7 @@ test('real Kimi: 全部停止 cuts a turn Kimi is really in the middle of; the p
   await until(async () => (await session(quick.sessionId)).status === 'idle' && (await session(quick.sessionId)).events.some((e) => e.type === 'turn_end'), 30000, 'the quick one done');
   await until(async () => (await session(stuck.sessionId)).status === 'running' && hung.size >= 1, 30000, 'the other one in the middle of its turn, the model not answering');
   await b.waitFor(`document.querySelector('.cluster-worker[data-session="${quick.sessionId}"] .cluster-worker-state').innerText.trim() === '已完成' && document.querySelector('.cluster-worker[data-session="${stuck.sessionId}"] .cluster-worker-state').innerText.trim() === '執行中'`, { timeout: 15000 });
-  assert.equal(await b.eval(`document.querySelector('.cluster-progress').innerText.trim()`), '1/2 完成');
+  assert.equal(await b.eval(`document.querySelector('.cluster-progress').innerText.trim()`), '任務 1/2 完成');
   await shot('k4-one-stuck-real-kimi-1280-light.png');
 
   await b.click('[data-action="stop"]');
@@ -346,7 +346,7 @@ test('real Kimi: 全部停止 cuts a turn Kimi is really in the middle of; the p
   const states = await b.eval(`Object.fromEntries([...document.querySelectorAll('.cluster-worker')].map((x) => [x.dataset.session, x.querySelector('.cluster-worker-state').innerText.trim()]))`);
   assert.equal(states[quick.sessionId], '已完成');
   assert.notEqual(states[stuck.sessionId], '已完成', 'a worker that was cut off did not finish');
-  assert.equal(await b.eval(`document.querySelector('.cluster-progress').innerText.trim()`), '1/2 完成');
+  assert.equal(await b.eval(`document.querySelector('.cluster-progress').innerText.trim()`), '任務 1/2 完成');
   const api2 = await getCluster(c.id);
   assert.equal(api2.status, 'stopped');
   assert.equal(api2.workers.find((w) => w.sessionId === stuck.sessionId).finishedAt, null);
@@ -357,5 +357,5 @@ test('real Kimi: 全部停止 cuts a turn Kimi is really in the middle of; the p
   // It can be sent on: the cluster runs again and ends done.
   await api('POST', `/sessions/${stuck.sessionId}/messages`, { text: '改做別的事，很快就好' });
   await b.waitFor(`document.querySelector('[data-field="status"]').innerText.trim() === '已完成'`, { timeout: 40000, label: 'done once the stopped worker has been through a turn' });
-  assert.equal(await b.eval(`document.querySelector('.cluster-progress').innerText.trim()`), '2/2 完成');
+  assert.equal(await b.eval(`document.querySelector('.cluster-progress').innerText.trim()`), '任務 2/2 完成');
 });

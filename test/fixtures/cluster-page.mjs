@@ -49,17 +49,18 @@ export function clusterPage({ b, base, cluster }) {
     },
     submitDialog: () => b.click('.cluster-dialog button[type="submit"]'),
     // Dispatch `tasks` ([{ title, prompt }], a title may be '') from `parent` through the screen; returns the cluster as the Hub has it.
-    async dispatch(parent, tasks, { note, fork = false, isolate = true } = {}) {
+    async dispatch(parent, tasks, { note, fork = false, isolate = true, workers = null } = {}) {
       await page.openDialog(parent.id);
       for (let i = 1; i < tasks.length; i++) await b.click('[data-action="add-task"]');
       for (const [i, t] of tasks.entries()) await page.fillTask(i, t.title, t.prompt);
       if (note) await page.typeInto('textarea[name="note"]', note);
+      if (workers !== null) await page.typeInto('input[name="workers"]', String(workers));
       if (fork) await b.eval(`[...document.querySelectorAll('[data-field="mode"] button')].find((x) => x.innerText.includes('完整分叉')).click()`);
       if (!isolate) await b.click('input[name="isolate"]');
       await page.submitDialog();
       await b.waitFor(`/^#\\/cluster\\//.test(location.hash)`, { timeout: 30000 });
       const cid = await b.eval('location.hash.slice(10)');
-      await b.waitFor(`document.querySelectorAll('.cluster-worker').length === ${tasks.length}`);
+      await b.waitFor(`document.querySelectorAll('.cluster-worker').length === ${workers ?? Math.min(tasks.length, 4)}`);
       return cluster(cid);
     },
   };

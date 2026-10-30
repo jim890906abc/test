@@ -231,7 +231,7 @@ test('with the computer off, the menu item is greyed out and /cluster says why i
 
 // ------------------------------------------------------------ dispatch dialog
 
-test('the dialog starts as the spec says and sends exactly spec §2: tasks, mode, isolate, swarm', { skip }, async () => {
+test('the dialog starts as the spec says and sends exactly spec §2: tasks, mode, isolate, swarm, workers', { skip }, async () => {
   await setFake();
   await openDialog();
   await ui.clearCalls();
@@ -262,6 +262,7 @@ test('the dialog starts as the spec says and sends exactly spec §2: tasks, mode
     mode: 'brief',
     isolate: true,
     swarm: true,
+    workers: 2,
   });
   await b.waitFor(`document.body.innerText.includes('不是 git 專案')`);
   assert.equal(await b.eval(`Boolean(document.querySelector('.cluster-dialog'))`), false, 'the dialog is gone');
@@ -299,27 +300,27 @@ test('every choice reaches the body: fork, no worktrees, Kimi\'s own swarm mode 
   await b.waitFor(`window.__calls.some((c) => /\\/cluster$/.test(c.url))`);
   const [post] = await clusterPosts();
   assert.equal(post.url, '/api/sessions/s_ds/cluster', 'for THIS conversation');
-  assert.deepEqual(post.body, { tasks: [{ title: 'A', prompt: 'do a' }], mode: 'fork', isolate: false, swarm: false, note: '先讀 README，再動手' });
+  assert.deepEqual(post.body, { tasks: [{ title: 'A', prompt: 'do a' }], mode: 'fork', isolate: false, swarm: false, workers: 1, note: '先讀 README，再動手' });
   await ui.stopAnswering();
 });
 
-test('1 to 8 tasks: the last one cannot be removed, a ninth cannot be added, and a task with nothing in it is not sent', { skip }, async () => {
+test('1 to 64 tasks: the last one cannot be removed, a 65th cannot be added, and a task with nothing in it is not sent', { skip }, async () => {
   await setFake();
   await openDialog();
   await ui.clearCalls();
   const state = () => b.eval(`({ n: document.querySelectorAll('.cluster-task').length, addDisabled: document.querySelector('[data-action="add-task"]').disabled, removeDisabled: [...document.querySelectorAll('[data-action="remove-task"]')].map((x) => x.disabled), count: document.querySelector('.cluster-count')?.innerText.trim() })`);
   let s = await state();
-  assert.deepEqual([s.n, s.addDisabled, s.removeDisabled, s.count], [1, false, [true], '1 / 8']);
-  for (let i = 1; i < 8; i++) await b.click('[data-action="add-task"]');
+  assert.deepEqual([s.n, s.addDisabled, s.removeDisabled, s.count], [1, false, [true], '1 / 64']);
+  for (let i = 1; i < 64; i++) await b.click('[data-action="add-task"]');
   s = await state();
-  assert.deepEqual([s.n, s.addDisabled, s.count], [8, true, '8 / 8'], 'eight is the most');
+  assert.deepEqual([s.n, s.addDisabled, s.count], [64, true, '64 / 64'], 'sixty-four is the most');
   assert.ok(s.removeDisabled.every((d) => d === false));
   // Task 3 is removed: the numbering closes up.
   await fillTask(2, 'gone', 'x');
   await b.eval(`document.querySelectorAll('[data-action="remove-task"]')[2].click()`);
   s = await state();
-  assert.equal(s.n, 7);
-  assert.equal(await b.eval(`[...document.querySelectorAll('.cluster-task')].map((t) => t.querySelector('.cluster-task-no').innerText.trim()).join()`), '任務 1,任務 2,任務 3,任務 4,任務 5,任務 6,任務 7');
+  assert.equal(s.n, 63);
+  assert.equal(await b.eval(`[...document.querySelectorAll('.cluster-task')].map((t) => t.querySelector('.cluster-task-no').innerText.trim()).join()`), Array.from({ length: 63 }, (_, i) => `任務 ${i + 1}`).join());
   assert.equal(await b.eval(`[...document.querySelectorAll('.cluster-task input[name="task-title"]')].some((i) => i.value === 'gone')`), false);
   // Only the first has something to do: the form refuses, says which, and sends nothing.
   await fillTask(0, 'one', 'do one');

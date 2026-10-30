@@ -5774,6 +5774,131 @@ pre.tail {
   gap: var(--space-1);
 }
 
+/* the queue: more tasks than workers (cluster-queue) */
+.cluster-lines textarea {
+  min-height: 72px;
+}
+.cluster-lines-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2) var(--space-3);
+}
+.cluster-lines-foot .om-field__help {
+  flex: 1 1 200px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.cluster-lines-foot .om-field__help:empty {
+  display: none;
+}
+.cluster-workers-input {
+  width: 96px;
+  font-variant-numeric: tabular-nums;
+}
+/* Many tasks: the list scrolls inside the dialog instead of making the dialog a mile long. */
+.cluster-tasks {
+  max-height: min(46vh, 420px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding-right: var(--space-1);
+}
+.cluster-advice {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.cluster-advice:empty {
+  display: none;
+}
+.cluster-advice-item {
+  background: var(--accent-soft);
+  color: var(--ink);
+}
+.cluster-advice-item .om-icon {
+  color: var(--accent);
+}
+.cluster-worker-queue {
+  margin: 0;
+  font-size: 12px;
+  line-height: 17px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.cluster-worker-queue[hidden] {
+  display: none;
+}
+.cluster-queue {
+  padding: var(--space-4);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--window-raised);
+  box-shadow: var(--shadow-card);
+}
+.cluster-queue-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  max-height: 420px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+.cluster-queue-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space-2) var(--space-3);
+  min-width: 0;
+}
+.cluster-queue-row + .cluster-queue-row {
+  border-top: 1px solid var(--line);
+}
+.cluster-queue-main {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.cluster-queue-no {
+  flex: none;
+  min-width: 28px;
+  font-size: 12px;
+  color: var(--ink-secondary);
+  font-variant-numeric: tabular-nums;
+}
+.cluster-queue-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  line-height: 18px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cluster-queue-times,
+.cluster-queue-note {
+  margin: 0;
+  padding-left: calc(28px + var(--space-2));
+  font-size: 11px;
+  line-height: 16px;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+/* A part with nothing in it takes no room (and no gap) on the page. */
+.cluster-queue-slot:empty,
+.cluster-merge-slot:empty,
+.cluster-cleanup-slot:empty {
+  display: none;
+}
+.cluster-queue-row[data-status='pending'] .cluster-queue-title {
+  color: var(--ink-secondary);
+}
+
 /* the note on a main conversation and on a worker, the list of clusters, the sidebar tag */
 .cluster-banner {
   align-items: center;
@@ -5834,5 +5959,24 @@ pre.tail {
   }
   .cluster-legend {
     gap: 2px var(--space-3);
+  }
+  .cluster-queue {
+    padding: var(--space-3);
+  }
+  /* the title takes its own line; the state and the worker sit under it */
+  .cluster-queue-main {
+    flex-wrap: wrap;
+  }
+  .cluster-queue-title {
+    flex: 1 0 calc(100% - 28px - var(--space-2));
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .cluster-queue-times,
+  .cluster-queue-note {
+    padding-left: 0;
+  }
+  .cluster-tasks {
+    max-height: 40vh;
   }
 }

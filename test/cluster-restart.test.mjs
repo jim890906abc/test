@@ -173,3 +173,56 @@ test('a clean-up is on disk as soon as it is done, not only when the Hub is stop
   const sessionFile = path.join(hub.DATA, 'sessions', `${c.workers[0].sessionId}.json`);
   await until(async () => JSON.parse(fs.readFileSync(sessionFile, 'utf8')).clusterHidden === true, 8000, 'the hidden flag on disk');
 });
+
+test('the queue survives a Hub restart: who did what, and what is still waiting; a turn that ended while the Hub was away is settled and the queue goes on - every task is sent once, none of the finished ones again', async () => {
+  const first = await start('cluster-queue-restart-1');
+  const repo = path.join(first.TMP, 'repo');
+  fs.mkdirSync(repo, { recursive: true });
+  git(repo, 'init', '-q', '-b', 'main');
+  fs.writeFileSync(path.join(repo, 'a.txt'), 'x\n');
+  git(repo, 'add', '-A');
+  git(repo, 'commit', '-q', '-m', 'first');
+  const { groups } = await first.api('GET', '/models?machine=m_fake');
+  const m = groups.find((g) => g.provider === 'kimi').models[0];
+  const parent = await first.api('POST', '/sessions', { provider: 'kimi', machineId: 'm_fake', cwd: repo, model: m.id, effort: m.efforts[0], permission: 'auto' });
+  const tasks = Array.from({ length: 6 }, (_, i) => ({ title: `任務 ${i + 1}`, prompt: `做第 ${i + 1} 條 TASK_MARK_${i}_END` }));
+  const markOf = (hub, kid) => hub.machine.prompts.filter((p) => p.sid === kid).map((p) => /TASK_MARK_(\d+)_END/.exec(p.body.content.map((c) => c.text || '').join('\n'))?.[1]);
+  first.machine.autoReply = false;
+  const { cluster: c } = await first.api('POST', `/sessions/${parent.id}/cluster`, { tasks, workers: 2 });
+  const [w1, w2] = c.workers;
+  const k1 = (await snap(first, w1.sessionId)).kimiSessionId;
+  // w1 reports its first task, so it is on its second (task 2) when the Hub goes.
+  first.machine.reply(k1, first.machine.prompts.filter((p) => p.sid === k1)[0].body.prompt_id, '回報');
+  await until(async () => (await first.api('GET', `/clusters/${c.id}`)).tasks[2].status === 'running', 8000, 'w1 on its second task');
+  const before = await first.api('GET', `/clusters/${c.id}`);
+  assert.deepEqual(before.tasks.map((t) => t.status), ['done', 'running', 'running', 'pending', 'pending', 'pending'], 'the premise');
+
+  await first.halt();
+  const keep = fs.mkdtempSync(path.join(os.tmpdir(), 'cluster-queue-keep-'));
+  fs.cpSync(first.DATA, keep, { recursive: true });
+  const second = await start('cluster-queue-restart-2', keep);
+  fs.rmSync(keep, { recursive: true, force: true });
+
+  // The Hub is back, the computer is not yet listing its conversations: the queue is as it was left.
+  const back = await second.api('GET', `/clusters/${c.id}`);
+  assert.deepEqual(back.tasks.map((t) => [t.index, t.status, t.workerSessionId, t.startedAt, t.finishedAt, t.attempts]), before.tasks.map((t) => [t.index, t.status, t.workerSessionId, t.startedAt, t.finishedAt, t.attempts]), 'every task, its worker and its times came back');
+  assert.equal(back.status, 'running', 'with tasks still to do the cluster is not done');
+  await assert.rejects(second.api('POST', `/clusters/${c.id}/cleanup`), (e) => e.status === 409 && /佇列還有任務/.test(e.message), 'clean-up counts the waiting queue as work, even with every worker quiet');
+
+  // The computer lists its conversations (Kimi is not working on any of them): the turns that ended while nobody was
+  // listening are settled, and the queue goes on to the end.
+  for (const [sid, st] of first.machine.sessions.entries()) second.machine.add(sid, { ...st, history: (st.history || []).map((h) => ({ ...h })) });
+  second.machine.pushSessions();
+  const done = await until(async () => {
+    const x = await second.api('GET', `/clusters/${c.id}`);
+    return x.status === 'done' && x.tasks.every((t) => t.status === 'done') && x;
+  }, 20000, 'the queue finished after the restart');
+  const kids = [k1, (await snap(second, w2.sessionId)).kimiSessionId];
+  const sentAfter = kids.flatMap((k) => markOf(second, k));
+  assert.deepEqual(sentAfter.map(Number).sort((a, b) => a - b), [3, 4, 5], 'only the waiting tasks were sent after the restart, each once');
+  assert.equal(done.workers[0].done + done.workers[1].done, 6);
+  assert.equal(done.tasks[0].workerSessionId, w1.sessionId, 'who did what is kept');
+  assert.equal(done.tasks[1].workerSessionId, w2.sessionId);
+  assert.ok(done.tasks[0].finishedAt === before.tasks[0].finishedAt, 'the time of a task finished before the restart is the one measured then');
+  assert.ok(done.tasks[1].startedAt === before.tasks[1].startedAt);
+});

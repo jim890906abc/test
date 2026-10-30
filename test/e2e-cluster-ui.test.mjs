@@ -267,7 +267,7 @@ test('a worker finishing its turn reaches the open page by itself (socket, no re
   await b.waitFor(`document.querySelector('.cluster-worker[data-session="${w1.sessionId}"] .cluster-worker-state')?.innerText.trim() === '已完成'`, { label: 'w1 reads 已完成 without a reload' });
   assert.equal((await cards())[1].state, '執行中', 'the other one is still at work');
   let head = await b.eval(`({ status: document.querySelector('[data-field="status"]').innerText.trim(), text: document.querySelector('.cluster-progress').innerText.trim() })`);
-  assert.deepEqual(head, { status: '進行中', text: '1/2 完成' });
+  assert.deepEqual(head, { status: '進行中', text: '任務 1/2 完成' });
   // Its progress line is the Hub's own one-line reading of its last words.
   const api1 = (await getCluster(S.c.id)).workers[0];
   assert.match(api1.progress, /W1_DONE_LINE/);
@@ -277,7 +277,7 @@ test('a worker finishing its turn reaches the open page by itself (socket, no re
   hub.machine.reply(S.k[1], f2.body.prompt_id, '乙的簡報');
   await b.waitFor(`document.querySelector('[data-field="status"]').innerText.trim() === '已完成'`, { label: 'the cluster reads 已完成' });
   head = await b.eval(`document.querySelector('.cluster-progress').innerText.trim()`);
-  assert.equal(head, '2/2 完成');
+  assert.equal(head, '任務 2/2 完成');
   assert.equal((await cards()).map((c) => c.state).join(), '已完成,已完成');
   assert.equal((await getCluster(S.c.id)).status, 'done', 'and that is what the Hub says');
   // The stop button has nothing to stop any more.
@@ -647,7 +647,7 @@ test('after 全部停止 a worker that was cut off in the middle is not 已完�
   const kc = await kidOf(cut.sessionId);
   hub.machine.reply(kd, prompts(kd)[0].body.prompt_id, '簡報');
   await b.waitFor(`document.querySelector('.cluster-worker[data-session="${done.sessionId}"] .cluster-worker-state').innerText.trim() === '已完成'`);
-  assert.equal(await b.eval(`document.querySelector('.cluster-progress').innerText.trim()`), '1/2 完成');
+  assert.equal(await b.eval(`document.querySelector('.cluster-progress').innerText.trim()`), '任務 1/2 完成');
 
   await b.click('[data-action="stop"]');
   await confirm();
@@ -657,19 +657,19 @@ test('after 全部停止 a worker that was cut off in the middle is not 已完�
   const states = await b.eval(`Object.fromEntries([...document.querySelectorAll('.cluster-worker')].map((c) => [c.dataset.session, c.querySelector('.cluster-worker-state').innerText.trim()]))`);
   assert.equal(states[done.sessionId], '已完成', 'it had finished before the stop');
   assert.notEqual(states[cut.sessionId], '已完成', 'it did not finish: it was stopped');
-  assert.equal(await b.eval(`document.querySelector('.cluster-progress').innerText.trim()`), '1/2 完成', 'only the one that finished is counted');
+  assert.equal(await b.eval(`document.querySelector('.cluster-progress').innerText.trim()`), '任務 1/2 完成', 'only the one that finished is counted');
   const api = await getCluster(c.id);
   assert.equal(api.status, 'stopped');
   assert.equal(api.workers.find((w) => w.sessionId === cut.sessionId).finishedAt, null, 'the Hub does not say it finished');
   assert.ok(api.workers.find((w) => w.sessionId === done.sessionId).finishedAt);
   // The merge button tells that one worker is not done.
-  assert.match(await b.eval(`document.querySelector('[data-action="merge"]').title`), /還有 1 個工作者沒做完/);
+  assert.match(await b.eval(`document.querySelector('[data-action="merge"]').title`), /1 條任務失敗或被中斷/);
   // Going on with the stopped worker (a message to it) makes the cluster a running one again.
   await hub.api('POST', `/sessions/${cut.sessionId}/messages`, { text: '接著做' });
   await b.waitFor(`document.querySelector('[data-field="status"]').innerText.trim() === '進行中'`, { label: 'running again' });
   hub.machine.reply(kc, prompts(kc).at(-1).body.prompt_id, '接著做');
   await b.waitFor(`document.querySelector('[data-field="status"]').innerText.trim() === '已完成'`, { label: 'done once it has finished' });
-  assert.equal(await b.eval(`document.querySelector('.cluster-progress').innerText.trim()`), '2/2 完成');
+  assert.equal(await b.eval(`document.querySelector('.cluster-progress').innerText.trim()`), '任務 2/2 完成');
 });
 
 // ------------------------------------------------------- other kinds of folder
@@ -847,11 +847,11 @@ test('a cluster that does not exist says so with a way to try again; a task titl
   assert.equal((await clustersOf(parent.id)).length, before, 'nothing was made');
 });
 
-test('eight tasks make eight workers (the most), each with its worktree, and the page and the sidebar hold them', { skip }, async () => {
+test('eight workers (the most) when asked for, each with its worktree, and the page and the sidebar hold them', { skip }, async () => {
   const parent = await newKimi(S.repo);
   await idle(parent.id);
   const titles = Array.from({ length: 8 }, (_, i) => `並行任務 ${i + 1}`);
-  const c = await dispatchFromScreen(parent, titles);
+  const c = await dispatchFromScreen(parent, titles, { workers: 8 });
   assert.equal(c.workers.length, 8);
   assert.deepEqual(c.workers.map((w) => w.title), titles);
   assert.equal((await cards()).length, 8);
@@ -865,7 +865,7 @@ test('eight tasks make eight workers (the most), each with its worktree, and the
     const kid = await kidOf(w.sessionId);
     hub.machine.reply(kid, prompts(kid)[0].body.prompt_id, '簡報');
   }
-  await b.waitFor(`document.querySelector('[data-field="status"]').innerText.trim() === '已完成' && document.querySelector('.cluster-progress').innerText.trim() === '8/8 完成'`);
+  await b.waitFor(`document.querySelector('[data-field="status"]').innerText.trim() === '已完成' && document.querySelector('.cluster-progress').innerText.trim() === '任務 8/8 完成'`);
 });
 
 // ------------------------------------------- coming back to what was dispatched
