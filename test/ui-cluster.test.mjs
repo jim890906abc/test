@@ -1049,10 +1049,13 @@ for (const L of LOOKS) {
     await ui.stopAnswering();
 
     // The sidebar tag (plain, on the open row and under the pointer) and the notes on a conversation.
+    // A cluster's workers are not listed in the sidebar (a search finds them by name, and the open one is listed): the plain tag is read on the row a search finds.
     await open('#/s/s_kimi');
     await b.waitFor(`document.querySelector('.composer-input')`);
     await b.eval(`window.__emit(${JSON.stringify({ t: 'cluster', cluster: CLUSTER() })})`);
-    await b.waitFor(`document.querySelector('.cluster-banner') && document.querySelector('.row-tag.cluster')`);
+    await b.waitFor(`document.querySelector('.cluster-banner')`);
+    await b.eval(`(() => { const i = document.querySelector('.side-search input'); i.value = 'DeepSeek'; i.dispatchEvent(new Event('input')); })()`);
+    await b.waitFor(`document.querySelector('.row-tag.cluster')`);
     const tag = await b.eval(`(${CONTRAST_JS})(document.querySelector('.row-tag.cluster'))`);
     const bad = [];
     if (tag.ratio < AA) bad.push(`sidebar tag ${tag.ratio.toFixed(2)}:1`);

@@ -287,6 +287,7 @@ __export(store_exports, {
   DATA_DIR: () => DATA_DIR,
   GuardedConfig: () => GuardedConfig,
   ROOT_DIR: () => ROOT_DIR,
+  SAVE_PACING: () => SAVE_PACING,
   SETTINGS_FILE: () => SETTINGS_FILE,
   WORKSPACES_DIR: () => WORKSPACES_DIR,
   annotate: () => annotate,
@@ -433,6 +434,11 @@ function deleteAgent(id) {
   agents = agents.filter((a) => a.id !== id);
   saveAgents({ explicit: true });
 }
+function saveDelayFor(id) {
+  const cost = writeCost.get(id);
+  if (!cost || cost.chars < SAVE_BIG_CHARS) return SAVE_DELAY;
+  return Math.min(SAVE_MAX_DEFER, Math.max(SAVE_DELAY, cost.ms * SAVE_DUTY));
+}
 function loadSessions() {
   damagedFiles = [];
   for (const file of fs.readdirSync(SESSIONS_DIR)) {
@@ -451,6 +457,7 @@ function loadSessions() {
       migrateSession(s);
       sessions.set(s.id, s);
       indexNative(s);
+      noteLoaded(s.id, fileSize(file) ?? 0);
     } catch (err) {
       noteDamaged({ file, code: "bad-structure", reason: `\u5167\u5BB9\u4E0D\u50CF\u4E00\u500B\u5C0D\u8A71\uFF1A${err.message}`, bytes: fileSize(file), backup: null });
     }
@@ -755,16 +762,30 @@ function quietly(fn) {
 }
 function saveSession(session, { immediate = false, touch: touch2 = true } = {}) {
   if (touch2 && !quiet) session.updatedAt = Date.now();
+  const on = TURN_ON.has(session.status);
+  const turnEnded = turnWasOn.get(session) === true && !on;
+  turnWasOn.set(session, on);
   if (immediate) return saveSessionNow(session);
-  if (saveTimers.has(session.id)) return;
-  saveTimers.set(
-    session.id,
-    setTimeout(() => saveSessionNow(session), SAVE_DELAY)
-  );
+  if (!turnEnded) return scheduleSave(session, saveDelayFor(session.id));
+  const now = Date.now();
+  const last = turnEndFlushedAt.get(session) || 0;
+  if (last > now) return;
+  const at = Math.max(now, last + SAVE_DELAY);
+  turnEndFlushedAt.set(session, at);
+  if (at === now) saveSessionNow(session);
+  else scheduleSave(session, at - now);
+}
+function scheduleSave(session, delay) {
+  const due = Date.now() + delay;
+  const waiting = saveTimers.get(session.id);
+  if (waiting) {
+    if (waiting.due <= due) return;
+    clearTimeout(waiting.timer);
+  }
+  saveTimers.set(session.id, { due, timer: setTimeout(() => saveSessionNow(session), delay) });
 }
 function saveSessionNow(session) {
-  clearTimeout(saveTimers.get(session.id));
-  saveTimers.delete(session.id);
+  dropTimer(session.id);
   if (!sessions.has(session.id)) return;
   const busy = saving.get(session.id);
   if (busy) return void (busy.again = true);
@@ -796,11 +817,14 @@ async function writeSession(session) {
   const file = sessionFile(session.id);
   const tmp = `${file}.${process.pid}.w.tmp`;
   const { view: view2, landed } = forWriting(session);
+  const t0 = performance.now();
+  let chars = 0;
   const fh = await fs.promises.open(tmp, "w", 384);
   let complete = false;
   try {
     for await (const part of jsonParts(view2, "events")) {
       if (!sessions.has(session.id)) return;
+      chars += part.length;
       await fh.write(part);
     }
     await fh.sync();
@@ -814,6 +838,7 @@ async function writeSession(session) {
   fs.renameSync(tmp, file);
   landed();
   await fsyncDir(SESSIONS_DIR);
+  if (sessions.has(session.id)) writeCost.set(session.id, { chars, ms: performance.now() - t0 });
 }
 async function* jsonParts(obj, key, { slice = 200, chars = 256 * 1024 } = {}) {
   const list = obj[key] || [];
@@ -845,8 +870,8 @@ async function jsonInSlices(obj, key, slice = 200) {
   return parts.join("");
 }
 function deleteSession(id) {
-  clearTimeout(saveTimers.get(id));
-  saveTimers.delete(id);
+  dropTimer(id);
+  writeCost.delete(id);
   const gone = sessions.get(id);
   if (gone && nativeIndex.get(nativeKey(gone.machineId, gone.kimiSessionId)) === id) nativeIndex.delete(nativeKey(gone.machineId, gone.kimiSessionId));
   sessions.delete(id);
@@ -854,8 +879,7 @@ function deleteSession(id) {
 }
 function flushAll() {
   for (const id of /* @__PURE__ */ new Set([...saveTimers.keys(), ...saving.keys()])) {
-    clearTimeout(saveTimers.get(id));
-    saveTimers.delete(id);
+    dropTimer(id);
     const s = sessions.get(id);
     if (!s) continue;
     const tmp = `${sessionFile(id)}.${process.pid}.tmp`;
@@ -880,7 +904,7 @@ function migrateSettings(name, change) {
   st2.migrated = [...st2.migrated || [], name];
   return settingsFile.writeIfAllowed(st2);
 }
-var ROOT_DIR, DATA_DIR, WORKSPACES_DIR, SESSIONS_DIR, AGENTS_FILE, DAMAGED_CONFIG_DIR, ConfigBlockedError, GuardedConfig, agents, agentsFile, sessions, saveTimers, saving, SAVE_DELAY, DAMAGED_DIR, damagedFiles, fileSize, SESSION_ORIGINS, nativeIndex, nativeKey, quiet, sessionFile, SETTINGS_FILE, settingsFile;
+var ROOT_DIR, DATA_DIR, WORKSPACES_DIR, SESSIONS_DIR, AGENTS_FILE, DAMAGED_CONFIG_DIR, ConfigBlockedError, GuardedConfig, agents, agentsFile, sessions, saveTimers, saving, SAVE_DELAY, SAVE_BIG_CHARS, SAVE_DUTY, maxDeferEnv, SAVE_MAX_DEFER, SAVE_PACING, writeCost, GUESS_MS_PER_CHAR, noteLoaded, TURN_ON, turnWasOn, turnEndFlushedAt, DAMAGED_DIR, damagedFiles, fileSize, SESSION_ORIGINS, nativeIndex, nativeKey, quiet, dropTimer, sessionFile, SETTINGS_FILE, settingsFile;
 var init_store = __esm({
   "server/store.js"() {
     init_presets();
@@ -993,6 +1017,17 @@ var init_store = __esm({
     saveTimers = /* @__PURE__ */ new Map();
     saving = /* @__PURE__ */ new Map();
     SAVE_DELAY = 1500;
+    SAVE_BIG_CHARS = 2 * 1024 * 1024;
+    SAVE_DUTY = 60;
+    maxDeferEnv = process.env.AGENT_HUB_SAVE_MAX_DEFER_MS;
+    SAVE_MAX_DEFER = Math.max(SAVE_DELAY, maxDeferEnv !== void 0 && maxDeferEnv !== "" && Number.isFinite(Number(maxDeferEnv)) ? Number(maxDeferEnv) : 15e3);
+    SAVE_PACING = { delayMs: SAVE_DELAY, bigChars: SAVE_BIG_CHARS, duty: SAVE_DUTY, maxDeferMs: SAVE_MAX_DEFER };
+    writeCost = /* @__PURE__ */ new Map();
+    GUESS_MS_PER_CHAR = 5e-6;
+    noteLoaded = (id, chars) => writeCost.set(id, { chars, ms: chars * GUESS_MS_PER_CHAR });
+    TURN_ON = /* @__PURE__ */ new Set(["running", "awaiting_permission"]);
+    turnWasOn = /* @__PURE__ */ new WeakMap();
+    turnEndFlushedAt = /* @__PURE__ */ new WeakMap();
     DAMAGED_DIR = path.join(DATA_DIR, "sessions-damaged");
     damagedFiles = [];
     fileSize = (file) => {
@@ -1006,6 +1041,10 @@ var init_store = __esm({
     nativeIndex = /* @__PURE__ */ new Map();
     nativeKey = (machineId, kimiSessionId) => `${machineId}:${kimiSessionId}`;
     quiet = 0;
+    dropTimer = (id) => {
+      clearTimeout(saveTimers.get(id)?.timer);
+      saveTimers.delete(id);
+    };
     sessionFile = (id) => path.join(SESSIONS_DIR, `${id}.json`);
     SETTINGS_FILE = path.join(DATA_DIR, "settings.json");
     settingsFile = new GuardedConfig(SETTINGS_FILE, {
@@ -20602,6 +20641,7 @@ var DIR = path10.resolve(argv[argv.indexOf("--dir") + 1] || path10.join(process.
 fs8.mkdirSync(DIR, { recursive: true, mode: 448 });
 process.env.AGENT_HUB_DATA = DIR;
 process.env.AGENT_HUB_WORKSPACES ||= path10.join(process.env.HOME || DIR, "agent-hub-workspaces");
+process.env.AGENT_HUB_SAVE_MAX_DEFER_MS ??= "0";
 var store = await Promise.resolve().then(() => (init_store(), store_exports));
 var account = await Promise.resolve().then(() => (init_claude_account(), claude_account_exports));
 var claude = await Promise.resolve().then(() => (init_claude(), claude_exports));

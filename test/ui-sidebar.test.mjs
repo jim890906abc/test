@@ -89,7 +89,7 @@ test('a parent whose subagent waits for approval says so on its row (summary.pen
       const real = window.fetch.bind(window);
       window.fetch = async (url, init) => {
         const res = await real(url, init);
-        if (String(url) === '/api/sessions' && !(init && init.method && init.method !== 'GET')) {
+        if (String(url).split('?')[0] === '/api/sessions' && !(init && init.method && init.method !== 'GET')) {
           const list = await res.clone().json();
           for (const s of list) if (s.id === 's_claude') s.pendingChildPermission = true;
           return new Response(JSON.stringify(list), { status: 200, headers: { 'content-type': 'application/json' } });

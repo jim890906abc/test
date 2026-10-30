@@ -24,10 +24,10 @@ import * as runner from './runner.js';
 import * as machines from './machines.js';
 import { redact } from './redact.js';
 import * as mem from './cluster-memory.js';
-import { subagentsOf } from './cluster-subagents.js';
+import { subagentsOf, stepsOfNode } from './cluster-subagents.js';
 import * as roster from './subagent-roster.js';
 import * as timing from './timing.js';
-import { summarizeCluster } from '../public/js/cluster-model.js';
+import { summarizeCluster, autoClusterName, cleanClusterName, CLUSTER_NAME_MAX } from '../public/js/cluster-model.js';
 
 export const MAX_WORKERS = 8;
 // More tasks than workers is allowed: a worker that finishes a task is given
@@ -175,12 +175,30 @@ function statusOf(rec) {
   return 'running';
 }
 
+function parentTitleOf(rec) {
+  const p = store.getSession(rec.parentId);
+  return p ? (store.leafOf(p) || p).title ?? '' : null;
+}
+
 export function publicCluster(rec) {
   const leaves = rec.workers.map(leafOfWorker);
   const chains = leaves.map((s) => (s ? store.chainOf(s) : []));
+  // 步數: the tool calls in each worker's conversation (all of its nodes, subagents' included), counted the
+  // way the conversation's cards count them. A worker whose conversation was deleted keeps the number
+  // it was last seen at (written down here, saved with the record); one never seen at all is not guessed.
+  const steps = rec.workers.map((w, i) => {
+    if (!leaves[i]) return Number.isFinite(w.stepsSeen) ? w.stepsSeen : null;
+    w.stepsSeen = chains[i].reduce((a, n) => a + stepsOfNode(n), 0);
+    return w.stepsSeen;
+  });
+  const counted = steps.filter((n) => n !== null);
   return {
     id: rec.id,
+    // The cluster's own name, never the main conversation's title.
+    name: cleanClusterName(rec.name) || autoClusterName(tasksOf(rec)) || '叢集',
     parentId: rec.parentId,
+    // The main conversation's title as it is now; null: it has been deleted.
+    parentTitle: parentTitleOf(rec),
     createdAt: rec.createdAt,
     status: statusOf(rec),
     mode: rec.mode,
@@ -189,6 +207,9 @@ export function publicCluster(rec) {
     warnings: [...rec.warnings],
     // What the whole cluster - its workers and their subagents - produced in the last minute: one window over all of their conversations (the request records tie a subagent to its worker's session id).
     throughput: timing.recentOutput(chains, { from: rec.createdAt }),
+    steps: counted.length ? counted.reduce((a, n) => a + n, 0) : null,
+    // Workers whose steps cannot be said (the conversation is gone and was never counted): not in `steps`.
+    stepsUnknown: steps.length - counted.length,
     workers: rec.workers.map((w, i) => {
       const s = leaves[i];
       // Its subagents, one entry each (an AgentSwarm's members too), judged by the conversation's own rules.
@@ -198,6 +219,7 @@ export function publicCluster(rec) {
       return {
         sessionId: w.sessionId,
         title: w.title,
+        steps: steps[i],
         task: clip(w.task, TASK_SHOWN),
         status: s ? s.status : 'deleted',
         branch: w.branch || null,
@@ -232,6 +254,8 @@ export function publicCluster(rec) {
     memory: { path: rec.memory.path, bytes: rec.memory.bytes ?? 0, updatedAt: rec.memory.updatedAt ?? null },
     merge: rec.merge || null,
     cleanup: publicCleanup(rec),
+    // Set only by a full purge that could not take everything away: the cluster is kept, marked, and the button works again.
+    purge: rec.purge ? { at: rec.purge.at, partial: Boolean(rec.purge.partial), failed: [...(rec.purge.failed || [])] } : null,
   };
 }
 
@@ -418,6 +442,9 @@ function adoptQueue(rec) {
     }));
   }
   rec.halted ??= false;
+  // A cluster from before names: named the way a new one with no name is, from
+  // its tasks (written down at its next save).
+  if (!cleanClusterName(rec.name)) rec.name = autoClusterName(rec.tasks) || '叢集';
 }
 
 const CUT_OFF = '被「全部停止」中斷了';
@@ -632,6 +659,8 @@ function reconcile(rec, w) {
 
 // A worker's conversation was deleted: its task goes back to the queue (once).
 function workerGone(cid, sessionId) {
+  // A purge deletes the conversations itself; they are not a worker that vanished.
+  if (cleaning.has(cid)) return;
   const rec = clusters.get(cid);
   const w = rec?.workers.find((x) => x.sessionId === sessionId);
   if (!w || store.getSession(sessionId) || w.out === 'deleted') return;
@@ -677,7 +706,7 @@ export function listFor(session) {
 export function listAll() {
   return [...clusters.values()]
     .sort((a, b) => b.createdAt - a.createdAt)
-    .map((rec) => ({ ...summarizeCluster(publicCluster(rec)), parentTitle: store.getSession(rec.parentId)?.title ?? null }));
+    .map((rec) => summarizeCluster(publicCluster(rec)));
 }
 
 // ------------------------------------------------------------------ memory
@@ -819,6 +848,9 @@ function parseRequest(body) {
   for (const k of ['isolate', 'swarm']) if (b[k] !== undefined && typeof b[k] !== 'boolean') throw fail(400, `${k} 必須是 true 或 false`);
   if (b.note !== undefined && typeof b.note !== 'string') throw fail(400, 'note 必須是文字');
   if ((b.note || '').length > MAX_NOTE) throw fail(400, `給全部工作者的話最多 ${MAX_NOTE} 個字`);
+  if (b.name !== undefined && b.name !== null && typeof b.name !== 'string') throw fail(400, 'name（叢集名稱）必須是文字');
+  const name = cleanClusterName(b.name);
+  if (Array.from(name).length > CLUSTER_NAME_MAX) throw fail(400, `叢集名稱最多 ${CLUSTER_NAME_MAX} 個字`);
   if (!Array.isArray(b.tasks) || !b.tasks.length) throw fail(400, '至少要有一個任務');
   if (b.tasks.length > MAX_TASKS) throw fail(400, `一個叢集最多 ${MAX_TASKS} 條任務`);
   if (b.workers !== undefined && (!Number.isInteger(b.workers) || b.workers < 1 || b.workers > MAX_WORKERS)) throw fail(400, `workers（工作者數）要是 1 到 ${MAX_WORKERS} 的整數`);
@@ -834,7 +866,7 @@ function parseRequest(body) {
   // Workers: as many as asked (at most 8), by default one per task up to 4. More
   // workers than tasks would leave some with nothing to do: only as many are opened as there are tasks.
   const asked = b.workers ?? Math.min(tasks.length, DEFAULT_WORKERS);
-  return { tasks, workers: Math.min(asked, tasks.length), workersAsked: b.workers ?? null, mode, isolate: b.isolate !== false, swarm: b.swarm !== false, note: (b.note || '').trim() };
+  return { tasks, workers: Math.min(asked, tasks.length), workersAsked: b.workers ?? null, mode, isolate: b.isolate !== false, swarm: b.swarm !== false, note: (b.note || '').trim(), name };
 }
 
 // What the parent runs on, to be given to every worker: the same provider and
@@ -907,6 +939,7 @@ export async function create(parentNode, body) {
   const memoryPath = git ? `${git.common}/agent-hub-cluster/${cid}/memory.md` : `${parent.cwd.replace(/\/+$/, '')}/.agent-hub-cluster/${cid}/memory.md`;
   const rec = {
     id: cid,
+    name: req.name || autoClusterName(req.tasks),
     parentId: parent.id,
     machineId: parent.machineId,
     cwd: parent.cwd,
@@ -1115,6 +1148,27 @@ export async function stop(cid) {
   persist(rec);
   announce(rec, { force: true });
   return publicCluster(rec);
+}
+
+// ----------------------------------------------------------------- name
+
+// A new name from the person (the pencil on the cluster's page). Allowed at any
+// time, even while the workers run: it changes nothing but what the cluster is called.
+export function rename(cid, raw) {
+  const rec = getRecord(cid);
+  if (typeof raw !== 'string') throw fail(400, '名稱必須是文字');
+  const name = cleanClusterName(raw);
+  if (!name) throw fail(400, '名稱是空的');
+  if (Array.from(name).length > CLUSTER_NAME_MAX) throw fail(400, `叢集名稱最多 ${CLUSTER_NAME_MAX} 個字`);
+  rec.name = name;
+  persist(rec);
+  announce(rec, { force: true });
+  return publicCluster(rec);
+}
+
+// A conversation was deleted: the clusters it started say their main conversation is gone.
+export function noteDeleted(sessionId) {
+  for (const rec of clusters.values()) if (rec.parentId === sessionId && !rec.phase) announce(rec, { force: true });
 }
 
 // ------------------------------------------------------------ clean up
@@ -1543,3 +1597,26 @@ function announceMerge(rec, head) {
   ].filter(Boolean).join('');
   runner.liveContext(leaf).emit({ type: 'info', text });
 }
+
+// ----------------------------------------------------- for the full purge
+
+// cluster-purge.js works on these same records and asks a computer about a
+// worktree the same way the clean-up does; it is handed the pieces here and
+// nothing else of this file's state.
+export const internals = {
+  WORKING,
+  fail,
+  clusters,
+  workerIndex,
+  lastSent,
+  cleaning,
+  fileOf,
+  persist,
+  announce,
+  leafOfWorker,
+  inspectWorker,
+  gitIn,
+  queueOpen,
+  tasksOf,
+  say: (msg) => broadcast(msg),
+};

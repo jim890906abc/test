@@ -243,7 +243,60 @@ function cleanRecord(r) {
   };
 }
 
-const stores = new Map(); // machine id -> { records: Map(id -> record), since, floor }
+// machine id -> { records: Map(id -> record), since, floor, version, bySession, orphans }
+//   records    every record kept, by id, oldest first (what is dropped at the cap)
+//   bySession  the same records by conversation, each list in order of start time,
+//              so a window is found by bisection instead of by reading them all
+//   orphans    the records that name no conversation, in order of start time
+//   version    moves whenever anything above (or `since`, `floor`) changes: an
+//              answer worked out at one version is good for exactly that version
+const stores = new Map();
+
+// A conversation's records in order of start time. `maxDur` is the longest
+// request in it (never lowered when one is dropped: a bound that is too long
+// only costs a few more records read, never a wrong number).
+const newGroup = () => ({ recs: [], maxDur: 0 });
+
+// The first position whose start time is not before `t`.
+function lowerBound(recs, t) {
+  let lo = 0;
+  let hi = recs.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (recs[mid].startAt < t) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+function indexRecord(s, r) {
+  let g;
+  if (r.session) {
+    g = s.bySession.get(r.session);
+    if (!g) s.bySession.set(r.session, (g = newGroup()));
+  } else g = s.orphans;
+  const { recs } = g;
+  if (!recs.length || recs[recs.length - 1].startAt <= r.startAt) recs.push(r);
+  else {
+    // Records arrive about in order; one that came late goes after the ones that started at the same moment.
+    let lo = lowerBound(recs, r.startAt);
+    while (lo < recs.length && recs[lo].startAt === r.startAt) lo++;
+    recs.splice(lo, 0, r);
+  }
+  if (finite(r.endMs) && r.endMs > g.maxDur) g.maxDur = r.endMs;
+}
+
+function unindexRecord(s, r) {
+  const g = r.session ? s.bySession.get(r.session) : s.orphans;
+  if (!g) return;
+  for (let i = lowerBound(g.recs, r.startAt); i < g.recs.length && g.recs[i].startAt === r.startAt; i++) {
+    if (g.recs[i] === r) {
+      g.recs.splice(i, 1);
+      break;
+    }
+  }
+  if (r.session && !g.recs.length) s.bySession.delete(r.session);
+}
 
 // A connector's {t:'deepseek.requests'}: kept by record id, so the same record
 // sent again (after a reconnect, or to a Hub that restarted) is one record.
@@ -251,21 +304,29 @@ export function applyRequests(machineId, msg) {
   try {
     if (!machineId || !msg || msg.t !== 'deepseek.requests' || !Array.isArray(msg.records)) return false;
     let s = stores.get(machineId);
-    if (!s) stores.set(machineId, (s = { records: new Map(), since: null, floor: 0 }));
+    if (!s) stores.set(machineId, (s = { records: new Map(), since: null, floor: 0, version: 0, bySession: new Map(), orphans: newGroup() }));
     const since = epoch(msg.since);
-    if (since !== null && (s.since === null || since < s.since)) s.since = since;
+    let moved = false;
+    if (since !== null && (s.since === null || since < s.since)) {
+      s.since = since;
+      moved = true;
+    }
     let added = 0;
     for (const raw of msg.records.slice(0, 500)) {
       const r = cleanRecord(raw);
       if (!r || s.records.has(r.id)) continue;
       s.records.set(r.id, r);
+      indexRecord(s, r);
       added++;
     }
     while (s.records.size > MAX_RECORDS) {
       const [k, v] = s.records.entries().next().value;
       s.records.delete(k);
+      unindexRecord(s, v);
       if (v.startAt > s.floor) s.floor = v.startAt;
+      moved = true;
     }
+    if (added > 0 || moved) s.version++;
     return added > 0;
   } catch {
     return false;
@@ -666,7 +727,7 @@ export const OUTPUT_WINDOW_MS = 60_000;
 // left out, and when none can, the answer is null with the first chain's reason.
 // A subagent's requests carry its worker's session id (prompt_cache_key), so a
 // worker's chain covers its subagents' requests too.
-function speedOver(chains, { now = Date.now(), windowMs = SPEED_WINDOW_MS, from = null } = {}) {
+function speedOver(chains, { now: asked = null, windowMs = SPEED_WINDOW_MS, from = null } = {}) {
   const none = (unmeasured) => ({ result: { windowMs: null, outTokens: null, tokensPerSecond: null, requests: null, requestsPerMinute: null, unmeasured }, counted: 0 });
   const usable = [];
   const why = [];
@@ -691,27 +752,66 @@ function speedOver(chains, { now = Date.now(), windowMs = SPEED_WINDOW_MS, from 
     const cov = s ? coverageOf(s) : null;
     if (cov === null) continue;
     coverage = coverage === null ? cov : Math.min(coverage, cov);
-    used.push([s, ids]);
+    used.push([machineId, s, ids]);
   }
   if (lacking.length) return none(`「${lacking.join('、')}」的連接器太舊，沒有寫請求紀錄。在那台電腦重新執行連接指令更新`);
   if (coverage === null) return none('連接器還沒有回報過任何請求紀錄（沒有請求，或連接器剛連上；它回報時會自己補上）');
+  // The same question inside one second is answered once (see `saved` below).
+  // A caller that names its own clock gets an answer of that moment, always.
+  const clock = Date.now();
+  const now = finite(asked) ? asked : clock;
+  const key = `${finite(asked) ? now : 'now'}|${windowMs}|${usable.length}|${finite(from) ? from : ''}|${used.map(([machineId, s, ids]) => `${machineId}:${s.version}:${[...ids].sort().join(',')}`).join(';')}`;
+  const kept = saved.get(key);
+  if (kept && (finite(asked) || clock - kept.at < SAVED_MS)) return { result: { ...kept.answer.result }, counted: kept.answer.counted };
+  const answer = speedFrom(used, usable.length, { now, windowMs, from, coverage, none });
+  saved.set(key, { at: clock, answer });
+  if (saved.size > SAVED_MAX) saved.delete(saved.keys().next().value);
+  return { result: { ...answer.result }, counted: answer.counted };
+}
+
+// What was worked out for a question, by its key: the records it was worked out
+// from (a computer's `version`), the window, and - for a caller that named its
+// own clock - the moment. Without a clock of its own a question is answered
+// with the moment it was first asked for SAVED_MS: a cluster is read for its
+// page, its push and the list of clusters within a second of each other, and
+// each of them would read the same records again for the same figures. A
+// record that arrives (a new `version`) is a different question, so it is never
+// hidden by what was saved.
+const SAVED_MS = 1000;
+const SAVED_MAX = 512;
+const saved = new Map();
+
+// The figures themselves: the request records of the window, found by bisection
+// in each conversation's list of records (in order of start time) instead of by
+// reading every record the computer holds.
+//   requests    started inside the window
+//   outTokens   ENDED inside the window (a request longer than the window may
+//               have started before it, so the search starts one longest
+//               request earlier)
+function speedFrom(used, counted, { now, windowMs, from, coverage, none }) {
   const since = Math.max(now - windowMs, finite(from) ? from : 0, coverage);
   const span = now - since;
   if (span < SPEED_MIN_SPAN_MS) return none(`可以算的時間窗只有 ${Math.max(0, Math.round(span / 1000))} 秒（工作剛開始，或連接器剛開始記請求），還量不出速度`);
   let outTokens = 0;
   let requests = 0;
   let unattributed = 0;
-  for (const [s, ids] of used) {
-    for (const r of s.records.values()) {
-      if (!r.session) {
-        if (r.startAt >= since && r.startAt <= now) unattributed++;
-        continue;
+  for (const [, s, ids] of used) {
+    for (const id of ids) {
+      const g = s.bySession.get(id);
+      if (!g) continue;
+      const { recs } = g;
+      // One millisecond beyond the longest request: the sum start + duration may round.
+      for (let i = lowerBound(recs, since - g.maxDur - 1); i < recs.length; i++) {
+        const r = recs[i];
+        if (r.startAt > now) break;
+        if (r.startAt >= since) requests++;
+        const end = finite(r.endMs) ? r.startAt + r.endMs : null;
+        if (end !== null && end >= since && end <= now && r.outTokens !== null) outTokens += r.outTokens;
       }
-      if (!ids.has(r.session)) continue;
-      if (r.startAt >= since && r.startAt <= now) requests++;
-      const end = finite(r.endMs) ? r.startAt + r.endMs : null;
-      if (end !== null && end >= since && end <= now && r.outTokens !== null) outTokens += r.outTokens;
     }
+    // A request that names no conversation may be anyone's.
+    const o = s.orphans.recs;
+    for (let i = lowerBound(o, since); i < o.length && o[i].startAt <= now; i++) unattributed++;
   }
   // As for the request count of a conversation: a request that names no conversation may be this one's, so a zero is not claimed.
   if (requests === 0 && unattributed > 0) return none(`窗內有 ${unattributed} 個請求沒帶對話識別（Kimi 版本沒有送 prompt_cache_key），沒辦法判斷哪些是這個對話的`);
@@ -724,7 +824,7 @@ function speedOver(chains, { now = Date.now(), windowMs = SPEED_WINDOW_MS, from 
       requestsPerMinute: Math.round((requests / (span / 60_000)) * 10) / 10,
       unmeasured: null,
     },
-    counted: usable.length,
+    counted,
   };
 }
 

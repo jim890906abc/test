@@ -26,13 +26,22 @@ export function startFakeGateway() {
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, url: `http://127.0.0.1:${server.address().port}`, calls, close: () => server.close() })));
 }
 
-export function startFakeMachine({ port, key, id = 'm_fake', name = 'fake-machine', home = '/home/fake' }) {
+// `capabilities`: what the hello says this connector can do ([] / none: an old one).
+// `kimiHome`: when given, every conversation is a REAL folder there (as Kimi
+// keeps it: sessions/wd_<project>/<id>/agents/main + one subagent), :delete
+// removes it, :archive leaves it - so a backup of it can be checked on disk.
+// `stateDir`: where the connector keeps its trash (answered by trash.info on a
+// connector that says `kimi_delete`).
+export function startFakeMachine({ port, key, id = 'm_fake', name = 'fake-machine', home = '/home/fake', capabilities, kimiHome = null, stateDir = null }) {
   const k = {
     id,
     sessions: new Map(), // kimi session id -> { cwd, model, thinking, title, permission, busy }
     profiles: [], // { sid, agent_config }
     prompts: [], // { sid, body }
     archived: [],
+    deleted: [], // every :delete asked of this machine
+    // :delete answers an error envelope for these Kimi session ids ({ id: { code, msg } }); once, unless sticky.
+    deleteFails: new Map(),
     forks: [], // { from, to, body } for every :fork asked of the machine
     requests: [],
     rpcs: [], // every bridge operation asked of this machine, in order
@@ -81,8 +90,20 @@ export function startFakeMachine({ port, key, id = 'm_fake', name = 'fake-machin
     { type: 'assistant.delta', session_id: sid, time: 1_000_500 + i * 2000, payload: { agentId: 'main', turnId: `t${i}`, delta: h.assistant } },
     { type: 'turn.ended', session_id: sid, time: 1_001_000 + i * 2000, payload: { agentId: 'main', reason: 'completed' } },
   ]);
+  // Where Kimi keeps a conversation on this computer (only with `kimiHome`).
+  k.dirOf = (sid) => (kimiHome ? path.join(kimiHome, 'sessions', 'wd_project_0123456789ab', sid) : null);
+  const makeDir = (sid) => {
+    const dir = k.dirOf(sid);
+    if (!dir) return;
+    fs.mkdirSync(path.join(dir, 'agents', 'main'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'agents', 'agent-0'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'agents', 'main', 'wire.jsonl'), `{"type":"main","session":"${sid}"}\n`);
+    fs.writeFileSync(path.join(dir, 'agents', 'agent-0', 'wire.jsonl'), `{"type":"subagent","session":"${sid}"}\n`);
+    fs.writeFileSync(path.join(dir, 'state.json'), '{}');
+  };
   k.add = (sid, over = {}) => {
     k.sessions.set(sid, { cwd: '/tmp/project', model: '', thinking: '', title: sid, permission: 'manual', history: [], ...over });
+    makeDir(sid);
     send({ t: 'kimi.session.update', item: entry(sid) });
   };
   // The native's own word about its model, as Kimi's journal gives it: a
@@ -199,6 +220,21 @@ export function startFakeMachine({ port, key, id = 'm_fake', name = 'fake-machin
       k.forks.push({ from: m[1], to: sid, body });
       return ok({ id: sid, metadata: { cwd: src.cwd } });
     }
+    // Kimi 2.3.3+: the conversation's folder (subagents' journals inside it) and its index entry are removed; one that is not there is 40401.
+    if (m && method === 'POST' && m[2] === ':delete') {
+      k.deleted.push(m[1]);
+      const fail = k.deleteFails.get(m[1]);
+      if (fail) {
+        if (!fail.sticky) k.deleteFails.delete(m[1]);
+        return { code: fail.code ?? 50001, msg: fail.msg ?? 'simulated: could not delete', data: null };
+      }
+      if (!k.sessions.has(m[1])) return { code: 40401, msg: `session ${m[1]} does not exist`, data: null };
+      k.sessions.delete(m[1]);
+      const dir = k.dirOf(m[1]);
+      if (dir) fs.rmSync(dir, { recursive: true, force: true });
+      queueMicrotask(() => send({ t: 'kimi.event', frame: { type: 'event.session.deleted', session_id: m[1] } }));
+      return ok({ deleted: true });
+    }
     if (m && method === 'POST' && m[2] === ':archive') {
       k.archived.push(m[1]);
       if (k.autoRemoveOnArchive) {
@@ -210,7 +246,7 @@ export function startFakeMachine({ port, key, id = 'm_fake', name = 'fake-machin
     return ok({});
   };
   ws.on('open', () => {
-    send({ t: 'hello', machineId: id, name, hostname: os.hostname(), platform: 'test', bridgeVersion: '0.9.0', broker: 1, home, status });
+    send({ t: 'hello', machineId: id, name, hostname: os.hostname(), platform: 'test', bridgeVersion: '0.9.0', broker: 1, home, status, ...(capabilities ? { capabilities } : {}) });
     send({ t: 'kimi.sessions', items: [] });
   });
   // The Claude side of this computer: the REAL daemon (server/claude-daemon.js)
@@ -315,6 +351,14 @@ export function startFakeMachine({ port, key, id = 'm_fake', name = 'fake-machin
       case 'kimi.request':
         out = request(a.method, a.path, a.body);
         break;
+      // Where this connector keeps its trash and where Kimi keeps the given conversations (a connector that says `kimi_delete` knows the op; an older one does not).
+      case 'trash.info': {
+        if (!capabilities?.includes('kimi_delete')) return send({ t: 'res', id: m.id, ok: false, error: '未知的操作：trash.info' });
+        const dirs = {};
+        for (const sid of a.sessionIds || []) dirs[sid] = k.sessions.has(sid) && k.dirOf(sid) && fs.existsSync(k.dirOf(sid)) ? k.dirOf(sid) : null;
+        out = { trashDir: path.join(stateDir || home, 'trash'), days: 7, dirs };
+        break;
+      }
       case 'kimi.deepseek.provision':
         k.dsModels = a.models.map((x) => `${DS}/${x.model}`);
         out = { ok: true, created: true, models: k.dsModels, sessionHeader: true };

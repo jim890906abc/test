@@ -19,6 +19,28 @@ export const CLUSTER_MODES = ['brief', 'fork'];
 // From this share of the main conversation's context on, a full fork is a poor start (spec §2).
 export const FORK_CONTEXT_WARN = 0.5;
 
+// --------------------------------------------------------------- the name
+
+// A cluster has a name of its own (never the main conversation's title: several
+// clusters are sent from one conversation and would all read the same). Given
+// by the person when it is sent, else made from its tasks: one task is named
+// after it, several after the first (cut to about 24 characters) and how many
+// there are. The Hub and the dispatch dialog use this one function, so what
+// the dialog shows as the suggestion is what the Hub will call it.
+export const CLUSTER_NAME_MAX = 60;
+const NAME_FIRST_MAX = 24;
+const cutChars = (text, n) => {
+  const chars = Array.from(text);
+  return chars.length > n ? `${chars.slice(0, n - 1).join('')}…` : text;
+};
+export const cleanClusterName = (raw) => String(raw ?? '').replace(/\s+/g, ' ').trim();
+export function autoClusterName(tasks) {
+  const list = Array.isArray(tasks) ? tasks : [];
+  const first = cleanClusterName(list[0]?.title);
+  if (!first) return '';
+  return list.length <= 1 ? cutChars(first, CLUSTER_NAME_MAX) : `${cutChars(first, NAME_FIRST_MAX)} 等 ${list.length} 條`;
+}
+
 // --------------------------------------------------------------- dispatch
 
 // A task without a name is named after the first line of what it says.
@@ -53,6 +75,7 @@ export function draftProblems(draft) {
   if (!CLUSTER_MODES.includes(draft?.mode)) problems.push('起跑方式要選「簡報起跑」或「完整分叉」');
   if (!tasks.length) problems.push('至少要有 1 個任務');
   if (tasks.length > CLUSTER_MAX_TASKS) problems.push(`一次最多 ${CLUSTER_MAX_TASKS} 個任務`);
+  if (Array.from(cleanClusterName(draft?.name)).length > CLUSTER_NAME_MAX) problems.push(`叢集名稱最多 ${CLUSTER_NAME_MAX} 個字`);
   if (draft?.workers !== undefined && draft?.workers !== null && (!Number.isInteger(draft.workers) || draft.workers < 1 || draft.workers > CLUSTER_MAX_WORKERS)) problems.push(`工作者數要是 1 到 ${CLUSTER_MAX_WORKERS} 的整數`);
   tasks.forEach((t, i) => {
     if (!String(t?.prompt ?? '').trim()) problems.push(`任務 ${i + 1} 還沒寫要做什麼`);
@@ -74,6 +97,8 @@ export function requestBody(draft) {
   };
   const note = String(draft.note ?? '').trim();
   if (note) body.note = note;
+  const name = cleanClusterName(draft.name);
+  if (name) body.name = name;
   return body;
 }
 
@@ -127,7 +152,7 @@ export function contextWarnings({ mode, isolate, context, busy } = {}) {
 
 // ----------------------------------------------------------------- state
 
-const CLUSTER_STATUS = { starting: '啟動中', running: '進行中', merging: '合併中', done: '已完成', stopped: '已停止', error: '出錯' };
+const CLUSTER_STATUS = { starting: '啟動中', running: '進行中', merging: '合併中', purging: '清除中', done: '已完成', stopped: '已停止', error: '出錯' };
 export const clusterStatusLabel = (status) => CLUSTER_STATUS[status] || String(status ?? '');
 export const isActive = (cluster) => ['starting', 'running', 'merging'].includes(cluster?.status);
 // A cluster stop can still do something for: workers are working or about to.
@@ -242,6 +267,7 @@ export function mergeAvailability(cluster, busy = false) {
   if (!cluster?.isolate || !workers.some((w) => w?.branch)) return { ok: false, why: '沒有獨立 worktree，沒有分支可以合併' };
   if (cluster.merge) return { ok: false, why: '已經合併過了：第一版不支援重新合併，結果在下面' };
   if (cluster.status === 'merging') return { ok: false, why: '正在合併' };
+  if (cluster.status === 'purging') return { ok: false, why: '正在完全清除' };
   if (cluster.status === 'starting') return { ok: false, why: '工作者還在啟動' };
   if (busy) return { ok: false, why: '上一個操作還沒完成' };
   const tasks = Array.isArray(cluster?.tasks) ? cluster.tasks : [];
@@ -280,6 +306,7 @@ export function cleanupAvailability(cluster, busy = false) {
   if (busy) return { ok: false, why: '上一個操作還沒完成' };
   if (cluster.status === 'starting') return { ok: false, why: '工作者還在啟動' };
   if (cluster.status === 'merging') return { ok: false, why: '正在合併' };
+  if (cluster.status === 'purging') return { ok: false, why: '正在完全清除' };
   if (workers.some(isWorking)) return { ok: false, why: '工作者還在跑，先全部停止' };
   // Tasks still waiting (or handed out and not ended) count as work, unless a stop ended the dispatching.
   if (cluster.status !== 'stopped' && (Array.isArray(cluster.tasks) ? cluster.tasks : []).some((t) => t?.status === 'pending' || t?.status === 'running')) return { ok: false, why: '佇列還有任務沒做完：等它們做完，或先全部停止' };
@@ -290,6 +317,23 @@ export function cleanupAvailability(cluster, busy = false) {
     why: cluster.merge ? '移除乾淨的 worktree、刪除已經併進合併分支的工作者分支、把工作者對話從側欄收起；有未提交修改或沒併進去的會保留' : '還沒合併過：只清掉沒有任何新 commit 的 worktree 與分支；有 commit 的會保留',
   };
 }
+
+// Whether 完全清除 works, and what to say either way (the Hub says 409 to the
+// same cases). A cluster that is over - done, stopped, or failed - can be purged.
+export function purgeAvailability(cluster, busy = false) {
+  const workers = Array.isArray(cluster?.workers) ? cluster.workers : [];
+  if (!cluster) return { ok: false, why: '' };
+  if (busy) return { ok: false, why: '上一個操作還沒完成' };
+  if (cluster.status === 'starting') return { ok: false, why: '工作者還在啟動' };
+  if (cluster.status === 'merging') return { ok: false, why: '正在合併' };
+  if (cluster.status === 'purging') return { ok: false, why: '正在完全清除' };
+  if (workers.some(isWorking)) return { ok: false, why: '叢集還在跑，先全部停止' };
+  if (cluster.status === 'running') return { ok: false, why: '叢集還在跑：等它們做完，或先全部停止' };
+  return { ok: true, why: cluster.purge?.partial ? '上次只清除了一部分：再按一次，繼續清掉剩下的' : '把這個叢集整個清掉：工作者對話、worktree、分支、記憶檔與叢集本身；主對話不動。刪除前預設先備份，保留 7 天' };
+}
+
+// On the page of every cluster: the ones that can be picked for a batch purge.
+export const isPurgeableRow = (row) => ['done', 'stopped', 'error'].includes(row?.status) && !(row?.workersRunning > 0);
 
 // GET /clusters/:id/cleanup/plan laid out for the confirmation: per worker what
 // will be done and what is kept (with why), and the counts of what will really
@@ -321,6 +365,154 @@ export function cleanupResultView(r) {
   const worktree = part(r.worktree, 'removed');
   const branch = part(r.branch, 'deleted');
   return { worktree, branch, hidden: Boolean(r.hidden), reasons: Array.isArray(r.reasons) ? r.reasons : [], kept: Boolean(worktree?.kept || branch?.kept) };
+}
+
+// ------------------------------------------------------------ full purge
+//
+// 完全清除 takes a finished cluster away whole: its worker conversations (the
+// Hub's record and Kimi's, subagents with them), worktrees, worker branches,
+// memory file and the cluster's own record. The main conversation is never
+// touched. What is thrown away is decided by three boxes, all off by default,
+// and the decision is ONE function used by the Hub (to do it) and by the dialog
+// (to show it before it is done), so the two cannot disagree.
+
+export const PURGE_DAYS = 7;
+export const PURGE_OPTIONS = Object.freeze({ discardDirty: false, deleteUnmerged: false, deleteMerged: false, noBackup: false });
+export const purgeOptions = (raw) => ({
+  discardDirty: raw?.discardDirty === true,
+  deleteUnmerged: raw?.deleteUnmerged === true,
+  deleteMerged: raw?.deleteMerged === true,
+  noBackup: raw?.noBackup === true,
+});
+
+// facts: what the computer said of one worker's worktree and branch (the Hub's
+// inspectWorker): { hasWorktree, dir, registered, dirty, statusError, tip, safe, unique, checkedOutAt }.
+//   worktree  'none' shared folder · 'gone' already missing · 'remove' clean · 'discard' dirty, removed with force · 'keep'
+//   branch    'none' · 'gone' · 'delete' every commit is somewhere else · 'delete-unmerged' commits found nowhere else · 'keep'
+// What is kept says why (`why`) and whose choice it is (`keptBy`): 'option' is
+// a box left unticked - the person chose it - and 'problem' is something that
+// stops the purge from taking it (git does not know the folder, a branch is
+// checked out elsewhere), which makes the purge partial.
+export function decidePurgeWorker(f, opts = {}) {
+  const o = purgeOptions(opts);
+  const out = { worktree: 'none', branch: 'none', reasons: [], why: { worktree: '', branch: '' }, keptBy: { worktree: null, branch: null } };
+  if (!f?.hasWorktree) return out;
+  const keep = (part, kind, why) => {
+    out[part] = 'keep';
+    out.why[part] = why;
+    out.keptBy[part] = kind;
+    out.reasons.push(why);
+  };
+  if (!f.dir) out.worktree = 'gone';
+  else if (!f.registered) keep('worktree', 'problem', 'git 不認得這個資料夾是 worktree，沒有動它');
+  else if (f.statusError) keep('worktree', 'problem', `看不到 worktree 的狀態：${f.statusError}`);
+  else if (f.dirty > 0) {
+    if (o.discardDirty) out.worktree = 'discard';
+    else keep('worktree', 'option', `有 ${f.dirty} 項未提交的修改或未追蹤的檔案（沒勾「也丟掉未提交的修改」，所以保留）`);
+  } else out.worktree = 'remove';
+  if (!f.tip) out.branch = 'gone';
+  else if (Array.isArray(f.checkedOutAt) && f.checkedOutAt.length) keep('branch', 'problem', `分支正被 ${f.checkedOutAt[0]} 檢出，沒有動它`);
+  else if (!f.safe && !o.deleteUnmerged) keep('branch', 'option', `分支有 ${f.unique} 個 commit 沒合併進去（沒勾「也刪除沒合併進去的分支」，所以保留）`);
+  else out.branch = f.safe ? 'delete' : 'delete-unmerged';
+  // A branch cannot go while the worktree that has it checked out stays.
+  if ((out.branch === 'delete' || out.branch === 'delete-unmerged') && out.worktree === 'keep') keep('branch', out.keptBy.worktree, `分支還被保留下來的 worktree 使用中${out.keptBy.worktree === 'option' ? '（沒勾「也丟掉未提交的修改」）' : ''}`);
+  return out;
+}
+
+// cluster/<id>/merged: the product of the merge. Deleted only when asked.
+export function decidePurgeMerged(exists, opts = {}) {
+  if (!exists) return { state: 'none', reason: '' };
+  return purgeOptions(opts).deleteMerged ? { state: 'delete', reason: '' } : { state: 'keep', reason: '沒勾「也刪除合併分支」，所以保留' };
+}
+
+// ---- the confirmation: GET /clusters/:id/purge/plan laid out for the dialog.
+// The plan carries the facts of every worktree and branch, so what each box
+// would change is worked out here, with the very function the Hub runs.
+export function purgePlanView(plan, rawOpts = {}) {
+  const opts = purgeOptions(rawOpts);
+  const workers = Array.isArray(plan?.workers) ? plan.workers : [];
+  const rows = workers.map((w) => {
+    const d = decidePurgeWorker(w.facts, opts);
+    const will = [];
+    if (w.exists) will.push(`對話（Hub 紀錄${w.conversation?.kimiSessions ? '＋Kimi 紀錄' : ''}${w.conversation?.kimiSubagents ? `，含子代理 ${w.conversation.kimiSubagents} 個` : ''}）`);
+    if (d.worktree === 'remove') will.push('移除 worktree');
+    if (d.worktree === 'discard') will.push('移除 worktree（連同未提交的修改）');
+    if (d.branch === 'delete') will.push('刪除分支');
+    if (d.branch === 'delete-unmerged') will.push('刪除分支（含沒合併進去的 commit）');
+    return { sessionId: w.sessionId, n: w.n, title: w.title, exists: Boolean(w.exists), worktreePath: w.worktree || null, branchName: w.branch || null, will, keeps: d.worktree === 'keep' || d.branch === 'keep', reasons: d.reasons, decision: d };
+  });
+  const count = (f) => rows.filter(f).length;
+  const merged = decidePurgeMerged(plan?.merged?.exists, opts);
+  const totals = {
+    conversations: count((r) => r.exists),
+    kimiSessions: Number(plan?.totals?.kimiSessions) || 0,
+    kimiSubagents: Number(plan?.totals?.kimiSubagents) || 0,
+    worktrees: count((r) => r.decision.worktree === 'remove' || r.decision.worktree === 'discard'),
+    discarded: count((r) => r.decision.worktree === 'discard'),
+    branches: count((r) => r.decision.branch === 'delete' || r.decision.branch === 'delete-unmerged'),
+    kept: count((r) => r.keeps) + (merged.state === 'keep' ? 1 : 0),
+  };
+  const facts = workers.filter((w) => w.facts?.hasWorktree);
+  return {
+    rows,
+    totals,
+    merged: { ...merged, branch: plan?.merged?.branch || '', exists: Boolean(plan?.merged?.exists) },
+    // What the three boxes could change: how many things each one would take (so a box with nothing behind it can say so).
+    boxes: {
+      dirty: facts.filter((w) => w.facts.dir && w.facts.registered && !w.facts.statusError && w.facts.dirty > 0).length,
+      unmerged: facts.filter((w) => w.facts.tip && !w.facts.safe && !(w.facts.checkedOutAt || []).length).length,
+      merged: Boolean(plan?.merged?.exists),
+    },
+    memory: plan?.memory || null,
+    connector: plan?.connector || null,
+    days: Number(plan?.days) || PURGE_DAYS,
+  };
+}
+
+// The outcome of POST /clusters/:id/purge in the words of the result page.
+export function purgeResultView(r) {
+  if (!r) return null;
+  const workers = Array.isArray(r.workers) ? r.workers : [];
+  const n = (f) => workers.filter(f).length;
+  if (r.aborted) return { tone: 'aborted', title: '沒有清除：什麼都沒有刪', summary: r.reason || '', deleted: [], kept: [], failed: [], backup: null, connectorNote: null, cluster: false };
+  const deleted = [];
+  const conv = n((w) => w.conversation === 'deleted' || w.conversation === 'archived');
+  if (conv) deleted.push(`${conv} 個工作者對話（Hub 紀錄${r.connectorNote ? '；Kimi 紀錄只封存' : '＋Kimi 紀錄與子代理'}）`);
+  const wt = n((w) => w.worktree === 'removed' || w.worktree === 'discarded');
+  if (wt) deleted.push(`${wt} 個 worktree${n((w) => w.worktree === 'discarded') ? `（其中 ${n((w) => w.worktree === 'discarded')} 個連同未提交的修改）` : ''}`);
+  const br = n((w) => w.branch === 'deleted');
+  if (br) deleted.push(`${br} 個工作者分支`);
+  if (r.merged?.state === 'deleted') deleted.push(`合併分支 ${r.merged.branch}`);
+  if (r.memory?.state === 'deleted') deleted.push('叢集記憶檔與資料夾');
+  if (r.removed) deleted.push('叢集紀錄本身（已從總覽移除）');
+  const kept = Array.isArray(r.kept) ? [...r.kept] : [];
+  const failed = Array.isArray(r.failed) ? [...r.failed] : [];
+  const b = r.backup || {};
+  const backup = b.enabled
+    ? { enabled: true, days: Number(b.days) || PURGE_DAYS, expiresAt: b.expiresAt || null, hub: b.hub ? { file: b.hub.file, bytes: b.hub.bytes } : null, machine: b.machine ? { name: b.machine.machineName, path: b.machine.path, bytes: b.machine.bytes, missing: b.machine.missing || [] } : null }
+    : { enabled: false };
+  const partial = Boolean(r.partial);
+  return {
+    tone: partial ? 'partial' : 'ok',
+    title: partial ? `部分清除：有 ${failed.length} 項沒清掉` : kept.length ? '清除完成（有些東西依你的選擇保留了）' : '清除完成',
+    summary: partial ? '叢集還在總覽裡，標著「部分清除」；排除問題後再按一次「完全清除」，只會處理剩下的。' : '',
+    deleted,
+    kept,
+    failed,
+    backup,
+    connectorNote: r.connectorNote || null,
+    cluster: Boolean(r.removed),
+  };
+}
+
+// ---- the name and the main conversation under it
+export const clusterNameOf = (c, liveParentTitle = '') => (typeof c?.name === 'string' && c.name.trim() ? c.name.trim() : liveParentTitle || (typeof c?.parentTitle === 'string' ? c.parentTitle : '') || '（未命名叢集）');
+// The small line: "主對話：<title>", or that it is gone. `live`: the title the page itself knows.
+export function parentLine(c, live = '') {
+  const title = live || (typeof c?.parentTitle === 'string' ? c.parentTitle : '');
+  if (title) return { text: `主對話：${title}`, title, gone: false };
+  if (c && 'parentTitle' in c && c.parentTitle === null) return { text: '主對話已刪除', title: '', gone: true };
+  return c?.parentId ? { text: '主對話', title: '', gone: false } : { text: '', title: '', gone: false };
 }
 
 // The most one decision may be (the Hub answers 400 above it).
@@ -528,6 +720,66 @@ export function fmtRate(v) {
 }
 export const fmtWindow = (ms) => (isCount(ms) && ms > 0 ? (ms < 90_000 ? `${Math.max(1, Math.round(ms / 1000))} 秒` : `${Math.round(ms / 60_000)} 分鐘`) : null);
 
+// 步數 of one cluster: how many steps it has taken, as the chat room counts them
+// ("483 個步驟" on a subagent card is the number of tool calls under it). Said
+// for the cluster only; it is not added up over clusters.
+export function stepsView(steps, unknown = 0) {
+  if (typeof steps !== 'number' || !Number.isFinite(steps) || steps < 0) return { shown: false, text: '', long: '', title: '' };
+  const n = Math.round(steps);
+  return {
+    shown: true,
+    n,
+    text: `${n.toLocaleString('en-US')} 步`,
+    long: `共 ${n.toLocaleString('en-US')} 步`,
+    title: `一步＝一次工具呼叫，工作者主代理與所有子代理的加總（和聊天室子代理卡片的「N 個步驟」同一個算法）${unknown ? `；有 ${unknown} 個工作者的對話已刪除、沒有紀錄，沒算進去` : ''}`,
+  };
+}
+
+// 工作者生成時約 X tok/s，約有 Y% 時間在生成: why the band's cluster output (averaged over the last
+// minute, idle time in it) reads lower than one working tile. Only from numbers the Hub
+// measured, by dividing: Σ = the generation speeds of the workers that are working now;
+// X = Σ ÷ how many; Y = the cluster output ÷ Σ. It needs every working worker's speed
+// (one missing makes Σ too small), a cluster that is working and measured, and a Y that
+// can be one (above 100% the output holds subagents' text the workers' speeds do not,
+// and nothing is said). Otherwise the line is not shown.
+export function genShareView(c) {
+  const none = (why) => ({ shown: false, why });
+  if (!isActive(c)) return none('叢集不在跑');
+  const out = c?.throughput?.tokensPerSecond;
+  if (typeof out !== 'number' || !Number.isFinite(out) || out < 0) return none('量不到叢集總產出');
+  const working = (Array.isArray(c?.workers) ? c.workers : []).filter(isWorking);
+  if (!working.length) return none('沒有工作者在跑');
+  const speeds = working.map((w) => w?.gen?.tokensPerSecond);
+  if (!speeds.every((v) => typeof v === 'number' && Number.isFinite(v) && v > 0)) return none('有在跑的工作者量不到生成速度');
+  const sum = speeds.reduce((a, v) => a + v, 0);
+  const x = sum / working.length;
+  const y = (out / sum) * 100;
+  if (y > 100) return none('總產出比工作者的生成速度合計還大（含子代理的字數），算不出占比');
+  const xs = fmtRate(x);
+  const ys = Math.max(1, Math.round(y));
+  return {
+    shown: true,
+    x: xs,
+    y: ys,
+    text: `工作者生成時約 ${xs} tok/s，約有 ${ys}% 時間在生成，其餘在跑工具或等待`,
+    title: `${working.length} 個工作者現在的生成速度合計 ${fmtRate(sum)} tok/s；叢集總產出 ${fmtRate(out)} tok/s ÷ ${fmtRate(sum)} ≈ ${ys}%。兩個數字都是量到的，只做除法。`,
+  };
+}
+
+// The worker tile's speed: 生成 (what it writes while it writes, the chat room's number) beside
+// 平均 (its last five minutes, waiting and tools in it). "—" where it is not working.
+export function tileSpeedView(w) {
+  const gen = genView(w?.gen);
+  if (!gen.measured) return { measured: false, text: '—', title: `生成速度：${gen.tip}。現在量不到（原因在詳細裡）` };
+  const avg = speedView(w?.speed);
+  const avgText = avg.measured ? String(fmtRate(w.speed.tokensPerSecond)) : '—';
+  return {
+    measured: true,
+    text: `生成 ${fmtRate(w.gen.tokensPerSecond)} · 平均 ${avgText}`,
+    title: `生成 ${gen.text}：${gen.tip}（和聊天室狀態列同一個數字）。平均 ${avg.measured ? avg.text : '量不到'}：${avg.tip}`,
+  };
+}
+
 // One sentence of how each is worked out (the tooltips and the drawer say it).
 export const TIP_GEN = '模型實際吐字時每秒的字數，不含等工具與等第一個字';
 export const TIP_OUTPUT = '最近 1 分鐘所有代理（含子代理）實際產出的字數 ÷ 60 秒；字數在每個請求結束時才計入，所以會略有跳動';
@@ -614,8 +866,16 @@ export function summarizeCluster(c) {
   const reqRates = workers.map((w) => w?.speed).filter((s) => s && fmtRate(s.requestsPerMinute) !== null);
   return {
     id: c?.id,
+    // The cluster's own name (the Hub makes one if the person gave none); the main conversation is a small line under it.
+    name: typeof c?.name === 'string' ? c.name : '',
     parentId: c?.parentId ?? null,
+    // The main conversation's title; null: it no longer exists. Absent (an older Hub): not said.
+    ...(c && 'parentTitle' in c ? { parentTitle: c.parentTitle } : {}),
     status: c?.status,
+    purgePartial: Boolean(c?.purge?.partial),
+    // 步數 (the tool calls of its workers and their subagents); null: not said (an older Hub, or never counted). Not added up over clusters.
+    steps: typeof c?.steps === 'number' && Number.isFinite(c.steps) && c.steps >= 0 ? c.steps : null,
+    stepsUnknown: typeof c?.stepsUnknown === 'number' ? c.stepsUnknown : 0,
     createdAt: c?.createdAt ?? null,
     tasks: { done: p.done, total: p.total, failed: p.failed, running: tasks.filter((t) => t?.status === 'running').length, pending: tasks.filter((t) => t?.status === 'pending').length },
     workers: workers.length,

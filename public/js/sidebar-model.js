@@ -109,6 +109,29 @@ export function buildRows({ sessions, machines, knownChainNative = new Set(), ch
   return out.filter((r) => !r.hub?.clusterHidden).sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
+// ------------------------------------------------- the workers of clusters
+
+// The workers of clusters are rows in the model (so that a search finds them by
+// name and a worker that waits for you is noticed) but not rows of the list: a
+// cluster opens a dozen of them. Not searching, they are counted, not listed -
+// except the one that is open, which is listed like any open conversation so
+// the page shows where it is; searching, they are among the results.
+export const isWorkerRow = (r) => r?.hub?.clusterRole === 'worker';
+
+export function splitWorkers(allRows, { query = '', currentId = null } = {}) {
+  const workers = allRows.filter(isWorkerRow);
+  const searching = Boolean(String(query || '').trim());
+  return { listed: searching ? allRows : allRows.filter((r) => !isWorkerRow(r) || (currentId && (r.hub.id === currentId || r.conversationId === currentId))), workers };
+}
+
+// The one line that stands for the workers when they are not listed, or null
+// when there are none.
+export function workersLine(workers) {
+  if (!workers.length) return null;
+  const working = workers.filter((r) => busy(r.status)).length;
+  return { count: workers.length, working, title: `叢集工作者 ${workers.length} 個`, sub: working ? `${working} 個進行中 · 在叢集總覽查看與打開` : '在叢集總覽查看與打開', needsYou: workers.some((r) => r.status === 'awaiting_permission' || r.childWaiting) };
+}
+
 // ------------------------------------------------------------ the two groups
 
 // 聊天室 starts open, 子session starts folded. A stored choice wins.

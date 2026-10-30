@@ -12,7 +12,7 @@
 //   - what was not reported is null: no model is borrowed from the conversation,
 //     no end time is guessed.
 import { agentLife, subagentModelView } from '../public/js/agent-state.js';
-import { agentDescription, activityOf } from '../public/js/agent-activity.js';
+import { agentDescription, activityOf, countSteps } from '../public/js/agent-activity.js';
 import { UNVERIFIED, actualOf } from './subagent-policy.js';
 import * as roster from './subagent-roster.js';
 
@@ -56,10 +56,16 @@ function indexOf(session) {
     if (ev.agentId && ev.agentId !== 'main') take(byAgent, ev.agentId, ev);
     if (ev.parent) take(byParent, ev.parent, ev);
   }
-  const built = { key, byAgent, byParent, cards };
+  const built = { key, byAgent, byParent, cards, steps: countSteps(events) };
   indexes.set(session, built);
   return built;
 }
+
+// How many steps (tool calls, the main agent's and every subagent's - the very
+// count the conversation's subagent cards show) one conversation node holds.
+// Counted over its events, not over the listed subagents: the list is cut to the
+// newest 160, the events are all there.
+export const stepsOfNode = (session) => (session ? indexOf(session).steps : 0);
 
 // → { list, counts, older }.  `childStatus(id)`: the status of a Hub-run
 // subagent's own conversation, when the Hub has it.

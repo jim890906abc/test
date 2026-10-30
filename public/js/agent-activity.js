@@ -79,3 +79,14 @@ export function activityOf(last, max = 120) {
 
 // The newest event of a list (oldest first) that tells what the subagent did.
 export const lastShown = (events) => [...events].reverse().find((k) => k.type === 'tool_use' || (k.type === 'text' && k.text?.trim()));
+
+// A step: one tool call, of the main agent or of a subagent. The conversation's
+// subagent cards say "N 個步驟" from exactly this (transcript.js stepCount), and a
+// cluster's 步數 counts the same thing over all of its workers' conversations,
+// so the two cannot mean different things.
+export const isStep = (ev) => ev?.type === 'tool_use';
+export function countSteps(events) {
+  let n = 0;
+  for (const ev of events || []) if (isStep(ev)) n++;
+  return n;
+}

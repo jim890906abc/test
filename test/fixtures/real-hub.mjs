@@ -25,7 +25,9 @@ export async function until(fn, ms = 10000, what = 'condition') {
   throw new Error(`timed out waiting for ${what}`);
 }
 
-export async function startRealHub(name, { claude = false, seed } = {}) {
+// `machine`: options of the fake computer (see startFakeMachine), or a function
+// of the scratch folder that gives them.
+export async function startRealHub(name, { claude = false, seed, machine: machineOptions } = {}) {
   const TMP = fs.mkdtempSync(path.join(os.tmpdir(), `agent-hub-${name}-`));
   const before = snapshot(); // for the check in stop()
   const DATA = path.join(TMP, 'data');
@@ -57,7 +59,7 @@ export async function startRealHub(name, { claude = false, seed } = {}) {
     return j;
   };
   const key = JSON.parse(fs.readFileSync(path.join(DATA, 'hub.json'), 'utf8')).bridgeKey;
-  const machine = startFakeMachine({ port: PORT, key, id: 'm_fake' });
+  const machine = startFakeMachine({ port: PORT, key, id: 'm_fake', ...(typeof machineOptions === 'function' ? machineOptions(TMP) : machineOptions || {}) });
   await machine.ready;
   await until(async () => (await api('GET', '/machines')).find((m) => m.id === 'm_fake' && m.online), 10000, 'machine online');
   if (fakeClaude) {

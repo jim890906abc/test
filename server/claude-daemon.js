@@ -27,6 +27,10 @@ fs.mkdirSync(DIR, { recursive: true, mode: 0o700 });
 // The engine below keeps its state under AGENT_HUB_DATA.
 process.env.AGENT_HUB_DATA = DIR;
 process.env.AGENT_HUB_WORKSPACES ||= path.join(process.env.HOME || DIR, 'agent-hub-workspaces');
+// A Claude conversation's file here is its only record (nothing native to
+// replay it from, unlike a Kimi one), so big conversations are not written
+// less often in this process: keep the 1.5 s write unless told otherwise.
+process.env.AGENT_HUB_SAVE_MAX_DEFER_MS ??= '0';
 
 const store = await import('./store.js');
 const account = await import('./claude-account.js');

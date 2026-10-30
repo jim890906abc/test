@@ -11,7 +11,14 @@ import { h, fill, icon, relTime } from './dom.js';
 import { get, post } from './api.js';
 import { busy as sessionBusy } from './providers.js';
 import { WorkerTile, WorkerDrawer, ClusterListPage, TONE_BADGE, CLUSTER_BADGE, barEl, elapsedText } from './cluster-tiles.js';
+import { confirmPurge, purgeResultEl, purgeBatchResultEl, purgedListEl } from './cluster-purge.js';
 import {
+  CLUSTER_NAME_MAX,
+  autoClusterName,
+  cleanClusterName,
+  clusterNameOf,
+  parentLine,
+  purgeAvailability,
   CLUSTER_MAX_TASKS,
   CLUSTER_MAX_WORKERS,
   CLUSTER_DEFAULTS,
@@ -38,6 +45,8 @@ import {
   requestBody,
   outputView,
   speedView,
+  stepsView,
+  genShareView,
   summarizeCluster,
   taskBar,
   totalsOf,
@@ -56,7 +65,6 @@ const askedFor = new Map(); // main conversation id -> the list of its cluster i
 // number beside its link in the sidebar. Told about a cluster, it is redrawn
 // only if the line changed.
 const summaries = new Map();
-const rowTitles = new Map(); // cluster id -> the main conversation's name the Hub gave in the list
 const listeners = new Set();
 const sigs = new Map();
 export const onClusterRows = (fn) => (listeners.add(fn), () => listeners.delete(fn));
@@ -87,16 +95,44 @@ export async function loadClusterRows() {
   let changed = false;
   for (const r of Array.isArray(list) ? list : []) {
     if (!r?.id) continue;
-    const { parentTitle, ...row } = r;
-    if (parentTitle) rowTitles.set(r.id, parentTitle);
-    changed = keepRow(row) || changed;
+    changed = keepRow(r) || changed;
   }
   if (changed) noteRows();
 }
 export const clusterById = (id) => known.get(id) || null;
 
-// The page that lists every cluster (#/clusters). ctx.parentTitle(id): the main conversation's name.
-export const createClusterList = (ctx) => new ClusterListPage({ rows: clusterRows, title: (r) => ctx.parentTitle?.(r.parentId) || rowTitles.get(r.id) || '（主對話）', load: loadClusterRows });
+// A cluster that is gone (a full purge took it): forgotten by every list and count.
+export function forgetCluster(id) {
+  let changed = known.delete(id);
+  changed = summaries.delete(id) || changed;
+  sigs.delete(id);
+  loadedFor.delete(id);
+  if (changed) noteRows();
+}
+
+// The page that lists every cluster (#/clusters). ctx.parentTitle(id): the main conversation's name as the page knows it now.
+export const createClusterList = (ctx) =>
+  new ClusterListPage({
+    ctx,
+    rows: clusterRows,
+    // The big title is the cluster's own name; the main conversation is the small line under it (or says it is gone).
+    name: (r) => clusterNameOf(r, r.name ? '' : ctx.parentTitle?.(r.parentId)),
+    // (A cluster the Hub gave no name - an older Hub - is called by its main conversation; the small line would only say it twice.)
+    parent: (r) => (r.name ? parentLine(r, ctx.parentTitle?.(r.parentId) || '') : { text: '', gone: false }),
+    load: loadClusterRows,
+    confirmPurge: (entries) => confirmPurge(ctx, entries),
+    onPurged: (items) => {
+      const d = ctx.dialog(h('div', { class: 'settings cluster-purge-batch-dialog' }, h('div', { class: 'dialog-title' }, '清除結果'), purgeBatchResultEl(items, ctx), h('div', { class: 'dialog-actions' }, h('button', { class: 'om-btn om-btn--primary', type: 'button', dataset: { action: 'close-result' }, onclick: () => d.close() }, '關閉'))), { wide: true });
+    },
+    loadPurged: async () => {
+      try {
+        return await get('/clusters/trash');
+      } catch {
+        return { items: [] };
+      }
+    },
+    purgedEl: (r) => purgedListEl(r?.items, { days: r?.days, ctx }),
+  });
 // The clusters a main conversation started, newest first. A cluster names the
 // node of the conversation's chain it was made from (parentId); once the
 // conversation has moved on to another node (a model on another runtime and
@@ -197,7 +233,7 @@ export function drawClusterNote(slot, summary) {
 // ctx: { dialog, toast, fail, go } from the page. `session`: the main conversation.
 export function openClusterDialog(ctx, session, { prompt = '' } = {}) {
   // `workers: null` is "not chosen": the Hub's default (one per task, at most 4) follows the number of tasks.
-  const draft = { tasks: [{ title: '', prompt }], ...CLUSTER_DEFAULTS, workers: null, note: '' };
+  const draft = { tasks: [{ title: '', prompt }], ...CLUSTER_DEFAULTS, workers: null, note: '', name: '' };
   let dirty = Boolean(prompt);
   let sending = false;
   let closed = false;
@@ -206,6 +242,8 @@ export function openClusterDialog(ctx, session, { prompt = '' } = {}) {
   const tasksBox = h('div', { class: 'cluster-tasks' });
   const count = h('span', { class: 'cluster-count' });
   const addBtn = h('button', { class: 'om-btn om-btn--sm', type: 'button', dataset: { action: 'add-task' }, onclick: () => addTask() }, icon('plus'), '新增任務');
+  // The cluster's own name; left empty it is made from the tasks (the box shows what it would be).
+  const nameInput = h('input', { class: 'om-input', type: 'text', name: 'cluster-name', maxLength: CLUSTER_NAME_MAX, autocomplete: 'off', 'aria-label': '叢集名稱（選填）', oninput: () => ((draft.name = nameInput.value), (dirty = true), drawState()) });
   const workersInput = h('input', {
     class: 'om-input cluster-workers-input',
     type: 'number',
@@ -321,6 +359,7 @@ export function openClusterDialog(ctx, session, { prompt = '' } = {}) {
           ? `${n} 條任務、${w} 個工作者：每個工作者一次做一條，做完在同一個對話裡自動領下一條。每個工作者是一個要花額度的對話。`
           : `${w} 個工作者各做一條。任務比工作者多時，做完的會自動領下一條。`,
     );
+    nameInput.placeholder = autoClusterName(requestBody(draft).tasks) || '留空就用任務的名稱（例如「第一條任務 等 3 條」）';
     const advice = queueAdvice({ tasks: draft.tasks, workers: w, isolate: draft.isolate, mode: draft.mode });
     fill(adviceBox, advice.map((a) => h('div', { class: 'callout small cluster-advice-item', dataset: { advice: a.id } }, icon('sparkle'), h('div', { class: 'callout-text' }, a.text))));
     submit.disabled = sending || problems.length > 0;
@@ -336,6 +375,7 @@ export function openClusterDialog(ctx, session, { prompt = '' } = {}) {
     'fieldset',
     { class: 'cluster-fields' },
     h('p', { class: 'dialog-text settings-lead' }, '把任務分給幾個工作者，各自開一個新的對話同時做；做完可以一鍵合併。每個工作者都是一個要花額度的對話。'),
+    h('label', { class: 'om-field' }, h('span', { class: 'om-field__label' }, '叢集名稱（選填）'), nameInput, h('span', { class: 'om-field__help' }, `最多 ${CLUSTER_NAME_MAX} 個字。留空會用任務的名稱自動取；之後可以在叢集頁改名。`)),
     h('div', { class: 'om-field' }, h('span', { class: 'om-field__label' }, '任務'), tasksBox, h('div', { class: 'cluster-tasks-foot' }, count, addBtn)),
     h('div', { class: 'om-field cluster-lines' }, h('label', { class: 'om-field__label' }, '一次貼上多條任務（選填）', lines), h('div', { class: 'cluster-lines-foot' }, linesNote, addLinesBtn)),
     h('div', { class: 'om-field' }, h('label', { class: 'om-field__label' }, '工作者數（1 到 8）', workersInput), workersHelp),
@@ -422,7 +462,7 @@ export async function openClusterList(ctx, session) {
             'a',
             { class: 'cluster-list-item', href: clusterHash(c.id), onclick: () => d.close() },
             h('span', { class: `om-badge${isActive(c) ? ' cluster-badge-busy' : ''}` }, clusterStatusLabel(c.status)),
-            h('span', { class: 'cluster-list-text' }, `${modeLabel(c.mode)} · 任務 ${done}/${total} 完成`),
+            h('span', { class: 'cluster-list-text' }, `${clusterNameOf(c)} · ${modeLabel(c.mode)} · 任務 ${done}/${total} 完成`),
             h('span', { class: 'muted' }, relTime(c.createdAt)),
           );
         }),
@@ -449,7 +489,7 @@ export class ClusterPage {
     this.timings = new Map(); // worker session id -> { timing } | { error }, for the worker whose drawer is open
     this.tiles = new Map(); // worker session id -> WorkerTile
     this.sigs = {}; // what each part of the page was last drawn from
-    this.busy = null; // 'stop' | 'merge' | 'cleanup' | 'unhide' while that request is out
+    this.busy = null; // 'stop' | 'merge' | 'cleanup' | 'unhide' | 'purge' | 'rename' while that request is out
     this.actionError = ''; // what the Hub said to the last stop / merge it refused
     this.started = false; // the first cluster has come in: the memory is then read
     this.memSeen = null; // { bytes, updatedAt } of the memory file as last read
@@ -457,12 +497,16 @@ export class ClusterPage {
     this.fold = { queue: false, memory: false }; // which of the folded parts the person opened
     this.dead = false;
     this.sig = '';
+    this.nameRow = h('div', { class: 'ch-namerow' });
+    this.resultBox = h('div', { class: 'cluster-purge-slot' }); // the outcome of the last full purge
+    this.result = null; // { r, name }
+    this.gone = false; // the cluster was purged: only the result is left to show
     this.headTop = h('div', { class: 'ch-top' });
     this.bar = barEl('ch-bar');
     this.elapsed = h('span', { class: 'ch-elapsed', dataset: { field: 'elapsed' } });
-    this.stats = { output: this.statBox('output', '叢集總產出', { avg: true }), workers: this.statBox('workers', '執行中工作者'), subs: this.statBox('subagents', '執行中子代理') };
+    this.stats = { output: this.statBox('output', '叢集總產出', { avg: true, share: true }), workers: this.statBox('workers', '執行中工作者'), subs: this.statBox('subagents', '執行中子代理') };
     this.facts = h('div', { class: 'ch-facts' });
-    this.head = h('div', { class: 'cluster-head' }, this.headTop, h('div', { class: 'ch-barrow' }, this.bar, this.elapsed), h('div', { class: 'ch-stats' }, this.stats.output.el, this.stats.workers.el, this.stats.subs.el), this.facts);
+    this.head = h('div', { class: 'cluster-head' }, this.nameRow, this.headTop, h('div', { class: 'ch-barrow' }, this.bar, this.elapsed), h('div', { class: 'ch-stats' }, this.stats.output.el, this.stats.workers.el, this.stats.subs.el), this.facts);
     this.warns = h('div', { class: 'cluster-warns' });
     this.workers = h('div', { class: 'cluster-workers' });
     this.count = h('span', { class: 'muted cluster-workers-count' });
@@ -513,7 +557,7 @@ export class ClusterPage {
 
   // A cluster arrived (from the Hub or down the socket); other clusters' news is not ours.
   update(c) {
-    if (this.dead || !c || c.id !== this.id) return;
+    if (this.dead || this.gone || !c || c.id !== this.id) return;
     const first = !this.started;
     this.started = true;
     this.cluster = rememberCluster(c);
@@ -545,9 +589,10 @@ export class ClusterPage {
     const c = this.cluster;
     if (!c) return;
     this.ctx.onTitle?.(c);
-    if (this.body.firstChild !== this.head) {
+    if (this.body.firstChild !== this.resultBox) {
       fill(
         this.body,
+        this.resultBox,
         this.head,
         this.warns,
         h('section', { class: 'cluster-section' }, h('div', { class: 'cluster-section-title' }, h('span', null, '工作者'), this.count), this.workers),
@@ -558,6 +603,7 @@ export class ClusterPage {
       );
       this.sigs = {};
     }
+    this.drawResult();
     this.drawHead();
     this.drawStats();
     this.drawWarnings();
@@ -577,22 +623,30 @@ export class ClusterPage {
 
   // One of the big numbers under the progress bar; its parts are updated in place (they change every second).
   // `avg`: a second small line under the first (the five-minute average beside the last minute's output).
-  statBox(key, label, { avg = false } = {}) {
+  statBox(key, label, { avg = false, share = false } = {}) {
     const num = h('span', { class: 'ch-stat-num', dataset: { field: 'num' } });
     const unit = h('span', { class: 'ch-stat-unit' });
     const sub = h('div', { class: 'ch-stat-sub', dataset: { field: 'sub' } });
     const second = avg ? h('div', { class: 'ch-stat-sub ch-stat-avg', dataset: { field: 'avg' } }) : null;
-    const el = h('div', { class: 'ch-stat', dataset: { stat: key } }, h('div', { class: 'ch-stat-label' }, label), h('div', { class: 'ch-stat-value' }, num, unit), sub, second);
-    return { el, num, unit, sub, avg: second };
+    // (the share of time the workers spend writing: shown only where it can be worked out)
+    const third = share ? h('div', { class: 'ch-stat-sub ch-stat-share', dataset: { field: 'gen-share' }, hidden: true }) : null;
+    const el = h('div', { class: 'ch-stat', dataset: { stat: key } }, h('div', { class: 'ch-stat-label' }, label), h('div', { class: 'ch-stat-value' }, num, unit), sub, second, third);
+    return { el, num, unit, sub, avg: second, share: third };
   }
 
-  setStat(box, { num, unit = '', sub = '', title = '', live = false, none = false, avg = '', avgTitle = '' }) {
+  setStat(box, { num, unit = '', sub = '', title = '', live = false, none = false, avg = '', avgTitle = '', share = null }) {
     if (box.num.textContent !== num) box.num.textContent = num;
     if (box.unit.textContent !== unit) box.unit.textContent = unit;
     if (box.sub.textContent !== sub) box.sub.textContent = sub;
     if (box.avg) {
       if (box.avg.textContent !== avg) box.avg.textContent = avg;
       box.avg.title = avgTitle;
+    }
+    if (box.share) {
+      const text = share?.shown ? share.text : '';
+      if (box.share.textContent !== text) box.share.textContent = text;
+      box.share.hidden = !share?.shown;
+      box.share.title = share?.shown ? share.title : '';
     }
     box.el.title = title;
     box.el.classList.toggle('live', live);
@@ -615,6 +669,7 @@ export class ClusterPage {
       none: !out.measured,
       avg: avg.measured ? `平均產出（最近 5 分鐘）${avg.text}${part}` : '平均產出（最近 5 分鐘）—',
       avgTitle: avg.measured ? [avg.tip, sum.speed.requestsPerMinute !== null ? `請求 ${speedView({ tokensPerSecond: 0, requestsPerMinute: sum.speed.requestsPerMinute }).requests.replace('請求 ', '')}` : null].filter(Boolean).join('；') : `量不到：${avg.why}`,
+      share: genShareView(c),
     });
     this.setStat(this.stats.workers, { num: String(sum.workersRunning), unit: `／${sum.workers}`, sub: '個在工作', live: sum.workersRunning > 0 });
     const sub = sum.subagents;
@@ -638,13 +693,23 @@ export class ClusterPage {
     const { done, total, failed, deleted } = progressOf(c);
     const merge = mergeAvailability(c, Boolean(this.busy));
     const cleanup = cleanupAvailability(c, Boolean(this.busy));
+    const purge = purgeAvailability(c, Boolean(this.busy));
     const stoppable = isStoppable(c) && !this.busy;
-    const parentTitle = c.parentId ? this.ctx.parentTitle?.(c.parentId) : '';
+    // The page may know the main conversation's title better than the cluster's last news (it was renamed since).
+    const parentTitle = c.parentId ? this.ctx.parentTitle?.(c.parentId) || '' : '';
+    const name = clusterNameOf(c, c.name ? '' : parentTitle);
+    const pl = parentLine(c, parentTitle);
     // The heading over the tiles counts workers; `total` counts tasks once a queue is used.
     this.count.textContent = `${(c.workers || []).length} 個`;
     // The "x minutes ago" moves on by itself, so it is part of what this is drawn from.
-    if (!this.changed('head', [c.status, done, total, failed, deleted, c.mode, c.isolate, c.swarm, c.parentId, parentTitle, merge, cleanup, stoppable, this.busy, this.actionError, Math.floor(Date.now() / 60_000), (c.workers || []).some((w) => w.branch)])) return;
+    if (!this.changed('head', [c.status, done, total, failed, deleted, c.mode, c.isolate, c.swarm, c.parentId, name, pl, merge, cleanup, purge, Boolean(c.purge?.partial), stoppable, this.busy, this.actionError, Math.floor(Date.now() / 60_000), (c.workers || []).some((w) => w.branch), c.steps, c.stepsUnknown])) return;
     const parent = c.parentId;
+    fill(
+      this.nameRow,
+      h('div', { class: 'ch-nameline' }, h('h2', { class: 'ch-name', dataset: { field: 'name' }, title: name }, name), h('button', { class: 'om-btn om-btn--toolbar om-btn--sm', type: 'button', dataset: { action: 'rename' }, 'aria-label': '重新命名叢集', title: '重新命名', disabled: Boolean(this.busy) || c.status === 'purging', onclick: () => this.rename() }, icon('pencil'))),
+      // The main conversation is the small line under the name (a link while it exists).
+      pl.text ? (pl.gone || !parent ? h('div', { class: 'ch-parent gone', dataset: { field: 'parent' } }, pl.text) : h('a', { class: 'linklike ch-parent', href: `#/s/${parent}`, dataset: { action: 'open-parent', field: 'parent' }, title: '回主對話' }, pl.text)) : null,
+    );
     fill(
       this.headTop,
       h(
@@ -654,24 +719,42 @@ export class ClusterPage {
         h('span', { class: 'cluster-progress', dataset: { field: 'progress' } }, `任務 ${done}/${total} 完成`),
         failed ? h('span', { class: 'om-badge om-badge--danger' }, failedText(c, failed)) : null,
         deleted ? h('span', { class: 'om-badge' }, `${deleted} 個已刪除`) : null,
+        c.purge?.partial ? h('span', { class: 'om-badge om-badge--warning', dataset: { field: 'purge-partial' }, title: (c.purge.failed || []).join('\n') }, '部分清除') : null,
       ),
       h(
         'div',
         { class: 'cluster-actions' },
         h('button', { class: 'om-btn om-btn--sm om-btn--destructive', type: 'button', dataset: { action: 'stop' }, 'aria-label': '全部停止', disabled: !stoppable, title: stoppable ? '中斷每個工作者目前這一輪（對話、分支與 worktree 都保留）' : '叢集已經不在跑了', onclick: () => this.stop() }, icon('stop'), h('span', { class: 'btn-label' }, '全部停止')),
         h('button', { class: 'om-btn om-btn--sm om-btn--primary', type: 'button', dataset: { action: 'merge' }, 'aria-label': '合併工作者分支', disabled: !merge.ok, title: merge.why, onclick: () => this.merge() }, icon('branch'), h('span', { class: 'btn-label' }, '合併工作者分支')),
-        h('button', { class: 'om-btn om-btn--sm', type: 'button', dataset: { action: 'cleanup' }, 'aria-label': '清理', disabled: !cleanup.ok, title: cleanup.why, onclick: () => this.cleanup() }, icon('trash'), h('span', { class: 'btn-label' }, '清理')),
+        h('button', { class: 'om-btn om-btn--sm', type: 'button', dataset: { action: 'cleanup' }, 'aria-label': '清理', disabled: !cleanup.ok, title: cleanup.why, onclick: () => this.cleanup() }, icon('sparkle'), h('span', { class: 'btn-label' }, '清理')),
+        h('button', { class: 'om-btn om-btn--sm om-btn--destructive cluster-purge-btn', type: 'button', dataset: { action: 'purge' }, 'aria-label': c.purge?.partial ? '再清除一次' : '完全清除', disabled: !purge.ok, title: purge.why, onclick: () => this.purge() }, icon('trash'), h('span', { class: 'btn-label' }, c.purge?.partial ? '再清除一次' : '完全清除')),
       ),
     );
     fill(
       this.facts,
       h('span', null, `建立於 ${relTime(c.createdAt)}`),
+      // 共 N 步: its own steps, as the chat room counts them (follows every pushed cluster).
+      stepsView(c.steps, c.stepsUnknown).shown ? h('span', { dataset: { field: 'steps' }, title: stepsView(c.steps, c.stepsUnknown).title }, stepsView(c.steps, c.stepsUnknown).long) : null,
       h('span', null, modeLabel(c.mode)),
       h('span', null, c.isolate ? '每個工作者獨立 worktree' : '共用同一個資料夾'),
       nativeSwarm(c.swarm),
-      parent ? h('a', { class: 'linklike', href: `#/s/${parent}`, dataset: { action: 'open-parent' } }, `回主對話${parentTitle ? `「${parentTitle}」` : ''}`) : null,
       c.isolate && (c.workers || []).some((w) => w.branch) ? null : h('div', { class: 'om-field__help ch-note', dataset: { field: 'no-merge' } }, '沒有獨立 worktree，沒有分支可以合併；工作者改的都在同一個資料夾裡。'),
       this.actionError ? h('div', { class: 'om-field__error cluster-error ch-note', role: 'alert' }, this.actionError) : null,
+    );
+  }
+
+  // The outcome of the last full purge, over the cluster (when it is partly purged the cluster is still under it).
+  drawResult() {
+    const r = this.result;
+    if (!this.changed('result', [r?.r, this.gone])) return;
+    if (!r) return fill(this.resultBox);
+    const el = purgeResultEl(r.r, { name: r.name, ctx: this.ctx });
+    fill(
+      this.resultBox,
+      el,
+      this.gone
+        ? h('div', { class: 'cluster-gone' }, h('p', { class: 'om-field__help' }, '這個叢集已經從總覽移除了。'), h('a', { class: 'om-btn om-btn--primary', href: '#/clusters', dataset: { action: 'back-to-list' } }, '回叢集總覽'))
+        : h('div', { class: 'cluster-purge-actions' }, h('button', { class: 'om-btn om-btn--sm', type: 'button', dataset: { action: 'dismiss-result' }, onclick: () => ((this.result = null), this.drawResult()) }, '知道了')),
     );
   }
 
@@ -961,6 +1044,106 @@ export class ClusterPage {
       this.busy = null;
       this.actionError = err.message || String(err);
       this.drawHead();
+    }
+  }
+
+  // ---- the name
+
+  // The pencil: a small dialog with the name in a box. The Hub refuses a blank or too long one (400) and says so there.
+  rename() {
+    if (this.busy || this.gone) return;
+    const c = this.cluster;
+    const input = h('input', { class: 'om-input', type: 'text', name: 'cluster-name', value: clusterNameOf(c), maxLength: CLUSTER_NAME_MAX, autocomplete: 'off', autofocus: true, 'aria-label': '叢集名稱' });
+    const error = h('div', { class: 'om-field__error', role: 'alert', dataset: { field: 'rename-error' } });
+    const save = h('button', { class: 'om-btn om-btn--primary', type: 'submit', dataset: { action: 'rename-save' } }, '儲存');
+    const form = h(
+      'form',
+      {
+        class: 'settings cluster-rename-dialog',
+        onsubmit: async (e) => {
+          e.preventDefault();
+          const name = cleanClusterName(input.value);
+          fill(error);
+          if (!name) return fill(error, '名稱不能是空的');
+          if (Array.from(name).length > CLUSTER_NAME_MAX) return fill(error, `名稱最多 ${CLUSTER_NAME_MAX} 個字`);
+          save.disabled = true;
+          try {
+            const next = await post(`/clusters/${this.id}/name`, { name });
+            d.close();
+            this.update(next);
+          } catch (err) {
+            save.disabled = false;
+            fill(error, err.message || String(err));
+          }
+        },
+      },
+      h('div', { class: 'dialog-title' }, '重新命名叢集'),
+      h('label', { class: 'om-field' }, h('span', { class: 'om-field__label' }, '叢集名稱'), input, h('span', { class: 'om-field__help' }, `最多 ${CLUSTER_NAME_MAX} 個字。只改叢集的名字，不影響工作者、分支或主對話。`)),
+      error,
+      h('div', { class: 'dialog-actions' }, h('button', { class: 'om-btn', type: 'button', onclick: () => d.close() }, '取消'), save),
+    );
+    const d = this.ctx.dialog(form);
+  }
+
+  // ---- 完全清除
+
+  // Ask the Hub what it would do (a dry run), say it with the three boxes, and only then do it.
+  async purge() {
+    if (this.busy || this.gone) return;
+    this.busy = 'purge';
+    this.actionError = '';
+    this.drawHead();
+    let plan;
+    try {
+      plan = await get(`/clusters/${this.id}/purge/plan`);
+    } catch (err) {
+      this.busy = null;
+      this.actionError = err.message || String(err);
+      this.drawHead();
+      return;
+    }
+    this.busy = null;
+    this.drawHead();
+    if (this.dead) return;
+    const name = clusterNameOf(this.cluster);
+    const opts = await confirmPurge(this.ctx, [{ id: this.id, name, plan }]);
+    if (!opts || this.dead) return;
+    this.busy = 'purge';
+    this.drawHead();
+    try {
+      const r = await post(`/clusters/${this.id}/purge`, opts);
+      this.busy = null;
+      await this.showResult(r, name);
+    } catch (err) {
+      this.busy = null;
+      this.actionError = err.message || String(err);
+      this.drawHead();
+    }
+  }
+
+  // The result goes over the cluster. Purged away: it is all that is left of the page. Partly: the cluster is under it, marked.
+  async showResult(r, name) {
+    this.result = { r, name };
+    if (r.removed) {
+      this.gone = true;
+      forgetCluster(this.id);
+      this.drawResult();
+      return fill(this.body, this.resultBox);
+    }
+    this.drawResult();
+    try {
+      this.update(await get(`/clusters/${this.id}`));
+    } catch {}
+  }
+
+  // Told (down the socket) that this cluster no longer exists.
+  removed() {
+    if (this.dead || this.gone) return;
+    this.gone = true;
+    forgetCluster(this.id);
+    if (!this.result) {
+      this.result = null;
+      fill(this.body, h('div', { class: 'cluster-none' }, h('div', { class: 'large-title' }, '這個叢集已被清除'), h('p', { class: 'home-lead' }, '它的工作者對話、worktree 與記憶檔都已刪除（備份保留 7 天，見叢集總覽）。'), h('a', { class: 'om-btn om-btn--primary', href: '#/clusters', dataset: { action: 'back-to-list' } }, '回叢集總覽')));
     }
   }
 

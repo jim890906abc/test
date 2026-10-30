@@ -195,8 +195,8 @@ test('a brief cluster in a git repo: a worker per task, each in a worktree and a
 
   // Status, the list, the stream.
   const got = await getCluster(c.id);
-  assert.deepEqual(Object.keys(got).sort(), ['cleanup', 'createdAt', 'id', 'isolate', 'memory', 'merge', 'mode', 'parentId', 'status', 'swarm', 'tasks', 'throughput', 'warnings', 'workers']);
-  assert.deepEqual(Object.keys(got.workers[0]).sort(), ['branch', 'done', 'finishedAt', 'gen', 'hidden', 'progress', 'sessionId', 'speed', 'status', 'subagentCounts', 'subagents', 'subagentsOlder', 'swarm', 'task', 'taskIndex', 'title', 'worktree']);
+  assert.deepEqual(Object.keys(got).sort(), ['cleanup', 'createdAt', 'id', 'isolate', 'memory', 'merge', 'mode', 'name', 'parentId', 'parentTitle', 'purge', 'status', 'steps', 'stepsUnknown', 'swarm', 'tasks', 'throughput', 'warnings', 'workers']);
+  assert.deepEqual(Object.keys(got.workers[0]).sort(), ['branch', 'done', 'finishedAt', 'gen', 'hidden', 'progress', 'sessionId', 'speed', 'status', 'steps', 'subagentCounts', 'subagents', 'subagentsOlder', 'swarm', 'task', 'taskIndex', 'title', 'worktree']);
   assert.equal(got.cleanup, null, 'nothing has been cleaned up yet');
   assert.equal(got.workers[0].hidden, false);
   assert.deepEqual(Object.keys(got.memory).sort(), ['bytes', 'path', 'updatedAt']);

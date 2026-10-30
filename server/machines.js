@@ -25,6 +25,10 @@ const FILE = path.join(DATA_DIR, 'machines.json');
 //                    keeps it aside as "refused" (authFailedAt, authFailures, authRetryAt; never
 //                    "exhausted") and probes it again with real requests at doubling gaps; the Hub
 //                    sends those fields only to a connector that says so
+//   kimi_delete      Kimi's `:delete` of a conversation may be asked of this computer, and `trash.info`
+//                    says where Kimi keeps a conversation and where the connector keeps the backups
+//                    a cluster purge makes (it deletes them itself after 7 days). A connector without
+//                    it can only have a conversation archived, and the Hub says so.
 //   pool_sticky      the DeepSeek proxy can give each conversation one key for good (the pool's
 //                    `distribution`: 'sticky', or 'relay' for the order of old) and says how many
 //                    conversations each key has; the Hub sends the setting only to a connector
@@ -33,7 +37,7 @@ const FILE = path.join(DATA_DIR, 'machines.json');
 // version string is never used to guess. The first connector that sends the
 // field is CAPABILITY_CONNECTOR_VERSION; older ones must be reconnected with
 // the current command (a message about "upgrade" can name this version).
-export const CAPABILITIES = ['pool', 'pool_cross', 'secondary_model', 'broker', 'handoff', 'pool_timing', 'pool_measure', 'event_timing', 'pool_auth', 'pool_sticky'];
+export const CAPABILITIES = ['pool', 'pool_cross', 'secondary_model', 'broker', 'handoff', 'pool_timing', 'pool_measure', 'event_timing', 'pool_auth', 'pool_sticky', 'kimi_delete'];
 export const CAPABILITY_CONNECTOR_VERSION = '0.11.0';
 const cleanCapabilities = (raw) => (Array.isArray(raw) ? [...new Set(raw.filter((x) => typeof x === 'string' && /^[a-z][a-z0-9_]{0,31}$/.test(x)))].slice(0, 16) : []);
 const machines = new Map(); // id -> machine
@@ -149,6 +153,20 @@ export function publicMachine(m) {
     kimi: m.kimi || { available: false },
     sessions: m.online ? visibleSessions(m) : [],
   };
+}
+
+// The Kimi conversation of a cluster worker is not a row of the sidebar (the
+// worker is not listed: server/session-list.js), and left in the computer's list
+// it would turn up there as a conversation of the terminal. The leaf of a
+// chain is the one that says it is a worker.
+export function isWorkerNative(machineId, kimiSessionId) {
+  const hub = findByNative(machineId, kimiSessionId);
+  return Boolean(hub && (leafOf(hub) || hub).clusterRole === 'worker');
+}
+
+// A computer as the sidebar's page keeps it: the same, without the list entries of cluster workers.
+export function sidebarView(pub) {
+  return { ...pub, sessions: pub.sessions.filter((e) => !isWorkerNative(pub.id, e.id)) };
 }
 
 export function hasCapability(machineId, name) {

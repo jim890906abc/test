@@ -12,6 +12,7 @@ import * as modelDrift from './model-drift.js';
 import * as claudeAccount from './claude-account.js';
 import * as handoff from './handoff.js';
 import { redactSecrets, redactDeep, appendRedacted } from './redact.js';
+import { syncEvents, forgetEvents, findEvent, lastUserEventWithText } from './event-index.js';
 import { inheritPermission, nativePermission, hubModeFor } from './permissions.js';
 import { isActive as autoPauseActive } from './autopause.js';
 import * as subagentPolicy from './subagent-policy.js';
@@ -245,16 +246,16 @@ const brokerCardOwnedByOther = (card, childId) => brokerCardOwners(card).some((i
 const brokerCardUnclaimed = (card) => brokerCardOwners(card).length === 0;
 const isDelegateCard = (ev) => ev?.type === 'tool_use' && !isBrokerProjection(ev) && /delegate|mcp__agent-hub|broker|\bTask\b/i.test(ev.name || '');
 const brokerTaskOf = (child) => {
-  const said = [...(child?.events || [])].reverse().find((e) => e.type === 'user' && String(e.text || '').trim());
+  const said = lastUserEventWithText(child?.events);
   return String(said?.text || child?.title || '').trim();
 };
 const brokerCardTask = (card) => String(card?.input?.task || card?.input?.prompt || '').trim();
 
 function brokerCardState(child) {
   const busy = ['running', 'awaiting_permission'].includes(child.status);
-  const end = [...(child.events || [])].reverse().find((e) => e.type === 'turn_end');
-  const text = [...(child.events || [])].reverse().find((e) => e.type === 'text' && String(e.text || '').trim())?.text?.trim() || '';
-  const error = end?.error ? [...(child.events || [])].reverse().find((e) => e.type === 'error' && e.text)?.text || '' : '';
+  const end = (child.events || []).findLast((e) => e.type === 'turn_end');
+  const text = (child.events || []).findLast((e) => e.type === 'text' && String(e.text || '').trim())?.text?.trim() || '';
+  const error = end?.error ? (child.events || []).findLast((e) => e.type === 'error' && e.text)?.text || '' : '';
   return {
     status: busy ? 'running' : end?.interrupted ? 'interrupted' : end?.error || child.status === 'error' ? 'error' : 'done',
     subStatus: busy ? 'running' : end?.interrupted ? 'cancelled' : end?.error || child.status === 'error' ? 'error' : 'done',
@@ -307,14 +308,22 @@ function makeBrokerCard(child) {
 // another child's id: judged by what each was asked, not by the id it holds.
 const normTask = (t) => String(t || '').replace(/\s+/g, ' ').trim();
 const PLACEHOLDER_TITLES = new Set(['', 'New session', '新對話']);
+// Asked on every step the child streams: the verdict depends only on the two
+// texts compared, so the last one for each child is remembered by those texts.
+const fitsMemo = new WeakMap();
 function brokerCardFits(card, child) {
-  const a = normTask(brokerCardTask(card));
+  const rawA = brokerCardTask(card);
   // What the child was asked: its own first words, or a title that is not a
   // placeholder. A child with neither tells nothing, so its card stays.
-  const said = [...(child?.events || [])].reverse().find((e) => e.type === 'user' && String(e.text || '').trim())?.text;
-  const b = normTask(said || (PLACEHOLDER_TITLES.has(String(child?.title || '').trim()) ? '' : child.title));
-  if (!a || !b) return true; // cannot tell: do not move it
-  return a === b || a.startsWith(b) || b.startsWith(a);
+  const said = lastUserEventWithText(child?.events)?.text;
+  const rawB = said || (PLACEHOLDER_TITLES.has(String(child?.title || '').trim()) ? '' : child.title);
+  const memo = child && typeof child === 'object' ? fitsMemo.get(child) : null;
+  if (memo && memo.a === rawA && memo.b === rawB) return memo.fits;
+  const a = normTask(rawA);
+  const b = normTask(rawB);
+  const fits = !a || !b ? true /* cannot tell: do not move it */ : a === b || a.startsWith(b) || b.startsWith(a);
+  if (child && typeof child === 'object') fitsMemo.set(child, { a: rawA, b: rawB, fits });
+  return fits;
 }
 function brokerCardWronglyOwned(card) {
   return brokerCardOwners(card).some((id) => {
@@ -336,13 +345,24 @@ function claimBrokerCard(card, child, { force = false } = {}) {
   return changed;
 }
 
+// Every step of `child` hangs under `card`. Looking at the whole parent each
+// time made every streamed token cost as much as the parent is long, so the
+// events already checked for this child and this card are not looked at again:
+// steps are only ever added at the end, and a new one is made with its card's
+// id. A different card, or an array that changed under the index, starts over.
 function reparentBrokerProjections(parent, child, card) {
+  const events = parent.events || [];
+  const index = syncEvents(events);
+  const done = index.reparented.get(child.id);
+  const from = done && done.cardId === card.id && done.n <= events.length ? done.n : 0;
   let changed = false;
-  for (const ev of parent.events || []) {
+  for (let i = from; i < events.length; i++) {
+    const ev = events[i];
     if (ev.brokerChildId !== child.id || ev.parent === card.id) continue;
     ev.parent = card.id;
     changed = true;
   }
+  index.reparented.set(child.id, { cardId: card.id, n: events.length });
   return changed;
 }
 
@@ -356,7 +376,7 @@ function brokerLinkFor(child) {
   // shared-card bug, not this child's card.
   let card = null;
   if (saved?.parentId === parent.id && saved?.parentEventId) {
-    const found = (parent.events || []).find((e) => e.id === saved.parentEventId);
+    const found = findEvent(parent.events, saved.parentEventId);
     if (found && !isBrokerProjection(found) && !brokerCardOwnedByOther(found, child.id) && brokerCardFits(found, child)) card = found;
   }
   if (card) {
@@ -377,10 +397,10 @@ function brokerLinkFor(child) {
   // Find an existing card this child already owns (a replay may have given
   // it a new id), else an unclaimed native/synthetic card for the same task.
   const task = brokerTaskOf(child);
-  card = [...(parent.events || [])].reverse().find((e) => isDelegateCard(e) && brokerCardOwnedBy(e, child.id) && brokerCardFits(e, child));
+  card = (parent.events || []).findLast((e) => isDelegateCard(e) && brokerCardOwnedBy(e, child.id) && brokerCardFits(e, child));
   let rehomed = false;
   if (!card) {
-    card = [...(parent.events || [])].reverse().find((e) => isDelegateCard(e) && (brokerCardUnclaimed(e) || brokerCardWronglyOwned(e)) && task && normTask(brokerCardTask(e)) === normTask(task));
+    card = (parent.events || []).findLast((e) => isDelegateCard(e) && (brokerCardUnclaimed(e) || brokerCardWronglyOwned(e)) && task && normTask(brokerCardTask(e)) === normTask(task));
     rehomed = Boolean(card) && !brokerCardUnclaimed(card);
   }
   const created = !card;
@@ -388,6 +408,7 @@ function brokerLinkFor(child) {
     card = makeBrokerCard(child);
     const firstProjection = (parent.events || []).findIndex((e) => e.brokerChildId === child.id);
     parent.events.splice(firstProjection === -1 ? parent.events.length : firstProjection, 0, card);
+    forgetEvents(parent.events); // an element was inserted among the indexed ones
   } else {
     claimBrokerCard(card, child, { force: rehomed });
   }
@@ -412,7 +433,7 @@ function projectBrokerEvent(child, ev) {
   const link = brokerLinkFor(child);
   if (!link) return null;
   const fields = brokerFields(child, ev, link.card.id);
-  let pev = link.parent.events.find((e) => e.id === fields.id);
+  let pev = findEvent(link.parent.events, fields.id);
   const created = !pev;
   if (created) {
     link.parent.events.push(fields);
@@ -429,7 +450,7 @@ function projectBrokerPatch(child, ev, fields) {
   const link = brokerLinkFor(child);
   if (!link) return null;
   const id = brokerProjectedId(child.id, ev.id);
-  const pev = link.parent.events.find((e) => e.id === id);
+  const pev = findEvent(link.parent.events, id);
   if (!pev) return projectBrokerEvent(child, ev);
   const clean = cleanBrokerValue(fields) || {};
   delete clean.brokerChildId;
@@ -447,7 +468,7 @@ function projectBrokerDelta(child, ev, text, field) {
   const link = brokerLinkFor(child);
   if (!link) return null;
   const id = brokerProjectedId(child.id, ev.id);
-  const pev = link.parent.events.find((e) => e.id === id);
+  const pev = findEvent(link.parent.events, id);
   if (!pev) return projectBrokerEvent(child, ev);
   const safe = scrubBrokerText(text);
   if (!safe) return pev;
@@ -472,14 +493,14 @@ function stableJson(value) {
 // turn or a child that is still working.
 function reconcileBrokerCard(child, { parent, card }) {
   if (['running', 'awaiting_permission'].includes(child.status)) return false;
-  const end = [...(child.events || [])].reverse().find((e) => e.type === 'turn_end');
+  const end = (child.events || []).findLast((e) => e.type === 'turn_end');
   if (!end || !card.subagent) return false;
   const status = end.interrupted ? 'interrupted' : end.error ? 'error' : 'done';
   const subStatus = end.interrupted ? 'cancelled' : end.error ? 'error' : 'done';
-  const text = [...(child.events || [])].reverse().find((e) => e.type === 'text' && String(e.text || '').trim())?.text?.trim();
+  const text = (child.events || []).findLast((e) => e.type === 'text' && String(e.text || '').trim())?.text?.trim();
   const isError = Boolean(end.error);
   if (card.status === status && card.subagent.status === subStatus && card.isError === isError && (!text || card.subagent.summary === text)) return false;
-  const error = isError ? [...(child.events || [])].reverse().find((e) => e.type === 'error' && e.text)?.text || card.subagent.error || card.output : null;
+  const error = isError ? (child.events || []).findLast((e) => e.type === 'error' && e.text)?.text || card.subagent.error || card.output : null;
   patch(parent, card, {
     status,
     isError,
@@ -571,7 +592,7 @@ function syntheticBrokerCard(session, fields) {
   if (!/delegate|mcp__agent-hub|broker/i.test(fields.name || '')) return null;
   const task = String(fields.input.task || '').trim();
   if (!task) return null;
-  return [...(session.events || [])].reverse().find((e) => e.brokerSynthetic && !e.brokerChildId && e.type === 'tool_use' && String(e.input?.task || '').trim() === task) || null;
+  return (session.events || []).findLast((e) => e.brokerSynthetic && !e.brokerChildId && e.type === 'tool_use' && String(e.input?.task || '').trim() === task) || null;
 }
 
 function emit(session, fields) {
@@ -1481,21 +1502,10 @@ export function disposeSession(session) {
   adapterFor(session)?.dispose?.(session);
 }
 
-// Delete a conversation: the one implementation behind every way to do it
-// (the API, a Kimi row's 刪除, the /archive command). A conversation is its
-// whole continuation chain plus, recursively, every sub-agent conversation
-// (`parentId`) of any node; `continuedFrom` is a link in the chain, never a
-// parent. Nodes go oldest first: a stop half way leaves a shorter valid chain,
-// never an old node standing alone as the leaf again.
-// The Kimi sessions of deleted sub-agents are Hub-made artifacts: they are
-// archived on their machine (retried when it comes back if it is away) and
-// kept out of the machine list meanwhile, so they never surface as 子session.
-// The conversation's own Kimi sessions are the user's, and are left alone.
-export function deleteConversation(session) {
+// The nodes a conversation is made of: its whole chain and, recursively, the
+// sub-agent conversations of any of them. → { chain: [ids], kids: [ids] }
+export function conversationMembers(session) {
   const leaf = store.leafOf(session) || session;
-  // A switch in progress holds a half-made node and native sessions of its
-  // own; deleting under it would strand them.
-  if (switching.has(conversationOf(leaf))) throw Object.assign(new Error('正在切換接續節點，請等切換完成再刪除'), { status: 409 });
   const ids = new Set(store.chainOf(leaf).map((n) => n.id));
   ids.add(session.id);
   const chain = [...ids];
@@ -1509,6 +1519,28 @@ export function deleteConversation(session) {
     }
   };
   for (const id of chain) addChildren(id);
+  return { chain, kids };
+}
+
+// Delete a conversation: the one implementation behind every way to do it
+// (the API, a Kimi row's 刪除, the /archive command). A conversation is its
+// whole continuation chain plus, recursively, every sub-agent conversation
+// (`parentId`) of any node; `continuedFrom` is a link in the chain, never a
+// parent. Nodes go oldest first: a stop half way leaves a shorter valid chain,
+// never an old node standing alone as the leaf again.
+// The Kimi sessions of deleted sub-agents are Hub-made artifacts: they are
+// archived on their machine (retried when it comes back if it is away) and
+// kept out of the machine list meanwhile, so they never surface as 子session.
+// The conversation's own Kimi sessions are the user's, and are left alone.
+// `archiveNatives: false`: the caller has already dealt with the Kimi sessions
+// on the machine (a full purge of a cluster deletes them), so they are only
+// kept out of the machine list and not archived again.
+export function deleteConversation(session, { archiveNatives = true } = {}) {
+  const leaf = store.leafOf(session) || session;
+  // A switch in progress holds a half-made node and native sessions of its
+  // own; deleting under it would strand them.
+  if (switching.has(conversationOf(leaf))) throw Object.assign(new Error('正在切換接續節點，請等切換完成再刪除'), { status: 409 });
+  const { chain, kids } = conversationMembers(session);
   const subagentNatives = [];
   for (const id of [...chain, ...kids]) {
     const node = store.getSession(id);
@@ -1520,10 +1552,10 @@ export function deleteConversation(session) {
   }
   for (const [machineId, kimiSessionId] of subagentNatives) {
     machines.hideNative(machineId, kimiSessionId);
-    archiveOrphanNative(machineId, kimiSessionId);
+    if (archiveNatives) archiveOrphanNative(machineId, kimiSessionId);
   }
   machines.chainChanged();
-  return { ok: true, deleted: [...chain, ...kids], archiving: subagentNatives.map(([, k]) => k) };
+  return { ok: true, deleted: [...chain, ...kids], archiving: archiveNatives ? subagentNatives.map(([, k]) => k) : [] };
 }
 
 // ------------------------------------------------- provider switching

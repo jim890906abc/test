@@ -62,6 +62,17 @@ const shot = async (name) => {
   await b.shot(path.join(SHOTS, name));
 };
 
+// A cluster's workers are not listed in the sidebar (one line counts them): a search for a name is how the sidebar shows one.
+// Returns the rows the search finds, then clears the search.
+const searchSidebar = async (text) => {
+  const type = (t) => b.eval(`(() => { const i = document.querySelector('.side-search input'); i.value = ${JSON.stringify(t)}; i.dispatchEvent(new Event('input')); })()`);
+  await type(text);
+  await b.sleep(150);
+  const rows = await b.eval(`[...document.querySelectorAll('.sidebar .side-row')].map((r) => ({ title: r.querySelector('.row-title')?.innerText.trim(), href: r.getAttribute('href'), tags: [...r.querySelectorAll('.row-tag')].map((e) => e.innerText.trim()), text: r.innerText }))`);
+  await type('');
+  return rows;
+};
+
 // ------------------------------------------------------------ driving the page
 
 let page; // the driver of the screens (test/fixtures/cluster-page.mjs), made once the browser is up
@@ -188,7 +199,7 @@ test('the cluster page shows the workers the Hub really made: title, task, branc
   await shot('04-cluster-page-running-1280-light.png');
 });
 
-test('the main conversation carries the banner; the workers carry the 叢集 tag in the sidebar and a note of where they belong', { skip }, async () => {
+test('the main conversation carries the banner; the workers are counted on one line of the sidebar, carry the 叢集 tag where a search finds them, and a note of where they belong', { skip }, async () => {
   await open(`#/s/${S.parent.id}`);
   await b.waitFor(`document.querySelector('.cluster-banner')`);
   const banner = await b.eval(`({ text: document.querySelector('.cluster-banner').innerText.trim(), href: document.querySelector('.cluster-banner a').getAttribute('href') })`);
@@ -199,14 +210,16 @@ test('the main conversation carries the banner; the workers carry the 叢集 tag
   await b.click('.cluster-banner a');
   await b.waitFor(`location.hash === '#/cluster/${S.c.id}'`);
 
-  // The sidebar: both workers carry the tag; the main conversation does not.
-  const rows = await b.eval(`[...document.querySelectorAll('.sidebar .side-row')].map((r) => ({ title: r.querySelector('.row-title')?.innerText.trim(), tag: r.querySelector('.row-tag.cluster')?.innerText.trim() ?? null }))`);
+  // The sidebar: the workers are one line, not rows; a search finds each, with the tag; the main conversation has none.
+  const listed = await b.eval(`[...document.querySelectorAll('.sidebar .side-row')].map((r) => r.querySelector('.row-title')?.innerText.trim())`);
+  for (const w of S.c.workers) assert.ok(!listed.includes(w.title), `${w.title} is not a row of the list: ${JSON.stringify(listed)}`);
+  assert.ok(listed.includes(`叢集工作者 ${S.c.workers.length} 個`), `the line that counts them: ${JSON.stringify(listed)}`);
   for (const w of S.c.workers) {
-    const row = rows.find((r) => r.title === w.title);
-    assert.ok(row, `${w.title} is in the sidebar: ${JSON.stringify(rows)}`);
-    assert.equal(row.tag, '叢集');
+    const row = (await searchSidebar(w.title)).find((r) => r.title === w.title);
+    assert.ok(row, `${w.title} is found by a search`);
+    assert.deepEqual(row.tags.includes('叢集'), true);
   }
-  assert.equal(rows.find((r) => r.title === S.parent.title)?.tag ?? null, null);
+  assert.equal((await searchSidebar(S.parent.title)).find((r) => r.title === S.parent.title)?.tags.includes('叢集') ?? false, false);
 
   // A worker's own conversation says where it belongs and links back.
   await open(`#/s/${S.c.workers[0].sessionId}`);
@@ -770,7 +783,7 @@ test('a DeepSeek conversation dispatches DeepSeek workers; the request count and
   const s = await snap(w.sessionId);
   assert.equal(s.provider, 'deepseek');
   assert.equal(s.clusterRole, 'worker');
-  const rows = await b.eval(`[...document.querySelectorAll('.sidebar .side-row')].find((r) => r.querySelector('.row-title')?.innerText.trim() === '深甲')?.querySelectorAll('.row-tag').length ? [...[...document.querySelectorAll('.sidebar .side-row')].find((r) => r.querySelector('.row-title')?.innerText.trim() === '深甲').querySelectorAll('.row-tag')].map((e) => e.innerText.trim()) : null`);
+  const rows = (await searchSidebar('深甲')).find((r) => r.title === '深甲')?.tags ?? null;
   assert.ok(rows?.includes('叢集') && rows.some((x) => /deepseek/i.test(x)), `the worker's row says DeepSeek and 叢集: ${JSON.stringify(rows)}`);
 
   // The connector's proxy reports what it sent for this worker's conversation: 3 requests, one a 429.
@@ -1050,7 +1063,9 @@ test('a worker waiting for the person\'s approval reads 等你核准 on the card
   await page.openDrawer(w.sessionId);
   assert.equal(await b.eval(`Boolean(document.querySelector('.cluster-drawer [data-action="open-worker"]') && !document.querySelector('.cluster-drawer [data-action="open-worker"]').hidden)`), true, 'with the way to the conversation where it is answered, in its drawer');
   await page.closeDrawer();
-  const row = await b.eval(`[...document.querySelectorAll('.sidebar .side-row')].find((r) => r.querySelector('.row-title')?.innerText.trim() === '等核准的')?.innerText ?? null`);
+  // The sidebar says it too: on the line that counts the workers, and on the worker's row where a search finds it.
+  await b.waitFor(`document.querySelector('.sidebar .side-workers .om-badge--warning')`, { label: 'the workers line says 需要你' });
+  const row = (await searchSidebar('等核准的')).find((r) => r.title === '等核准的')?.text ?? null;
   assert.match(row, /需要你/, 'the sidebar says it too');
   assert.equal((await getCluster(c.id)).workers[0].status, 'awaiting_permission');
   await shot('26-worker-awaiting-approval-1280-light.png');
@@ -1073,10 +1088,10 @@ test('the main conversation is deleted: the cluster and its workers stay, the pa
   await open(`#/cluster/${c.id}`);
   await b.waitFor(`document.querySelectorAll('.cluster-worker').length === 1`);
   assert.equal(await b.eval(`document.querySelector('.cluster-worker-state').innerText.trim()`), '已完成');
-  const link = await b.eval(`({ text: document.querySelector('[data-action="open-parent"]')?.innerText ?? null, href: document.querySelector('[data-action="open-parent"]')?.getAttribute('href') ?? null })`);
-  assert.ok(!/「」/.test(link.text || ''), `no empty quotes where the title was: ${JSON.stringify(link)}`);
-  await b.click('[data-action="open-parent"]');
-  await b.sleep(600);
+  // Its main conversation is gone: the small line under the cluster's name says so in plain words (a link to nothing is not offered).
+  const line = await b.eval(`({ text: document.querySelector('.cluster-head [data-field="parent"]')?.innerText.trim() ?? null, link: Boolean(document.querySelector('[data-action="open-parent"]')) })`);
+  assert.deepEqual(line, { text: '主對話已刪除', link: false });
+  await b.sleep(300);
   // Wherever it goes, the page is alive (not blank, no raw error) and the worker's own conversation still opens.
   assert.ok((await b.eval(`document.body.innerText.length`)) > 20);
   await shot('27-parent-deleted-then-back-1280-light.png');
@@ -1240,7 +1255,7 @@ test('a dispatch that fails half way (the second conversation cannot be opened; 
     assert.equal(git(S.repo, 'branch', '--list', 'cluster/*'), branchesBefore, `${what}: no branch left`);
     assert.deepEqual(await clustersOf(parent.id), [], `${what}: no cluster`);
     await until(async () => (await hub.api('GET', '/sessions')).length === sessionsBefore, 8000, `${what}: the half-made conversations are gone from the Hub's list`);
-    await b.waitFor(`![...document.querySelectorAll('.sidebar .side-row .row-title')].some((e) => e.innerText.includes('半途'))`, { label: `${what}: and from the sidebar` });
+    await until(async () => (await searchSidebar('半途')).length === 0, 8000, `${what}: and from the sidebar (a search finds nothing of it)`);
   };
   const tryDispatch = async () => {
     await openDialogFromComposer(parent.id);
@@ -1390,7 +1405,7 @@ test('on a phone (390) the dispatch dialog, the cluster page with its time bars 
   assert.ok(o.page <= 0 && o.body <= 0, `no sideways scroll: ${JSON.stringify(o)}`);
   assert.deepEqual(o.wide, [], 'nothing sticks out past the right edge');
   const buttons = await b.eval(`[...document.querySelectorAll('.cluster-actions button')].map((e) => { const r = e.getBoundingClientRect(); return { text: e.innerText.trim(), w: Math.round(r.width), h: Math.round(r.height), inside: r.left >= 0 && r.right <= innerWidth }; })`);
-  assert.equal(buttons.length, 3, '全部停止, 合併, 清理');
+  assert.equal(buttons.length, 4, '全部停止, 合併, 清理, 完全清除');
   for (const bt of buttons) assert.ok(bt.inside && bt.h >= 24, `${bt.text} is whole and at least the 24 px a finger target needs (WCAG 2.2): ${JSON.stringify(bt)}`);
   await shot('18-cluster-page-390-light.png');
   await b.eval(`document.querySelector('.cluster-merge').scrollIntoView()`);

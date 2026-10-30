@@ -27,7 +27,7 @@ const machineOnline = (online) =>
   b.beforeLoad(`(() => {
     const real = window.fetch;
     window.fetch = async (url, init) => {
-      if (String(url) === '/api/machines' && !(init?.method && init.method !== 'GET')) {
+      if (String(url).split('?')[0] === '/api/machines' && !(init?.method && init.method !== 'GET')) {
         return new Response(JSON.stringify([{ id: 'm1', name: 'box', online: ${online}, kimi: { available: ${online} } }]), { status: 200, headers: { 'content-type': 'application/json' } });
       }
       return real(url, init);

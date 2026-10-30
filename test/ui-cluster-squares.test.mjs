@@ -114,8 +114,8 @@ test('the page is an overview: a progress band with the speed and the counts, th
   assert.equal(tiles.length, 6);
   assert.deepEqual(tiles.map((t) => t.state), ['執行中', '執行中', '執行中', '已完成', '出錯', '等你核准']);
   assert.deepEqual(tiles.map((t) => t.place), ['第 1/8 條', '第 2/8 條', '第 3/8 條', '做完 3 條', '做完 1 條', '第 6/8 條']);
-  // The tile says 生成速度 (the chat room's number), not the five-minute average: a worker that is not running is a dash, never 0 (0 reads as slow).
-  assert.deepEqual(tiles.map((t) => t.gen), ['103 tok/s', '87 tok/s', '—', '—', '—', '41 tok/s']);
+  // The tile says 生成 (the chat room's number) beside 平均 (its last five minutes, waiting and tools in it): a worker that is not running is a dash, never 0 (0 reads as slow).
+  assert.deepEqual(tiles.map((t) => t.gen), ['生成 103 · 平均 64', '生成 87 · 平均 120', '—', '—', '—', '生成 41 · 平均 18']);
   assert.deepEqual(tiles.map((t) => t.genNone), [false, false, true, true, true, false]);
   assert.ok(tiles.every((t) => !/^0 tok/.test(t.gen)), 'no tile reads 0');
   assert.deepEqual(tiles.map((t) => t.sub), ['子代理 5/8', '子代理 43/128', '', '子代理 0/4', '子代理 0/3', '子代理 6/6'], 'working over opened, from the counts the Hub sent');
@@ -127,10 +127,11 @@ test('the page is an overview: a progress band with the speed and the counts, th
   for (const t of tiles) {
     assert.ok(t.text.length < 90, `a tile is a few words, not a paragraph: ${JSON.stringify(t.text)}`);
     assert.doesNotMatch(t.text, /把第|cluster\/c_|worktree|量不到：|正在改|\/home\//, t.session);
-    assert.ok(t.height < 150, `${t.session} is ${t.height}px tall`);
+    // (A narrow tile wraps its 生成 · 平均 line under the state: one line more than before.)
+    assert.ok(t.height < 170, `${t.session} is ${t.height}px tall`);
   }
   // The tooltip says in one sentence how it is worked out; a dash says that it cannot be said now, and the long form is in the drawer.
-  assert.equal(tiles[0].genTitle, '生成速度：模型實際吐字時每秒的字數，不含等工具與等第一個字（和聊天室狀態列同一個數字）');
+  assert.equal(tiles[0].genTitle, '生成 103 tok/s：模型實際吐字時每秒的字數，不含等工具與等第一個字（和聊天室狀態列同一個數字）。平均 64 tok/s：最近 5 分鐘內產出的字數 ÷ 300 秒，含等待與工具時間');
   assert.equal(tiles[2].genTitle, '生成速度：模型實際吐字時每秒的字數，不含等工具與等第一個字。現在量不到（原因在詳細裡）');
   assert.doesNotMatch(tiles[2].text, /DeepSeek 號池/);
   assert.equal(await b.eval(`document.querySelectorAll('.cluster-worker .cluster-timing, .cluster-worker .cluster-kv, .cluster-worker-task, .cluster-worker-progress').length`), 0);
@@ -138,7 +139,7 @@ test('the page is an overview: a progress band with the speed and the counts, th
   const aria = await b.eval(`[...document.querySelectorAll('.cluster-worker')].map((t) => [t.getAttribute('role'), t.tabIndex, t.getAttribute('aria-label')])`);
   assert.deepEqual(aria.map((a) => a[0]), Array(6).fill('button'));
   assert.deepEqual(aria.map((a) => a[1]), Array(6).fill(0));
-  assert.match(aria[1][2], /凱恩.*執行中.*第 2\/8 條.*生成速度 87 tok\/s.*子代理 128：22 執行中・21 等你核准・43 完成・21 失敗或取消・21 狀態未知.*按下查看詳細/);
+  assert.match(aria[1][2], /凱恩.*執行中.*第 2\/8 條.*生成速度 87 tok\/s，平均 120 tok\/s.*子代理 128：22 執行中・21 等你核准・43 完成・21 失敗或取消・21 狀態未知.*按下查看詳細/);
   assert.match(aria[2][2], /生成速度 量不到/);
   await shot('page-1280');
 });
@@ -529,14 +530,17 @@ test('the cluster moves under an open page: numbers change, tiles stay the same 
   assert.equal(await text('[data-stat="output"] [data-field="num"]'), '13', 'the cluster\'s output follows the pushed line');
   assert.equal(await text('[data-stat="output"] [data-field="avg"]'), `平均產出（最近 5 分鐘）${Math.round(summarizeCluster(next).speed.tokensPerSecond)} tok/s・5/6 個工作者量得到`);
   assert.equal(await text(`${tileOf(1)} [data-field="subcount"]`), '子代理 2/8');
-  assert.equal(await text(`${tileOf(1)} [data-field="gen"]`), '55 tok/s');
+  assert.equal(await text(`${tileOf(1)} [data-field="gen"]`), '生成 55 · 平均 7.3');
   assert.equal(await b.eval(`document.querySelectorAll('.cluster-worker[data-mark="kept"]').length`), 6, 'no tile was torn down for a number that moved');
   // The drawer: still open, still on the same subagent, with what changed.
   assert.equal(await drawerOpen(), true);
   await b.waitFor(`document.querySelector('.sa-detail [data-field="steps"]')?.innerText.trim() === '99 步'`);
   assert.equal(await text('.sa-detail [data-field="last-action"]'), '執行 npm test');
   assert.equal(await b.eval(`document.querySelector('.cluster-drawer .sa-cell[data-id="agent-2"]').getAttribute('aria-expanded')`), 'true');
-  assert.equal(await b.eval(`document.querySelector('.cd-body').scrollTop`), 120, 'and where the person had scrolled to');
+  // The browser can land a pixel off the scrollTop it was given (fractional
+  // layout); a redrawn drawer would be back at 0, which this still catches.
+  const top = await b.eval(`document.querySelector('.cd-body').scrollTop`);
+  assert.ok(Math.abs(top - 120) <= 2, `and where the person had scrolled to (120, got ${top})`);
   assert.equal(await text('.cluster-drawer [data-field="subagent-line"]'), '子代理 8：2 執行中・6 完成');
   assert.equal(await text('.cluster-drawer [data-field="tokens"]'), '平均產出（最近 2 分鐘，含等待）：7.3 tok/s');
   assert.equal(await text('.cluster-drawer [data-field="gen"]'), '55 tok/s');
@@ -592,7 +596,7 @@ test('on a phone the drawer is a sheet from the bottom, tiles are two across, an
   const over = await b.eval(`(() => { const e = document.documentElement; return e.scrollWidth - e.clientWidth; })()`);
   assert.ok(over <= 1);
   // The three buttons are icons here and still have names.
-  assert.deepEqual(await b.eval(`[...document.querySelectorAll('.cluster-head .cluster-actions .om-btn')].map((x) => x.getAttribute('aria-label'))`), ['全部停止', '合併工作者分支', '清理']);
+  assert.deepEqual(await b.eval(`[...document.querySelectorAll('.cluster-head .cluster-actions .om-btn')].map((x) => x.getAttribute('aria-label'))`), ['全部停止', '合併工作者分支', '清理', '完全清除']);
 });
 
 // ------------------------------------------------------ every cluster

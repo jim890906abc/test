@@ -178,12 +178,13 @@ test('the three numbers: a tile says the worker\'s 生成速度 (the chat room\'
       { id: 'sq-3', req: 3, attempt: 1, key: 'dk_none', gateway: 'opencode-go', session: S.w2.kid, recvAt: now - 2000, startAt: now - 1900, headersMs: 50, firstByteMs: 80, endMs: 900, status: 200, outcome: 'ok', inflight: 1, outTokens: 200 },
     ],
   });
-  await b.waitFor(`document.querySelector('.cluster-worker[data-session="${w1.sessionId}"] [data-field="gen"]')?.innerText.trim() === '100 tok/s'`, { timeout: 10000, label: 'the tile shows worker 1\'s generation speed' });
+  await b.waitFor(`document.querySelector('.cluster-worker[data-session="${w1.sessionId}"] [data-field="gen"]')?.innerText.trim().startsWith('生成 100 · 平均')`, { timeout: 10000, label: 'the tile shows worker 1\'s generation speed' });
   const api = await getCluster(S.c1.id);
   // The tile is the chat room\'s number: the very meta.tps of the conversation (400 tokens over 4.0 s of streaming).
   assert.equal((await snap(w1.sessionId)).meta.tps, 100);
   assert.equal(api.workers[0].gen.tokensPerSecond, 100);
-  assert.equal(await text(`.cluster-worker[data-session="${w1.sessionId}"] [data-field="gen"]`), '100 tok/s');
+  // ...with the worker's five-minute average beside it (the Hub's own, waiting in it: a different number, and said as one).
+  assert.match(await text(`.cluster-worker[data-session="${w1.sessionId}"] [data-field="gen"]`), /^生成 100 · 平均 \d+(\.\d)?$/);
   // Worker 2 has no step done: nothing was measured, so a dash - not 0, and not worker 1\'s.
   assert.equal(api.workers[1].gen.tokensPerSecond, null);
   assert.equal(await text(`.cluster-worker[data-session="${w2.sessionId}"] [data-field="gen"]`), '—');
@@ -238,7 +239,9 @@ test('a second cluster: the list of every cluster, the big numbers over both, th
   assert.equal(await text('.cluster-nav-count'), String(t.subagentsRunning), 'the sidebar says the same');
   assert.equal(await text(`.cluster-card[data-cluster="${S.c2.id}"] [data-field="subagents"]`), '子代理 3/3');
   assert.equal(await text(`.cluster-card[data-cluster="${S.c1.id}"] [data-field="subagents"]`), '子代理 3/6'.replace('3/6', `${rows.find((r) => r.id === S.c1.id).subagents.running + rows.find((r) => r.id === S.c1.id).subagents.awaiting}/6`));
-  assert.equal(await text(`.cluster-card[data-cluster="${S.c1.id}"] .cc-title`), (await snap(S.p1.id)).title);
+  // The card is called by the cluster's own name; the conversation it was sent from is the small line under it.
+  assert.equal(await text(`.cluster-card[data-cluster="${S.c1.id}"] .cc-title`), (await getCluster(S.c1.id)).name);
+  assert.equal(await text(`.cluster-card[data-cluster="${S.c1.id}"] .cc-parent`), `主對話：${(await snap(S.p1.id)).title}`);
   await shot('e2e-squares-list-1280.png');
 
   // Live, with no reload: two of the new members finish.

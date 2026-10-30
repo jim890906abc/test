@@ -10,6 +10,10 @@ import { WebSocketServer } from 'ws';
 import * as store from './store.js';
 import * as runner from './runner.js';
 import * as clusters from './cluster.js';
+import * as clusterPurge from './cluster-purge.js';
+import * as clusterTrash from './cluster-trash.js';
+import * as sessionList from './session-list.js';
+import * as pagePush from './page-push.js';
 import * as workspace from './workspace.js';
 import { ADAPTERS, TYPE_LABELS } from './adapters/index.js';
 import { TEMPLATES } from './adapters/presets.js';
@@ -533,11 +537,16 @@ app.use('/api/sessions/:id', (req, res, next) => {
   next();
 });
 
-app.get('/api/sessions', wrap(() =>
-  store
-    .listLeaves()
-    .map(runner.summarize)
-    .sort((a, b) => b.updatedAt - a.updatedAt),
+// `?for=sidebar`: what the sidebar lists (server/session-list.js) - the summaries
+// without the model/skill lists, and each cluster worker as a stub (`stub: true`).
+// Without it, every conversation whole, as always.
+app.get('/api/sessions', wrap((req) =>
+  req.query.for === 'sidebar'
+    ? sessionList.sidebarSessions()
+    : store
+      .listLeaves()
+      .map(runner.summarize)
+      .sort((a, b) => b.updatedAt - a.updatedAt),
 ));
 
 // Conversation files that were damaged on disk: the ones repaired and loaded
@@ -1063,17 +1072,25 @@ app.post('/api/sessions/:id/backup', wrap(async (req) => {
 app.post('/api/sessions/:id/cluster', wrap((req) => clusters.create(leafOf(req), req.body)));
 app.get('/api/sessions/:id/clusters', wrap((req) => clusters.listFor(leafOf(req))));
 app.get('/api/clusters', wrap(() => clusters.listAll()));
+// (before /api/clusters/:cid) the backups of purged clusters that are still kept.
+app.get('/api/clusters/trash', wrap(() => ({ days: clusterTrash.TRASH_DAYS, items: clusterPurge.listPurged() })));
 app.get('/api/clusters/:cid', wrap((req) => clusters.get(req.params.cid)));
 app.post('/api/clusters/:cid/stop', wrap((req) => clusters.stop(req.params.cid)));
 app.post('/api/clusters/:cid/merge', wrap((req) => clusters.merge(req.params.cid)));
+app.post('/api/clusters/:cid/name', wrap((req) => clusters.rename(req.params.cid, req.body?.name)));
 // Clean-up after the work is merged (worktrees, worker branches, sidebar rows); the plan is a dry run for the confirmation.
 app.get('/api/clusters/:cid/cleanup/plan', wrap((req) => clusters.cleanupPlan(req.params.cid)));
 app.post('/api/clusters/:cid/cleanup', wrap((req) => clusters.cleanup(req.params.cid)));
+// 完全清除: what it would do with these options (the boxes), and doing it.
+const purgeOptions = (src) => ({ discardDirty: [true, '1', 'true'].includes(src?.discardDirty), deleteUnmerged: [true, '1', 'true'].includes(src?.deleteUnmerged), deleteMerged: [true, '1', 'true'].includes(src?.deleteMerged), noBackup: [true, '1', 'true'].includes(src?.noBackup) });
+app.get('/api/clusters/:cid/purge/plan', wrap((req) => clusterPurge.plan(req.params.cid, purgeOptions(req.query))));
+app.post('/api/clusters/:cid/purge', wrap((req) => clusterPurge.purge(req.params.cid, purgeOptions(req.body))));
 app.post('/api/clusters/:cid/unhide', wrap((req) => clusters.unhide(req.params.cid, req.body?.sessionId)));
 app.get('/api/clusters/:cid/memory', wrap((req) => clusters.readMemoryOf(req.params.cid)));
 app.post('/api/clusters/:cid/memory', wrap((req) => clusters.appendDecision(req.params.cid, req.body?.text)));
 
-app.get('/api/machines', wrap(() => machines.listMachines()));
+// `?for=sidebar`: without the Kimi conversations of cluster workers (see machines.sidebarView).
+app.get('/api/machines', wrap((req) => (req.query.for === 'sidebar' ? machines.listMachines().map(machines.sidebarView) : machines.listMachines())));
 app.delete('/api/machines/:id', wrap((req) => machines.removeMachine(req.params.id)));
 app.post('/api/machines/:id/refresh', wrap((req) => machines.rpc(req.params.id, 'kimi.status')));
 app.post('/api/machines/:id/kimi/start', wrap((req) => machines.rpc(req.params.id, 'kimi.start', {}, 40_000)));
@@ -1269,6 +1286,8 @@ server.on('upgrade', (req, socket, head) => {
       // snapshot instead of its newest window (kept for tools; the page uses the window).
       if (m.t === 'watch') {
         ws.windowAll = m.window === 'all';
+        // A page that keeps the slim forms (server/page-push.js) says so; one that does not gets every message whole.
+        ws.slim = m.slim === 1 || m.slim === true;
         watch(ws, typeof m.sid === 'string' ? m.sid : null).catch((err) => console.warn('[ws] watch:', err.message));
       }
     });
@@ -1333,6 +1352,8 @@ async function watch(ws, sid) {
   // written out is queued behind it.
   const snap = snapshotOf(s, { window: !ws.windowAll });
   if (requested.id !== s.id) snap.redirectedFrom = requested.id;
+  // The snapshot carries the summary: what the page was sent of this conversation before it no longer says what it holds.
+  pagePush.forgetSession(ws, s.id);
   ws.holding = (ws.holding || 0) + 1;
   try {
     const body = await store.jsonInSlices(snap, 'events');
@@ -1373,12 +1394,19 @@ function broadcast(msg) {
   // A worker's generation speed lives in its conversation's meta, which moves with
   // no event beside it (a step's end): the summary that carries it is activity too.
   else if (msg.t === 'session' && msg.session?.id) clusters.noteActivity(msg.session.id);
-  const data = JSON.stringify(msg);
+  // The clusters a deleted conversation started say its name is gone.
+  if (msg.sid && msg.t === 'deleted') clusters.noteDeleted(msg.sid);
+  // Written out once, and only if some page needs it whole.
+  let text = null;
+  const whole = () => (text ??= JSON.stringify(msg));
   const sid = STREAM.has(msg.t) ? msg.sid : null;
+  // Pages that keep the slim forms are sent what changed since they were last told (server/page-push.js).
+  let slim;
+  const slimWay = () => (slim === undefined ? (slim = sid ? null : pagePush.prepare(msg, { sidebarView: machines.sidebarView, isWorkerNative: machines.isWorkerNative })) : slim);
   for (const ws of wss.clients) {
     if (ws.readyState !== 1) continue;
     if (ws.watch === undefined) {
-      ws.send(data);
+      ws.send(whole());
       continue;
     }
     if (sid) {
@@ -1390,13 +1418,19 @@ function broadcast(msg) {
         continue;
       }
     }
-    queue(ws, data);
+    const way = ws.slim ? slimWay() : null;
+    if (way) {
+      for (const part of way.deliver(ws, whole)) queue(ws, part);
+      continue;
+    }
+    queue(ws, whole());
   }
 }
 runner.setBroadcast(broadcast);
 machines.setBroadcast(broadcast);
 clusters.setBroadcast(broadcast);
 clusters.load();
+clusterTrash.startSweeper();
 // A connector reports which key of its provisioned pool it is on, and which
 // ones its proxy found exhausted. The account validates it (known gateway
 // and key ids only, never a secret) and the settings pages see it at once.

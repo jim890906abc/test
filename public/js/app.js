@@ -13,15 +13,19 @@ import { driftOf, contextHint, dismissContextHint } from './model-drift.js';
 import { turnStartTs } from './window-state.js';
 import { salvageView, damagedView, damagedHeadline, backupPath, configProblemText, UNSAVED_LABEL, BACKUP_DIR } from './damaged.js';
 import { fadeColors } from './color-fade.js';
-import { buildRows, newChildIndex, rememberChildren, parseSideSections, sidebarSections, rowProviderView } from './sidebar-model.js';
+import { buildRows, newChildIndex, rememberChildren, parseSideSections, sidebarSections, rowProviderView, splitWorkers, workersLine } from './sidebar-model.js';
+import { patchMachine, createClusterSync } from './page-sync.js';
+import { workerStub, mergeWhole, syncWorkers } from './list-form.js';
 import { TimingPane, hasTiming } from './timing-panel.js';
-import { ClusterPage, openClusterDialog, openClusterList, drawClusterNote, rememberCluster, loadClustersOf, clusterHash, createClusterList, loadClusterRows, onClusterRows, clusterTotals } from './cluster.js';
+import { ClusterPage, openClusterDialog, openClusterList, drawClusterNote, rememberCluster, forgetCluster, loadClustersOf, clusterHash, createClusterList, loadClusterRows, onClusterRows, clusterTotals } from './cluster.js';
+import { clusterNameOf, parentLine } from './cluster-model.js';
 import { DEFAULT_SUBAGENT, modeIn, subagentPayload, subagentChoiceText, subagentModeText, providerDefaultsFor as providerDefaultsOf, runWithRollback } from './home-state.js';
 
 const S = {
   config: null,
   machines: [],
   sessions: new Map(), // hub sessions: Kimi conversations taken over by the hub, and Claude conversations
+  workers: new Map(), // the workers of clusters, as stubs (the Hub does not list them as conversations; the whole summary comes when one is opened)
   claude: null, // the Claude API account: { hasKey, keyHint, keySource, defaults, webTools }
   claudeModels: null, // { defaultModel, models } this key can use
   deepseek: null, // the DeepSeek account: { gateway, hasKey, keyHint, keyCount, gateways, activity, defaults }
@@ -320,7 +324,9 @@ const knownChainNative = new Set(); // old native ids seen in a leaf's chain
 
 function rows() {
   rememberChildren(childNatives, S.sessions.values());
-  return buildRows({ sessions: S.sessions.values(), machines: S.machines, knownChainNative, children: childNatives });
+  // A worker that is open has its whole summary in S.sessions; the others are stubs.
+  const stubs = [...S.workers.values()].filter((w) => !S.sessions.has(w.id));
+  return buildRows({ sessions: [...S.sessions.values(), ...stubs], machines: S.machines, knownChainNative, children: childNatives });
 }
 
 let sideRaf = 0;
@@ -334,8 +340,12 @@ function renderSidebar() {
 }
 
 function drawSidebar() {
-  const all = rows();
-  checkAttention(all);
+  const everyRow = rows();
+  // Every row is looked at for "needs you" - a cluster's workers too - but the
+  // list does not draw the workers unless a search asks for them: it counts them.
+  checkAttention(everyRow);
+  const { listed: all, workers: workerRows } = splitWorkers(everyRow, { query: S.query, currentId: S.cur?.id || null });
+  const workersEntry = S.query ? null : workersLine(workerRows);
   // Both categories are display-only: 聊天室 is one updatedAt-ordered list,
   // 子session is native/external sessions only (subagent children stay in their
   // parent's 子代理 panel). A search opens both for the moment without
@@ -352,13 +362,14 @@ function drawSidebar() {
     S.query,
     S.machines.some((m) => m.online),
     [sideSections.chat, sideSections.sub],
+    workersEntry && [workersEntry.count, workersEntry.working, workersEntry.needsYou],
     sections.map(([key, , rs, isOpen]) => [key, isOpen, rs.map((r) => [r.key, r.title, r.cwd, r.status, r.offline, r.provider, r.conversationId, rowProviderView(r).text, r.hub?.clusterRole === 'worker' ? r.hub.clusterId : null, r.childWaiting, r.kimi?.owner || r.hub?.meta?.owner, r.machine?.name, relTime(r.updatedAt), salvageView(r.hub?.meta?.salvaged)?.title])]),
   ]);
   if (sig === lastSidebar) return;
   lastSidebar = sig;
   const items = [];
   if (!list.length) {
-    items.push(h('div', { class: 'side-empty' }, all.length ? '沒有符合搜尋的對話。' : S.machines.some((m) => m.online) ? '在任一台電腦的 Kimi 裡開一個對話，或在這裡開新對話；終端機與外部 session 會放在「子session」。' : '在這裡開一個 Claude 對話，或連接一台電腦使用 Kimi，對話會出現在這裡。'));
+    if (!workersEntry) items.push(h('div', { class: 'side-empty' }, all.length ? '沒有符合搜尋的對話。' : S.machines.some((m) => m.online) ? '在任一台電腦的 Kimi 裡開一個對話，或在這裡開新對話；終端機與外部 session 會放在「子session」。' : '在這裡開一個 Claude 對話，或連接一台電腦使用 Kimi，對話會出現在這裡。'));
   }
   for (const [key, label, rs, isOpen] of sections) {
     const folded = !isOpen;
@@ -377,10 +388,23 @@ function drawSidebar() {
     );
     items.push(h('div', { class: `side-group${folded ? '' : ' open'}` }, head, folded ? null : rs.map((r) => sideRow(r, current, multi))));
   }
+  if (workersEntry) items.push(workersRow(workersEntry));
   fill($list, ...items);
-  $search.parentElement.hidden = all.length < 8 && !S.query;
+  // The workers count for the search box too: a search is how to find one by name.
+  $search.parentElement.hidden = everyRow.length < 8 && !S.query;
   drawFoot();
   updateTitle();
+}
+
+// The one row that stands for a cluster's workers: they are not listed, the
+// cluster pages open them (and a search finds them by name).
+function workersRow(entry) {
+  return h(
+    'a',
+    { class: 'side-row side-workers', href: '#/clusters', role: 'listitem', title: '叢集的工作者對話不列在這裡：到叢集總覽打開它們，或在上面搜尋名稱', onclick: closeDrawer },
+    h('span', { class: 'row-text' }, h('span', { class: 'row-title' }, entry.title), h('span', { class: 'row-sub' }, h('span', { class: 'row-sub-text' }, entry.sub))),
+    entry.needsYou ? h('span', { class: 'om-badge om-badge--warning' }, '需要你') : entry.working ? h('span', { class: 'spinner', 'aria-label': '執行中' }) : null,
+  );
 }
 
 function sideRow(r, current, multi) {
@@ -730,8 +754,11 @@ onClusterRows(() => {
 
 function renderClusterToolbar(c) {
   if (!S.route?.startsWith('cluster:')) return;
-  const parent = c ? S.sessions.get(c.parentId) : null;
-  fill($toolbar, sidebarToggle(), h('div', { class: 'toolbar-titles' }, h('div', { class: 'om-toolbar__title' }, '叢集'), h('div', { class: 'om-toolbar__subtitle' }, [parent?.title, c?.id].filter(Boolean).join(' · '))));
+  // The cluster's own name (the page's head shows it big); never the main conversation's title in its place.
+  const live = c ? S.sessions.get(c.parentId)?.title || '' : '';
+  const name = c ? clusterNameOf(c, c.name ? '' : live) : '';
+  const parent = c ? parentLine(c, live) : { text: '' };
+  fill($toolbar, sidebarToggle(), h('div', { class: 'toolbar-titles' }, h('div', { class: 'om-toolbar__title' }, '叢集'), h('div', { class: 'om-toolbar__subtitle' }, [c?.name ? name : '', c?.name ? '' : parent.text, c?.id].filter(Boolean).join(' · '))));
 }
 
 // All pages Kimi made, across conversations, like Claude's Artifacts list.
@@ -1395,11 +1422,19 @@ let artifactView = null;
 let socket = null;
 function watchCurrent() {
   if (S.cur) S.cur.syncing = true;
-  socket?.send({ t: 'watch', sid: S.cur?.id || null });
+  // `slim`: this page keeps the slim forms of what the Hub pushes (machine.patch, cluster.patch, listed summaries).
+  socket?.send({ t: 'watch', sid: S.cur?.id || null, slim: 1 });
 }
 
 function leaveSession() {
   if (!S.cur) return;
+  // A worker that was opened goes back to being a stub (the sidebar does not list workers).
+  const left = S.cur.summary;
+  if (left?.clusterRole === 'worker') {
+    S.workers.set(left.id, workerStub(left));
+    S.sessions.delete(left.id);
+    renderSidebar();
+  }
   if (['agents', 'todos', 'timing'].includes(S.panel?.tab)) hidePanel();
   clearInterval(S.cur.ping);
   S.cur.transcript.destroy();
@@ -5376,13 +5411,16 @@ function showLogin(message) {
 // ------------------------------------------------------------ live data
 
 async function loadMachines() {
-  S.machines = await get('/machines');
+  S.machines = await get('/machines?for=sidebar');
   renderSidebar();
 }
 
 async function loadSessions() {
-  const r = await get('/sessions');
-  const list = Array.isArray(r) ? r : r?.sessions || [];
+  // What the sidebar lists: the summaries without the computer's model and skill lists, and a cluster's workers as stubs.
+  const r = await get('/sessions?for=sidebar');
+  const all = Array.isArray(r) ? r : r?.sessions || [];
+  const list = all.filter((s) => !s?.stub);
+  S.workers = new Map(all.filter((s) => s?.stub && s.id).map((w) => [w.id, w]));
   // The server returns each chain's leaf. Keep that contract even if an older
   // hub still sends every node: retain one leaf per conversationId.
   const byConversation = new Map();
@@ -5393,13 +5431,24 @@ async function loadSessions() {
     const prev = byConversation.get(cid);
     if (!prev || rank(s, cid) > rank(prev, cid) || (rank(s, cid) === rank(prev, cid) && (s.updatedAt || 0) >= (prev.updatedAt || 0))) byConversation.set(cid, s);
   }
+  const open = S.cur ? S.sessions.get(S.cur.id) : null;
   S.sessions = new Map([...byConversation.values()].map((s) => [s.id, s]));
+  // (The conversation that is open is held whole; a list read again does not make it listed.)
+  if (open && S.sessions.has(open.id)) S.sessions.set(open.id, mergeWhole(S.sessions.get(open.id), open));
   renderSidebar();
 }
 
 function upsertSession(summary) {
   const s = normalizeSummary(summary);
   if (!s.id) return;
+  // The Hub sends the whole summary of the conversation that is open and a listed one of the others: a listed one never replaces what the open conversation shows.
+  if (s.slim && S.cur?.id === s.id) return;
+  // A cluster's worker is a stub in the sidebar until it is opened.
+  if (s.clusterRole === 'worker' && S.cur?.id !== s.id) {
+    S.workers.set(s.id, workerStub(s));
+    S.sessions.delete(s.id);
+    return renderSidebar();
+  }
   // An old chain node is not a sidebar entry. If it is the one on screen, go
   // to the leaf it was continued into.
   if (s.continuedTo || s.isLeaf === false) {
@@ -5464,22 +5513,80 @@ function upsertSession(summary) {
   }
 }
 
+// A computer as the Hub says it now (a whole one, or a patch applied to the one the page has).
+function takeMachine(next) {
+  const i = S.machines.findIndex((x) => x.id === next.id);
+  const before = i === -1 ? null : S.machines[i];
+  if (i === -1) S.machines.push(next);
+  else S.machines[i] = next;
+  renderSidebar();
+  machinesDialog?.draw();
+  if (S.route === 'home' && (!before || before.online !== next.online || before.kimi?.available !== next.kimi?.available)) {
+    modelCatalogs.clear();
+    homeCatalog = null;
+    showHome();
+  }
+}
+
+// The page's copy of each cluster as the Hub last sent it (the patches apply to it).
+const clusterSync = createClusterSync();
+
+// A cluster as the Hub says it now. Its workers are the sidebar's stubs, so what a
+// worker is doing - and whether it needs you - comes from here.
+function takeCluster(c) {
+  let moved = syncWorkers(S.workers, c, { parent: S.sessions.get(c.parentId) });
+  // A worker's conversation is announced before it is known to be a worker's (the Hub marks it a moment after it makes it), so it may have come in as a plain conversation: it is a stub from now on, unless it is the one open.
+  const named = new Set(c.workers.map((w) => w.sessionId));
+  for (const [id, s] of S.sessions) {
+    if ((named.has(id) || named.has(s.conversationId)) && S.cur?.id !== id) {
+      S.sessions.delete(id);
+      moved = true;
+    }
+  }
+  rememberCluster(c);
+  clusterPage?.update(c);
+  if (moved) renderSidebar();
+  return drawCurrentClusterNote();
+}
+
 function onMessage(m) {
   switch (m.t) {
     case 'session':
       return upsertSession(m.session);
     case 'cluster': {
       if (!m.cluster?.id) return;
-      rememberCluster(m.cluster);
-      clusterPage?.update(m.cluster);
+      return takeCluster(clusterSync.whole(m.cluster));
+    }
+    case 'cluster.patch': {
+      // What changed since the cluster the Hub last sent this page. A cluster the page was never sent whole is read from the Hub.
+      const c = clusterSync.patch(m);
+      if (c) return takeCluster(c);
+      return get(`/clusters/${encodeURIComponent(m.id)}`)
+        .then((whole) => whole?.id && takeCluster(clusterSync.whole(whole)))
+        .catch(() => {});
+    }
+    // A full purge took the cluster away: it leaves every list, and its own page says so.
+    case 'cluster.removed': {
+      if (!m.id) return;
+      if (clusterPage?.id === m.id) clusterPage.removed();
+      forgetCluster(m.id);
+      clusterList?.reloadPurged?.();
       return drawCurrentClusterNote();
     }
     case 'deleted':
       S.sessions.delete(m.sid);
+      S.workers.delete(m.sid);
       if (S.cur?.id === m.sid) go('#/');
       return renderSidebar();
     case 'batch':
-      for (const x of m.items) onMessage(x);
+      // One message that fails must not take the others in its bundle with it: a patch lost is a page that no longer matches the Hub.
+      for (const x of m.items) {
+        try {
+          onMessage(x);
+        } catch (err) {
+          console.error(err);
+        }
+      }
       return;
     case 'snapshot': {
       const cur = S.cur;
@@ -5515,19 +5622,13 @@ function onMessage(m) {
       else t.delta(m.id, m.field, m.text);
       return;
     }
-    case 'machine': {
-      const i = S.machines.findIndex((x) => x.id === m.machine.id);
-      const before = i === -1 ? null : S.machines[i];
-      if (i === -1) S.machines.push(m.machine);
-      else S.machines[i] = m.machine;
-      renderSidebar();
-      machinesDialog?.draw();
-      if (S.route === 'home' && (!before || before.online !== m.machine.online || before.kimi?.available !== m.machine.kimi?.available)) {
-        modelCatalogs.clear();
-        homeCatalog = null;
-        showHome();
-      }
-      return;
+    case 'machine':
+      return takeMachine(m.machine);
+    case 'machine.patch': {
+      // A computer the page does not have must be read from the Hub.
+      const r = patchMachine(S.machines, m);
+      if (!r) return loadMachines().then(() => machinesDialog?.draw());
+      return takeMachine(r.machine);
     }
     case 'machines':
       return loadMachines().then(() => machinesDialog?.draw());

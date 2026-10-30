@@ -39,6 +39,8 @@
 //   AGENT_HUB_DEEPSEEK_STICKY_MAX     most conversations remembered at once (default 20000; the one that
 //                                     asked longest ago is forgotten first); sticky pools only
 //   AGENT_HUB_DAEMON_RECHECK_MS       how often a stale Claude daemon is looked at (default 15000)
+//   AGENT_HUB_TRASH_SWEEP_MS          how often the cluster backups older than 7 days are deleted from <state dir>/trash
+//                                     (default 86400000 = once a day, and once at start)
 // The hello names what this version supports (`capabilities`); a Claude daemon
 // that lacks what the hub's features need is replaced as soon as it is idle.
 //
@@ -443,6 +445,13 @@ async function runBridge() {
   }
   hub.connect(MACHINE_ID);
   setInterval(ensureBroker, 10_000).unref();
+  // Backups older than their 7 days go, now and then once a day.
+  const sweepTrash = () => {
+    const gone = trashSweep(TRASH_DIR);
+    if (gone.length) log(`… 刪除了 ${gone.length} 個超過 ${TRASH_DAYS} 天的叢集備份`);
+  };
+  sweepTrash();
+  setInterval(sweepTrash, Number(process.env.AGENT_HUB_TRASH_SWEEP_MS) || 24 * 60 * 60 * 1000).unref();
   // A Claude daemon from an earlier run may still be running conversations.
   if (fs.existsSync(path.join(daemon.dir, 'daemon.json'))) daemon.follow();
 
@@ -479,7 +488,7 @@ const ALLOW = [
   ['GET', /^\/api\/v1\/workspaces\/[\w.-]+\/skills$/],
   ['POST', /^\/api\/v1\/sessions$/],
   ['GET', /^\/api\/v1\/sessions\/session_[\w-]+(\/[\w./:-]*)?(\?.*)?$/],
-  ['POST', /^\/api\/v1\/sessions\/session_[\w-]+(:(abort|compact|fork|undo|btw|archive))?$/],
+  ['POST', /^\/api\/v1\/sessions\/session_[\w-]+(:(abort|compact|fork|undo|btw|archive|delete))?$/],
   ['POST', /^\/api\/v1\/sessions\/session_[\w-]+\/(prompts|prompts:steer|prompts\/[\w-]+:(abort|steer)|approvals\/[\w-]+|questions\/[\w-]+(:dismiss)?|profile|skills\/[\w.%-]+:activate)$/],
   ['POST', /^\/api\/v1\/sessions\/session_[\w-]+\/fs:(list|read|stat|git_status|diff|search|grep)$/],
   // Ctrl+B: move work running in the foreground to the background.
@@ -4782,14 +4791,50 @@ const daemon = {
 //                    keeps that key aside as "refused" (authFailedAt, authFailures,
 //                    authRetryAt: its own fields, never "exhausted") and probes it again with
 //                    real requests at doubling gaps; the Hub may send and read those fields
+//   kimi_delete      Kimi's `:delete` of a conversation (its folder, subagents' journals inside it, and its
+//                    index entry) may be asked of this computer, and `trash.info` says where Kimi keeps
+//                    a conversation and where this connector keeps the backups a cluster purge makes
+//                    (they are deleted here after 7 days; see "the trash")
 //   pool_sticky      the pool may name a `distribution`: 'sticky' gives each conversation (the
 //                    `prompt_cache_key` of its requests) one key for good - the key with the
 //                    fewest conversations takes a new one - and moves only the conversations
 //                    of a key that runs out or is refused; 'relay' is the order of old. The
 //                    pool report says each key's `sessions` (a count) in a sticky pool
 function connectorCapabilities() {
-  return ['pool', 'pool_cross', 'secondary_model', ...(brokerReady ? ['broker'] : []), 'handoff', 'pool_timing', 'pool_measure', 'event_timing', 'pool_auth', 'pool_sticky'];
+  return ['pool', 'pool_cross', 'secondary_model', ...(brokerReady ? ['broker'] : []), 'handoff', 'pool_timing', 'pool_measure', 'event_timing', 'pool_auth', 'pool_sticky', 'kimi_delete'];
 }
+
+
+// ---- trash:begin
+// The trash. A cluster's full purge (完全清除) packs what it is about to delete
+// into <state dir>/trash/cluster-<id>-<time>.tar.gz; they are kept TRASH_DAYS
+// days and then deleted - by the Hub, and by this connector itself (at start
+// and once a day), so a Hub that is gone for good does not leave them here for
+// ever. Only files named like a backup are ever deleted.
+const TRASH_DAYS = 7;
+const TRASH_NAME = /^cluster-c_[0-9a-f]{12}-[0-9A-Za-z._-]+\.tar\.gz$/;
+function trashSweep(dir, now = Date.now(), days = TRASH_DAYS) {
+  const removed = [];
+  let names = [];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return removed;
+  }
+  for (const name of names) {
+    if (!TRASH_NAME.test(name)) continue;
+    const file = path.join(dir, name);
+    try {
+      const st = fs.lstatSync(file);
+      if (!st.isFile() || now - st.mtimeMs < days * 24 * 60 * 60 * 1000) continue;
+      fs.unlinkSync(file);
+      removed.push(name);
+    } catch {}
+  }
+  return removed;
+}
+// ---- trash:end
+const TRASH_DIR = path.join(STATE_DIR, 'trash');
 
 // ------------------------------------------------------------- the hub
 
@@ -4944,6 +4989,15 @@ const hub = {
         const st = fs.statSync(abs);
         if (st.size > 5 * 1024 * 1024) throw new Error('頁面超過 5 MB');
         return { path: abs, content: fs.readFileSync(abs, 'utf8') };
+      }
+      // Where Kimi keeps these conversations on this computer (the Hub packs them before it deletes them), and where this connector's trash is.
+      case 'trash.info': {
+        const dirs = {};
+        for (const id of (Array.isArray(args.sessionIds) ? args.sessionIds : []).slice(0, 2000)) {
+          const key = String(id);
+          dirs[key] = /^session_[\w-]+$/.test(key) ? disk.get(key)?.dir ?? null : null;
+        }
+        return { trashDir: TRASH_DIR, days: TRASH_DAYS, dirs };
       }
       case 'kimi.unlock': {
         const sid = String(args.sessionId || '');

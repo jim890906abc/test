@@ -8,6 +8,7 @@
 // a subagent belongs to, how a speed is written) is in cluster-model.js; this
 // file draws it.
 import { h, fill, icon, relTime, copyText } from './dom.js';
+import { get, post } from './api.js';
 import { modelWithProvider, PROVIDER_LABELS } from './providers.js';
 import { timingBox } from './timing-box.js';
 import {
@@ -18,6 +19,7 @@ import {
   genView,
   groupCounts,
   isActive,
+  isPurgeableRow,
   keyView,
   outputTotalView,
   outputView,
@@ -25,10 +27,12 @@ import {
   speedView,
   squareLabel,
   squaresView,
+  stepsView,
   subagentDetail,
   subagentLine,
   subagentState,
   taskBar,
+  tileSpeedView,
   totalsOf,
   workerQueueLine,
   workerSquare,
@@ -37,7 +41,7 @@ import {
 } from './cluster-model.js';
 
 export const TONE_BADGE = { busy: 'cluster-badge-busy', warn: 'om-badge--warning', danger: 'om-badge--danger', ok: 'om-badge--success', idle: '' };
-export const CLUSTER_BADGE = { starting: 'cluster-badge-busy', running: 'cluster-badge-busy', merging: 'cluster-badge-busy', done: 'om-badge--success', stopped: '', error: 'om-badge--danger' };
+export const CLUSTER_BADGE = { starting: 'cluster-badge-busy', running: 'cluster-badge-busy', merging: 'cluster-badge-busy', purging: 'cluster-badge-busy', done: 'om-badge--success', stopped: '', error: 'om-badge--danger' };
 // A tile has room for one row of little squares: the ones that need a look first.
 const MINIS_SHOWN = 12;
 const MINI_ORDER = { awaiting: 0, running: 1, unknown: 2, failed: 3, cancelled: 3, done: 4 };
@@ -250,7 +254,9 @@ export class WorkerTile {
   update(w, cluster) {
     const st = workerState(w);
     const sq = workerSquare(w, cluster);
+    const tv = tileSpeedView(w);
     const gv = genView(w.gen);
+    const sp = speedView(w.speed);
     const counts = w.subagentCounts;
     const g = groupCounts(counts);
     const line = subagentLine(counts, w.subagentsOlder);
@@ -261,11 +267,12 @@ export class WorkerTile {
       this.state.textContent = st.label;
     });
     this.set('place', sq.place, (v) => ((this.place.hidden = !v), (this.place.textContent = v || '')));
-    // 生成速度, the chat room's number: a dash where the worker is not running or no step is done; why is in the drawer.
-    this.set('gen', gv.text, (v) => {
-      this.gen.textContent = v;
-      this.gen.classList.toggle('none', !gv.measured);
-      this.gen.title = gv.measured ? `生成速度：${gv.tip}（和聊天室狀態列同一個數字）` : `生成速度：${gv.tip}。現在量不到（原因在詳細裡）`;
+    // 生成 (the chat room's number) beside 平均 (its last five minutes, waiting in it): a dash where the worker
+    // is not running or no step is done; why is in the drawer.
+    this.set('gen', `${tv.text}|${tv.title}`, () => {
+      this.gen.textContent = tv.text;
+      this.gen.classList.toggle('none', !tv.measured);
+      this.gen.title = tv.title;
     });
     this.set('bar', JSON.stringify([sq.share, sq.working, w.status]), () => {
       const total = sq.total || 1;
@@ -289,7 +296,7 @@ export class WorkerTile {
       this.count.title = line;
     });
     this.set('aria', `${w.title}|${st.label}|${sq.place}|${gv.text}|${line}`, () => {
-      this.el.setAttribute('aria-label', `${w.title}，${st.label}${sq.place ? `，${sq.place}` : ''}，生成速度 ${gv.measured ? gv.text : '量不到'}，${line}。按下查看詳細`);
+      this.el.setAttribute('aria-label', `${w.title}，${st.label}${sq.place ? `，${sq.place}` : ''}，生成速度 ${gv.measured ? `${gv.text}，平均 ${sp.measured ? sp.text : '量不到'}` : '量不到'}，${line}。按下查看詳細`);
     });
   }
 }
@@ -552,20 +559,26 @@ export class WorkerDrawer {
 // you to the cluster's own page.
 export class ClusterCard {
   constructor() {
-    this.title = h('span', { class: 'cc-title' });
+    this.title = h('span', { class: 'cc-title', dataset: { field: 'name' } });
     this.badge = h('span', { class: 'om-badge cc-state' });
+    this.partial = h('span', { class: 'om-badge om-badge--warning cc-partial', dataset: { field: 'purge-partial' }, hidden: true }, '部分清除');
+    this.check = h('span', { class: 'cc-check', role: 'checkbox', 'aria-checked': 'false', dataset: { field: 'select' }, hidden: true }, icon('check'));
+    // The main conversation, small, under the name (or that it is gone).
+    this.parent = h('div', { class: 'cc-parent', dataset: { field: 'parent' } });
     this.bar = barEl('cc-bar');
     this.progress = h('span', { class: 'cc-progress' });
     this.outNum = h('span', { class: 'cc-output-num' });
     this.outUnit = h('span', { class: 'cc-output-unit' }, 'tok/s 總產出');
     this.workers = h('span', { class: 'cc-fact', dataset: { field: 'workers' } });
     this.subs = h('span', { class: 'cc-fact', dataset: { field: 'subagents' } });
+    this.stepsEl = h('span', { class: 'cc-fact', dataset: { field: 'steps' }, hidden: true });
     this.el = h(
       'a',
       { class: 'cluster-card' },
-      h('div', { class: 'cc-top' }, this.title, this.badge),
+      h('div', { class: 'cc-top' }, this.check, this.title, this.partial, this.badge),
+      this.parent,
       h('div', { class: 'cc-mid' }, h('div', { class: 'cc-prog' }, this.bar, this.progress), h('div', { class: 'cc-output', dataset: { field: 'output' } }, this.outNum, this.outUnit)),
-      h('div', { class: 'cc-facts' }, this.workers, this.subs),
+      h('div', { class: 'cc-facts' }, this.workers, this.subs, this.stepsEl),
     );
     this.last = {};
   }
@@ -576,18 +589,36 @@ export class ClusterCard {
     apply(value);
   }
 
-  // row: summarizeCluster(); title: the main conversation's name.
-  update(row, title) {
+  // row: summarizeCluster(); name: the cluster's own name; parent: { text, gone } the small line;
+  // pick: { on, can, selected } while the person is choosing clusters for a batch purge.
+  update(row, name, parent = { text: '', gone: false }, pick = { on: false, can: false, selected: false }) {
     const live = isActive(row);
     const ov = outputView(row.throughput, { active: live });
     const t = row.tasks;
     this.el.href = `#/cluster/${row.id}`;
     this.el.dataset.cluster = row.id;
     this.el.dataset.status = row.status;
-    this.set('title', title, (v) => ((this.title.textContent = v), (this.title.title = v)));
+    this.set('title', name, (v) => ((this.title.textContent = v), (this.title.title = v)));
+    this.set('parent', `${parent.text}|${parent.gone}`, () => {
+      this.parent.textContent = parent.text;
+      this.parent.hidden = !parent.text;
+      this.parent.classList.toggle('gone', Boolean(parent.gone));
+      this.parent.title = parent.text;
+    });
     this.set('badge', row.status, () => {
       this.badge.className = `om-badge cc-state ${CLUSTER_BADGE[row.status] || ''}`;
       this.badge.textContent = clusterStatusLabel(row.status);
+    });
+    this.set('partial', Boolean(row.purgePartial), (v) => (this.partial.hidden = !v));
+    this.set('pick', `${pick.on}|${pick.can}|${pick.selected}`, () => {
+      this.check.hidden = !pick.on;
+      this.check.setAttribute('aria-checked', String(pick.selected));
+      this.check.setAttribute('aria-disabled', String(!pick.can));
+      this.check.classList.toggle('on', pick.selected);
+      this.el.classList.toggle('picking', pick.on);
+      this.el.classList.toggle('pickable', pick.on && pick.can);
+      this.el.classList.toggle('unpickable', pick.on && !pick.can);
+      this.el.classList.toggle('picked', pick.on && pick.selected);
     });
     this.set('bar', JSON.stringify(t), () => {
       const total = t.total || 1;
@@ -607,8 +638,15 @@ export class ClusterCard {
       this.subs.textContent = sub ? `子代理 ${sub.running + sub.awaiting}/${sub.total + sub.older}` : `子代理 ${DASH}`;
       this.subs.title = sub ? subagentLine(sub, sub.older) : '量不到';
     });
-    this.set('aria', `${title}|${row.status}|${t.done}|${t.total}|${ov.text}|${JSON.stringify(sub)}`, () => {
-      this.el.setAttribute('aria-label', `${title}，${clusterStatusLabel(row.status)}，任務 ${t.done}／${t.total} 完成，叢集總產出 ${ov.measured ? ov.text : '量不到'}，${sub ? subagentLine(sub, sub.older) : '子代理量不到'}`);
+    // 步數: this cluster's own steps, as the chat room counts them. Not added up over clusters.
+    const sv = stepsView(row.steps, row.stepsUnknown);
+    this.set('steps', `${sv.shown}|${sv.text}|${sv.title}`, () => {
+      this.stepsEl.hidden = !sv.shown;
+      this.stepsEl.textContent = sv.text;
+      this.stepsEl.title = sv.title;
+    });
+    this.set('aria', `${name}|${parent.text}|${row.status}|${t.done}|${t.total}|${ov.text}|${JSON.stringify(sub)}|${pick.on}|${pick.selected}`, () => {
+      this.el.setAttribute('aria-label', `${name}${parent.text ? `，${parent.text}` : ''}，${clusterStatusLabel(row.status)}，任務 ${t.done}／${t.total} 完成，叢集總產出 ${ov.measured ? ov.text : '量不到'}，${sub ? subagentLine(sub, sub.older) : '子代理量不到'}${pick.on ? (pick.can ? (pick.selected ? '，已選取' : '，可選取') : '，還在跑，不能選') : ''}`);
     });
   }
 }
@@ -616,17 +654,32 @@ export class ClusterCard {
 // The page that lists every cluster: the totals over all of them in big
 // numbers, then one card each, the working ones first.
 export class ClusterListPage {
-  constructor({ rows, title, load }) {
+  // name(row), parent(row): the big title and the small line of a card. confirmPurge / onPurged / loadPurged / purgedEl:
+  // the batch purge (cluster-purge.js), handed in by cluster.js.
+  constructor({ ctx, rows, name, parent, load, confirmPurge, onPurged, loadPurged, purgedEl }) {
+    this.ctx = ctx;
     this.rows = rows;
-    this.title = title;
+    this.name = name;
+    this.parent = parent;
     this.loadRows = load;
+    this.confirmPurge = confirmPurge;
+    this.onPurged = onPurged;
+    this.loadPurged = loadPurged;
+    this.purgedEl = purgedEl;
     this.cards = new Map();
     this.sig = '';
     this.stat = {};
+    this.picking = false; // choosing clusters for a batch purge
+    this.selected = new Set();
+    this.working = false;
+    this.purged = null; // GET /clusters/trash
     this.statsEl = h('div', { class: 'cl-stats', role: 'status', 'aria-label': '全部叢集合計' });
+    this.bar = h('div', { class: 'cl-bar', dataset: { field: 'batch-bar' }, hidden: true });
     this.grid = h('div', { class: 'cl-grid' });
     this.empty = h('div', { class: 'cl-empty', hidden: true }, h('div', { class: 'large-title' }, '還沒有叢集'), h('p', { class: 'home-lead' }, '在 Kimi 或 DeepSeek 對話裡輸入 /cluster，把任務分給幾個工作者同時做。'));
-    this.el = h('div', { class: 'cluster-page cluster-list-page' }, h('div', { class: 'cluster-body' }, this.statsEl, this.grid, this.empty));
+    this.purgedBox = h('div', { class: 'cluster-purged-slot' });
+    this.el = h('div', { class: 'cluster-page cluster-list-page' }, h('div', { class: 'cluster-body' }, this.statsEl, this.bar, this.grid, this.empty, this.purgedBox));
+    this.grid.addEventListener('click', (e) => this.onGridClick(e), true);
     this.draw();
   }
 
@@ -638,6 +691,21 @@ export class ClusterListPage {
       return;
     }
     this.draw();
+    this.reloadPurged();
+  }
+
+  async reloadPurged() {
+    if (!this.loadPurged) return;
+    this.purged = await this.loadPurged();
+    this.drawPurged();
+  }
+
+  drawPurged() {
+    const el = this.purgedEl?.(this.purged);
+    // (Open or closed stays as the person left it.)
+    const was = this.purgedBox.querySelector('details');
+    if (el && was?.open) el.open = true;
+    fill(this.purgedBox, el);
   }
 
   // `extra`: { avg, avgTitle, title } - a second small line under the first, and a tooltip for the box.
@@ -662,8 +730,103 @@ export class ClusterListPage {
     return el.el;
   }
 
+  // ---- choosing clusters for a batch purge
+
+  canPick(row) {
+    return isPurgeableRow(row);
+  }
+
+  startPicking() {
+    this.picking = true;
+    this.selected.clear();
+    this.draw();
+  }
+
+  stopPicking() {
+    this.picking = false;
+    this.selected.clear();
+    this.draw();
+  }
+
+  // In picking mode a press on a card chooses it (or says why not) instead of opening it.
+  onGridClick(e) {
+    if (!this.picking) return;
+    const card = e.target.closest?.('.cluster-card');
+    if (!card) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const id = card.dataset.cluster;
+    const row = this.rows().find((r) => r.id === id);
+    if (!row || !this.canPick(row) || this.working) return;
+    if (this.selected.has(id)) this.selected.delete(id);
+    else this.selected.add(id);
+    this.draw();
+  }
+
+  drawBar() {
+    const rows = this.rows();
+    const can = rows.filter((r) => this.canPick(r));
+    this.bar.hidden = !rows.length;
+    if (this.picking) {
+      const n = this.selected.size;
+      fill(
+        this.bar,
+        h('span', { class: 'cl-bar-count', role: 'status', dataset: { field: 'picked' } }, n ? `已選 ${n} 個叢集` : '點卡片選取要清除的叢集（只有已結束的可以選）'),
+        h('div', { class: 'cl-bar-actions' },
+          h('button', { class: 'om-btn om-btn--sm', type: 'button', dataset: { action: 'pick-all' }, disabled: !can.length || this.working, onclick: () => ((this.selected = new Set(can.map((r) => r.id))), this.draw()) }, `全選已結束的（${can.length}）`),
+          h('button', { class: 'om-btn om-btn--sm om-btn--destructive', type: 'button', dataset: { action: 'batch-purge' }, disabled: !n || this.working, onclick: () => this.purgeSelected() }, icon('trash'), this.working ? '處理中…' : '完全清除…'),
+          h('button', { class: 'om-btn om-btn--sm', type: 'button', dataset: { action: 'pick-cancel' }, disabled: this.working, onclick: () => this.stopPicking() }, '取消'),
+        ),
+      );
+    } else {
+      fill(
+        this.bar,
+        h('span', { class: 'cl-bar-count muted' }, `${rows.length} 個叢集`),
+        h('div', { class: 'cl-bar-actions' }, h('button', { class: 'om-btn om-btn--sm', type: 'button', dataset: { action: 'pick-start' }, disabled: !can.length, title: can.length ? '勾選多個已結束的叢集，一次完全清除' : '沒有已結束的叢集可以清除', onclick: () => this.startPicking() }, icon('trash'), '批次清除…')),
+      );
+    }
+  }
+
+  // The dry run of every chosen cluster, one confirmation for all of them, then one purge after the other.
+  async purgeSelected() {
+    if (this.working || !this.selected.size) return;
+    const rows = this.rows();
+    const ids = [...this.selected];
+    this.working = true;
+    this.drawBar();
+    try {
+      const results = await Promise.allSettled(ids.map((id) => get(`/clusters/${id}/purge/plan`)));
+      const nameOf = (id) => this.name(rows.find((r) => r.id === id) || { id });
+      const entries = [];
+      const items = [];
+      results.forEach((r, i) => {
+        if (r.status === 'fulfilled') entries.push({ id: ids[i], name: nameOf(ids[i]), plan: r.value });
+        else items.push({ name: nameOf(ids[i]), error: r.reason?.message || String(r.reason) });
+      });
+      let opts = null;
+      if (entries.length) opts = await this.confirmPurge(entries);
+      if (!opts && entries.length) return;
+      for (const e of entries) {
+        try {
+          items.push({ name: e.name, result: await post(`/clusters/${e.id}/purge`, opts) });
+        } catch (err) {
+          items.push({ name: e.name, error: err.message || String(err) });
+        }
+      }
+      this.picking = false;
+      this.selected.clear();
+      this.working = false;
+      this.onPurged?.(items);
+      await this.load();
+    } finally {
+      this.working = false;
+      this.draw();
+    }
+  }
+
   draw() {
     const rows = this.rows();
+    for (const id of [...this.selected]) if (!rows.some((r) => r.id === id && this.canPick(r))) this.selected.delete(id);
     const t = totalsOf(rows);
     const ov = outputTotalView(t);
     const avg = speedView({ tokensPerSecond: t.avgTokensPerSecond });
@@ -678,12 +841,13 @@ export class ClusterListPage {
         avgTitle: avg.measured ? avg.tip : `量不到：${avg.why}`,
       }),
     );
+    this.drawBar();
     const sorted = sortClusters(rows);
     this.empty.hidden = sorted.length > 0;
     const els = sorted.map((r) => {
       let c = this.cards.get(r.id);
       if (!c) this.cards.set(r.id, (c = new ClusterCard()));
-      c.update(r, this.title(r));
+      c.update(r, this.name(r), this.parent(r), { on: this.picking, can: this.canPick(r), selected: this.selected.has(r.id) });
       return c.el;
     });
     for (const id of [...this.cards.keys()]) if (!sorted.some((r) => r.id === id)) this.cards.delete(id);

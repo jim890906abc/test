@@ -6230,9 +6230,10 @@ pre.tail {
 }
 .cw-meta {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: var(--space-2);
+  gap: 2px var(--space-2);
   min-width: 0;
   font-size: 12px;
   line-height: 16px;
@@ -6270,7 +6271,10 @@ pre.tail {
   white-space: nowrap;
 }
 .cw-gen {
-  flex: none;
+  flex: 0 1 auto;
+  margin-left: auto;
+  min-width: 0;
+  white-space: nowrap;
   font-size: 12px;
   line-height: 16px;
   font-weight: 600;
@@ -6931,4 +6935,261 @@ pre.tail {
 }
 .cd-key-label {
   color: var(--ink-secondary);
+}
+
+/* ---- a cluster's own name, with the main conversation as the small line under it */
+.ch-namerow {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.ch-nameline {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.ch-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  margin: 0;
+  font-size: 20px;
+  line-height: 28px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ch-parent {
+  align-self: flex-start;
+  max-width: 100%;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--ink-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ch-parent.gone {
+  color: var(--ink-disabled);
+}
+.cc-parent {
+  margin-top: -8px;
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--ink-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cc-parent[hidden] {
+  display: none;
+}
+.cc-parent.gone {
+  color: var(--ink-disabled);
+}
+.cc-partial[hidden],
+.cc-check[hidden] {
+  display: none;
+}
+.cluster-rename-dialog input {
+  width: 100%;
+}
+
+/* ---- the page of every cluster: choosing clusters for a batch purge */
+.cl-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2) var(--space-3);
+  margin: 0 0 var(--space-3);
+}
+.cl-bar[hidden] {
+  display: none;
+}
+.cl-bar-count {
+  font-size: 13px;
+  line-height: 20px;
+}
+.cl-bar-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+.cc-check {
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border: 1.5px solid var(--control-border);
+  border-radius: var(--radius-xs);
+  background: var(--window);
+  color: transparent;
+}
+.cc-check .om-icon {
+  width: 14px;
+  height: 14px;
+}
+.cc-check.on {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--on-accent);
+}
+.cluster-card.picking {
+  cursor: pointer;
+}
+.cluster-card.picked {
+  border-color: var(--accent);
+  box-shadow: var(--shadow-card), 0 0 0 1px var(--accent);
+}
+.cluster-card.unpickable {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+.cluster-purged-slot {
+  margin-top: var(--space-6);
+}
+.cluster-purged-slot:empty {
+  display: none;
+}
+
+/* ---- 完全清除: the confirmation, the result, the list of backups */
+.cluster-purge-dialog {
+  min-width: 0;
+}
+.cluster-purge-summary,
+.cluster-purge-lines {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0;
+  padding: var(--space-3);
+  border-radius: var(--radius-sm);
+  background: var(--window);
+  font-size: 13px;
+  line-height: 19px;
+  overflow-wrap: anywhere;
+}
+.cluster-purge-summary li::before {
+  content: '刪除　';
+  color: var(--danger);
+  font-weight: 650;
+}
+.cluster-purge-summary li.keep::before {
+  content: '保留　';
+  color: var(--warning);
+}
+.cluster-purge-clusters {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.cluster-purge-list {
+  max-height: 34vh;
+  overflow-y: auto;
+}
+.cluster-purge-boxes {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+.cluster-purge-box.none {
+  opacity: 0.6;
+}
+.cluster-purge-box.danger .om-field__label,
+.cluster-purge-note.danger {
+  color: var(--danger);
+}
+.cluster-purge-note {
+  margin: 0;
+}
+.cluster-purge-result {
+  margin-bottom: var(--space-4);
+  padding: var(--space-4) var(--space-5);
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--success);
+  border-radius: var(--radius-md);
+  background: var(--window-raised);
+  box-shadow: var(--shadow-card);
+}
+.cluster-purge-result.tone-partial {
+  border-left-color: var(--warning);
+}
+.cluster-purge-result.tone-aborted {
+  border-left-color: var(--danger);
+}
+.cluster-purge-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin-top: var(--space-3);
+}
+.cluster-purge-section.failed .cluster-purge-lines {
+  border-left: 3px solid var(--danger);
+}
+.cluster-purge-section.kept .cluster-purge-lines {
+  border-left: 3px solid var(--warning);
+}
+.cluster-purge-section.deleted .cluster-purge-lines {
+  border-left: 3px solid var(--success);
+}
+.cluster-purge-lines code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 18px;
+  overflow-wrap: anywhere;
+}
+.cluster-purge-lines .om-btn {
+  vertical-align: middle;
+}
+.cluster-purge-actions,
+.cluster-gone {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin-top: var(--space-3);
+}
+.cluster-purge-batch {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  max-height: 60vh;
+  overflow-y: auto;
+}
+.cluster-purge-batch .cluster-purge-result {
+  margin-bottom: 0;
+}
+
+@media (max-width: 760px) {
+  .ch-name {
+    font-size: 18px;
+    line-height: 24px;
+  }
+  .cluster-purge-result {
+    padding: var(--space-3) var(--space-4);
+  }
+  .cl-bar-actions .om-btn {
+    flex: 1 1 auto;
+  }
+}
+.ch-stat-share[hidden] {
+  display: none;
+}
+.cc-fact[hidden] {
+  display: none;
+}
+.cluster-purge-slot:empty {
+  display: none;
+}
+.cluster-gone .om-btn {
+  text-decoration: none;
 }

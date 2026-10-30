@@ -1,11 +1,17 @@
 // Persistence for agents and sessions. Everything lives as JSON under DATA_DIR
 // so the hub needs no database. Session writes are debounced (the first change
-// starts a 1.5 s timer; changes meanwhile ride along, the timer is not pushed
-// back, so nothing waits longer than that), and made piece by piece with a
+// starts a timer; changes meanwhile ride along, the timer is not pushed back,
+// so nothing waits longer than it was set for), and made piece by piece with a
 // pause after each: a big conversation (tens of megabytes of events) turned
 // into one string and one buffer would hold up the live stream for a tenth of
 // a second each time. The new file is flushed to disk before it replaces the
 // old one, so a crash leaves the old or the new whole file, never a mix.
+//
+// How long the timer is depends on what the conversation costs to write (see
+// "Save pacing" below): 1.5 s for an ordinary one, longer for a big one that is
+// being streamed into, but never longer than SAVE_MAX_DEFER, and a turn that
+// ends is written at once. The file format has not changed: a file written by
+// an older Hub loads as it is, and an older Hub reads what this one writes.
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -308,9 +314,60 @@ export function deleteAgent(id) {
 // -------------------------------------------------------------- sessions
 
 const sessions = new Map();
-const saveTimers = new Map();
+const saveTimers = new Map(); // id -> { timer, due }: the write that is waiting for its time
 const saving = new Map(); // id -> { again }: a write in progress
+
+// ---- Save pacing
+//
+// Every change to a conversation ends in a write of the WHOLE file, and the
+// conversation under a working agent changes 20+ times a second. For an
+// ordinary conversation that is cheap and stays as it was: one write, 1.5 s
+// after the first unsaved change. A big one (tens of MB) costs a few hundred
+// ms of the one thread that serves every request, per write, and a Hub with a
+// handful of streaming workers spent a fifth of its CPU on it. So a
+// conversation of SAVE_BIG_CHARS or more waits SAVE_DUTY times what its last
+// write took (about 1.7% of the time is spent writing it), clamped between
+// SAVE_DELAY and SAVE_MAX_DEFER.
+//
+// What a crash (kill -9, power cut, OOM kill) can take is therefore the latest
+//   SAVE_MAX_DEFER + 2 writes   of changes (a change made while a write is in
+// progress may miss it, waits at most SAVE_MAX_DEFER for the next, and that one
+// takes a write to land), and nothing of a turn that has ended once its write
+// (a few hundred ms) is done. What is lost is what streamed in that time, and the conversation
+// file is never half-written (tmp + fsync + rename). The Hub's own copy is a
+// cache of the agent's: a Kimi conversation is rebuilt from Kimi's journal the
+// next time it is attached (kimi-remote.js attach -> kimi.history, or
+// importHistory), a Claude one from its daemon's snapshot (claude-mirror.js
+// sync). SAVE_MAX_DEFER can be changed with AGENT_HUB_SAVE_MAX_DEFER_MS (not
+// below SAVE_DELAY: 0 gives back the old behaviour, a write 1.5 s after the
+// first unsaved change).
 const SAVE_DELAY = 1500;
+const SAVE_BIG_CHARS = 2 * 1024 * 1024;
+const SAVE_DUTY = 60;
+const maxDeferEnv = process.env.AGENT_HUB_SAVE_MAX_DEFER_MS;
+const SAVE_MAX_DEFER = Math.max(SAVE_DELAY, maxDeferEnv !== undefined && maxDeferEnv !== '' && Number.isFinite(Number(maxDeferEnv)) ? Number(maxDeferEnv) : 15_000);
+export const SAVE_PACING = { delayMs: SAVE_DELAY, bigChars: SAVE_BIG_CHARS, duty: SAVE_DUTY, maxDeferMs: SAVE_MAX_DEFER };
+
+// id -> { chars, ms }: how big the last write of a conversation was (in
+// characters of JSON) and how long it took. A conversation
+// that was read at start counts as written with the cost its size predicts,
+// until a write of it says what it really costs.
+const writeCost = new Map();
+const GUESS_MS_PER_CHAR = 5e-6; // 200 ms for 40 M characters: what the dev box measures; the first real write replaces it
+const noteLoaded = (id, chars) => writeCost.set(id, { chars, ms: chars * GUESS_MS_PER_CHAR });
+
+// How long a change to this conversation may wait before it is written.
+function saveDelayFor(id) {
+  const cost = writeCost.get(id);
+  if (!cost || cost.chars < SAVE_BIG_CHARS) return SAVE_DELAY;
+  return Math.min(SAVE_MAX_DEFER, Math.max(SAVE_DELAY, cost.ms * SAVE_DUTY));
+}
+
+// Working or waiting for an answer: the turn is on. The moment a conversation
+// leaves these (the agent is done, failed, was stopped) it is written.
+const TURN_ON = new Set(['running', 'awaiting_permission']);
+const turnWasOn = new WeakMap(); // session -> whether the last saveSession saw the turn on
+const turnEndFlushedAt = new WeakMap(); // session -> when the write for the latest end of a turn starts (or started)
 
 // Conversation files that could not be read back as they are. Every one is
 // copied untouched into DAMAGED_DIR first (outside the sessions folder, so it
@@ -340,6 +397,7 @@ export function loadSessions() {
       migrateSession(s);
       sessions.set(s.id, s);
       indexNative(s);
+      noteLoaded(s.id, fileSize(file) ?? 0);
     } catch (err) {
       noteDamaged({ file, code: 'bad-structure', reason: `內容不像一個對話：${err.message}`, bytes: fileSize(file), backup: null });
     }
@@ -761,21 +819,48 @@ export function quietly(fn) {
 // `touch: false` is for bookkeeping that is not the user's activity (filling
 // in a default on an old conversation, clearing a stale marker at start):
 // updatedAt is the sidebar's sort key and only real activity may move it.
+// The wait before the write is the conversation's own (saveDelayFor); a turn
+// that has just ended is written now (but a turn's end makes a write start at
+// once no more than once per SAVE_DELAY, so a conversation flipping between
+// working and idle is not written on every flip).
 export function saveSession(session, { immediate = false, touch = true } = {}) {
   if (touch && !quiet) session.updatedAt = Date.now();
+  const on = TURN_ON.has(session.status);
+  const turnEnded = turnWasOn.get(session) === true && !on;
+  turnWasOn.set(session, on);
   if (immediate) return saveSessionNow(session);
-  if (saveTimers.has(session.id)) return;
-  saveTimers.set(
-    session.id,
-    setTimeout(() => saveSessionNow(session), SAVE_DELAY),
-  );
+  if (!turnEnded) return scheduleSave(session, saveDelayFor(session.id));
+  const now = Date.now();
+  const last = turnEndFlushedAt.get(session) || 0;
+  if (last > now) return; // an earlier end of a turn already has its write coming
+  const at = Math.max(now, last + SAVE_DELAY);
+  turnEndFlushedAt.set(session, at);
+  if (at === now) saveSessionNow(session);
+  else scheduleSave(session, at - now);
 }
+
+// Writes `session` in `delay` ms, unless a write is already due sooner. A
+// timer is never pushed back by later changes: the wait of the first unsaved
+// change is the wait of all that follow.
+function scheduleSave(session, delay) {
+  const due = Date.now() + delay;
+  const waiting = saveTimers.get(session.id);
+  if (waiting) {
+    if (waiting.due <= due) return;
+    clearTimeout(waiting.timer);
+  }
+  saveTimers.set(session.id, { due, timer: setTimeout(() => saveSessionNow(session), delay) });
+}
+
+const dropTimer = (id) => {
+  clearTimeout(saveTimers.get(id)?.timer);
+  saveTimers.delete(id);
+};
 
 const sessionFile = (id) => path.join(SESSIONS_DIR, `${id}.json`);
 
 function saveSessionNow(session) {
-  clearTimeout(saveTimers.get(session.id));
-  saveTimers.delete(session.id);
+  dropTimer(session.id);
   if (!sessions.has(session.id)) return;
   // One write at a time per session; changes made meanwhile get the next.
   const busy = saving.get(session.id);
@@ -820,12 +905,15 @@ async function writeSession(session) {
   const file = sessionFile(session.id);
   const tmp = `${file}.${process.pid}.w.tmp`;
   const { view, landed } = forWriting(session);
+  const t0 = performance.now();
+  let chars = 0;
   const fh = await fs.promises.open(tmp, 'w', 0o600);
   let complete = false;
   try {
     for await (const part of jsonParts(view, 'events')) {
       // Deleted while it was being written: stop, and do not bring it back.
       if (!sessions.has(session.id)) return;
+      chars += part.length;
       await fh.write(part);
     }
     // On disk before it takes the old file's place: a crash then leaves the
@@ -840,6 +928,8 @@ async function writeSession(session) {
   fs.renameSync(tmp, file);
   landed();
   await fsyncDir(SESSIONS_DIR);
+  // What this write cost sets how long the next change may wait.
+  if (sessions.has(session.id)) writeCost.set(session.id, { chars, ms: performance.now() - t0 });
 }
 
 // The JSON of `obj` as a series of strings that join into exactly
@@ -881,8 +971,8 @@ export async function jsonInSlices(obj, key, slice = 200) {
 }
 
 export function deleteSession(id) {
-  clearTimeout(saveTimers.get(id));
-  saveTimers.delete(id);
+  dropTimer(id);
+  writeCost.delete(id);
   const gone = sessions.get(id);
   if (gone && nativeIndex.get(nativeKey(gone.machineId, gone.kimiSessionId)) === id) nativeIndex.delete(nativeKey(gone.machineId, gone.kimiSessionId));
   sessions.delete(id);
@@ -893,8 +983,7 @@ export function deleteSession(id) {
 // whole file, then renamed over the old one).
 export function flushAll() {
   for (const id of new Set([...saveTimers.keys(), ...saving.keys()])) {
-    clearTimeout(saveTimers.get(id));
-    saveTimers.delete(id);
+    dropTimer(id);
     const s = sessions.get(id);
     if (!s) continue;
     const tmp = `${sessionFile(id)}.${process.pid}.tmp`;

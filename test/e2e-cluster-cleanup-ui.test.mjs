@@ -57,7 +57,16 @@ const shot = async (name) => {
   await b.sleep(450);
   await b.shot(path.join(SHOTS, name));
 };
-const sidebarHas = (sid) => b.eval(`[...document.querySelectorAll('.sidebar .side-row')].some((r) => r.getAttribute('href') === '#/s/${sid}')`);
+// A cluster's workers are not rows of the sidebar's list (one line counts them); a worker "has a row" when a search for its name finds it - and a worker the clean-up took off the sidebar is not found.
+const typeSearch = (text) => b.eval(`(() => { const i = document.querySelector('.side-search input'); i.value = ${JSON.stringify(text)}; i.dispatchEvent(new Event('input')); })()`);
+const rowOf = (sid) => `[...document.querySelectorAll('.sidebar .side-row')].some((r) => r.getAttribute('href') === '#/s/${sid}')`;
+const sidebarHas = async (sid) => {
+  await typeSearch((await hub.api('GET', `/sessions/${sid}`)).title);
+  await b.sleep(150);
+  const has = await b.eval(rowOf(sid));
+  await typeSearch('');
+  return has;
+};
 // What the clean-up did to each worker is in its drawer: open it, read it, close it.
 const cards = async () => {
   const sids = await b.eval(`[...document.querySelectorAll('.cluster-worker')].map((c) => c.dataset.session)`);
@@ -278,5 +287,6 @@ test('a cluster that was never merged, cleaned by hand from the page: the worker
 
 // The condition the page waits for until a worker's row is on the sidebar (a string for b.waitFor).
 async function sidebarHasExpr(sid) {
-  return `[...document.querySelectorAll('.sidebar .side-row')].some((r) => r.getAttribute('href') === '#/s/${sid}')`;
+  await typeSearch((await hub.api('GET', `/sessions/${sid}`)).title); // (left typed: the condition is waited for, then the next check types its own)
+  return rowOf(sid);
 }

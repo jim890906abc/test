@@ -27,7 +27,7 @@ async function pageWith(patches, { list = true } = {}) {
     const real = window.fetch.bind(window);
     window.fetch = async (url, init) => {
       const res = await real(url, init);
-      if (${list} && String(url) === '/api/sessions' && !(init && init.method && init.method !== 'GET')) {
+      if (${list} && String(url).split('?')[0] === '/api/sessions' && !(init && init.method && init.method !== 'GET')) {
         const list = await res.clone().json();
         for (const s of list) if (patches[s.id]) Object.assign(s, patches[s.id]);
         return new Response(JSON.stringify(list), { status: 200, headers: { 'content-type': 'application/json' } });

@@ -34,6 +34,16 @@ export const FAKE_SCRIPT = `(() => {
     const method = (init.method || 'GET').toUpperCase();
     if (method !== 'GET') {
       window.__posts.push(method + ' ' + u);
+      window.__bodies = window.__bodies || [];
+      window.__bodies.push({ method, url: u, body: typeof init.body === 'string' ? JSON.parse(init.body) : null });
+      // A change the test answers itself (\`answers['POST /api/clusters/c_x/purge'] = { status, body }\`), instead of sending it to the scratch Hub.
+      const a = (window.__fake.answers || {})[method + ' ' + u];
+      if (a) {
+        const list = Array.isArray(a) ? a : [a];
+        const one = list.length > 1 ? list.shift() : list[0];
+        if (one.delay) await new Promise((r) => setTimeout(r, one.delay));
+        return reply(one.status ?? 200, one.body ?? {});
+      }
       const d = window.__postDelay;
       if (d && u.startsWith(d.prefix)) await new Promise((r) => setTimeout(r, d.ms));
       return real(url, init);
@@ -42,14 +52,16 @@ export const FAKE_SCRIPT = `(() => {
     const F = window.__fake;
     let m;
     if (u === '/api/clusters') return reply(200, F.list || []);
-    if (u === '/api/machines' && F.online !== null) return reply(200, [{ id: 'm1', name: 'box', online: F.online, kimi: { available: F.online } }]);
+    if (u === '/api/clusters/trash') return reply(200, F.trash || { days: 7, items: [] });
+    if ((m = u.match(/^\\/api\\/clusters\\/([\\w-]+)\\/purge\\/plan(\\?.*)?$/))) return hit(F.purgePlans || {}, m[1]);
+    if (u.split('?')[0] === '/api/machines' && F.online !== null) return reply(200, [{ id: 'm1', name: 'box', online: F.online, kimi: { available: F.online } }]);
     if ((m = u.match(/^\\/api\\/clusters\\/([\\w-]+)\\/cleanup\\/plan$/))) return hit(F.plans || {}, m[1]);
     if ((m = u.match(/^\\/api\\/clusters\\/([\\w-]+)\\/memory$/))) return hit(F.memory, m[1]);
     if ((m = u.match(/^\\/api\\/clusters\\/([\\w-]+)$/))) return hit(F.clusters, m[1]);
     if ((m = u.match(/^\\/api\\/sessions\\/([\\w-]+)\\/clusters$/))) return hit(F.parents, m[1]);
     if ((m = u.match(/^\\/api\\/sessions\\/([\\w-]+)\\/timing$/))) return hit(F.timing, m[1]);
     const res = await real(url, init);
-    if (/^\\/api\\/sessions(\\/[\\w-]+)?$/.test(u) && Object.keys(window.__patch).length) {
+    if (/^\\/api\\/sessions(\\/[\\w-]+)?(\\?.*)?$/.test(u) && Object.keys(window.__patch).length) {
       const j = await res.clone().json().catch(() => null);
       if (Array.isArray(j)) return reply(res.status, j.map(patchSession));
       if (j && j.id) return reply(res.status, patchSession(j));

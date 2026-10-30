@@ -10,7 +10,7 @@ import { h, fill, icon, fmtDuration } from './dom.js';
 import { markdownInto, MarkdownStream, renderMarkdown, renderLineDiff, diffStats } from './markdown.js';
 import { artifactOf, collectArtifacts, mergeArtifactIndex, artifactCard } from './artifacts.js';
 import { agentLife, subagentModelView, lifeBadge } from './agent-state.js';
-import { TOOLS, INTERNAL_TITLE, agentName, agentDescription, activityOf, lastShown } from './agent-activity.js';
+import { TOOLS, INTERNAL_TITLE, agentName, agentDescription, activityOf, lastShown, isStep } from './agent-activity.js';
 
 // The verbs tool calls are shown with live in agent-activity.js (the cluster page uses them too).
 export { TOOLS };
@@ -944,7 +944,7 @@ export class Transcript {
   // A card's tool calls: the ones held, and the ones before the window that the Hub counted.
   stepCount(id, kids = this.childrenOf(id)) {
     // (`?.`: a Transcript built without its constructor, as the broker tests do, has no such table)
-    return kids.filter((k) => k.type === 'tool_use').length + (this.stepsOlder?.get(id) || 0);
+    return kids.filter(isStep).length + (this.stepsOlder?.get(id) || 0);
   }
 
   childrenOf(id) {
