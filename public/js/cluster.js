@@ -36,6 +36,7 @@ import {
   queueAdvice,
   queueView,
   requestBody,
+  outputView,
   speedView,
   summarizeCluster,
   taskBar,
@@ -459,9 +460,9 @@ export class ClusterPage {
     this.headTop = h('div', { class: 'ch-top' });
     this.bar = barEl('ch-bar');
     this.elapsed = h('span', { class: 'ch-elapsed', dataset: { field: 'elapsed' } });
-    this.stats = { speed: this.statBox('speed', '目前速度'), workers: this.statBox('workers', '執行中工作者'), subs: this.statBox('subagents', '執行中子代理') };
+    this.stats = { output: this.statBox('output', '叢集總產出', { avg: true }), workers: this.statBox('workers', '執行中工作者'), subs: this.statBox('subagents', '執行中子代理') };
     this.facts = h('div', { class: 'ch-facts' });
-    this.head = h('div', { class: 'cluster-head' }, this.headTop, h('div', { class: 'ch-barrow' }, this.bar, this.elapsed), h('div', { class: 'ch-stats' }, this.stats.speed.el, this.stats.workers.el, this.stats.subs.el), this.facts);
+    this.head = h('div', { class: 'cluster-head' }, this.headTop, h('div', { class: 'ch-barrow' }, this.bar, this.elapsed), h('div', { class: 'ch-stats' }, this.stats.output.el, this.stats.workers.el, this.stats.subs.el), this.facts);
     this.warns = h('div', { class: 'cluster-warns' });
     this.workers = h('div', { class: 'cluster-workers' });
     this.count = h('span', { class: 'muted cluster-workers-count' });
@@ -575,18 +576,24 @@ export class ClusterPage {
   }
 
   // One of the big numbers under the progress bar; its parts are updated in place (they change every second).
-  statBox(key, label) {
+  // `avg`: a second small line under the first (the five-minute average beside the last minute's output).
+  statBox(key, label, { avg = false } = {}) {
     const num = h('span', { class: 'ch-stat-num', dataset: { field: 'num' } });
     const unit = h('span', { class: 'ch-stat-unit' });
     const sub = h('div', { class: 'ch-stat-sub', dataset: { field: 'sub' } });
-    const el = h('div', { class: 'ch-stat', dataset: { stat: key } }, h('div', { class: 'ch-stat-label' }, label), h('div', { class: 'ch-stat-value' }, num, unit), sub);
-    return { el, num, unit, sub };
+    const second = avg ? h('div', { class: 'ch-stat-sub ch-stat-avg', dataset: { field: 'avg' } }) : null;
+    const el = h('div', { class: 'ch-stat', dataset: { stat: key } }, h('div', { class: 'ch-stat-label' }, label), h('div', { class: 'ch-stat-value' }, num, unit), sub, second);
+    return { el, num, unit, sub, avg: second };
   }
 
-  setStat(box, { num, unit = '', sub = '', title = '', live = false, none = false }) {
+  setStat(box, { num, unit = '', sub = '', title = '', live = false, none = false, avg = '', avgTitle = '' }) {
     if (box.num.textContent !== num) box.num.textContent = num;
     if (box.unit.textContent !== unit) box.unit.textContent = unit;
     if (box.sub.textContent !== sub) box.sub.textContent = sub;
+    if (box.avg) {
+      if (box.avg.textContent !== avg) box.avg.textContent = avg;
+      box.avg.title = avgTitle;
+    }
     box.el.title = title;
     box.el.classList.toggle('live', live);
     box.el.classList.toggle('none', none);
@@ -595,14 +602,19 @@ export class ClusterPage {
   drawStats() {
     const c = this.cluster;
     const sum = summarizeCluster(c);
-    const sp = speedView(sum.speed);
-    this.setStat(this.stats.speed, {
-      num: sp.measured ? sp.text.replace(/ tok\/s$/, '') : DASH,
-      unit: sp.measured ? 'tok/s' : '',
-      sub: sp.measured ? [sum.speed.requestsPerMinute !== null ? `請求 ${speedView({ tokensPerSecond: 0, requestsPerMinute: sum.speed.requestsPerMinute }).requests.replace('請求 ', '')}` : null, sum.speed.workersMeasured < sum.speed.workers ? `${sum.speed.workersMeasured}/${sum.speed.workers} 個工作者量得到` : null].filter(Boolean).join('・') : '量不到',
-      title: sp.measured ? '最近幾分鐘連接器記下的請求，輸出的 token 數除以秒數；只算量得到的工作者' : `量不到：${sp.why}`,
-      live: sp.measured && isActive(c),
-      none: !sp.measured,
+    // 叢集總產出: the last minute of every agent of the cluster, subagents included (the Hub's one window); beside it, small, the five-minute 平均產出 it used to say.
+    const out = outputView(sum.throughput, { active: isActive(c) });
+    const avg = speedView(sum.speed);
+    const part = sum.speed.workersMeasured < sum.speed.workers ? `・${sum.speed.workersMeasured}/${sum.speed.workers} 個工作者量得到` : '';
+    this.setStat(this.stats.output, {
+      num: out.num,
+      unit: out.unit,
+      sub: out.sub,
+      title: out.measured ? out.tip : `量不到：${out.why}`,
+      live: out.measured && isActive(c),
+      none: !out.measured,
+      avg: avg.measured ? `平均產出（最近 5 分鐘）${avg.text}${part}` : '平均產出（最近 5 分鐘）—',
+      avgTitle: avg.measured ? [avg.tip, sum.speed.requestsPerMinute !== null ? `請求 ${speedView({ tokensPerSecond: 0, requestsPerMinute: sum.speed.requestsPerMinute }).requests.replace('請求 ', '')}` : null].filter(Boolean).join('；') : `量不到：${avg.why}`,
     });
     this.setStat(this.stats.workers, { num: String(sum.workersRunning), unit: `／${sum.workers}`, sub: '個在工作', live: sum.workersRunning > 0 });
     const sub = sum.subagents;

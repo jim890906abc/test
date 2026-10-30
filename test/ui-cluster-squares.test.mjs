@@ -16,7 +16,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { skipReason, uiSession, CONTRAST_JS } from './browser-harness.mjs';
 import { fixtureSessions } from './ui-fixtures.mjs';
-import { FAKE_SCRIPT, CID, T0, W, SUB, CLUSTER, rowOf, TIMING, MEMORY, SPEED, NO_SPEED, countsOf, fakeHub } from './fixtures/cluster-fake.mjs';
+import { FAKE_SCRIPT, CID, T0, W, SUB, CLUSTER, rowOf, TIMING, MEMORY, SPEED, NO_SPEED, GEN, NO_GEN, THROUGHPUT, NO_THROUGHPUT, countsOf, fakeHub } from './fixtures/cluster-fake.mjs';
 import { summarizeCluster, totalsOf } from '../public/js/cluster-model.js';
 
 const skip = skipReason();
@@ -40,12 +40,12 @@ const mix = (n, spec, patch = () => ({})) => Array.from({ length: n }, (_, i) =>
 const tasks8 = Array.from({ length: 8 }, (_, i) => ({ index: i, title: `任務 ${i + 1}`, status: i < 3 ? 'done' : i < 6 ? 'running' : 'pending', workerSessionId: i < 6 ? `s_w${i + 1}` : null, startedAt: T0 - 100_000, finishedAt: i < 3 ? T0 - 5000 : null, attempts: 1, error: null }));
 const BIG = mix(128, (i) => ['running', 'done', 'done', 'failed', 'unknown', 'awaiting'][i % 6]);
 const SIX = () => [
-  W(1, { title: '帳本領取登記核心：租約欄位＋claim/release＋原生接線', subagents: mix(8, (i) => (i < 5 ? 'running' : 'done')), done: 1, taskIndex: 0, speed: SPEED(64.2, 5.1) }),
-  W(2, { title: '凱恩：帳本領單→Intent、寫回綁帳本id、已證實延伸', subagents: BIG, done: 2, taskIndex: 1, speed: SPEED(120.4, 9) }),
-  W(3, { title: '新夜安：帳本領單→propose_intents', subagents: [], done: 0, taskIndex: 2, speed: NO_SPEED() }),
-  W(4, { title: '自然停才交auditor＋清查', status: 'idle', finishedAt: T0 - 5000, subagents: mix(4, () => 'done'), done: 3, taskIndex: null, speed: SPEED(0, 0) }),
-  W(5, { title: '歸因計數＋plugin.json開關', status: 'error', finishedAt: T0 - 1000, subagents: mix(3, (i) => (i === 0 ? 'failed' : 'cancelled')), done: 1, taskIndex: null, speed: SPEED(2, 1) }),
-  W(6, { title: '雜項修正：Caido閥後預檢', status: 'awaiting_permission', subagents: mix(6, (i) => (i < 2 ? 'awaiting' : 'running')), done: 0, taskIndex: 5, speed: SPEED(18.3, 2) }),
+  W(1, { title: '帳本領取登記核心：租約欄位＋claim/release＋原生接線', subagents: mix(8, (i) => (i < 5 ? 'running' : 'done')), done: 1, taskIndex: 0, speed: SPEED(64.2, 5.1), gen: GEN(103.4) }),
+  W(2, { title: '凱恩：帳本領單→Intent、寫回綁帳本id、已證實延伸', subagents: BIG, done: 2, taskIndex: 1, speed: SPEED(120.4, 9), gen: GEN(87.2) }),
+  W(3, { title: '新夜安：帳本領單→propose_intents', subagents: [], done: 0, taskIndex: 2, speed: NO_SPEED(), gen: NO_GEN('這一輪還沒有完成任何一步，或這個模型沒有回報串流時間；要等 Kimi 回報一步的字數與串流時間才量得到') }),
+  W(4, { title: '自然停才交auditor＋清查', status: 'idle', finishedAt: T0 - 5000, subagents: mix(4, () => 'done'), done: 3, taskIndex: null, speed: SPEED(0, 0), gen: NO_GEN() }),
+  W(5, { title: '歸因計數＋plugin.json開關', status: 'error', finishedAt: T0 - 1000, subagents: mix(3, (i) => (i === 0 ? 'failed' : 'cancelled')), done: 1, taskIndex: null, speed: SPEED(2, 1), gen: NO_GEN() }),
+  W(6, { title: '雜項修正：Caido閥後預檢', status: 'awaiting_permission', subagents: mix(6, (i) => (i < 2 ? 'awaiting' : 'running')), done: 0, taskIndex: 5, speed: SPEED(18.3, 2), gen: GEN(41.2) }),
 ];
 const SIX_CLUSTER = (patch = {}) => CLUSTER({ workers: SIX(), tasks: tasks8, ...patch });
 const fullFake = (c = SIX_CLUSTER(), extra = {}) => ({
@@ -101,8 +101,9 @@ test('the page is an overview: a progress band with the speed and the counts, th
     title: t.querySelector('.cluster-worker-title').innerText,
     state: t.querySelector('.cluster-worker-state').innerText.trim(),
     place: t.querySelector('.cluster-worker-queue').innerText.trim(),
-    speed: t.querySelector('[data-field="speed"]').innerText.trim(),
-    speedTitle: t.querySelector('[data-field="speed"]').title,
+    gen: t.querySelector('[data-field="gen"]').innerText.trim(),
+    genTitle: t.querySelector('[data-field="gen"]').title,
+    genNone: t.querySelector('[data-field="gen"]').classList.contains('none'),
     barNow: t.querySelector('[role="progressbar"]').getAttribute('aria-valuenow'),
     minis: t.querySelectorAll('.cw-mini').length,
     more: t.querySelector('.cw-mini-more')?.innerText ?? null,
@@ -113,7 +114,10 @@ test('the page is an overview: a progress band with the speed and the counts, th
   assert.equal(tiles.length, 6);
   assert.deepEqual(tiles.map((t) => t.state), ['執行中', '執行中', '執行中', '已完成', '出錯', '等你核准']);
   assert.deepEqual(tiles.map((t) => t.place), ['第 1/8 條', '第 2/8 條', '第 3/8 條', '做完 3 條', '做完 1 條', '第 6/8 條']);
-  assert.deepEqual(tiles.map((t) => t.speed), ['64 tok/s', '120 tok/s', '—', '0 tok/s', '2 tok/s', '18 tok/s']);
+  // The tile says 生成速度 (the chat room's number), not the five-minute average: a worker that is not running is a dash, never 0 (0 reads as slow).
+  assert.deepEqual(tiles.map((t) => t.gen), ['103 tok/s', '87 tok/s', '—', '—', '—', '41 tok/s']);
+  assert.deepEqual(tiles.map((t) => t.genNone), [false, false, true, true, true, false]);
+  assert.ok(tiles.every((t) => !/^0 tok/.test(t.gen)), 'no tile reads 0');
   assert.deepEqual(tiles.map((t) => t.sub), ['子代理 5/8', '子代理 43/128', '', '子代理 0/4', '子代理 0/3', '子代理 6/6'], 'working over opened, from the counts the Hub sent');
   assert.equal(tiles[0].title, '帳本領取登記核心：租約欄位＋claim/release＋原生接線');
   // One row of little squares at most: the ones that need a look first, then "+N" for the rest.
@@ -125,16 +129,17 @@ test('the page is an overview: a progress band with the speed and the counts, th
     assert.doesNotMatch(t.text, /把第|cluster\/c_|worktree|量不到：|正在改|\/home\//, t.session);
     assert.ok(t.height < 150, `${t.session} is ${t.height}px tall`);
   }
-  // A speed the records could not say is a dash on the tile; the reason is a tooltip, the long form is in the drawer.
-  assert.equal(tiles[2].speedTitle, '量不到（原因在詳細裡）');
+  // The tooltip says in one sentence how it is worked out; a dash says that it cannot be said now, and the long form is in the drawer.
+  assert.equal(tiles[0].genTitle, '生成速度：模型實際吐字時每秒的字數，不含等工具與等第一個字（和聊天室狀態列同一個數字）');
+  assert.equal(tiles[2].genTitle, '生成速度：模型實際吐字時每秒的字數，不含等工具與等第一個字。現在量不到（原因在詳細裡）');
   assert.doesNotMatch(tiles[2].text, /DeepSeek 號池/);
   assert.equal(await b.eval(`document.querySelectorAll('.cluster-worker .cluster-timing, .cluster-worker .cluster-kv, .cluster-worker-task, .cluster-worker-progress').length`), 0);
   // Each tile is one control: a button with a name that says everything the tile shows.
   const aria = await b.eval(`[...document.querySelectorAll('.cluster-worker')].map((t) => [t.getAttribute('role'), t.tabIndex, t.getAttribute('aria-label')])`);
   assert.deepEqual(aria.map((a) => a[0]), Array(6).fill('button'));
   assert.deepEqual(aria.map((a) => a[1]), Array(6).fill(0));
-  assert.match(aria[1][2], /凱恩.*執行中.*第 2\/8 條.*速度 120 tok\/s.*子代理 128：22 執行中・21 等你核准・43 完成・21 失敗或取消・21 狀態未知.*按下查看詳細/);
-  assert.match(aria[2][2], /速度 量不到/);
+  assert.match(aria[1][2], /凱恩.*執行中.*第 2\/8 條.*生成速度 87 tok\/s.*子代理 128：22 執行中・21 等你核准・43 完成・21 失敗或取消・21 狀態未知.*按下查看詳細/);
+  assert.match(aria[2][2], /生成速度 量不到/);
   await shot('page-1280');
 });
 
@@ -148,20 +153,30 @@ test('the band: how far the whole cluster is, how long it has run, how fast it g
     barNow: document.querySelector('.ch-bar').getAttribute('aria-valuenow'),
     barLabel: document.querySelector('.ch-bar').getAttribute('aria-label'),
     elapsed: document.querySelector('[data-field="elapsed"]').innerText.trim(),
-    speed: [...document.querySelectorAll('[data-stat="speed"] [data-field]')].map((e) => e.innerText.trim()),
+    output: [...document.querySelectorAll('[data-stat="output"] [data-field]')].map((e) => e.innerText.trim()),
+    outputLabel: document.querySelector('[data-stat="output"] .ch-stat-label').innerText.trim(),
+    outputTitle: document.querySelector('[data-stat="output"]').title,
+    avgTitle: document.querySelector('[data-stat="output"] [data-field="avg"]').title,
     workers: [...document.querySelectorAll('[data-stat="workers"] [data-field]')].map((e) => e.innerText.trim()),
     subs: [...document.querySelectorAll('[data-stat="subagents"] [data-field]')].map((e) => e.innerText.trim()),
-    unit: document.querySelector('[data-stat="speed"] .ch-stat-unit').innerText.trim(),
+    unit: document.querySelector('[data-stat="output"] .ch-stat-unit').innerText.trim(),
   })`);
   assert.equal(band.status, '進行中');
   assert.equal(band.progress, '任務 3/8 完成');
   assert.equal(band.barNow, '38');
   assert.equal(band.barLabel, '任務 3／8 完成');
   assert.match(band.elapsed, /^已跑 \d+ 分 \d+ 秒$/, 'since it was made, to now');
-  assert.equal(band.speed[0], String(Math.round(sum.speed.tokensPerSecond)), 'the sum of the workers the records could speak for');
+  // The big number is 叢集總產出: the Hub's one window over the whole cluster (subagents included) - not the workers' averages added up, and not the workers' generation speeds added up.
+  assert.equal(band.outputLabel, '叢集總產出');
+  assert.equal(band.output[0], String(Math.round(c.throughput.tokensPerSecond)));
+  assert.equal(band.output[0], '49');
+  assert.notEqual(band.output[0], String(Math.round(sum.speed.tokensPerSecond)), 'not the sum of the five-minute averages (205)');
   assert.equal(band.unit, 'tok/s');
-  assert.match(band.speed[1], /請求 \d+／分/);
-  assert.match(band.speed[1], /5\/6 個工作者量得到/, 'and says that one could not');
+  assert.equal(band.output[1], '最近 1 分鐘・所有代理（含子代理）');
+  assert.equal(band.outputTitle, '最近 1 分鐘所有代理（含子代理）實際產出的字數 ÷ 60 秒；字數在每個請求結束時才計入，所以會略有跳動');
+  // Under it, small: the number it used to say, renamed - 平均產出 (five minutes, waiting included), with how many workers could be measured.
+  assert.equal(band.output[2], `平均產出（最近 5 分鐘）${Math.round(sum.speed.tokensPerSecond)} tok/s・5/6 個工作者量得到`);
+  assert.match(band.avgTitle, /^最近 5 分鐘內產出的字數 ÷ 300 秒，含等待與工具時間；請求 \d+(\.\d)?／分$/);
   assert.equal(band.workers[0], String(sum.workersRunning));
   assert.equal(sum.workersRunning, 4);
   assert.equal(band.subs[0], String(sum.subagents.running + sum.subagents.awaiting));
@@ -222,6 +237,8 @@ test('pressing a tile (or Enter on it) opens the drawer with the whole task, whe
       title: q('.cd-title'), state: q('.cluster-worker-state'), task: q('[data-field="task"]'), queue: q('[data-field="worker-queue"]'), progress: q('[data-field="progress"]'),
       branch: q('[data-field="branch"]'), worktree: q('[data-field="worktree"]'), copy: el.querySelector('[data-action="copy-path"]')?.getAttribute('aria-label'),
       swarm: q('[data-native-swarm]'), open: el.querySelector('[data-action="open-worker"]')?.getAttribute('href'),
+      gen: q('[data-field="gen"]'), genHead: q('[data-sec="generation"] h3'), genTip: el.querySelector('[data-sec="generation"] h3')?.title, genHelp: q('[data-sec="generation"] .om-field__help'),
+      avgHead: q('[data-sec="speed"] h3'), avgTip: el.querySelector('[data-sec="speed"] h3')?.title, avgHelp: q('[data-sec="speed"] .om-field__help'),
       tokens: q('[data-field="tokens"]'), requests: q('[data-field="requests"]'),
       timing: Boolean(el.querySelector('.cluster-timing .cluster-bar')), inside: el.contains(document.activeElement),
     };
@@ -238,7 +255,15 @@ test('pressing a tile (or Enter on it) opens the drawer with the whole task, whe
   assert.match(d.copy, /複製 .* 的 worktree 路徑/);
   assert.equal(d.swarm, '原生 Swarm 開');
   assert.equal(d.open, '#/s/s_w2');
-  assert.equal(d.tokens, '最近 2 分鐘輸出 120 tok/s');
+  // 生成速度 first (the chat room's number), then 平均產出 (the five-minute figure, renamed), each with its one sentence of how it is worked out.
+  assert.equal(d.genHead, '生成速度');
+  assert.equal(d.gen, '87 tok/s');
+  assert.equal(d.genTip, '模型實際吐字時每秒的字數，不含等工具與等第一個字');
+  assert.match(d.genHelp, /^模型實際吐字時每秒的字數，不含等工具與等第一個字。和聊天室狀態列同一個數字/);
+  assert.equal(d.avgHead, '平均產出（最近 2 分鐘，含等待）');
+  assert.equal(d.avgTip, '最近 5 分鐘內產出的字數 ÷ 300 秒，含等待與工具時間');
+  assert.match(d.avgHelp, /^最近 5 分鐘內產出的字數 ÷ 300 秒，含等待與工具時間。/);
+  assert.equal(d.tokens, '平均產出（最近 2 分鐘，含等待）：120 tok/s');
   assert.equal(d.requests, '請求 9／分');
   assert.equal(d.timing, true, 'the time breakdown is in the drawer');
   assert.equal(d.inside, true, 'the focus moved into the drawer');
@@ -278,12 +303,23 @@ test('Tab goes round inside the open drawer and never reaches the page behind it
   }
 });
 
-test('a speed the records could not say is a dash on the tile, and in the drawer the reason in full; a deleted worker has no time to read', { skip }, async () => {
+test('a speed that cannot be said is a dash on the tile, and in the drawer the reason in full - for each of the two numbers on its own; a deleted worker has no time to read', { skip }, async () => {
   await openCluster();
   await openDrawer(3);
+  // Worker 3 runs but no step is done yet (no generation speed), and no request records tie to it (no average).
+  assert.match(await text('[data-field="gen-why"]'), /^—　量不到：這一輪還沒有完成任何一步/);
+  assert.equal(await b.eval(`document.querySelector('.cluster-drawer [data-field="gen"]')`), null);
   const why = await text('[data-field="speed-why"]');
   assert.match(why, /^—　量不到：這個對話用的不是 DeepSeek 號池/);
   assert.equal(await b.eval(`document.querySelector('[data-field="tokens"]')`), null);
+  // Worker 4 is not running: no generation speed "now" - not 0 - but its five-minute average is still said.
+  await b.eval(`document.querySelector('[data-action="close-drawer"]').click()`);
+  await b.waitFor(`!document.querySelector('.cluster-drawer.on')`);
+  await openDrawer(4);
+  assert.match(await text('[data-field="gen-why"]'), /^—　量不到：這個工作者現在沒有在跑/);
+  assert.equal(await text('[data-field="tokens"]'), '平均產出（最近 2 分鐘，含等待）：0 tok/s', 'the average is a measurement, zero included');
+  await b.eval(`document.querySelector('[data-action="close-drawer"]').click()`);
+  await b.waitFor(`!document.querySelector('.cluster-drawer.on')`);
   const ws = SIX();
   ws[2] = { ...ws[2], status: 'deleted' };
   await openCluster({ fake: fullFake(SIX_CLUSTER({ workers: ws })) });
@@ -486,13 +522,14 @@ test('the cluster moves under an open page: numbers change, tiles stay the same 
   await b.eval(`document.querySelector('.cd-body').scrollTop = 120`);
 
   const next = SIX_CLUSTER();
-  next.workers[0] = W(1, { title: c.workers[0].title, subagents: mix(8, (i) => (i < 2 ? 'running' : 'done'), (i) => (i === 2 ? { steps: 99, lastAction: '執行 npm test' } : {})), done: 1, taskIndex: 0, speed: SPEED(7.3, 2) });
-  next.workers[0].speed = SPEED(7.3, 2);
+  next.workers[0] = W(1, { title: c.workers[0].title, subagents: mix(8, (i) => (i < 2 ? 'running' : 'done'), (i) => (i === 2 ? { steps: 99, lastAction: '執行 npm test' } : {})), done: 1, taskIndex: 0, speed: SPEED(7.3, 2), gen: GEN(55.4) });
+  next.throughput = THROUGHPUT(12.6);
   await emit(next);
   await b.waitFor(`document.querySelector('[data-stat="subagents"] [data-field="num"]').innerText.trim() === '${summarizeCluster(next).subagents.running + summarizeCluster(next).subagents.awaiting}'`);
-  assert.equal(await text('[data-stat="speed"] [data-field="num"]'), String(Math.round(summarizeCluster(next).speed.tokensPerSecond)));
+  assert.equal(await text('[data-stat="output"] [data-field="num"]'), '13', 'the cluster\'s output follows the pushed line');
+  assert.equal(await text('[data-stat="output"] [data-field="avg"]'), `平均產出（最近 5 分鐘）${Math.round(summarizeCluster(next).speed.tokensPerSecond)} tok/s・5/6 個工作者量得到`);
   assert.equal(await text(`${tileOf(1)} [data-field="subcount"]`), '子代理 2/8');
-  assert.equal(await text(`${tileOf(1)} [data-field="speed"]`), '7.3 tok/s');
+  assert.equal(await text(`${tileOf(1)} [data-field="gen"]`), '55 tok/s');
   assert.equal(await b.eval(`document.querySelectorAll('.cluster-worker[data-mark="kept"]').length`), 6, 'no tile was torn down for a number that moved');
   // The drawer: still open, still on the same subagent, with what changed.
   assert.equal(await drawerOpen(), true);
@@ -501,7 +538,8 @@ test('the cluster moves under an open page: numbers change, tiles stay the same 
   assert.equal(await b.eval(`document.querySelector('.cluster-drawer .sa-cell[data-id="agent-2"]').getAttribute('aria-expanded')`), 'true');
   assert.equal(await b.eval(`document.querySelector('.cd-body').scrollTop`), 120, 'and where the person had scrolled to');
   assert.equal(await text('.cluster-drawer [data-field="subagent-line"]'), '子代理 8：2 執行中・6 完成');
-  assert.equal(await text('.cluster-drawer [data-field="tokens"]'), '最近 2 分鐘輸出 7.3 tok/s');
+  assert.equal(await text('.cluster-drawer [data-field="tokens"]'), '平均產出（最近 2 分鐘，含等待）：7.3 tok/s');
+  assert.equal(await text('.cluster-drawer [data-field="gen"]'), '55 tok/s');
 
   // The subagent it was showing is no longer in the list (the oldest are let go): the detail closes, nothing breaks.
   const gone = SIX_CLUSTER();
@@ -565,10 +603,11 @@ const LIST_CLUSTERS = () => {
     id: 'c_bbbbbbbbbbbb',
     parentId: 's_ds',
     createdAt: T0 - 60_000,
+    throughput: THROUGHPUT(34.2, { workers: 2, workersCounted: 2 }),
     workers: [W(1, { subagents: mix(12, (i) => (i < 9 ? 'running' : 'done')), taskIndex: 0, speed: SPEED(88, 7) }), W(2, { subagents: [], taskIndex: 1, speed: NO_SPEED() })],
     tasks: tasks8.slice(0, 4),
   });
-  const done = CLUSTER({ id: 'c_cccccccccccc', parentId: 's_kimi', status: 'done', createdAt: T0 - 3_600_000, workers: [W(1, { status: 'idle', finishedAt: T0 - 5000, taskIndex: null, subagents: mix(3, () => 'done'), speed: SPEED(0, 0) })], tasks: [{ ...tasks8[0], status: 'done', finishedAt: T0 - 5000 }] });
+  const done = CLUSTER({ id: 'c_cccccccccccc', parentId: 's_kimi', status: 'done', createdAt: T0 - 3_600_000, throughput: THROUGHPUT(0, { workers: 1, workersCounted: 1 }), workers: [W(1, { status: 'idle', finishedAt: T0 - 5000, taskIndex: null, subagents: mix(3, () => 'done'), speed: SPEED(0, 0), gen: NO_GEN() })], tasks: [{ ...tasks8[0], status: 'done', finishedAt: T0 - 5000 }] });
   return [done, running, newer];
 };
 const listFake = (cs = LIST_CLUSTERS()) => ({ clusters: Object.fromEntries(cs.map((c) => [c.id, c])), list: cs.map((c) => rowOf(c, c.parentId === 's_ds' ? 'DeepSeek chat' : 'Kimi chat with subagents')) });
@@ -580,15 +619,19 @@ test('#/clusters lists every cluster of every conversation, the working ones fir
   await b.sleep(200);
   const rows = cs.map((c) => rowOf(c));
   const t = totalsOf(rows);
-  const stats = await b.eval(`Object.fromEntries([...document.querySelectorAll('.cl-stat')].map((s) => [s.dataset.stat, [s.querySelector('[data-field="num"]').innerText.trim(), s.querySelector('.cl-stat-label').innerText.trim(), s.querySelector('[data-field="sub"]')?.innerText.trim() ?? null]]))`);
-  assert.deepEqual(stats['subagents-running'], [String(t.subagentsRunning), '執行中子代理', `共開過 ${t.subagentsOpened} 個`]);
-  assert.deepEqual(stats['workers-running'], [String(t.workersRunning), '執行中工作者', `${t.active} 個叢集進行中`]);
-  assert.equal(stats.speed[0], String(Math.round(t.tokensPerSecond)));
-  assert.equal(stats.speed[1], '目前總速度');
+  const stats = await b.eval(`Object.fromEntries([...document.querySelectorAll('.cl-stat')].map((s) => [s.dataset.stat, [s.querySelector('[data-field="num"]').innerText.trim(), s.querySelector('.cl-stat-label').innerText.trim(), s.querySelector('[data-field="sub"]')?.innerText.trim() ?? null, s.querySelector('[data-field="avg"]')?.innerText.trim() ?? null]]))`);
+  assert.deepEqual(stats['subagents-running'], [String(t.subagentsRunning), '執行中子代理', `共開過 ${t.subagentsOpened} 個`, null]);
+  assert.deepEqual(stats['workers-running'], [String(t.workersRunning), '執行中工作者', `${t.active} 個叢集進行中`, null]);
+  // The big number over everything is 叢集總產出: the working clusters' last minute added (34.2 + 48.6); the finished cluster's 0 is not added, and its own card says a dash.
+  assert.equal(stats.output[0], '83');
+  assert.equal(stats.output[0], String(Math.round(t.outputTokensPerSecond)));
+  assert.equal(stats.output[1], '叢集總產出');
+  assert.equal(stats.output[2], 'tok/s・最近 1 分鐘・2 個進行中叢集合計');
+  assert.equal(stats.output[3], `平均產出（最近 5 分鐘）${Math.round(t.avgTokensPerSecond)} tok/s`, 'and small under it, the average it used to say');
   assert.equal(t.active, 2);
   const cards = await b.eval(`[...document.querySelectorAll('.cluster-card')].map((c) => ({
     id: c.dataset.cluster, href: c.getAttribute('href'), title: c.querySelector('.cc-title').innerText, state: c.querySelector('.cc-state').innerText.trim(),
-    progress: c.querySelector('.cc-progress').innerText, speed: c.querySelector('[data-field="speed"]').innerText.replace(/\\s+/g, ' ').trim(), speedTitle: c.querySelector('[data-field="speed"]').title,
+    progress: c.querySelector('.cc-progress').innerText, output: c.querySelector('[data-field="output"]').innerText.replace(/\\s+/g, ' ').trim(), outputTitle: c.querySelector('[data-field="output"]').title,
     workers: c.querySelector('[data-field="workers"]').innerText, subs: c.querySelector('[data-field="subagents"]').innerText, aria: c.getAttribute('aria-label'), text: c.innerText,
   }))`);
   assert.deepEqual(cards.map((c) => c.id), ['c_bbbbbbbbbbbb', 'c_aaaaaaaaaaaa', 'c_cccccccccccc'], 'working first, newest first; then the finished');
@@ -598,8 +641,12 @@ test('#/clusters lists every cluster of every conversation, the working ones fir
   assert.deepEqual(cards.map((c) => c.progress), ['3/4', '3/8', '1/1']);
   assert.deepEqual(cards.map((c) => c.workers), ['工作者 2/2', '工作者 4/6', '工作者 0/1']);
   assert.deepEqual(cards.map((c) => c.subs), ['子代理 9/12', '子代理 54/149', '子代理 0/3']);
-  assert.equal(cards[0].speed, '88 tok/s');
-  assert.match(cards[0].aria, /DeepSeek chat，進行中，任務 3／4 完成，速度 88 tok\/s，子代理 12：9 執行中・3 完成/);
+  assert.equal(cards[0].output, '34 tok/s 總產出');
+  assert.equal(cards[0].outputTitle, '叢集總產出：最近 1 分鐘所有代理（含子代理）實際產出的字數 ÷ 60 秒；字數在每個請求結束時才計入，所以會略有跳動');
+  assert.equal(cards[1].output, '49 tok/s 總產出');
+  assert.equal(cards[2].output, '—', 'a finished cluster has no last minute: a dash, not 0');
+  assert.match(cards[2].outputTitle, /^叢集總產出：量不到：叢集已結束/);
+  assert.match(cards[0].aria, /DeepSeek chat，進行中，任務 3／4 完成，叢集總產出 34 tok\/s，子代理 12：9 執行中・3 完成/);
   for (const c of cards) {
     assert.ok(c.text.length < 80, `a card is a few words: ${JSON.stringify(c.text)}`);
     assert.doesNotMatch(c.text, FORBIDDEN_ETA);
@@ -614,15 +661,15 @@ test('the list follows the cluster messages: numbers change, a new cluster appea
   await open('#/clusters', { fake: listFake(cs) });
   await b.waitFor(`document.querySelectorAll('.cluster-card').length === 3`);
   await b.eval(`window.__gets.length = 0; document.querySelectorAll('.cluster-card').forEach((c) => (c.dataset.mark = 'kept'))`);
-  const speedOf = async (id) => (await text(`.cluster-card[data-cluster="${id}"] [data-field="speed"]`)).replace(/\s+/g, ' ');
-  assert.equal(await speedOf('c_bbbbbbbbbbbb'), '88 tok/s');
+  const outputOf = async (id) => (await text(`.cluster-card[data-cluster="${id}"] [data-field="output"]`)).replace(/\s+/g, ' ');
+  assert.equal(await outputOf('c_bbbbbbbbbbbb'), '34 tok/s 總產出');
   // One cluster's workers speed up and open more subagents.
   const b2 = cs[2];
-  const faster = { ...b2, workers: [W(1, { subagents: mix(20, () => 'running'), taskIndex: 0, speed: SPEED(300, 9) }), b2.workers[1]] };
+  const faster = { ...b2, throughput: THROUGHPUT(300), workers: [W(1, { subagents: mix(20, () => 'running'), taskIndex: 0, speed: SPEED(300, 9) }), b2.workers[1]] };
   await emit(faster);
   await b.waitFor(`document.querySelector('.cl-stat[data-stat="subagents-running"] [data-field="num"]').innerText.trim() === '${totalsOf([rowOf(cs[0]), rowOf(cs[1]), rowOf(faster)]).subagentsRunning}'`);
-  assert.equal(await speedOf('c_bbbbbbbbbbbb'), '300 tok/s');
-  assert.equal(await text('.cl-stat[data-stat="speed"] [data-field="num"]'), String(Math.round(totalsOf([rowOf(cs[0]), rowOf(cs[1]), rowOf(faster)]).tokensPerSecond)));
+  assert.equal(await outputOf('c_bbbbbbbbbbbb'), '300 tok/s 總產出');
+  assert.equal(await text('.cl-stat[data-stat="output"] [data-field="num"]'), String(Math.round(totalsOf([rowOf(cs[0]), rowOf(cs[1]), rowOf(faster)]).outputTokensPerSecond)));
   assert.equal(await b.eval(`document.querySelectorAll('.cluster-card[data-mark="kept"]').length`), 3, 'cards are updated in place');
   // The finished one is finished; a brand new cluster takes the first place; the oldest working one is second.
   const fresh = CLUSTER({ id: 'c_dddddddddddd', parentId: 's_kimi', createdAt: Date.now(), workers: [W(1, { subagents: mix(2, () => 'running') })], tasks: tasks8.slice(0, 2) });
@@ -706,11 +753,12 @@ const PAGE_TEXT = [
   ['stat number', '.ch-stat-num'],
   ['stat unit', '.ch-stat-unit'],
   ['stat sub', '.ch-stat-sub'],
+  ['stat avg', '.ch-stat-avg'],
   ['facts', '.ch-facts > span:not([data-native-swarm])'],
   ['tile title', '.cluster-worker-title'],
   ['tile state', '.cluster-worker-state'],
   ['tile place', '.cluster-worker-queue'],
-  ['tile speed', '.cw-speed'],
+  ['tile generation speed', '.cw-gen'],
   ['tile count', '.cw-subcount'],
   ['tile more', '.cw-mini-more'],
   ['fold title', '.cluster-fold .cf-title'],
@@ -723,7 +771,8 @@ const DRAWER_TEXT = [
   ['task', '.cd-task'],
   ['queue line', '.cd-sec .cluster-worker-queue'],
   ['progress line', '.cd-sec .cluster-worker-progress'],
-  ['speed', '[data-field="tokens"]'],
+  ['generation speed', '[data-field="gen"]'],
+  ['average output', '[data-field="tokens"]'],
   ['count line', '.sa-count'],
   ['legend', '.sa-legend li'],
   ['legend glyph running', '.sa-legend .sa-key[data-group="running"]'],
@@ -748,11 +797,12 @@ const LIST_TEXT = [
   ['stat number', '.cl-stat-num'],
   ['stat label', '.cl-stat-label'],
   ['stat sub', '.cl-stat-sub'],
+  ['stat avg', '.cl-stat-avg'],
   ['card title', '.cc-title'],
   ['card state', '.cc-state'],
   ['card progress', '.cc-progress'],
-  ['card speed', '.cc-speed-num'],
-  ['card speed unit', '.cc-speed-unit'],
+  ['card output', '.cc-output-num'],
+  ['card output unit', '.cc-output-unit'],
   ['card facts', '.cc-fact'],
   ['sidebar count', '.cluster-nav-count'],
 ];

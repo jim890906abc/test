@@ -12,8 +12,15 @@
 //    records yet) is null with a reason, and is not counted as zero;
 //  - GET /api/clusters is one light line per cluster, made by the same function the
 //    page applies to a cluster it is pushed.
+// And the two the page now leads with (the owner's, 2026-10-29):
+//  - a WORKER's 生成速度 is the chat room's own number (meta.tps: the tokens Kimi counted
+//    over the time it measured them streaming, the last ten steps), "—" and why when the
+//    worker is not running; the five-minute figure above stays, renamed 平均產出;
+//  - the CLUSTER's 叢集總產出 is what the whole cluster (workers and their subagents,
+//    one session id) produced in the last minute, one window, one total.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import WebSocket from 'ws';
 import { startRealHub, until, wait } from './fixtures/real-hub.mjs';
 import { summarizeCluster, totalsOf } from '../public/js/cluster-model.js';
 
@@ -86,7 +93,7 @@ test('speed is the output tokens of the requests that ended in the window, over 
   const row = (await hub.api('GET', '/clusters')).find((r) => r.id === c0.id);
   // (The window slides with the clock, so the two answers - asked a moment apart - may differ by a fraction in the speeds, and in nothing else.)
   const mine = summarizeCluster(got);
-  assert.deepEqual({ ...row, speed: null, parentTitle: undefined }, { ...mine, speed: null, parentTitle: undefined });
+  assert.deepEqual({ ...row, speed: null, throughput: null, parentTitle: undefined }, { ...mine, speed: null, throughput: null, parentTitle: undefined });
   assert.ok(Math.abs(row.speed.tokensPerSecond - mine.speed.tokensPerSecond) < 2, `${row.speed.tokensPerSecond} vs ${mine.speed.tokensPerSecond}`);
   assert.ok(Math.abs(row.speed.tokensPerSecond - (sa.tokensPerSecond + sb.tokensPerSecond)) < 2, 'the cluster\'s speed is the sum of its workers\'');
   assert.equal(row.speed.workersMeasured, 2);
@@ -188,4 +195,121 @@ test('GET /api/clusters: every cluster of every conversation, light, and the tot
   // And one cluster's own state gives the same line.
   assert.deepEqual({ ...a, parentTitle: undefined }, { ...summarizeCluster(await getCluster(c1.id)), parentTitle: undefined });
   assert.equal(a.parentTitle, (await snap(p1.id)).title);
+});
+
+function watchWs() {
+  const ws = new WebSocket(`ws://127.0.0.1:${hub.PORT}/ws`);
+  const msgs = [];
+  ws.on('message', (d) => {
+    try {
+      msgs.push(JSON.parse(d));
+    } catch {}
+  });
+  return { msgs, ready: new Promise((r) => ws.on('open', r)), close: () => ws.close() };
+}
+const turnOn = (kid) => {
+  hub.machine.frame(kid, 'turn.started', { turnId: 't1', promptId: 'p1', origin: { kind: 'user' }, prompt: 'x' });
+  hub.machine.frame(kid, 'event.session.work_changed', { busy: true, pending_interaction: 'none' });
+};
+
+test('a worker\'s 生成速度 is the chat room\'s own number - the tokens of its last steps over the time Kimi measured them streaming - pushed when it changes; "—" and why until a step is done and once the worker is not running', async () => {
+  const watch = watchWs();
+  await watch.ready;
+  try {
+    const parent = await newDeepseek();
+    const { cluster } = await dispatch(parent, 2);
+    const [a, b] = cluster.workers;
+    const [ka, kb] = [await kidOf(a.sessionId), await kidOf(b.sessionId)];
+    turnOn(ka);
+    turnOn(kb);
+    const first = await until(async () => {
+      const c = await getCluster(cluster.id);
+      return c.workers.every((w) => w.status === 'running') && c;
+    }, 8000, 'both workers running');
+    // Running, but no step done: nothing was measured, so not 0.
+    for (const w of first.workers) {
+      assert.equal(w.gen.tokensPerSecond, null);
+      assert.match(w.gen.unmeasured, /還沒有完成任何一步/);
+    }
+    // Kimi counts what it generated and times each step's streaming: 300 tokens in 1.0 s...
+    watch.msgs.length = 0;
+    hub.machine.frame(ka, 'turn.step.completed', { turnId: 't1', step: 1, stepId: 'g1', usage: { output: 300 }, llmStreamDurationMs: 1000 });
+    const pushed = (v) => until(async () => watch.msgs.find((m) => m.t === 'cluster' && m.cluster.id === cluster.id && m.cluster.workers[0].gen.tokensPerSecond === v)?.cluster, 6000, `the cluster pushed with ${v} tok/s and no event beside it`);
+    await pushed(300);
+    // ...and 100 more in 3.0 s: the rate is over both steps (400 tokens / 4.0 s), not the last step's (33) nor the mean of the two rates (167).
+    hub.machine.frame(ka, 'turn.step.completed', { turnId: 't1', step: 2, stepId: 'g2', usage: { output: 100 }, llmStreamDurationMs: 3000 });
+    const got = await pushed(100);
+    // The chat room reads the very same number from the conversation.
+    assert.equal((await snap(a.sessionId)).meta.tps, 100);
+    assert.equal((await getCluster(cluster.id)).workers[0].gen.tokensPerSecond, 100);
+    assert.equal(got.workers[0].gen.unmeasured, null);
+    // The other worker has none of its own: not a share of the first's.
+    assert.equal(got.workers[1].gen.tokensPerSecond, null);
+    // It is not the five-minute average of the request records: that is its own field, with its own reason here.
+    assert.match(got.workers[0].speed.unmeasured, /還沒有回報過任何請求紀錄|時間窗只有/);
+    // The worker's turn ends: it is not running, so no speed - though the conversation still holds its last rate.
+    hub.machine.frame(ka, 'turn.ended', { turnId: 't1', reason: 'completed', durationMs: 5000 });
+    hub.machine.frame(ka, 'event.session.work_changed', { busy: false, last_turn_reason: 'completed', pending_interaction: 'none' });
+    const idle = await until(async () => {
+      const c = await getCluster(cluster.id);
+      return c.workers[0].status !== 'running' && c;
+    }, 8000, 'worker a not running');
+    assert.equal(idle.workers[0].gen.tokensPerSecond, null, 'not 0, and not last turn\'s rate shown as if it were now');
+    assert.match(idle.workers[0].gen.unmeasured, /沒有在跑/);
+    assert.equal((await snap(a.sessionId)).meta.tps, 100, 'the conversation still has it; the cluster just does not call it current');
+  } finally {
+    watch.close();
+  }
+});
+
+test('叢集總產出: the cluster\'s throughput is one window over every worker\'s conversation - requests of a worker and of its subagents (one session id) alike - and the workers\' five-minute 平均產出 beside it is unchanged', async () => {
+  const parent = await newDeepseek();
+  const { cluster: c0 } = await dispatch(parent, 2);
+  const [a, b] = c0.workers;
+  const [ka, kb] = [await kidOf(a.sessionId), await kidOf(b.sessionId)];
+  await wait(6200);
+  const now = Date.now();
+  report([
+    // Worker a's own request and two of its subagents' (same session id), worker b's one, someone else's, and one from before the cluster existed.
+    record({ session: ka, startAt: now - 4000, endMs: 1000, outTokens: 100 }),
+    record({ session: ka, startAt: now - 3500, endMs: 1000, outTokens: 200 }),
+    record({ session: ka, startAt: now - 3000, endMs: 1000, outTokens: 300 }),
+    record({ session: kb, startAt: now - 2500, endMs: 1000, outTokens: 50 }),
+    record({ session: 'session_someone-else-1234', startAt: now - 2500, endMs: 1000, outTokens: 7777 }),
+    record({ session: ka, startAt: c0.createdAt - 120_000, endMs: 1000, outTokens: 9999 }),
+  ]);
+  const got = await until(async () => {
+    const c = await getCluster(c0.id);
+    return c.throughput?.outTokens === 650 && c;
+  }, 8000, 'the records');
+  const t = got.throughput;
+  assert.equal(t.unmeasured, null);
+  assert.ok(t.windowMs >= 5000 && t.windowMs <= Math.min(60_000, Date.now() - c0.createdAt + 50), `the window is the cluster\'s age (${t.windowMs} ms), and never more than a minute`);
+  assert.equal(t.tokensPerSecond, Math.round((650 / (t.windowMs / 1000)) * 10) / 10);
+  assert.deepEqual([t.workersCounted, t.workers], [2, 2]);
+  assert.equal(t.requests, 4);
+  // Beside it, each worker\'s own five-minute figure is what it was.
+  assert.deepEqual(got.workers.map((w) => w.speed.outTokens), [600, 50]);
+  assert.equal(got.workers[0].speed.tokensPerSecond, Math.round((600 / (got.workers[0].speed.windowMs / 1000)) * 10) / 10);
+  // The list gives the same line the page works out from the cluster.
+  const row = (await hub.api('GET', '/clusters')).find((r) => r.id === c0.id);
+  assert.equal(row.throughput.outTokens, 650);
+  // (The window slides with the clock: the two answers, asked a moment apart, may differ in the rates and in nothing else.)
+  assert.deepEqual({ ...row.throughput, windowMs: 0, tokensPerSecond: 0, requestsPerMinute: 0 }, { ...summarizeCluster(got).throughput, windowMs: 0, tokensPerSecond: 0, requestsPerMinute: 0 });
+  assert.ok(Math.abs(row.throughput.tokensPerSecond - t.tokensPerSecond) < 2);
+  assert.ok(!JSON.stringify(got).match(/eta|remaining|剩餘/i));
+});
+
+test('叢集總產出 is "—" with the reason where the records cannot say (workers not on the DeepSeek pool); it is not 0', async () => {
+  const parent = await newKimi();
+  const { cluster } = await dispatch(parent, 1);
+  await wait(5500);
+  const c = await getCluster(cluster.id);
+  assert.equal(c.throughput.tokensPerSecond, null);
+  assert.equal(c.throughput.outTokens, null);
+  assert.match(c.throughput.unmeasured, /不是 DeepSeek 號池/);
+  assert.equal(c.throughput.workersCounted, 0);
+  const row = (await hub.api('GET', '/clusters')).find((r) => r.id === cluster.id);
+  assert.equal(row.throughput.tokensPerSecond, null);
+  assert.match(row.throughput.unmeasured, /不是 DeepSeek 號池/);
 });

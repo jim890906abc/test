@@ -157,10 +157,13 @@ test('a worker waiting for an approval reads awaiting everywhere: its square, th
   await b.waitFor(`!document.querySelector('[data-stat="subagents"] [data-field="sub"]')?.innerText.includes('等你核准')`);
 });
 
-test('the speed is what the connector\'s request records add up to over a window no longer than the work has been going; "—" for a worker with no records; no time left anywhere', { skip }, async () => {
+test('the three numbers: a tile says the worker\'s 生成速度 (the chat room\'s own number), the band says 叢集總產出 (the last minute of every agent, subagents included) with the 平均產出 it used to say small under it; "—" for a worker with no step; no time left anywhere', { skip }, async () => {
   const [w1, w2] = S.c1.workers;
   // The window cannot be longer than the cluster's life: a few seconds of it, then records inside it.
   await wait(Math.max(0, 6500 - (Date.now() - S.c1.createdAt)));
+  // Worker 1 generates: Kimi counts what a step wrote and times its streaming (300 tokens in 1.0 s, then 100 in 3.0 s).
+  S.w1.f('turn.step.completed', { turnId: 't1', step: 1, stepId: 'e2e-g1', usage: { output: 300 }, llmStreamDurationMs: 1000 });
+  S.w1.f('turn.step.completed', { turnId: 't1', step: 2, stepId: 'e2e-g2', usage: { output: 100 }, llmStreamDurationMs: 3000 });
   const now = Date.now();
   hub.machine.send({
     t: 'deepseek.requests',
@@ -168,29 +171,46 @@ test('the speed is what the connector\'s request records add up to over a window
     since: now - 3_600_000,
     replay: false,
     records: [
+      // Worker 1's conversation: its own request and a subagent\'s (the same session id)...
       { id: 'sq-1', req: 1, attempt: 1, key: 'dk_none', gateway: 'opencode-go', session: S.w1.kid, recvAt: now - 4000, startAt: now - 3900, headersMs: 50, firstByteMs: 80, endMs: 900, status: 200, outcome: 'ok', inflight: 1, outTokens: 300 },
       { id: 'sq-2', req: 2, attempt: 1, key: 'dk_none', gateway: 'opencode-go', session: S.w1.kid, recvAt: now - 2500, startAt: now - 2400, headersMs: 50, firstByteMs: 80, endMs: 900, status: 200, outcome: 'ok', inflight: 1, outTokens: 500 },
+      // ...and worker 2\'s.
+      { id: 'sq-3', req: 3, attempt: 1, key: 'dk_none', gateway: 'opencode-go', session: S.w2.kid, recvAt: now - 2000, startAt: now - 1900, headersMs: 50, firstByteMs: 80, endMs: 900, status: 200, outcome: 'ok', inflight: 1, outTokens: 200 },
     ],
   });
-  await b.waitFor(`document.querySelector('.cluster-worker[data-session="${w1.sessionId}"] [data-field="speed"]')?.innerText.trim() !== '—'`, { timeout: 10000, label: 'the tile shows a speed' });
+  await b.waitFor(`document.querySelector('.cluster-worker[data-session="${w1.sessionId}"] [data-field="gen"]')?.innerText.trim() === '100 tok/s'`, { timeout: 10000, label: 'the tile shows worker 1\'s generation speed' });
   const api = await getCluster(S.c1.id);
-  const sp1 = api.workers[0].speed;
-  assert.equal(sp1.outTokens, 800);
-  assert.equal(sp1.requests, 2);
-  assert.ok(sp1.windowMs >= 5000 && sp1.windowMs <= Date.now() - S.c1.createdAt + 50, `the window is the cluster's age: ${sp1.windowMs} ms`);
-  assert.equal(sp1.tokensPerSecond, Math.round((800 / (sp1.windowMs / 1000)) * 10) / 10);
-  assert.equal(api.workers[1].speed.tokensPerSecond, 0, 'a worker whose requests the connector has all of, and none ended in the window, produced 0: that is a measurement');
-  assert.equal(api.workers[1].speed.outTokens, 0);
-  // On the page: the tile says the number, the other tile a dash; the band is the sum of those that could say.
-  const shown = Number((await text(`.cluster-worker[data-session="${w1.sessionId}"] [data-field="speed"]`)).replace(/[^\d.]/g, ''));
+  // The tile is the chat room\'s number: the very meta.tps of the conversation (400 tokens over 4.0 s of streaming).
+  assert.equal((await snap(w1.sessionId)).meta.tps, 100);
+  assert.equal(api.workers[0].gen.tokensPerSecond, 100);
+  assert.equal(await text(`.cluster-worker[data-session="${w1.sessionId}"] [data-field="gen"]`), '100 tok/s');
+  // Worker 2 has no step done: nothing was measured, so a dash - not 0, and not worker 1\'s.
+  assert.equal(api.workers[1].gen.tokensPerSecond, null);
+  assert.equal(await text(`.cluster-worker[data-session="${w2.sessionId}"] [data-field="gen"]`), '—');
+  // The band: 1000 tokens of the whole cluster over one window no longer than the cluster has lived.
+  const t = api.throughput;
+  assert.equal(t.outTokens, 1000);
+  assert.deepEqual([t.workersCounted, t.workers], [2, 2]);
+  assert.ok(t.windowMs >= 5000 && t.windowMs <= Date.now() - S.c1.createdAt + 50, `the window is the cluster\'s age: ${t.windowMs} ms`);
+  assert.equal(t.tokensPerSecond, Math.round((1000 / (t.windowMs / 1000)) * 10) / 10);
   const near = (x, y) => Math.abs(x - y) <= Math.max(2, y * 0.25);
-  assert.ok(near(shown, (await getCluster(S.c1.id)).workers[0].speed.tokensPerSecond), `tile ${shown} vs Hub`);
-  assert.equal(await text(`.cluster-worker[data-session="${w2.sessionId}"] [data-field="speed"]`), '0 tok/s');
-  assert.ok(near(Number(await statNum('speed')), (await getCluster(S.c1.id)).workers[0].speed.tokensPerSecond));
-  // The drawer says it in words: the window, the number, the requests.
+  await b.waitFor(`document.querySelector('[data-stat="output"] [data-field="num"]')?.innerText.trim() !== '—'`, { timeout: 10000, label: 'the band shows the cluster\'s output' });
+  assert.equal(await text('[data-stat="output"] .ch-stat-label'), '叢集總產出');
+  assert.ok(near(Number(await statNum('output')), (await getCluster(S.c1.id)).throughput.tokensPerSecond), 'band vs Hub');
+  assert.match(await text('[data-stat="output"] [data-field="sub"]'), /^最近 \d+ 秒（叢集才跑了這麼久）・所有代理（含子代理）$/, 'a cluster a few seconds old says the window it was measured over');
+  assert.match(await text('[data-stat="output"] [data-field="avg"]'), /^平均產出（最近 5 分鐘）\d+(\.\d)? tok\/s$/, 'and the average it used to say is still there, small');
+  assert.equal(await b.eval(`document.querySelector('[data-stat="output"]').title.startsWith('最近 1 分鐘所有代理（含子代理）實際產出的字數 ÷ 60 秒')`), true);
+  await shot('e2e-squares-numbers-1280.png');
+  // The drawer says each in words: 生成速度, then 平均產出 with its window and the requests.
   await page.openDrawer(w1.sessionId);
-  assert.match(await text('[data-field="tokens"]'), /^最近 \d+ 秒輸出 \d+(\.\d)? tok\/s$/);
+  assert.equal(await text('[data-sec="generation"] [data-field="gen"]'), '100 tok/s');
+  assert.match(await text('[data-sec="speed"] h3'), /^平均產出（最近 \d+ 秒，含等待）$/);
+  assert.match(await text('[data-field="tokens"]'), /^平均產出（最近 \d+ 秒，含等待）：\d+(\.\d)? tok\/s$/);
   assert.match(await text('[data-field="requests"]'), /^請求 \d+(\.\d)?／分$/);
+  await shot('e2e-squares-numbers-drawer-1280.png');
+  await page.closeDrawer();
+  await page.openDrawer(w2.sessionId);
+  assert.match(await text('[data-field="gen-why"]'), /^—　量不到：這一輪還沒有完成任何一步/);
   await page.closeDrawer();
   const everything = await b.eval(`document.body.innerText`);
   assert.doesNotMatch(everything, /ETA|剩餘|預計|預估|還要|remaining/i, 'nowhere does the page say how long anything will take');

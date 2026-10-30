@@ -146,6 +146,19 @@ function progressOf(s) {
   return '';
 }
 
+// How fast a worker is generating, the chat room's own number (the adapter keeps
+// it in the conversation's meta as `tps`: the tokens Kimi counted over the time
+// it measured them streaming, the last ten steps - nothing is estimated here).
+// Only a worker that is running has one to show: a finished or idle worker's last
+// rate is not "now", and 0 would read as slow. Null says why.
+function generationOf(s) {
+  if (!s) return { tokensPerSecond: null, unmeasured: '這個工作者的對話已被刪除' };
+  if (!WORKING.includes(s.status)) return { tokensPerSecond: null, unmeasured: '這個工作者現在沒有在跑，沒有「現在」的生成速度（上一輪的數字不當成現在的；對話裡還留著）' };
+  const tps = s.meta?.tps;
+  if (!(typeof tps === 'number' && Number.isFinite(tps) && tps > 0)) return { tokensPerSecond: null, unmeasured: '這一輪還沒有完成任何一步，或這個模型沒有回報串流時間；要等 Kimi 回報一步的字數與串流時間才量得到' };
+  return { tokensPerSecond: tps, unmeasured: null };
+}
+
 function statusOf(rec) {
   if (rec.phase) return rec.phase;
   const live = rec.workers.map(leafOfWorker);
@@ -163,6 +176,8 @@ function statusOf(rec) {
 }
 
 export function publicCluster(rec) {
+  const leaves = rec.workers.map(leafOfWorker);
+  const chains = leaves.map((s) => (s ? store.chainOf(s) : []));
   return {
     id: rec.id,
     parentId: rec.parentId,
@@ -172,12 +187,14 @@ export function publicCluster(rec) {
     isolate: rec.isolate,
     swarm: rec.swarm,
     warnings: [...rec.warnings],
-    workers: rec.workers.map((w) => {
-      const s = leafOfWorker(w);
+    // What the whole cluster - its workers and their subagents - produced in the last minute: one window over all of their conversations (the request records tie a subagent to its worker's session id).
+    throughput: timing.recentOutput(chains, { from: rec.createdAt }),
+    workers: rec.workers.map((w, i) => {
+      const s = leaves[i];
       // Its subagents, one entry each (an AgentSwarm's members too), judged by the conversation's own rules.
       const sub = subagentsOf(s, { childStatus: (id) => store.getSession(id)?.status });
-      // How fast it is going now: the connector's request records, added up over the last minutes (null and why where they cannot say).
-      const speed = timing.recentSpeed(s ? store.chainOf(s) : [], { from: rec.createdAt });
+      // 平均產出: the connector's request records, added up over the last five minutes, waiting included (null and why where they cannot say).
+      const speed = timing.recentSpeed(chains[i], { from: rec.createdAt });
       return {
         sessionId: w.sessionId,
         title: w.title,
@@ -202,6 +219,8 @@ export function publicCluster(rec) {
         subagentCounts: sub.counts,
         subagentsOlder: sub.older,
         speed,
+        // How fast it generates right now, as the chat room says it (null and why where it does not).
+        gen: generationOf(s),
       };
     }),
     // Every task, in the order given. Times are the Hub's own clock: `startedAt`

@@ -1370,6 +1370,9 @@ function broadcast(msg) {
   // A cluster worker's progress line follows what it says, and a worker whose
   // conversation is deleted reads 已刪除 on the pages that show its cluster.
   if (msg.sid && (msg.t === 'event' || msg.t === 'patch' || msg.t === 'delta' || msg.t === 'deleted')) clusters.noteActivity(msg.sid);
+  // A worker's generation speed lives in its conversation's meta, which moves with
+  // no event beside it (a step's end): the summary that carries it is activity too.
+  else if (msg.t === 'session' && msg.session?.id) clusters.noteActivity(msg.session.id);
   const data = JSON.stringify(msg);
   const sid = STREAM.has(msg.t) ? msg.sid : null;
   for (const ws of wss.clients) {

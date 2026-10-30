@@ -15,9 +15,12 @@ import {
   clusterElapsed,
   clusterStatusLabel,
   fmtMs,
+  genView,
   groupCounts,
   isActive,
   keyView,
+  outputTotalView,
+  outputView,
   sortClusters,
   speedView,
   squareLabel,
@@ -222,7 +225,7 @@ export class WorkerTile {
     this.title = h('span', { class: 'cluster-worker-title' });
     this.state = h('span', { class: 'om-badge cluster-worker-state' });
     this.place = h('span', { class: 'cluster-worker-queue cw-place' });
-    this.speed = h('span', { class: 'cw-speed', dataset: { field: 'speed' } });
+    this.gen = h('span', { class: 'cw-gen', dataset: { field: 'gen' } });
     this.bar = barEl();
     this.minis = h('span', { class: 'cw-minis', 'aria-hidden': 'true' });
     this.count = h('span', { class: 'cw-subcount', dataset: { field: 'subcount' } });
@@ -231,7 +234,7 @@ export class WorkerTile {
       'article',
       { class: 'cluster-worker', role: 'button', tabindex: '0', 'aria-haspopup': 'dialog', dataset: { session: sessionId }, onclick: () => onOpen(sessionId, this.el), onkeydown: (e) => (e.key === 'Enter' || e.key === ' ') && e.target === this.el && (e.preventDefault(), onOpen(sessionId, this.el)) },
       h('div', { class: 'cw-top' }, this.title),
-      h('div', { class: 'cw-meta' }, this.state, this.speed),
+      h('div', { class: 'cw-meta' }, this.state, this.gen),
       h('div', { class: 'cw-line' }, this.place, this.count),
       this.bar,
       this.minis,
@@ -247,7 +250,7 @@ export class WorkerTile {
   update(w, cluster) {
     const st = workerState(w);
     const sq = workerSquare(w, cluster);
-    const sp = speedView(w.speed);
+    const gv = genView(w.gen);
     const counts = w.subagentCounts;
     const g = groupCounts(counts);
     const line = subagentLine(counts, w.subagentsOlder);
@@ -258,11 +261,11 @@ export class WorkerTile {
       this.state.textContent = st.label;
     });
     this.set('place', sq.place, (v) => ((this.place.hidden = !v), (this.place.textContent = v || '')));
-    // A speed the records could not say is "—"; why is in the drawer.
-    this.set('speed', sp.text, (v) => {
-      this.speed.textContent = v;
-      this.speed.classList.toggle('none', !sp.measured);
-      this.speed.title = sp.measured ? [sp.tokens, sp.requests].filter(Boolean).join('；') : '量不到（原因在詳細裡）';
+    // 生成速度, the chat room's number: a dash where the worker is not running or no step is done; why is in the drawer.
+    this.set('gen', gv.text, (v) => {
+      this.gen.textContent = v;
+      this.gen.classList.toggle('none', !gv.measured);
+      this.gen.title = gv.measured ? `生成速度：${gv.tip}（和聊天室狀態列同一個數字）` : `生成速度：${gv.tip}。現在量不到（原因在詳細裡）`;
     });
     this.set('bar', JSON.stringify([sq.share, sq.working, w.status]), () => {
       const total = sq.total || 1;
@@ -285,8 +288,8 @@ export class WorkerTile {
       this.count.textContent = counts && g.total ? `子代理 ${workingSubagents(counts)}/${g.total}` : '';
       this.count.title = line;
     });
-    this.set('aria', `${w.title}|${st.label}|${sq.place}|${sp.text}|${line}`, () => {
-      this.el.setAttribute('aria-label', `${w.title}，${st.label}${sq.place ? `，${sq.place}` : ''}，速度 ${sp.measured ? sp.text : '量不到'}，${line}。按下查看詳細`);
+    this.set('aria', `${w.title}|${st.label}|${sq.place}|${gv.text}|${line}`, () => {
+      this.el.setAttribute('aria-label', `${w.title}，${st.label}${sq.place ? `，${sq.place}` : ''}，生成速度 ${gv.measured ? gv.text : '量不到'}，${line}。按下查看詳細`);
     });
   }
 }
@@ -454,6 +457,7 @@ export class WorkerDrawer {
     this.openLink.href = `#/s/${w.sessionId}`;
 
     const sp = speedView(w.speed);
+    const gv = genView(w.gen);
     const list = Array.isArray(w.subagents) ? w.subagents : [];
     const queue = workerQueueLine(w, c);
     const got = deleted ? { error: new Error('這個工作者的對話已被刪除，沒有耗時資料') } : this.timingOf?.(w.sessionId) || null;
@@ -469,15 +473,26 @@ export class WorkerDrawer {
           h('p', { class: `cluster-worker-progress${w.progress ? '' : ' muted'}`, dataset: { field: 'progress' } }, w.progress || '還沒有進度'),
         ),
       ),
+      // 生成速度: the chat room's number (the last ten model steps); a dash and why where the worker is not running or no step is done.
+      this.part('gen', gv, () =>
+        h(
+          'section',
+          { class: 'cd-sec', dataset: { sec: 'generation' } },
+          h('h3', { title: gv.tip }, '生成速度'),
+          gv.measured ? h('p', { class: 'cd-gen', dataset: { field: 'gen' } }, gv.text) : h('p', { class: 'cd-none', dataset: { field: 'gen-why' } }, `${DASH}　量不到：${gv.why}`),
+          h('p', { class: 'om-field__help' }, `${gv.tip}。和聊天室狀態列同一個數字：Kimi 數的字數 ÷ 它量的串流時間，看最近 10 個模型步驟；只有執行中的工作者才有。`),
+        ),
+      ),
+      // 平均產出: the connector's request records of the last five minutes, waiting and tools in the divisor.
       this.part('speed', [sp, w.speed?.requests], () =>
         h(
           'section',
           { class: 'cd-sec', dataset: { sec: 'speed' } },
-          h('h3', null, '目前速度'),
+          h('h3', { title: sp.tip }, sp.label),
           sp.measured
             ? h('ul', { class: 'cd-lines' }, h('li', { dataset: { field: 'tokens' } }, sp.tokens), sp.requests ? h('li', { dataset: { field: 'requests' } }, sp.requests) : null)
             : h('p', { class: 'cd-none', dataset: { field: 'speed-why' } }, `${DASH}　量不到：${sp.why}`),
-          h('p', { class: 'om-field__help' }, '只算連接器記下的請求：窗內結束的請求輸出的 token 數，除以窗的秒數；沒有任何推算。'),
+          h('p', { class: 'om-field__help' }, `${sp.tip}。只算連接器記下的請求：窗內結束的請求輸出的 token 數，除以窗的秒數；沒有任何推算。`),
         ),
       ),
       // Which key of the pool its requests go out with (the Hub's timing answer says it): the gateway and the last four characters, nothing more.
@@ -541,15 +556,15 @@ export class ClusterCard {
     this.badge = h('span', { class: 'om-badge cc-state' });
     this.bar = barEl('cc-bar');
     this.progress = h('span', { class: 'cc-progress' });
-    this.speedNum = h('span', { class: 'cc-speed-num' });
-    this.speedUnit = h('span', { class: 'cc-speed-unit' }, 'tok/s');
+    this.outNum = h('span', { class: 'cc-output-num' });
+    this.outUnit = h('span', { class: 'cc-output-unit' }, 'tok/s 總產出');
     this.workers = h('span', { class: 'cc-fact', dataset: { field: 'workers' } });
     this.subs = h('span', { class: 'cc-fact', dataset: { field: 'subagents' } });
     this.el = h(
       'a',
       { class: 'cluster-card' },
       h('div', { class: 'cc-top' }, this.title, this.badge),
-      h('div', { class: 'cc-mid' }, h('div', { class: 'cc-prog' }, this.bar, this.progress), h('div', { class: 'cc-speed', dataset: { field: 'speed' } }, this.speedNum, this.speedUnit)),
+      h('div', { class: 'cc-mid' }, h('div', { class: 'cc-prog' }, this.bar, this.progress), h('div', { class: 'cc-output', dataset: { field: 'output' } }, this.outNum, this.outUnit)),
       h('div', { class: 'cc-facts' }, this.workers, this.subs),
     );
     this.last = {};
@@ -563,9 +578,9 @@ export class ClusterCard {
 
   // row: summarizeCluster(); title: the main conversation's name.
   update(row, title) {
-    const sp = speedView(row.speed);
-    const t = row.tasks;
     const live = isActive(row);
+    const ov = outputView(row.throughput, { active: live });
+    const t = row.tasks;
     this.el.href = `#/cluster/${row.id}`;
     this.el.dataset.cluster = row.id;
     this.el.dataset.status = row.status;
@@ -579,11 +594,12 @@ export class ClusterCard {
       this.bar.set({ done: t.done / total, running: t.running / total, failed: t.failed / total }, `任務 ${t.done}／${t.total} 完成`);
       this.progress.textContent = `${t.done}/${t.total}`;
     });
-    this.set('speed', sp.text, () => {
-      this.speedNum.textContent = sp.measured ? sp.text.replace(/ tok\/s$/, '') : DASH;
-      this.speedUnit.hidden = !sp.measured;
-      this.el.querySelector('.cc-speed').classList.toggle('none', !sp.measured);
-      this.el.querySelector('.cc-speed').title = sp.measured ? [sp.tokens, sp.requests].filter(Boolean).join('；') : `量不到：${sp.why}`;
+    // 叢集總產出 (the last minute, every agent of the cluster); a dash where it cannot be said or the cluster is over.
+    this.set('output', ov.text, () => {
+      this.outNum.textContent = ov.num;
+      this.outUnit.hidden = !ov.measured;
+      this.el.querySelector('.cc-output').classList.toggle('none', !ov.measured);
+      this.el.querySelector('.cc-output').title = ov.measured ? `叢集總產出：${ov.tip}` : `叢集總產出：量不到：${ov.why}`;
     });
     this.set('workers', `${row.workersRunning}/${row.workers}|${live}`, () => (this.workers.textContent = `工作者 ${row.workersRunning}/${row.workers}`));
     const sub = row.subagents;
@@ -591,8 +607,8 @@ export class ClusterCard {
       this.subs.textContent = sub ? `子代理 ${sub.running + sub.awaiting}/${sub.total + sub.older}` : `子代理 ${DASH}`;
       this.subs.title = sub ? subagentLine(sub, sub.older) : '量不到';
     });
-    this.set('aria', `${title}|${row.status}|${t.done}|${t.total}|${sp.text}|${JSON.stringify(sub)}`, () => {
-      this.el.setAttribute('aria-label', `${title}，${clusterStatusLabel(row.status)}，任務 ${t.done}／${t.total} 完成，速度 ${sp.measured ? sp.text : '量不到'}，${sub ? subagentLine(sub, sub.older) : '子代理量不到'}`);
+    this.set('aria', `${title}|${row.status}|${t.done}|${t.total}|${ov.text}|${JSON.stringify(sub)}`, () => {
+      this.el.setAttribute('aria-label', `${title}，${clusterStatusLabel(row.status)}，任務 ${t.done}／${t.total} 完成，叢集總產出 ${ov.measured ? ov.text : '量不到'}，${sub ? subagentLine(sub, sub.older) : '子代理量不到'}`);
     });
   }
 }
@@ -624,16 +640,24 @@ export class ClusterListPage {
     this.draw();
   }
 
-  stat1(key, label, value, sub, tone = '') {
+  // `extra`: { avg, avgTitle, title } - a second small line under the first, and a tooltip for the box.
+  stat1(key, label, value, sub, tone = '', extra = {}) {
     let el = this.stat[key];
     if (!el) {
       el = this.stat[key] = { el: h('div', { class: 'cl-stat', dataset: { stat: key } }), sig: '' };
     }
-    const sig = JSON.stringify([label, value, sub, tone]);
+    const sig = JSON.stringify([label, value, sub, tone, extra]);
     if (el.sig !== sig) {
       el.sig = sig;
       el.el.className = `cl-stat${tone ? ` ${tone}` : ''}`;
-      fill(el.el, h('div', { class: 'cl-stat-num', dataset: { field: 'num' } }, value), h('div', { class: 'cl-stat-label' }, label), sub ? h('div', { class: 'cl-stat-sub', dataset: { field: 'sub' } }, sub) : null);
+      el.el.title = extra.title || '';
+      fill(
+        el.el,
+        h('div', { class: 'cl-stat-num', dataset: { field: 'num' } }, value),
+        h('div', { class: 'cl-stat-label' }, label),
+        sub ? h('div', { class: 'cl-stat-sub', dataset: { field: 'sub' } }, sub) : null,
+        extra.avg ? h('div', { class: 'cl-stat-sub cl-stat-avg', dataset: { field: 'avg' }, title: extra.avgTitle || '' }, extra.avg) : null,
+      );
     }
     return el.el;
   }
@@ -641,14 +665,18 @@ export class ClusterListPage {
   draw() {
     const rows = this.rows();
     const t = totalsOf(rows);
-    const speed = t.tokensPerSecond;
-    const sp = speedView({ tokensPerSecond: speed });
+    const ov = outputTotalView(t);
+    const avg = speedView({ tokensPerSecond: t.avgTokensPerSecond });
     const known = rows.some((r) => r.subagents);
     fill(
       this.statsEl,
       this.stat1('subagents-running', '執行中子代理', rows.length && known ? String(t.subagentsRunning) : DASH, rows.length ? (known ? `共開過 ${t.subagentsOpened} 個${t.subagentsPartial ? '（有叢集量不到）' : ''}` : '量不到') : null, t.subagentsRunning ? 'live' : ''),
       this.stat1('workers-running', '執行中工作者', String(t.workersRunning), `${t.active} 個叢集進行中`, t.workersRunning ? 'live' : ''),
-      this.stat1('speed', '目前總速度', sp.measured ? sp.text.replace(/ tok\/s$/, '') : DASH, sp.measured ? 'tok/s' : '量不到（沒有請求紀錄可算）'),
+      this.stat1('output', '叢集總產出', ov.num, ov.measured ? `tok/s・${ov.sub}` : ov.sub, '', {
+        title: ov.measured ? ov.tip : `量不到：${ov.why}`,
+        avg: `平均產出（最近 5 分鐘）${avg.measured ? avg.text : DASH}`,
+        avgTitle: avg.measured ? avg.tip : `量不到：${avg.why}`,
+      }),
     );
     const sorted = sortClusters(rows);
     this.empty.hidden = sorted.length > 0;

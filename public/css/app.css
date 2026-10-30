@@ -6109,6 +6109,15 @@ pre.tail {
 .cl-stat.none .cl-stat-num {
   color: var(--ink-secondary);
 }
+/* the line under a stat that says which window it is, and the second line (the five-minute average) beside the last minute's output */
+.ch-stat[data-stat='output'] .ch-stat-sub,
+.ch-stat-avg,
+.cl-stat-avg {
+  flex: none;
+  overflow: visible;
+  text-overflow: clip;
+  white-space: normal;
+}
 .ch-facts {
   display: flex;
   flex-wrap: wrap;
@@ -6260,14 +6269,14 @@ pre.tail {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.cw-speed {
+.cw-gen {
   flex: none;
   font-size: 12px;
   line-height: 16px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
-.cw-speed.none {
+.cw-gen.none {
   color: var(--ink-secondary);
   font-weight: 400;
 }
@@ -6610,6 +6619,13 @@ pre.tail {
   line-height: 18px;
   font-variant-numeric: tabular-nums;
 }
+.cd-gen {
+  margin: 0;
+  font-size: 20px;
+  line-height: 26px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+}
 .cd-none {
   font-size: 12px;
   line-height: 18px;
@@ -6808,24 +6824,24 @@ pre.tail {
   color: var(--ink-secondary);
   font-variant-numeric: tabular-nums;
 }
-.cc-speed {
+.cc-output {
   flex: none;
   display: flex;
   align-items: baseline;
   gap: 3px;
 }
-.cc-speed-num {
+.cc-output-num {
   font-size: 24px;
   line-height: 28px;
   font-weight: 650;
   letter-spacing: -0.02em;
   font-variant-numeric: tabular-nums;
 }
-.cc-speed-unit {
+.cc-output-unit {
   font-size: 11px;
   color: var(--ink-secondary);
 }
-.cc-speed.none .cc-speed-num {
+.cc-output.none .cc-output-num {
   color: var(--ink-secondary);
   font-weight: 400;
 }

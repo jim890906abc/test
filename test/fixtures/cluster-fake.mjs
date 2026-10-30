@@ -93,6 +93,11 @@ export const countsOf = (list) => {
   return c;
 };
 export const SPEED = (tps = 42.5, rpm = 3.2) => ({ windowMs: 120_000, outTokens: Math.round(tps * 120), tokensPerSecond: tps, requests: Math.round(rpm * 2), requestsPerMinute: rpm, unmeasured: null });
+// A worker's 生成速度 as the Hub says it (the chat room's number), and the cluster's 叢集總產出 (the last minute, every agent).
+export const GEN = (tps = 103.4) => ({ tokensPerSecond: tps, unmeasured: null });
+export const NO_GEN = (why = '這個工作者現在沒有在跑，沒有「現在」的生成速度（上一輪的數字不當成現在的；對話裡還留著）') => ({ tokensPerSecond: null, unmeasured: why });
+export const THROUGHPUT = (tps = 48.6, over = {}) => ({ windowMs: 60_000, outTokens: Math.round(tps * 60), tokensPerSecond: tps, requests: 9, requestsPerMinute: 9, unmeasured: null, workersCounted: 3, workers: 3, ...over });
+export const NO_THROUGHPUT = (why = '這個對話用的不是 DeepSeek 號池（沒有經過連接器的 proxy），沒有請求紀錄可以算速度', over = {}) => ({ windowMs: null, outTokens: null, tokensPerSecond: null, requests: null, requestsPerMinute: null, unmeasured: why, workersCounted: 0, workers: 3, ...over });
 export const NO_SPEED = (why = '這個對話用的不是 DeepSeek 號池（沒有經過連接器的 proxy），沒有請求紀錄可以算速度') => ({ windowMs: null, outTokens: null, tokensPerSecond: null, requests: null, requestsPerMinute: null, unmeasured: why });
 
 export const W = (n, patch = {}) => {
@@ -111,6 +116,7 @@ export const W = (n, patch = {}) => {
     taskIndex: n - 1,
     done: 0,
     speed: SPEED(10 * n, n),
+    gen: GEN(100 + n),
     subagentsOlder: 0,
     ...patch,
     subagents,
@@ -126,7 +132,8 @@ export const CLUSTER = (patch = {}) => ({
   isolate: true,
   swarm: true,
   warnings: [],
-  workers: [W(1), W(2, { status: 'idle', finishedAt: T0 - 5000, swarm: false, taskIndex: null, done: 1 }), W(3, { status: 'error', finishedAt: T0 - 1000, taskIndex: null })],
+  throughput: THROUGHPUT(),
+  workers: [W(1), W(2, { status: 'idle', finishedAt: T0 - 5000, swarm: false, taskIndex: null, done: 1, gen: NO_GEN() }), W(3, { status: 'error', finishedAt: T0 - 1000, taskIndex: null, gen: NO_GEN() })],
   tasks: [
     { index: 0, title: '任務一', status: 'running', workerSessionId: 's_w1', startedAt: T0 - 100_000, finishedAt: null, attempts: 1, error: null },
     { index: 1, title: '任務二', status: 'done', workerSessionId: 's_w2', startedAt: T0 - 100_000, finishedAt: T0 - 5000, attempts: 1, error: null },

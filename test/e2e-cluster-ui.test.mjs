@@ -1427,7 +1427,7 @@ test('on a phone (390) the dispatch dialog, the cluster page with its time bars 
 });
 
 test('in the dark look the cluster page text can be read: the tiles, the drawer with its time bars and reasons, the merge result and the memory all keep their contrast', { skip }, async () => {
-  const pageSels = ['.cluster-worker-title', '.cluster-merge-name', '.cluster-merge-branchname', '.cluster-memory-text', '.cluster-memory-path', '.cluster-head .om-badge', '.cluster-worker-state', '.cluster-merge .om-badge', '.cw-line', '.cw-speed'];
+  const pageSels = ['.cluster-worker-title', '.cluster-merge-name', '.cluster-merge-branchname', '.cluster-memory-text', '.cluster-memory-path', '.cluster-head .om-badge', '.cluster-worker-state', '.cluster-merge .om-badge', '.cw-line', '.cw-gen'];
   const drawerSels = ['.cd-task', '.cluster-kv code', '.cluster-drawer .cluster-worker-progress', '.cluster-timing-total', '.cluster-legend-label', '.cluster-legend-value', '.cluster-reason', '.cluster-timing-facts', '.cluster-drawer .cluster-chip', '.cd-sec h3'];
   // The second worker's turn was written without times: its unmeasured parts.
   const unmeasuredSels = ['.cluster-legend li.unmeasured .cluster-legend-value', '.cluster-reason'];

@@ -512,8 +512,15 @@ export function subagentDetail(s, { now = Date.now(), modelText = (p, m) => m, e
 
 // ----------------------------------------------------------------- speed
 
-// Speeds are what the connector's request records add up to over a time window
-// (the Hub's recentSpeed); null where they cannot say. Nothing here estimates,
+// Three different numbers, never to be mistaken for one another:
+//  - 生成速度 (a worker's `gen`): how fast the model writes when it really writes -
+//    the chat room's own number, from the tokens Kimi counted over the time it
+//    measured them streaming. Only a running worker has one;
+//  - 叢集總產出 (the cluster's `throughput`): what the whole cluster, its subagents
+//    included, produced in the last minute, one window (the Hub's recentOutput);
+//  - 平均產出 (a worker's `speed`): the connector's request records of the last five
+//    minutes added up, waiting and tools in the divisor (the Hub's recentSpeed).
+// Each is null where the Hub cannot say, with the reason; nothing here estimates,
 // and nothing here says how long anything will take.
 export function fmtRate(v) {
   if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) return null;
@@ -521,19 +528,71 @@ export function fmtRate(v) {
 }
 export const fmtWindow = (ms) => (isCount(ms) && ms > 0 ? (ms < 90_000 ? `${Math.max(1, Math.round(ms / 1000))} 秒` : `${Math.round(ms / 60_000)} 分鐘`) : null);
 
-// One worker's speed as the page draws it: the short text for a small square
-// ("42 tok/s", or "—"), and the longer lines for the drawer.
+// One sentence of how each is worked out (the tooltips and the drawer say it).
+export const TIP_GEN = '模型實際吐字時每秒的字數，不含等工具與等第一個字';
+export const TIP_OUTPUT = '最近 1 分鐘所有代理（含子代理）實際產出的字數 ÷ 60 秒；字數在每個請求結束時才計入，所以會略有跳動';
+export const TIP_AVG = '最近 5 分鐘內產出的字數 ÷ 300 秒，含等待與工具時間';
+export const OUTPUT_FULL_WINDOW_MS = 60_000;
+
+// One worker's 平均產出 as the page draws it: the short text, and the longer
+// lines for the drawer.
 export function speedView(speed) {
   const tps = fmtRate(speed?.tokensPerSecond);
   const rpm = fmtRate(speed?.requestsPerMinute);
   const win = fmtWindow(speed?.windowMs);
+  const label = `平均產出（最近 ${win || '5 分鐘'}，含等待）`;
   return {
     measured: tps !== null,
     text: tps === null ? '—' : `${tps} tok/s`,
-    tokens: tps === null ? null : `最近 ${win || '一段時間'}輸出 ${tps} tok/s`,
+    label,
+    tip: TIP_AVG,
+    tokens: tps === null ? null : `${label}：${tps} tok/s`,
     requests: rpm === null ? null : `請求 ${rpm}／分`,
     why: tps === null ? speed?.unmeasured || '伺服器沒有回報速度' : null,
   };
+}
+
+// One worker's 生成速度: the small square's text ("103 tok/s", or "—") and why.
+export function genView(gen) {
+  const tps = fmtRate(gen?.tokensPerSecond);
+  return {
+    measured: tps !== null,
+    text: tps === null ? '—' : `${tps} tok/s`,
+    tip: TIP_GEN,
+    why: tps === null ? gen?.unmeasured || '伺服器沒有回報生成速度' : null,
+  };
+}
+
+// A cluster's 叢集總產出 (its `throughput`, as the summary passes it on): the big
+// number and the small line under it. A window shorter than a minute is said
+// (a young cluster can only be measured over the time it has lived); so is how
+// many workers the records could speak for. A cluster that is over has no
+// "last minute" to say: a dash.
+export function outputView(throughput, { active = true } = {}) {
+  const tps = fmtRate(throughput?.tokensPerSecond);
+  if (!active) return { measured: false, num: '—', text: '—', unit: '', sub: '叢集已結束', tip: TIP_OUTPUT, why: '叢集已結束，沒有「最近 1 分鐘」可說' };
+  if (tps === null) {
+    const why = throughput?.unmeasured || '伺服器沒有回報叢集總產出';
+    return { measured: false, num: '—', text: '—', unit: '', sub: '量不到', tip: TIP_OUTPUT, why };
+  }
+  const win = fmtWindow(throughput.windowMs);
+  const short = isCount(throughput.windowMs) && throughput.windowMs < OUTPUT_FULL_WINDOW_MS;
+  const counted = isCount(throughput.workersCounted) ? throughput.workersCounted : null;
+  const total = isCount(throughput.workers) ? throughput.workers : null;
+  const sub = [short ? `最近 ${win}（叢集才跑了這麼久）・所有代理（含子代理）` : '最近 1 分鐘・所有代理（含子代理）', counted !== null && total !== null && counted < total ? `${counted}/${total} 個工作者量得到` : null].filter(Boolean).join('・');
+  return { measured: true, num: tps, text: `${tps} tok/s`, unit: 'tok/s', sub, tip: short ? `${TIP_OUTPUT}（叢集才跑了 ${win}，所以只算這段時間，÷ ${Math.round(throughput.windowMs / 1000)} 秒）` : TIP_OUTPUT, why: null };
+}
+
+// The same over every working cluster (the big number of the list of clusters),
+// from totalsOf(): the sum of the clusters that are working and measured one.
+export function outputTotalView(totals) {
+  const tps = fmtRate(totals?.outputTokensPerSecond);
+  if (tps === null) {
+    const none = isCount(totals?.active) && totals.active > 0;
+    return { measured: false, num: '—', sub: none ? '量不到' : '沒有進行中的叢集', tip: TIP_OUTPUT, why: none ? '進行中的叢集都沒有請求紀錄可算（不是 DeepSeek 號池，或連接器還沒回報）' : '沒有進行中的叢集，沒有「最近 1 分鐘」可說' };
+  }
+  const n = isCount(totals.outputMeasured) ? totals.outputMeasured : 0;
+  return { measured: true, num: tps, sub: `最近 1 分鐘・${n} 個進行中叢集合計`, tip: TIP_OUTPUT, why: null };
 }
 
 // ------------------------------------------------------ the whole cluster
@@ -570,6 +629,8 @@ export function summarizeCluster(c) {
       workers: workers.length,
       unmeasured: rates.length ? null : workers.map((w) => w?.speed?.unmeasured).find(Boolean) || '沒有任何工作者量得到速度',
     },
+    // What the whole cluster produced in the last minute: the Hub's own line, passed on as it is (not a sum of the workers' averages).
+    throughput: c?.throughput && typeof c.throughput === 'object' ? c.throughput : { windowMs: null, outTokens: null, tokensPerSecond: null, requests: null, requestsPerMinute: null, unmeasured: '伺服器沒有回報叢集總產出（較舊的 Hub）', workersCounted: 0, workers: workers.length },
   };
 }
 
@@ -584,6 +645,9 @@ export function totalsOf(list) {
   const active = rows.filter(isActive);
   const withSub = rows.filter((r) => r.subagents);
   const speeds = rows.map((r) => r.speed?.tokensPerSecond).filter((v) => fmtRate(v) !== null);
+  // 叢集總產出 over everything: the clusters that are working and measured one.
+  const outputs = active.map((r) => r.throughput?.tokensPerSecond).filter((v) => fmtRate(v) !== null);
+  const round1 = (list) => Math.round(list.reduce((a, v) => a + v, 0) * 10) / 10;
   return {
     clusters: rows.length,
     active: active.length,
@@ -592,7 +656,10 @@ export function totalsOf(list) {
     subagentsOpened: withSub.reduce((a, r) => a + r.subagents.total + r.subagents.older, 0),
     // Some cluster did not say how many subagents it has: the numbers above are what the others said.
     subagentsPartial: withSub.length < rows.length,
-    tokensPerSecond: speeds.length ? Math.round(speeds.reduce((a, v) => a + v, 0) * 10) / 10 : null,
+    outputTokensPerSecond: outputs.length ? round1(outputs) : null,
+    outputMeasured: outputs.length,
+    // 平均產出: the sum of the clusters' five-minute averages (every cluster that said).
+    avgTokensPerSecond: speeds.length ? round1(speeds) : null,
   };
 }
 

@@ -10,8 +10,11 @@ import {
   clusterElapsed,
   fmtRate,
   fmtWindow,
+  genView,
   groupCounts,
   keyView,
+  outputTotalView,
+  outputView,
   sortClusters,
   speedView,
   squareLabel,
@@ -27,7 +30,9 @@ import {
 } from '../public/js/cluster-model.js';
 
 const counts = (o = {}) => ({ total: 0, running: 0, awaiting: 0, done: 0, failed: 0, cancelled: 0, unknown: 0, ...o });
-const worker = (patch = {}) => ({ sessionId: 's', status: 'running', subagentCounts: counts(), subagentsOlder: 0, speed: { tokensPerSecond: null, requestsPerMinute: null, windowMs: null, unmeasured: '沒有' }, done: 0, taskIndex: 0, ...patch });
+const worker = (patch = {}) => ({ sessionId: 's', status: 'running', subagentCounts: counts(), subagentsOlder: 0, speed: { tokensPerSecond: null, requestsPerMinute: null, windowMs: null, unmeasured: '沒有' }, gen: { tokensPerSecond: null, unmeasured: '還沒有完成任何一步' }, done: 0, taskIndex: 0, ...patch });
+const THROUGHPUT = (tps = 5.8, over = {}) => ({ windowMs: 60_000, outTokens: Math.round(tps * 60), tokensPerSecond: tps, requests: 5, requestsPerMinute: 5, unmeasured: null, workersCounted: 2, workers: 2, ...over });
+const NO_THROUGHPUT = (why = '這個對話用的不是 DeepSeek 號池（沒有經過連接器的 proxy），沒有請求紀錄可以算速度') => ({ windowMs: null, outTokens: null, tokensPerSecond: null, requests: null, requestsPerMinute: null, unmeasured: why, workersCounted: 0, workers: 2 });
 const cluster = (patch = {}) => ({ id: 'c_1', parentId: 'p', status: 'running', createdAt: 1_000_000, workers: [worker()], tasks: [{ index: 0, status: 'running' }, { index: 1, status: 'pending' }], ...patch });
 
 test('the count line says how many and in which groups, only the groups that have any; cancelled and failed are one group', () => {
@@ -87,13 +92,69 @@ test('a speed is written from a measured number; "—" with the reason where the
   assert.equal(fmtWindow(300_000), '5 分鐘');
   assert.equal(fmtWindow(30_000), '30 秒');
   const v = speedView({ tokensPerSecond: 120.4, requestsPerMinute: 9, windowMs: 120_000 });
-  assert.deepEqual([v.measured, v.text, v.tokens, v.requests], [true, '120 tok/s', '最近 2 分鐘輸出 120 tok/s', '請求 9／分']);
+  // (The five-minute figure is 平均產出 now: it counts the waiting too, and says so.)
+  assert.deepEqual([v.measured, v.text, v.tokens, v.requests], [true, '120 tok/s', '平均產出（最近 2 分鐘，含等待）：120 tok/s', '請求 9／分']);
+  assert.equal(v.label, '平均產出（最近 2 分鐘，含等待）');
+  assert.equal(v.tip, '最近 5 分鐘內產出的字數 ÷ 300 秒，含等待與工具時間');
   const none = speedView({ tokensPerSecond: null, unmeasured: '連接器還沒有回報過任何請求紀錄' });
   assert.deepEqual([none.measured, none.text, none.tokens], [false, '—', null]);
   assert.equal(none.why, '連接器還沒有回報過任何請求紀錄');
   assert.equal(speedView(undefined).text, '—');
   assert.equal(speedView({ tokensPerSecond: 0, windowMs: 60_000 }).text, '0 tok/s', 'measured zero is a number');
   for (const v2 of [v, none]) assert.ok(!/eta|剩餘|預計|還要|remaining/i.test(JSON.stringify(v2)), 'no estimate of what is left');
+});
+
+test('生成速度 of a worker: a number only where the Hub measured one, "—" and its reason otherwise (a measured 0 is a number, not slow), the algorithm in one sentence', () => {
+  const v = genView({ tokensPerSecond: 103.4, unmeasured: null });
+  assert.deepEqual([v.measured, v.text, v.why], [true, '103 tok/s', null]);
+  assert.equal(v.tip, '模型實際吐字時每秒的字數，不含等工具與等第一個字');
+  const none = genView({ tokensPerSecond: null, unmeasured: '這個工作者現在沒有在跑' });
+  assert.deepEqual([none.measured, none.text, none.why], [false, '—', '這個工作者現在沒有在跑']);
+  assert.equal(genView(undefined).text, '—', 'a Hub that does not say: a dash');
+  assert.match(genView(undefined).why, /沒有回報生成速度/);
+  assert.equal(genView({ tokensPerSecond: 0 }).text, '0 tok/s');
+  assert.ok(!/eta|剩餘|預計|還要|remaining/i.test(JSON.stringify([v, none])));
+});
+
+test('叢集總產出: the cluster\'s last minute from the Hub\'s own line; says its window when it is shorter than a minute and how many workers the records could speak for; "—" and why where it cannot, and for a cluster that is over', () => {
+  const v = outputView(THROUGHPUT(5.84), { active: true });
+  assert.deepEqual([v.measured, v.num, v.text], [true, '5.8', '5.8 tok/s']);
+  assert.equal(v.sub, '最近 1 分鐘・所有代理（含子代理）');
+  assert.equal(v.tip, '最近 1 分鐘所有代理（含子代理）實際產出的字數 ÷ 60 秒；字數在每個請求結束時才計入，所以會略有跳動');
+  // A cluster 20 seconds old can only be measured over 20 seconds, and says so.
+  const young = outputView(THROUGHPUT(7.5, { windowMs: 20_000 }), { active: true });
+  assert.match(young.sub, /最近 20 秒/);
+  assert.match(young.sub, /叢集才跑了這麼久/);
+  assert.match(young.tip, /20 秒/);
+  // Some workers the records cannot speak for: the total is of the others, and says it.
+  const part = outputView(THROUGHPUT(5.8, { workersCounted: 1, workers: 3 }), { active: true });
+  assert.match(part.sub, /1\/3 個工作者量得到/);
+  // A measured zero is a number while the cluster works.
+  assert.equal(outputView(THROUGHPUT(0), { active: true }).text, '0 tok/s');
+  // Where the records cannot say: a dash and the reason, never 0.
+  const none = outputView(NO_THROUGHPUT('連接器還沒有回報過任何請求紀錄'), { active: true });
+  assert.deepEqual([none.measured, none.num, none.text, none.why], [false, '—', '—', '連接器還沒有回報過任何請求紀錄']);
+  assert.equal(none.sub, '量不到');
+  assert.equal(outputView(undefined, { active: true }).num, '—');
+  assert.match(outputView(undefined, { active: true }).why, /沒有回報叢集總產出/);
+  // A cluster that is over has no "last minute" to say: a dash, not 0.
+  const over = outputView(THROUGHPUT(0), { active: false });
+  assert.deepEqual([over.measured, over.num], [false, '—']);
+  assert.equal(over.sub, '叢集已結束');
+  assert.ok(!/eta|剩餘|預計|還要|remaining/i.test(JSON.stringify([v, young, part, none, over])));
+});
+
+test('叢集總產出 over every working cluster (the list page\'s big number): the sum, how many clusters it is of, and a dash with the reason when none can say or none is working', () => {
+  const v = outputTotalView({ active: 2, outputTokensPerSecond: 82.8, outputMeasured: 2 });
+  assert.deepEqual([v.measured, v.num, v.sub], [true, '83', '最近 1 分鐘・2 個進行中叢集合計']);
+  assert.equal(outputTotalView({ active: 2, outputTokensPerSecond: 0, outputMeasured: 2 }).num, '0', 'working clusters that produced nothing in the last minute: a measured zero');
+  const blind = outputTotalView({ active: 1, outputTokensPerSecond: null, outputMeasured: 0 });
+  assert.deepEqual([blind.measured, blind.num, blind.sub], [false, '—', '量不到']);
+  assert.match(blind.why, /沒有請求紀錄可算/);
+  const idle = outputTotalView({ active: 0, outputTokensPerSecond: null, outputMeasured: 0 });
+  assert.deepEqual([idle.measured, idle.num, idle.sub], [false, '—', '沒有進行中的叢集']);
+  assert.equal(outputTotalView(undefined).num, '—');
+  assert.equal(v.tip, '最近 1 分鐘所有代理（含子代理）實際產出的字數 ÷ 60 秒；字數在每個請求結束時才計入，所以會略有跳動');
 });
 
 test('summarizeCluster: tasks, workers, subagents and speed from the workers\' own numbers; null where nobody said', () => {
@@ -114,6 +175,11 @@ test('summarizeCluster: tasks, workers, subagents and speed from the workers\' o
   assert.equal(s.speed.requestsPerMinute, 3.5);
   assert.deepEqual([s.speed.workersMeasured, s.speed.workers], [2, 3]);
   assert.equal(s.speed.unmeasured, null);
+  // The cluster's last-minute output is the Hub's line, passed on as it is (not a sum of the workers' averages).
+  assert.equal(summarizeCluster(cluster({ throughput: THROUGHPUT(12.3) })).throughput.tokensPerSecond, 12.3);
+  assert.deepEqual(summarizeCluster(cluster({ throughput: THROUGHPUT(12.3) })).throughput, THROUGHPUT(12.3));
+  assert.equal(s.throughput.tokensPerSecond, null, 'a cluster the Hub sent no such line for');
+  assert.match(s.throughput.unmeasured, /沒有回報叢集總產出/);
 
   const blind = summarizeCluster(cluster({ workers: [worker({ speed: { tokensPerSecond: null, unmeasured: '第一個原因' } }), worker({ speed: { tokensPerSecond: null, unmeasured: '第二個原因' } })] }));
   assert.equal(blind.speed.tokensPerSecond, null, 'no worker could say: not zero');
@@ -127,20 +193,28 @@ test('summarizeCluster: tasks, workers, subagents and speed from the workers\' o
 
 test('the totals over every cluster are the sums of their summaries; a cluster that did not say is not counted as zero', () => {
   const rows = [
-    summarizeCluster(cluster({ id: 'c_1', workers: [worker({ subagentCounts: counts({ total: 5, running: 3, awaiting: 1, done: 1 }), speed: { tokensPerSecond: 20 } })] })),
-    summarizeCluster(cluster({ id: 'c_2', status: 'done', workers: [worker({ status: 'idle', subagentCounts: counts({ total: 4, done: 4 }), subagentsOlder: 2, speed: { tokensPerSecond: 5.5 } })] })),
+    summarizeCluster(cluster({ id: 'c_1', throughput: THROUGHPUT(8.5), workers: [worker({ subagentCounts: counts({ total: 5, running: 3, awaiting: 1, done: 1 }), speed: { tokensPerSecond: 20 } })] })),
+    summarizeCluster(cluster({ id: 'c_2', status: 'done', throughput: THROUGHPUT(0), workers: [worker({ status: 'idle', subagentCounts: counts({ total: 4, done: 4 }), subagentsOlder: 2, speed: { tokensPerSecond: 5.5 } })] })),
     summarizeCluster(cluster({ id: 'c_3', workers: [{ sessionId: 'x', status: 'running' }] })),
+    summarizeCluster(cluster({ id: 'c_4', throughput: THROUGHPUT(1.25), workers: [worker({ speed: { tokensPerSecond: 3 } })] })),
   ];
   const t = totalsOf(rows);
-  assert.equal(t.clusters, 3);
-  assert.equal(t.active, 2);
+  assert.equal(t.clusters, 4);
+  assert.equal(t.active, 3);
   assert.equal(t.subagentsRunning, 4, '3 running + 1 waiting, of the clusters that said');
   assert.equal(t.subagentsOpened, 11, 'everything ever opened: 5 + 4 + the 2 let go of');
   assert.equal(t.subagentsPartial, true, 'one cluster did not say');
-  assert.equal(t.workersRunning, 2);
-  assert.equal(t.tokensPerSecond, 25.5);
-  assert.deepEqual(totalsOf([]), { clusters: 0, active: 0, workersRunning: 0, subagentsRunning: 0, subagentsOpened: 0, subagentsPartial: false, tokensPerSecond: null });
-  assert.equal(totalsOf([rows[2]]).tokensPerSecond, null);
+  assert.equal(t.workersRunning, 3);
+  // 叢集總產出 over everything: the sum of the clusters that are WORKING and measured one - the finished cluster\'s minute is over, and the one that did not say is not 0.
+  assert.equal(t.outputTokensPerSecond, 9.8, '8.5 + 1.25 (the finished cluster\'s 0 is not added, the unsaid one neither)');
+  assert.equal(t.outputMeasured, 2);
+  // 平均產出 is what the number beside it used to be: the sum of the clusters\' averages, all of them.
+  assert.equal(t.avgTokensPerSecond, 28.5);
+  assert.ok(!('tokensPerSecond' in t), 'no number left that could be read as either');
+  assert.deepEqual(totalsOf([]), { clusters: 0, active: 0, workersRunning: 0, subagentsRunning: 0, subagentsOpened: 0, subagentsPartial: false, outputTokensPerSecond: null, outputMeasured: 0, avgTokensPerSecond: null });
+  assert.equal(totalsOf([rows[2]]).outputTokensPerSecond, null);
+  assert.equal(totalsOf([rows[1]]).outputTokensPerSecond, null, 'only a cluster that is over: nothing is working, so no output');
+  assert.equal(totalsOf([rows[2]]).avgTokensPerSecond, null);
 });
 
 test('the list is the working clusters first, each group newest first', () => {

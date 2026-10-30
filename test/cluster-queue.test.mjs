@@ -474,8 +474,8 @@ test('the cluster\'s fields: tasks and the worker\'s taskIndex and done are ther
   try {
     const { cluster: c0 } = await cluster(parent.id, { tasks: tasks(3), workers: 2 });
     const got = await getCluster(c0.id);
-    assert.deepEqual(Object.keys(got).sort(), ['cleanup', 'createdAt', 'id', 'isolate', 'memory', 'merge', 'mode', 'parentId', 'status', 'swarm', 'tasks', 'warnings', 'workers']);
-    assert.deepEqual(Object.keys(got.workers[0]).sort(), ['branch', 'done', 'finishedAt', 'hidden', 'progress', 'sessionId', 'speed', 'status', 'subagentCounts', 'subagents', 'subagentsOlder', 'swarm', 'task', 'taskIndex', 'title', 'worktree']);
+    assert.deepEqual(Object.keys(got).sort(), ['cleanup', 'createdAt', 'id', 'isolate', 'memory', 'merge', 'mode', 'parentId', 'status', 'swarm', 'tasks', 'throughput', 'warnings', 'workers']);
+    assert.deepEqual(Object.keys(got.workers[0]).sort(), ['branch', 'done', 'finishedAt', 'gen', 'hidden', 'progress', 'sessionId', 'speed', 'status', 'subagentCounts', 'subagents', 'subagentsOlder', 'swarm', 'task', 'taskIndex', 'title', 'worktree']);
     assert.deepEqual(got.workers.map((w) => [w.taskIndex, w.done]), [[0, 0], [1, 0]]);
     assert.deepEqual(got.tasks.map((t) => [t.index, t.title, t.status, t.workerSessionId]), [[0, '任務 1', 'running', got.workers[0].sessionId], [1, '任務 2', 'running', got.workers[1].sessionId], [2, '任務 3', 'pending', null]]);
     assert.ok(got.tasks[0].startedAt > 0 && got.tasks[0].finishedAt === null && got.tasks[2].startedAt === null);

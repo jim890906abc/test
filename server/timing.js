@@ -655,13 +655,30 @@ export async function measureKey({ keyId, levels, confirmedRequests, machineId, 
 // window too short to mean anything).
 export const SPEED_WINDOW_MS = 5 * 60_000;
 export const SPEED_MIN_SPAN_MS = 5_000;
-export function recentSpeed(nodes, { now = Date.now(), windowMs = SPEED_WINDOW_MS, from = null } = {}) {
-  const none = (unmeasured) => ({ windowMs: null, outTokens: null, tokensPerSecond: null, requests: null, requestsPerMinute: null, unmeasured });
-  const leaf = nodes?.at(-1);
-  if (!leaf?.kimiSessionId || !leaf.machineId) return none('這個對話還沒有對應到任何一台電腦上的 Kimi 對話');
-  if (!(deepseekAccount.isDeepseek(leaf) || leaf.provider === 'deepseek')) return none('這個對話用的不是 DeepSeek 號池（沒有經過連接器的 proxy），沒有請求紀錄可以算速度');
+// The cluster page's big number is over a shorter window: what the whole
+// cluster produced in the last minute.
+export const OUTPUT_WINDOW_MS = 60_000;
+
+// The one computation behind both: over the conversations of one or more
+// chains (a chain is a conversation's nodes, oldest first), the request records
+// of the window. `counted` is how many chains the records can speak for; a chain
+// they cannot (not a DeepSeek-pool conversation, not tied to a computer yet) is
+// left out, and when none can, the answer is null with the first chain's reason.
+// A subagent's requests carry its worker's session id (prompt_cache_key), so a
+// worker's chain covers its subagents' requests too.
+function speedOver(chains, { now = Date.now(), windowMs = SPEED_WINDOW_MS, from = null } = {}) {
+  const none = (unmeasured) => ({ result: { windowMs: null, outTokens: null, tokensPerSecond: null, requests: null, requestsPerMinute: null, unmeasured }, counted: 0 });
+  const usable = [];
+  const why = [];
+  for (const nodes of chains) {
+    const leaf = nodes?.at(-1);
+    if (!leaf?.kimiSessionId || !leaf.machineId) why.push('這個對話還沒有對應到任何一台電腦上的 Kimi 對話');
+    else if (!(deepseekAccount.isDeepseek(leaf) || leaf.provider === 'deepseek')) why.push('這個對話用的不是 DeepSeek 號池（沒有經過連接器的 proxy），沒有請求紀錄可以算速度');
+    else usable.push(nodes);
+  }
+  if (!usable.length) return none(why[0] || '這個叢集還沒有任何工作者');
   const byMachine = new Map();
-  for (const n of nodes) if (n.kimiSessionId && n.machineId) (byMachine.get(n.machineId) || byMachine.set(n.machineId, new Set()).get(n.machineId)).add(n.kimiSessionId);
+  for (const nodes of usable) for (const n of nodes) if (n.kimiSessionId && n.machineId) (byMachine.get(n.machineId) || byMachine.set(n.machineId, new Set()).get(n.machineId)).add(n.kimiSessionId);
   let coverage = null;
   const lacking = [];
   const used = [];
@@ -699,11 +716,29 @@ export function recentSpeed(nodes, { now = Date.now(), windowMs = SPEED_WINDOW_M
   // As for the request count of a conversation: a request that names no conversation may be this one's, so a zero is not claimed.
   if (requests === 0 && unattributed > 0) return none(`窗內有 ${unattributed} 個請求沒帶對話識別（Kimi 版本沒有送 prompt_cache_key），沒辦法判斷哪些是這個對話的`);
   return {
-    windowMs: span,
-    outTokens,
-    tokensPerSecond: Math.round((outTokens / (span / 1000)) * 10) / 10,
-    requests,
-    requestsPerMinute: Math.round((requests / (span / 60_000)) * 10) / 10,
-    unmeasured: null,
+    result: {
+      windowMs: span,
+      outTokens,
+      tokensPerSecond: Math.round((outTokens / (span / 1000)) * 10) / 10,
+      requests,
+      requestsPerMinute: Math.round((requests / (span / 60_000)) * 10) / 10,
+      unmeasured: null,
+    },
+    counted: usable.length,
   };
+}
+
+export function recentSpeed(nodes, opts = {}) {
+  return speedOver([nodes], opts).result;
+}
+
+// What a whole cluster produced in the last minute: the same figures as
+// recentSpeed over every worker's conversation at once (so one window, one
+// total - not a sum of per-worker numbers), plus how many of the cluster's
+// `workers` the records could speak for. A worker they cannot is left out and
+// counted as left out; the page says so.
+export function recentOutput(chains, { now = Date.now(), windowMs = OUTPUT_WINDOW_MS, from = null } = {}) {
+  const list = Array.isArray(chains) ? chains : [];
+  const { result, counted } = speedOver(list, { now, windowMs, from });
+  return { ...result, workersCounted: counted, workers: list.length };
 }
