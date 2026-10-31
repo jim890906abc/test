@@ -328,6 +328,27 @@ export function reload() {
 // to OpenCode Go.
 export const gateway = () => (isGateway(saved.gateway) ? saved.gateway : DEFAULT_GATEWAY);
 
+// Whoever keeps a record that holds a model name (the conversations) asks to be
+// told when the gateway the names follow changes - by the first key of a gateway
+// or by the choice in the settings, the only two ways - so one place decides
+// what a change of names means for what was already written with the old ones.
+const gatewayListeners = new Set();
+export const onGatewayChange = (fn) => {
+  gatewayListeners.add(fn);
+  return () => gatewayListeners.delete(fn);
+};
+function gatewayMayHaveChanged(before) {
+  const now = gateway();
+  if (now === before) return;
+  for (const fn of gatewayListeners) {
+    try {
+      fn(now, before);
+    } catch (err) {
+      console.warn(`[deepseek] gateway change listener: ${err.message}`);
+    }
+  }
+}
+
 // ------------------------------------------------------------- the keys
 
 // Why `key` cannot be a gateway key, or null.
@@ -465,20 +486,17 @@ function rateStatsOf(keyId) {
   return out;
 }
 // { catalog gateway's model id -> the id of the same model at gateway g }, for
-// the gateways other than the catalog's that hold a key. The same model is the
-// one whose last name part is the same (`deepseek/deepseek-v4.1-flash` and
-// `deepseek-v4.1-flash`); a model with no counterpart, or two, is left out and
-// the connector never sends it there.
+// the gateways other than the catalog's that hold a key. "The same model" is
+// idAt's judgment (the one used everywhere); a model with no counterpart, or two,
+// is left out and the connector never sends it there.
 function modelMapFor(catalog, catalogIds, gateways) {
-  const last = (id) => String(id).toLowerCase().replace(/^.*\//, '');
   const out = {};
   for (const g of gateways) {
     if (g === catalog) continue;
-    const theirs = modelIds(g);
     const table = {};
     for (const id of catalogIds) {
-      const same = theirs.filter((x) => last(x) === last(id));
-      if (same.length === 1) table[id] = same[0];
+      const theirs = idAt(g, id);
+      if (theirs) table[id] = theirs;
     }
     out[g] = table;
   }
@@ -523,6 +541,7 @@ export function setKey(gw, key) {
   // Refused before anything changes in memory.
   keyFile.check({ explicit: true });
   const text = String(key).trim();
+  const namesBefore = gateway();
   const pool = poolOf(gw) || { revision: 0, activeId: '', keys: [] };
   const existing = pool.keys.find((k) => k.key === text);
   if (existing) {
@@ -546,6 +565,7 @@ export function setKey(gw, key) {
   // are out (move it up to use it first).
   saved.order = [...rotationEntries().map((e) => e.k.id).filter((x) => x !== id), id];
   save({ explicit: true });
+  gatewayMayHaveChanged(namesBefore);
   return id;
 }
 
@@ -865,7 +885,8 @@ export function settings(gw = gateway()) {
   return {
     gateway: gw,
     defaults: {
-      model: typeof d.model === 'string' && ids.includes(d.model) ? d.model : pickDefaultModel(ids),
+      // A default saved in the other gateway's spelling is the same model here.
+      model: (typeof d.model === 'string' && idAt(gw, d.model)) || pickDefaultModel(ids),
       effort: EFFORTS.includes(d.effort) ? d.effort : DEFAULT_EFFORT,
       permission: PERMISSIONS.includes(d.permission) ? d.permission : 'manual',
       planMode: Boolean(d.planMode),
@@ -896,8 +917,10 @@ export function setSettings({ gateway: gw, defaults, autoResume } = {}) {
   // Not the key: a file that cannot be used is not written over for this (the
   // person is told, and types the key in again).
   keyFile.check();
+  const namesBefore = gateway();
   saved = next;
   save();
+  gatewayMayHaveChanged(namesBefore);
 }
 
 // The conversations on a key, from the computers that are online and said they
@@ -1083,6 +1106,48 @@ function info(id) {
 export function modelIds(gw = gateway()) {
   const live = saved.models?.[gw]?.ids;
   return Array.isArray(live) && live.length ? live : [...GATEWAYS[gw].models];
+}
+
+// ---- one model, two spellings
+// The gateways name a model differently (`deepseek-v4.1-flash` at OpenCode,
+// `deepseek/deepseek-v4.1-flash` at Command Code) and a conversation keeps the
+// spelling of the gateway that was in use when it chose. This is the ONE
+// judgment of "what is this model called at gateway g": the last name part is
+// the same, and exactly one id there has it. Whoever must tell a stale spelling
+// from a wrong model (a check on a chosen model, the connector's name table, the
+// records of old conversations, the native's alias) asks here.
+const lastPart = (id) => String(id).toLowerCase().replace(/^.*\//, '');
+
+// The gateway's id without Kimi's provider prefix (an alias or a bare id in).
+export const bareId = (model) => {
+  const t = String(model ?? '').trim();
+  return t.startsWith(MODEL_PREFIX) ? t.slice(MODEL_PREFIX.length) : t;
+};
+
+// The id at gateway `gw` of the model `model` names (in any gateway's
+// spelling, alias or bare), or null when `gw` has no such model.
+export function idAt(gw, model) {
+  const raw = bareId(model);
+  if (!raw || !lastPart(raw) || !isGateway(gw)) return null;
+  const theirs = modelIds(gw);
+  if (theirs.includes(raw)) return raw;
+  const same = theirs.filter((x) => lastPart(x) === lastPart(raw));
+  return same.length === 1 ? same[0] : null;
+}
+
+// The same, as the alias Kimi's provider has it under.
+export const aliasAt = (gw, model) => {
+  const id = idAt(gw, model);
+  return id ? aliasFor(id) : null;
+};
+
+// Why `model` is not at gateway `gw` (default: the one the names follow) when
+// another gateway has it: a sentence that names who has it and what the names
+// follow now. null when no gateway has it (it is simply not a model).
+export function notAtGateway(model, gw = gateway()) {
+  const others = Object.keys(GATEWAYS).filter((g) => g !== gw && idAt(g, model));
+  if (!others.length) return null;
+  return `${bareId(model).replace(/^.*\//, '')} 只有 ${others.map((g) => GATEWAYS[g].label).join('、')} 有；DeepSeek 模型名稱目前依 ${GATEWAYS[gw].label}，請在模型選單重選`;
 }
 
 export function models(gw = gateway()) {

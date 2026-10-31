@@ -31,6 +31,7 @@ export async function setupHub(name, { env = {} } = {}) {
   const { ADAPTERS } = await import('../../server/adapters/index.js');
   const runner = await import('../../server/runner.js');
   const deepseek = await import('../../server/deepseek-account.js');
+  const modelDrift = await import('../../server/model-drift.js');
   deepseek.setKey('opencode-go', 'sk-test');
 
   let n = 0;
@@ -158,7 +159,7 @@ export async function setupHub(name, { env = {} } = {}) {
   });
 
   return {
-    TMP, store, machines, runner, ADAPTERS, deepseek, kimi, claude, broadcasts, kimiNode, deepseekNode, claudeNode,
+    TMP, store, machines, runner, ADAPTERS, deepseek, modelDrift, kimi, claude, broadcasts, kimiNode, deepseekNode, claudeNode,
     ws, rpc,
     CLAUDE: { provider: 'claude', model: 'claude-opus-5-5', effort: 'high' },
     KIMI: { provider: 'kimi', model: 'kimi/k2', effort: 'on' },

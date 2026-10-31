@@ -51,6 +51,12 @@ export const sameModel = (a, b) => {
   return providerOfAlias(a) === providerOfAlias(b) && tail(a) === tail(b);
 };
 
+// Is what the native says it runs the alias that was asked for? Like sameModel,
+// except that two DeepSeek aliases must be the same string: another gateway's
+// spelling of the model is one the provider on the computer may not have, so a
+// native that answers "ok" and still names it did not take the change.
+export const sameAlias = (said, asked) => sameModel(said, asked) && !(deepseek.isDeepseekModel(said) && deepseek.isDeepseekModel(asked) && String(said).trim() !== String(asked).trim());
+
 // The provider a conversation was made for. The conversation's own field
 // wins; an old record without it is read from what it kept (the legacy mode,
 // the DeepSeek marker, a DeepSeek model in its settings or in what the native
@@ -76,6 +82,42 @@ export function isDeepseekFamily(s) {
     providerOfAlias(s.meta?.model) === 'deepseek' ||
     providerOfAlias(s.modelConfig?.model) === 'deepseek'
   );
+}
+
+// The Hub's own record of a conversation's DeepSeek model, in the spelling of the
+// gateway the model names follow now. A conversation keeps the spelling it chose
+// with, and the gateways spell one model differently, so after a change of gateway
+// the record names a model the menu no longer lists (the label then matches
+// nothing). What is rewritten is the Hub's record only, and only where the new
+// gateway has the same model (deepseek.aliasAt, the one judgment of that):
+//   modelConfig.model, state.deepseek, the sub-agent setting (any conversation can
+//   have a DeepSeek one), and a switch that waits for the turn to end.
+// NOT the native's word (meta.model: it is what the native really runs, and is
+// compared by canonicalModel), and not the events (history). Returns whether
+// anything changed; the caller saves, and decides that no turn is in progress.
+export function respellRecord(s) {
+  const gw = deepseek.gateway();
+  const now = (model) => {
+    if (!deepseek.isDeepseekModel(model)) return null;
+    const to = deepseek.aliasAt(gw, model);
+    return to && to !== model ? to : null;
+  };
+  const withModel = (obj) => {
+    const to = now(obj?.model);
+    return to ? { ...obj, model: to } : null;
+  };
+  let changed = false;
+  const mc = withModel(s.modelConfig);
+  if (mc) (s.modelConfig = mc), (changed = true);
+  const ds = withModel(s.state?.deepseek);
+  if (ds) (s.state = { ...s.state, deepseek: { ...ds, gateway: gw } }), (changed = true);
+  const sub = s.meta?.subagent?.provider === 'deepseek' ? withModel(s.meta.subagent) : null;
+  if (sub) (s.meta = { ...s.meta, subagent: sub }), (changed = true);
+  const pending = s.state?.pendingProvider?.provider === 'deepseek' ? withModel(s.state.pendingProvider) : null;
+  if (pending) (s.state = { ...s.state, pendingProvider: pending }), (changed = true);
+  const shown = s.meta?.pendingSwitch?.provider === 'deepseek' ? withModel(s.meta.pendingSwitch) : null;
+  if (shown) (s.meta = { ...s.meta, pendingSwitch: shown }), (changed = true);
+  return changed;
 }
 
 // What the native conversation reported last, or null while it has not said
@@ -117,10 +159,26 @@ export function driftOf(s, provider = providerOf(s)) {
   return kind ? { kind, expected, actual, since: native.at } : null;
 }
 
-// Does the native already run on this target? Unknown is not a yes.
+// The native runs an alias of the DeepSeek provider that the provider no longer
+// has under that spelling (the names moved to another gateway, which spells the
+// same model otherwise) while the gateway in use does have the model: the alias
+// to put on it, { from, to }; else null. Not a "drift" (to the person it is one
+// model, see sameModel), but the native can no longer start a turn on it.
+export function staleNativeAlias(s, provider = providerOf(s)) {
+  if (provider !== 'deepseek') return null;
+  const native = nativeOf(s);
+  if (!native || !deepseek.isDeepseekModel(native.model)) return null;
+  const gw = deepseek.gateway();
+  if (deepseek.modelIds(gw).some((id) => deepseek.aliasFor(id) === native.model)) return null;
+  const to = deepseek.aliasAt(gw, native.model);
+  return to ? { from: native.model, to } : null;
+}
+
+// Does the native already run on this target? Unknown is not a yes (and, for a
+// DeepSeek alias, the same model in another gateway's spelling is not a yes: see sameAlias).
 export function nativeMatches(s, target) {
   const native = nativeOf(s);
-  if (!native || !sameModel(native.model, target.model)) return false;
+  if (!native || !sameAlias(native.model, target.model)) return false;
   if (!target.effort) return true;
   return native.effort === target.effort;
 }

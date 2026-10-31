@@ -763,13 +763,15 @@ export async function validateChoice({ provider, model = '', effort = '', sessio
   const r = await modelsForProvider(provider, { session, machineId });
   let id = String(model || '').trim();
   if (provider === 'deepseek') {
-    const raw = id.startsWith(deepseek.MODEL_PREFIX) ? id.slice(deepseek.MODEL_PREFIX.length) : id;
-    const hit = r.models.find((m) => m.id === raw || m.alias === id);
-    if (!hit) {
-      if (!id && allowEmptyModel) id = r.defaultModel;
-      else throw Object.assign(new Error(`${PROVIDER_LABEL[provider]} 沒有 ${id || '（空白）'} 這個模型`), { status: 400 });
-    }
-    id = deepseek.aliasFor(id.startsWith(deepseek.MODEL_PREFIX) ? id.slice(deepseek.MODEL_PREFIX.length) : id);
+    // The gateways spell one model differently and a conversation keeps the
+    // spelling it chose with: the other gateway's spelling of a model the
+    // gateway in use has is that model, written the way this gateway has it.
+    // Only a model this gateway really lacks is refused, with who has it.
+    const here = id ? deepseek.idAt(deepseek.gateway(), id) : null;
+    if (here) id = here;
+    else if (!id && allowEmptyModel) id = r.defaultModel;
+    else throw Object.assign(new Error((id && deepseek.notAtGateway(id)) || `${PROVIDER_LABEL[provider]} 沒有 ${id || '（空白）'} 這個模型`), { status: 400 });
+    id = deepseek.aliasFor(deepseek.bareId(id));
   } else {
     const hit = r.models.find((m) => m.id === id);
     if (!hit) {
@@ -866,6 +868,24 @@ ADAPTERS.claude.init(liveContext);
 // creating a cycle); the fallback import still works without it.
 ADAPTERS.claude.setBroker?.(delegateToProvider);
 
+// A conversation's record of its DeepSeek model, rewritten in the spelling of the
+// gateway the names follow now (see modelDrift.respellRecord). A turn in progress,
+// or a switch being made, is left alone; the next pass (or the next message, which
+// does it for its own conversation) gets it. Returns how many conversations changed.
+export function respellDeepseekRecords() {
+  let n = 0;
+  for (const s of store.listLeaves()) {
+    if (running.has(s.id) || ['running', 'awaiting_permission'].includes(s.status) || s.state?.pendingSwitching || switching.has(conversationOf(s))) continue;
+    if (!modelDrift.respellRecord(s)) continue;
+    // A rewrite of the record is bookkeeping, not activity (the sidebar sorts on updatedAt).
+    store.saveSession(s, { touch: false });
+    broadcast({ t: 'session', session: summarize(s) });
+    n++;
+  }
+  return n;
+}
+deepseek.onGatewayChange(() => respellDeepseekRecords());
+
 export function restoreLiveSessions() {
   // Repairing an old store is bookkeeping, not activity: nothing saved here
   // may move a conversation's updatedAt (the sidebar sorts on it).
@@ -885,6 +905,9 @@ export function restoreLiveSessions() {
       store.saveSession(s);
     }
     for (const s of store.listSessions()) ensureDefaultSubagent(s);
+    // The names may have changed gateway while nothing rewrote the records (a Hub
+    // from before that did), or a turn was running when they did.
+    respellDeepseekRecords();
     // A restart keeps both halves of a broker conversation on disk; rebuild a
     // missing/partial mirror for children created before this link existed.
     restoreBrokerProjections();
@@ -1420,6 +1443,8 @@ export async function configure(session, change = {}) {
   if (change.swarmMode !== undefined && providerOf(session) === 'claude') throw Object.assign(new Error('Claude 沒有 swarm 模式：那是 Kimi Code 的功能，Kimi 與 DeepSeek 對話才有'), { status: 400 });
   let nextModel = change.model;
   let nextEffort = change.effort;
+  // The Hub's record of the model, in the spelling the check below turned it into.
+  let respelled = null;
   if (typeof nextModel === 'string' && nextModel) {
     const provider = providerOf(session);
     if (provider === 'deepseek' && !deepseek.isDeepseekModel(nextModel)) throw Object.assign(new Error('DeepSeek 對話只能用 DeepSeek 的模型'), { status: 400 });
@@ -1433,7 +1458,11 @@ export async function configure(session, change = {}) {
     if (provider === 'deepseek' && !deepseek.isDeepseekModel(nextModel)) throw Object.assign(new Error('DeepSeek 對話只能用 DeepSeek 的模型'), { status: 400 });
   } else if (typeof nextEffort === 'string' && nextEffort) {
     const mc = session.modelConfig || {};
-    if (mc.model) await validateChoice({ provider: providerOf(session), model: mc.model, effort: nextEffort, session });
+    if (mc.model) {
+      const provider = providerOf(session);
+      const choice = await validateChoice({ provider, model: mc.model, effort: nextEffort, session });
+      if (provider === 'deepseek' && choice.model !== mc.model) respelled = choice.model;
+    }
   }
   const payload = { ...change, model: nextModel, effort: nextEffort };
   const meta = await adapter.configure(session, payload);
@@ -1441,6 +1470,7 @@ export async function configure(session, change = {}) {
   const mc = { ...(session.modelConfig || { provider: providerOf(session) }) };
   mc.provider = providerOf(session);
   if (typeof nextModel === 'string' && nextModel) mc.model = nextModel;
+  else if (respelled) mc.model = respelled;
   if (typeof nextEffort === 'string') mc.effort = nextEffort;
   session.modelConfig = mc;
   store.saveSession(session);

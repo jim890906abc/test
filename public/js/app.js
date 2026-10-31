@@ -3706,7 +3706,7 @@ async function deepseekDialog() {
     opencode: 'OpenCode 按量計費。',
     commandcode: 'Command Code 需要含 API 的方案（Go 不含）。',
   };
-  const SWITCH_NOTE = '換閘道後，舊對話請重選模型。';
+  const SWITCH_NOTE = '換閘道後，舊對話會自動改用新閘道裡的同一個模型（下一則訊息生效）；新閘道沒有的模型，才需要在模型選單重選。';
   const STORAGE_NOTE = 'key 只顯示尾碼，保存在中控台與受控 connector（0600）。';
   const field = (label, control, help) => h('label', { class: 'om-field' }, h('span', { class: 'om-field__label' }, label), control, help ? (typeof help === 'string' ? h('span', { class: 'om-field__help' }, help) : help) : null);
   const cur = () => (acc.gateways || []).find((g) => g.id === gw) || { id: gw, label: gw, keys: [] };

@@ -1339,8 +1339,11 @@ export class Mirror {
   // nothing the user chose there is nothing to put back.
   restoreTarget(expected) {
     const own = (m) => m && modelDrift.providerOfAlias(m) === expected.provider;
-    const model = own(expected.model) ? expected.model : own(this.session.state?.deepseek?.model) && expected.provider === 'deepseek' ? this.session.state.deepseek.model : '';
+    let model = own(expected.model) ? expected.model : own(this.session.state?.deepseek?.model) && expected.provider === 'deepseek' ? this.session.state.deepseek.model : '';
     if (!model) return null;
+    // A record made under the other gateway's spelling is put back in this one's:
+    // the provider on the computer only has the gateway in use's.
+    if (expected.provider === 'deepseek' && deepseek.isDeepseekModel(model)) model = deepseek.aliasAt(deepseek.gateway(), model) || model;
     const info = (this.session.meta?.models || []).find((m) => m.id === model);
     const efforts = info?.efforts || [];
     const effort = expected.effort && (!efforts.length || efforts.includes(expected.effort)) ? expected.effort : info?.defaultEffort || undefined;
@@ -1359,13 +1362,17 @@ export class Mirror {
   //  - A restore that fails is a refusal to send, said in the conversation.
   async guardNativeModel() {
     const session = this.session;
+    // The Hub's own record of the model first, in the spelling of the gateway the
+    // names follow now (a conversation left behind by a change of gateway while a
+    // turn was running); not in the middle of a turn.
+    if (!['running', 'awaiting_permission'].includes(session.status) && modelDrift.respellRecord(session)) store.saveSession(session, { touch: false });
     const drift = modelDrift.driftOf(session);
     if (!drift) {
       if (session.state?.driftNoticed) {
         session.state = { ...session.state, driftNoticed: null };
         store.saveSession(session, { touch: false });
       }
-      return null;
+      return this.refreshNativeAlias();
     }
     const asked = drift.expected.model ? this.modelText(drift.expected.model) : { kimi: 'Kimi', deepseek: 'DeepSeek' }[drift.expected.provider];
     const running = this.modelText(drift.actual.model);
@@ -1378,7 +1385,7 @@ export class Mirror {
       }
       return null;
     }
-    if (!modelDrift.userChose(session, drift)) return null;
+    if (!modelDrift.userChose(session, drift)) return this.refreshNativeAlias();
     const target = this.restoreTarget(drift.expected);
     const busy = ['running', 'awaiting_permission'].includes(session.status);
     const refuse = (why) => {
@@ -1395,6 +1402,36 @@ export class Mirror {
       return refuse(`改回時失敗（${err.message}）`);
     }
     this.ctx.emit({ type: 'info', text: `偵測到原生對話正在用「${running}」，已依你的選擇改回「${this.modelText(target.model)}」${target.effort ? `（思考 ${target.effort}）` : ''}，再送出這則訊息。` });
+    return null;
+  }
+
+  // The names of the DeepSeek models follow one gateway, and the provider on the
+  // computer has only that gateway's. A conversation made before they moved still
+  // has the old spelling in its native profile: the same model to the person (no
+  // drift, see sameModel), but a name the provider no longer has, so the native
+  // could not start the turn - or would start it on something else. Before a
+  // message goes out, the native gets the gateway's spelling of the model it is
+  // on (one confirmed /profile change, said in the conversation). A terminal is
+  // never touched.
+  async refreshNativeAlias() {
+    const session = this.session;
+    if (modelDrift.providerOf(session) !== 'deepseek' || this.inTerminal()) return null;
+    const busy = ['running', 'awaiting_permission'].includes(session.status);
+    const stale = modelDrift.staleNativeAlias(session);
+    if (!stale) return null;
+    const label = deepseek.GATEWAYS[deepseek.gateway()].label;
+    const mc = session.modelConfig || {};
+    const effort = deepseek.EFFORTS.includes(mc.effort) ? mc.effort : undefined;
+    try {
+      await (this.restoring ??= this.configure({ model: stale.to, ...(effort ? { effort } : {}), confirm: true }).finally(() => (this.restoring = null)));
+    } catch (err) {
+      const text = `訊息沒有送出：DeepSeek 模型名稱現在依 ${label}，這個對話在原生 Kimi 裡用的「${stale.from}」已不在清單裡，換成同一個模型的「${stale.to}」時失敗（${err.message}）。為了不讓這一輪在不是你選的模型上執行（可能計到另一家的帳），先停下；請在輸入框重新選一次模型再送出。`;
+      if (!busy) throw Object.assign(new Error(text), { status: 502 });
+      // A turn is running: an exception would be taken for that turn failing.
+      this.ctx.emit({ type: 'error', text });
+      return { ok: false, error: text };
+    }
+    this.ctx.emit({ type: 'info', text: `DeepSeek 模型名稱現在依 ${label}：原生對話裡的「${stale.from}」已換成同一個模型的「${stale.to}」${effort ? `（思考 ${effort}）` : ''}，再送出這則訊息。` });
     return null;
   }
 
@@ -1451,7 +1488,7 @@ export class Mirror {
       if (!dsChat && deepseek.isDeepseekModel(mc.model)) return this.failSend(promptId, 'Kimi 對話不能用 DeepSeek 的模型；已停止送出', busy);
       // A runtime switch uses the prompt-level model so the next turn is
       // atomic. New conversations already got their profile at creation.
-      if (this.session.state.promptModel) body.model = mc.model;
+      if (this.session.state.promptModel) body.model = dsChat ? deepseek.aliasAt(deepseek.gateway(), mc.model) || mc.model : mc.model;
     }
     if (mc.effort && this.session.state.userSet?.effort && this.session.state.promptModel) body.thinking = mc.effort;
 
@@ -1828,7 +1865,7 @@ export class Mirror {
     }
     if (waiting) {
       const said = await waiting.promise;
-      if (said && !modelDrift.sameModel(said, agentConfig.model)) {
+      if (said && !modelDrift.sameAlias(said, agentConfig.model)) {
         throw Object.assign(new Error(`Kimi 收下了設定，但回報這個原生對話用的是「${said}」，不是「${agentConfig.model}」`), { status: 502 });
       }
     }

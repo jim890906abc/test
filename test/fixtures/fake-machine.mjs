@@ -13,15 +13,24 @@ export const SUB = 'managed:kimi-code/kimi-for-coding';
 export const DS = 'agent-hub-deepseek';
 export const GATEWAY_KEY = 'sk-oc-go-0123456789wxyz';
 
-// Go lists V4.1 Flash among others' models; it only takes the one key.
+// Go lists V4.1 Flash among others' models; it only takes the one key. Command
+// Code lists the same DeepSeek models in its own spelling (a vendor prefix) and
+// takes its own key, so a test can move the model names from one gateway to the
+// other the way a person does.
+export const GATEWAY_KEY_CC = 'sk-cc-0123456789abcdef';
+const GATEWAY_LISTS = {
+  '/opencode-go/models': { key: GATEWAY_KEY, ids: ['kimi-k2', 'deepseek-v4-pro', 'deepseek-v4.1-flash'] },
+  '/commandcode/models': { key: GATEWAY_KEY_CC, ids: ['kimi-k2', 'deepseek/deepseek-v4-pro', 'deepseek/deepseek-v4.1-flash', 'deepseek/deepseek-v4-flash-fast'] },
+};
 export function startFakeGateway() {
   const calls = [];
   const server = http.createServer((req, res) => {
     calls.push({ url: req.url, auth: req.headers.authorization });
     res.setHeader('content-type', 'application/json');
-    if (req.url !== '/opencode-go/models') return (res.statusCode = 404), res.end('{}');
-    if (req.headers.authorization !== `Bearer ${GATEWAY_KEY}`) return (res.statusCode = 401), res.end('{"error":"bad key"}');
-    res.end(JSON.stringify({ data: [{ id: 'kimi-k2' }, { id: 'deepseek-v4-pro' }, { id: 'deepseek-v4.1-flash' }] }));
+    const list = GATEWAY_LISTS[req.url];
+    if (!list) return (res.statusCode = 404), res.end('{}');
+    if (req.headers.authorization !== `Bearer ${list.key}`) return (res.statusCode = 401), res.end('{"error":"bad key"}');
+    res.end(JSON.stringify({ data: list.ids.map((id) => ({ id })) }));
   });
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, url: `http://127.0.0.1:${server.address().port}`, calls, close: () => server.close() })));
 }

@@ -355,6 +355,15 @@ async function validateSettingsProvider(provider, value, groups) {
     if (provider !== 'kimi' && model) throw Object.assign(new Error(`「${group?.label || provider}」目前不可用，不能儲存它的預設模型`), { status: 409 });
     return { model, effort, permission, planMode: Boolean(value.planMode) };
   }
+  // DeepSeek: the other gateway's spelling of a model the gateway in use has is that model.
+  if (provider === 'deepseek' && model && !group.models.some((m) => m.id === model || m.alias === model)) {
+    const here = deepseekAccount.idAt(deepseekAccount.gateway(), model);
+    if (here) model = here;
+    else {
+      const why = deepseekAccount.notAtGateway(model);
+      if (why) throw Object.assign(new Error(why), { status: 400 });
+    }
+  }
   const hit = group.models.find((m) => m.id === model || m.alias === model);
   if (model && !hit) throw Object.assign(new Error(`${group.label} 沒有 ${model} 這個模型`), { status: 400 });
   if (!model) model = group.defaultModel || group.models[0]?.id || '';
@@ -584,9 +593,10 @@ app.post('/api/sessions', wrap(async (req) => {
     if (!machineId) throw Object.assign(new Error('DeepSeek 對話在一台電腦的 Kimi 裡執行：請選一台電腦'), { status: 400 });
     if (!deepseekAccount.apiKey()) throw Object.assign(new Error(deepseekAccount.keyProblem() || '還沒有設定 DeepSeek 的 API key。在「設定」→「DeepSeek…」貼上閘道的 API key。'), { status: 409 });
     const d = deepseekAccount.settings().defaults;
-    const ids = deepseekAccount.modelIds();
-    if (model && !ids.includes(model)) throw Object.assign(new Error(`${deepseekAccount.GATEWAYS[deepseekAccount.gateway()].label} 沒有 ${String(model).slice(0, 60)} 這個模型`), { status: 400 });
-    model = deepseekAccount.aliasFor(model || d.model);
+    // The other gateway's spelling of a model this one has is that model.
+    const here = model ? deepseekAccount.idAt(deepseekAccount.gateway(), model) : null;
+    if (model && !here) throw Object.assign(new Error(deepseekAccount.notAtGateway(model) || `${deepseekAccount.GATEWAYS[deepseekAccount.gateway()].label} 沒有 ${String(model).slice(0, 60)} 這個模型`), { status: 400 });
+    model = deepseekAccount.aliasFor(here || d.model);
     effort = deepseekAccount.EFFORTS.includes(effort) ? effort : d.effort;
     permission = ['manual', 'yolo', 'auto'].includes(permission) ? permission : d.permission;
     planMode ??= d.planMode || undefined;

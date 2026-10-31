@@ -146,3 +146,16 @@ test('deleting a key removes just that key and keeps the order of the others', {
   assert.deepEqual(list.map((r) => r.id).filter((id) => id.startsWith('k_')), ['k_go1', 'k_go2']);
   assert.equal(list[2].gateway, 'Command Code', 'the key added last is still last');
 });
+
+test('choosing another gateway for the model names says what happens to the conversations made before: they follow, and only a model the new gateway lacks is chosen again', { skip }, async () => {
+  const gatewayNote = `[...document.querySelectorAll('.deepseek-settings .ds-note')].map((n) => n.innerText).find((t) => t.includes('需要含 API 的方案')) || ''`;
+  await b.eval(`document.querySelector('.deepseek-settings input[name="gateway"][value="commandcode"]').click()`);
+  await b.waitFor(`(${gatewayNote}).includes('需要含 API 的方案')`, { timeout: 5000 });
+  const note = await b.eval(gatewayNote);
+  assert.match(note, /舊對話會自動改用新閘道/, 'old conversations are moved to the same model at the new gateway');
+  assert.match(note, /新閘道沒有的模型.*重選/, 'and only what the new gateway lacks has to be chosen again');
+  assert.doesNotMatch(note, /舊對話請重選模型/, 'the old blanket advice is gone: it was the bug');
+  // back on the gateway in use there is nothing to say about a change
+  await b.eval(`document.querySelector('.deepseek-settings input[name="gateway"][value="opencode-go"]').click()`);
+  await b.waitFor(`!([...document.querySelectorAll('.deepseek-settings .ds-note')].map((n) => n.innerText).join(' ')).includes('舊對話')`, { timeout: 5000 });
+});
